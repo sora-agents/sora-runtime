@@ -114,14 +114,16 @@ Observe => Reflect (optional) => Situate => Reason => Act
 The decision cycle follows 5 steps:
 
 - Observe: the agent receives perceptual input and messages asynchronously, which are reflected in the agent's working memory
-- Reflect: for each activity, decides whether it has completed successfully or failed — and if so, executes an internal action to summarize and store the experience in episodic memory; "optional" means this decision itself is cheap by default and made fresh every cycle, not that the cycle is externally told when to check
+- Reflect: for each activity, decides whether it has completed successfully or failed — and if so, executes an internal action to summarize and store the experience in episodic memory; "optional" means this decision itself is cheap by default and made fresh every cycle, not that the cycle is externally told when to check; the judgment is synchronous — it must land before Situate selects, so a just-completed activity is never re-selected the same cycle — while summarizing and storing run asynchronously and never block the cycle; several activities may terminate in the same cycle
 - Situate: the agent selects an activity and adjusts its working memory for that activity — for example, by selecting tools, loading required manuals, unloading obsolete ones, and filtering the perceptual input; if an unhandled message in working memory doesn't correspond to any existing activity, Situate creates one via the internal _create_activity_ action before selecting
 - Reason: the agent retrieves or infers a plan for the current activity — a multi-step, reusable artifact, not regenerated every cycle — and selects the next step to advance it; if the activity already has a valid plan, this is as cheap as reading its next step, no replanning involved; the Situate phase may suggest prerequisite external actions for situated reasoning, such as to retrieve tool manuals from an external repository, focus on or unfocus from tools; these prerequisite actions should take priority unless a more urgent action is needed — for example, to respond to a critical signal; if no prerequisite or urgent actions are required, the agent selects the next external action that advances the plan, which is either to send a message to another agent or invoke a tool operation
 - Act: binds the step to a concrete invocation and executes the external action; for external actions that invoke tool operations, if the tool's manual specifies waiting for a signal or an observable property change before completion, the agent invokes the suspend internal action to suspend the current activity; the activity can resume once the expected external event is received
 
-Each phase may involve one LLM call, starting at up to five per cycle. A core efficiency goal is collapsing this to one call per cycle by fusing phases, starting from Observe or Reflect when a single call can decide the whole cycle. A hard interrupt can preempt the current phase for high-priority signals, independent of where the cycle is mid-flight — this is what backs the 10ms reactiveness target, deliberately not a hard per-phase timeout, since an in-flight model call can't be safely cut off mid-generation.
+The five phases are a ceiling, not a quota: every cycle runs the pipeline, but a given cycle may conclude with one external action, with internal work only (e.g., storing experiences), or with nothing to do — at most one external action per cycle, never a mandatory one.
 
-Every phase has a pluggable strategy. The default strategy for each phase is mechanical or deterministic, or it can use an LLM call to make a decision. A strategy may also short-circuit later phases by producing their answer directly — e.g., Situate deciding the step and the concrete invocation in the same call that selects the activity, or even Observe doing so for the whole cycle — so that a single underlying computation can serve multiple phases. The shared decision value lives only for the duration of one cycle.
+How many model calls a cycle costs is a configuration choice, not a property of the runtime. Observe and Reflect are deterministic by default: Observe mechanically ingests percepts and messages (an LLM-backed Observe is possible where perception itself needs interpretation — e.g., describing a camera snapshot — but that is an addition, not a fusion entry point), and Reflect's completion judgment may be deterministic or model-backed, with summarizing and storing dispatched asynchronously so they never block the cycle. Situate → Reason → Act form the decision chain proper — select an activity, advance its plan, bind a concrete invocation — and are the natural unit to fuse into a single model call, made after this cycle's percepts and messages are already in working memory. In the common case — a valid cached plan, mechanical defaults — a cycle costs zero model calls. A hard interrupt can preempt the current phase for high-priority signals, independent of where the cycle is mid-flight — this is what backs the 10ms reactiveness target, deliberately not a hard per-phase timeout, since an in-flight model call can't be safely cut off mid-generation.
+
+Every phase has a pluggable strategy. A strategy may short-circuit later phases by producing their answer directly — e.g., Situate deciding the step and the concrete invocation in the same call that selects the activity — so that a single underlying computation can serve multiple phases. The shared decision value lives only for the duration of one cycle.
 
 ## Technology Stack & Requirements
 
@@ -210,12 +212,6 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         payload: dict
 
     @dataclass(frozen=True)
-    class Operation:
-        name: str
-        description: str
-        parameters: dict     # JSON-Schema-shaped
-
-    @dataclass(frozen=True)
     class ActionAck:          # returned by ExternalAction.execute() — dispatch, not outcome (see EXAMPLES.md)
         ok: bool
         result: Any = None
@@ -237,23 +233,23 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         steps: list[Step]
 
     @dataclass(frozen=True)
-    class Invocation:         # the concrete, schema-bound call — distinct from a Step's more abstract decision
+    class OperationInvocation:  # was Invocation — the concrete, schema-bound call, distinct from a Step's more abstract decision
         tool_id: str
-        operation: str
+        operation_name: str     # correlates to OperationSpecification.name, same way tool_id correlates to Tool.id
         params: dict            # bound, ready to pass to Tool.invoke() — this is the tool-hallucination-prone step
 
     @dataclass(frozen=True)
     class PendingOperation:   # tracks one in-flight invoke — lives on Activity, not on WorkingMemory or Percept
         id: str                 # correlates to what InvokeAction pushed into result_sink
-        invocation: Invocation
+        invocation: OperationInvocation
         invoked_at: float
 
-    # sora/tool.py — usage interface + adapters (S-ORA does not author tools, only consumes them)
+    # sora/environment.py — usage interface + adapters (S-ORA does not author tools, only consumes them)
     class Tool(Protocol):
         id: str
         manual: Manual
         address: str | None   # overrides the workspace's address when this tool has its own endpoint
-        async def invoke(self, operation: str, **params) -> OperationAck: ...
+        async def invoke(self, operation_name: str, **params) -> OperationAck: ...
         async def focus(self, sink: SignalSink) -> None: ...
         async def unfocus(self) -> None: ...
         def observe(self) -> list[ObservableProperty]: ...
@@ -339,12 +335,30 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     # sora/manual.py
     @dataclass(frozen=True)
+    class OperationSpecification:   # was Operation — renamed for symmetry with the two specs below
+        name: str
+        description: str
+        parameters: dict     # JSON-Schema-shaped
+
+    @dataclass(frozen=True)
+    class ObservablePropertySpecification:
+        name: str
+        description: str
+        schema: dict          # JSON-Schema-shaped, matching e.g. a WoT property affordance
+
+    @dataclass(frozen=True)
+    class SignalSpecification:
+        name: str
+        description: str
+        schema: dict          # JSON-Schema-shaped, matching e.g. a WoT event affordance
+
+    @dataclass(frozen=True)
     class Manual:
         id: str            # type identifier — NOT a tool instance id; shared across instances
         metadata: dict; description: str
-        observable_properties: list[ObservableProperty]
-        signals: list[Signal]
-        operations: list[Operation]
+        observable_properties: list[ObservablePropertySpecification]
+        signals: list[SignalSpecification]
+        operations: list[OperationSpecification]
         usage_protocols: str
 
     class ManualParser(Protocol):     # Markdown by default, XML pluggable
@@ -395,7 +409,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     class ExternalAction(Protocol):
         name: str
-        async def execute(self, tools: EnvironmentRegistry, cycle: DecisionCycle, *,
+        async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            activity_id: str, **kwargs) -> ActionAck:
             """Narrower than passing a whole Agent: tools (Agent-owned) + cycle (memory/transport/sinks),
             nothing else — see the tick() signature below for why. `activity_id` is always passed by
@@ -407,23 +421,23 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     class InvokeAction:                # predefined external action: _invoke_
         name = "invoke"
-        async def execute(self, tools: EnvironmentRegistry, cycle: DecisionCycle, *,
-                           activity_id: str, tool_id: str, operation: str, **params) -> ActionAck:
+        async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
+                           activity_id: str, tool_id: str, operation_name: str, **params) -> ActionAck:
             tool = tools.get(tool_id)
-            invocation = Invocation(tool_id=tool_id, operation=operation, params=params)
+            invocation = OperationInvocation(tool_id=tool_id, operation_name=operation_name, params=params)
             op_id = new_id()
             activity = cycle.working.activities[activity_id]
             activity.pending_operation = PendingOperation(id=op_id, invocation=invocation, invoked_at=now())
             activity.state = ActivityState.RUNNING   # implicit, unconditional — see Activities
-            asyncio.create_task(self._call(cycle, tool, operation, params, op_id))
+            asyncio.create_task(self._call(cycle, tool, operation_name, params, op_id))
             return ActionAck(ok=True)     # immediate — the round-trip runs off-cycle, cycle never blocks
-        async def _call(self, cycle: DecisionCycle, tool: Tool, operation: str, params: dict, op_id: str) -> None:
-            ack = await tool.invoke(operation, **params)
+        async def _call(self, cycle: DecisionCycle, tool: Tool, operation_name: str, params: dict, op_id: str) -> None:
+            ack = await tool.invoke(operation_name, **params)
             cycle.result_sink.push(op_id, ack)   # keyed by op_id, not tool_id — see DefaultObserveStrategy
 
     class FocusAction:                # predefined external action: _focus_
         name = "focus"
-        async def execute(self, tools: EnvironmentRegistry, cycle: DecisionCycle, *,
+        async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            tool_id: str, **kwargs) -> ActionAck:
             tool = tools.get(tool_id)
             await tool.focus(cycle.signal_sink)
@@ -432,7 +446,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     class UnfocusAction:              # predefined external action: _unfocus_
         name = "unfocus"
-        async def execute(self, tools: EnvironmentRegistry, cycle: DecisionCycle, *,
+        async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            tool_id: str, **kwargs) -> ActionAck:
             tool = cycle.working.focused_tools.pop(tool_id, None)
             if tool is not None:
@@ -441,7 +455,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     class JoinAction:                  # predefined external action: _join_ — implies discover/connect
         name = "join"
-        async def execute(self, tools: EnvironmentRegistry, cycle: DecisionCycle, *,
+        async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            origin: WorkspaceOrigin, **kwargs) -> ActionAck:
             workspace = await tools.join(origin)
             await cycle.semantic.store_workspace_record(WorkspaceRecord(
@@ -459,16 +473,16 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     class LeaveAction:                 # predefined external action: _leave_ — implies close
         name = "leave"
-        async def execute(self, tools: EnvironmentRegistry, cycle: DecisionCycle, *,
+        async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            workspace_id: str, **kwargs) -> ActionAck:
             await tools.leave(workspace_id)
             return ActionAck(ok=True)
 
     class SendAction:                  # predefined external action: _send_
         name = "send"
-        async def execute(self, tools: EnvironmentRegistry, cycle: DecisionCycle, *,
+        async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            to: str, content: dict, **kwargs) -> ActionAck:
-            await cycle.transport.send(to, content)   # tools unused here — every ExternalAction still
+            await cycle.communication.send(to, content)   # tools unused here — every ExternalAction still
             return ActionAck(ok=True)                  # gets the same uniform (tools, cycle) signature
 
     # sora/memory.py
@@ -522,25 +536,29 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         call — nothing persists across cycles, so there's no cache to key or invalidate."""
         activity: Activity | None = None
         step: Step | None = None      # this cycle's concrete decision — not the whole (possibly multi-step) Plan
-        invocation: Invocation | None = None
+        invocation: OperationInvocation | None = None
 
     class ObserveStrategy(Protocol):
         async def observe(self, cycle: DecisionCycle) -> TickResult:
             """Mutates cycle.working (perceptions, messages) as a side effect — same as the default
-            below. May additionally return activity/step/invocation already filled in: the entry point
-            for fusing the entire cycle into one call. Default: mutates working memory, returns an
-            empty TickResult()."""
+            below. Default: mechanical, no model call, returns an empty TickResult(). An LLM-backed
+            Observe is for interpreting raw perception itself (e.g., describing a camera snapshot),
+            not for deciding the cycle — decision-chain fusion starts at Situate, not here."""
 
     class ReflectStrategy(Protocol):
         async def reflect(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
                            result: TickResult) -> TickResult:
-            """Decides whether this activity just completed or failed and, if so, summarizes and stores
-            to episodic memory — moved here from Observe. On success, also stores activity.plan via
-            cycle.procedural.store() so future activities with a similar goal can reuse it; on failure,
-            it isn't stored. Passes `result` through, optionally adding to it. Default: performs the
-            completion check and the store-on-success, leaves TickResult's other fields untouched.
-            `cycle` is what makes these memory calls possible at all — previously missing from this
-            Protocol despite the calls it was already documented as making."""
+            """Decides whether this activity just completed or failed — deterministic or model-backed,
+            depending on the application — and if so, summarizes and stores to episodic memory. On
+            success, also stores activity.plan via cycle.procedural.store() so future activities with
+            a similar goal can reuse it; on failure, it isn't stored. The completion judgment is
+            synchronous — it must land before Situate selects, so a just-completed activity is never
+            re-selected the same cycle — while the summarize/store side effects are dispatched
+            asynchronously and never block the cycle; several activities may terminate in the same
+            cycle. Passes `result` through, optionally adding to it. Default: performs the completion
+            check and the store-on-success, leaves TickResult's other fields untouched. `cycle` is
+            what makes these memory calls possible at all — previously missing from this Protocol
+            despite the calls it was already documented as making."""
 
     class SituateStrategy(Protocol):
         async def situate(self, activities: list[Activity], wm: WorkingMemory, cycle: DecisionCycle,
@@ -548,7 +566,10 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
             """Selects the next activity and adjusts wm for it. Only called if result.activity is still
             None. Also responsible for activity creation: if wm.messages has one that doesn't correspond
             to any existing activity, invokes the internal _create_activity_ action (via cycle) before
-            selecting. May additionally fill in step/invocation, short-circuiting Reason/Act."""
+            selecting. Head of the decision chain (Situate -> Reason -> Act) and the intended entry
+            point for fusing the remaining phases into one model call — it runs after this cycle's
+            percepts and messages are already in working memory. May additionally fill in
+            step/invocation, short-circuiting Reason/Act."""
 
     class ReasonStrategy(Protocol):   # pluggable; default targets 1 LLM call/cycle
         async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
@@ -565,8 +586,8 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         async def bind(self, step: Step, manual: Manual | None, cycle: DecisionCycle,
                         result: TickResult) -> TickResult:
             """Only called if result.invocation is still None. Binds an abstract Step to a concrete,
-            schema-conformant Invocation. `cycle` is available for implementations that cache bindings
-            (e.g. belief-state -> params) rather than re-deriving one every time."""
+            schema-conformant OperationInvocation. `cycle` is available for implementations that
+            cache bindings (e.g. belief-state -> params) rather than re-deriving one every time."""
 
     @dataclass(frozen=True)
     class Strategies:          # bundles the five, so DecisionCycle.__init__ doesn't take five loose params
@@ -593,7 +614,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
                     activity.last_operation = ack
                     activity.pending_operation = None
                     activity.state = ActivityState.READY
-            async for message in cycle.transport.receive():
+            async for message in cycle.communication.receive():
                 cycle.working.messages.append(message)
             return TickResult()
 
@@ -604,19 +625,25 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     # sora/cycle.py
     class DecisionCycle:
-        def __init__(self, strategies: Strategies, transport: MessageTransport,
+        def __init__(self, strategies: Strategies, communication: MessageTransport,
                      actions: ActionRegistry, working: WorkingMemory,
                      semantic: SemanticMemory, procedural: ProceduralMemory,
                      episodic: EpisodicMemory):
+            # Both sinks live here rather than on WorkingMemory: they're the bridge from
+            # asynchronous, off-cycle events into this engine's tick()/interrupt() — not settled
+            # state. signal_sink specifically has to be co-located with interrupt() below, since
+            # a pushed Signal can preempt the current phase; that control-flow role, not "where
+            # it eventually lands as a percept," is why it isn't a WorkingMemory field.
             self.signal_sink: NotificationQueueSink[Signal] = NotificationQueueSink()        # tools push here via focus()
             self.result_sink: NotificationQueueSink[OperationAck] = NotificationQueueSink()  # InvokeAction pushes here — internal only
             ...
-        async def tick(self, tools: EnvironmentRegistry) -> None:
+        async def tick(self, registry: EnvironmentRegistry) -> None:
             """One Observe -> Reflect -> Situate -> Reason -> Act pass, threading a TickResult through
             all five phases and calling each phase's own strategy only for whatever's still missing —
             so a fully-fused Observe (or Reflect) call can skip the rest of the cycle entirely. `tools`
-            is the only thing this doesn't already hold (working/semantic/procedural/episodic/transport
-            are shared with Agent, constructed once and passed to both — see sora/bootstrap.py)."""
+            is the only thing this doesn't already hold (working/semantic/procedural/episodic/
+            communication are shared with Agent, constructed once and passed to both — see
+            sora/bootstrap.py)."""
             result = await self.strategies.observe.observe(self)
             for activity in self.working.activities.values():
                 result = await self.strategies.reflect.reflect(activity, self.working, self, result)
@@ -636,13 +663,13 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
             """Preempts the current phase for a high-priority event (10ms target)."""
 
     class Agent:
-        """Owns the pieces conceptually the agent's own — tools, memory, transport — constructed from
-        the same instances handed to DecisionCycle, so e.g. agent.tools.restore(records, agent.semantic)
-        needs no reaching through agent.cycle."""
-        def __init__(self, cycle: DecisionCycle, tools: EnvironmentRegistry,
+        """Owns the pieces that are conceptually the agent's own — tools, memory, transport — built
+        from the same shared instances as DecisionCycle, so e.g. agent.registry.restore(records,
+        agent.semantic) never needs to reach through agent.cycle."""
+        def __init__(self, cycle: DecisionCycle, registry: EnvironmentRegistry,
                      working: WorkingMemory, semantic: SemanticMemory,
                      procedural: ProceduralMemory, episodic: EpisodicMemory,
-                     transport: MessageTransport): ...
+                     communication: MessageTransport): ...
         async def run(self) -> None:
             """Loop: await self.cycle.tick(self.tools) — passes only what tick() doesn't already have."""
         async def stop(self) -> None: ...
@@ -664,7 +691,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         semantic = SemanticMemory(backend_for(config.memory.semantic))
         procedural = ProceduralMemory(backend_for(config.memory.procedural))
         episodic = EpisodicMemory(backend_for(config.memory.episodic))
-        transport = HttpTransport(self=config.transport.self, peers=config.transport.peers)
+        communication = HttpTransport(self=config.transport.self, peers=config.transport.peers)
         strategies = Strategies(
             observe=import_object(config.strategies.get("observe", "sora.observe.default"))(),
             reflect=import_object(config.strategies.get("reflect", "sora.reflect.default"))(),
@@ -673,10 +700,10 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
             act=import_object(config.strategies.get("act", "sora.act.default"))(),
         )
 
-        cycle = DecisionCycle(strategies=strategies, transport=transport, actions=default_action_registry(),
+        cycle = DecisionCycle(strategies=strategies, communication=communication, actions=default_action_registry(),
                                working=working, semantic=semantic, procedural=procedural, episodic=episodic)
         adapters = {WorkspaceOrigin(**w["origin"]): adapter_for(w["origin"]) for w in config.workspaces}
         tools = EnvironmentRegistry(adapters=adapters)
         return Agent(cycle=cycle, tools=tools, working=working, semantic=semantic,
-                     procedural=procedural, episodic=episodic, transport=transport)
+                     procedural=procedural, episodic=episodic, communication=communication)
 ```

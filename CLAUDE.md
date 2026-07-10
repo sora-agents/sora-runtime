@@ -12,7 +12,7 @@ The S-ORA runtime — a runtime for practical agents in dynamic and asynchronous
 uv sync --all-extras --dev        # install pinned deps into .venv (uv provisions Python itself)
 uv run ruff check .               # lint
 uv run ruff format --check .      # format check (drop --check to auto-format)
-uv run mypy .                     # type check (strict)
+uv run mypy                       # type check (strict)
 uv run pytest                     # full test suite
 uv run pytest tests/test_smoke.py::test_package_importable  # single test
 uv run pre-commit install         # one-time: run the same checks locally on commit
@@ -25,20 +25,21 @@ CI (`.github/workflows/ci.yml`) runs all four checks above on Python 3.12 and 3.
 There is no code to navigate yet, but the design fixes a specific shape that any implementation must follow — this is what would otherwise require reading all of README.md's API Sketch to piece together:
 
 - **Decision cycle, not a single call.** An agent's core loop is five phases — Observe, Reflect, Situate, Reason, Act — executing at most one external action per cycle, even though many activities can be pursued concurrently. Each phase has its own independently pluggable strategy (`ObserveStrategy`, `ReflectStrategy`, `SituateStrategy`, `ReasonStrategy`, `ActStrategy`); pluggable never implies a model call, mechanical/deterministic defaults are first-class.
-- **`TickResult` threads through all five phases.** It's the only fusion mechanism: each phase strategy receives and returns it, filling in whatever fields (`activity`, `step`, `invocation`) it can, and `DecisionCycle.tick()` only calls a phase's strategy if the relevant field is still `None`. This is how "1 model call for the whole cycle" and "5 separate calls" are both valid configurations of the same code — there is no separate caching mechanism, and none should be added (see [ADR-0011](docs/adrs/0011-phase-fusion-via-threaded-result.md)).
+- **`TickResult` threads through all five phases.** It's the only fusion mechanism: each phase strategy receives and returns it, filling in whatever fields (`activity`, `step`, `invocation`) it can, and `DecisionCycle.tick()` only calls a phase's strategy if the relevant field is still `None`. This is how "one fused Situate→Reason→Act call," "several focused calls," and "zero calls (cached plan, mechanical defaults)" are all valid configurations of the same code — Observe/Reflect stay deterministic by default, fusion starts at Situate, not Observe — and there is no separate caching mechanism, and none should be added (see [ADR-0011](docs/adrs/0011-phase-fusion-via-threaded-result.md)).
 - **Tools live behind adapters, grouped into Workspaces.** The runtime never authors tools ([ADR-0003](docs/adrs/0003-adapters-not-tool-authoring.md)); a `WorkspaceAdapter` imports them from an external ecosystem (MCP, WoT, ...) into the three-part usage interface (observable properties, signals, operations). A `Workspace` is the shared connection/lifecycle boundary; an individual `Tool` may still have its own address distinct from its workspace's ([ADR-0005](docs/adrs/0005-workspace-grouping.md)).
-- **`Agent` and `DecisionCycle` share constructed instances rather than one referencing the other.** Memory modules and transport are built once and hand the same objects to both; actions receive only `(tools, cycle)`, never a whole `Agent`. This is deliberate — see [ADR-0013](docs/adrs/0013-shared-instances-narrow-dependencies.md) before reintroducing a back-reference to fix a wiring inconvenience.
+- **`Agent` and `DecisionCycle` share constructed instances rather than one referencing the other.** Memory modules and communication are built once and hand the same objects to both; actions receive only `(tools, cycle)`, never a whole `Agent`. This is deliberate — see [ADR-0013](docs/adrs/0013-shared-instances-narrow-dependencies.md) before reintroducing a back-reference to fix a wiring inconvenience.
 - **All wiring is centralized in `sora/bootstrap.py`.** A developer implementing an agent only ever writes `agent.yaml` plus, typically, one `ReasonStrategy` — never constructs `Agent`/`DecisionCycle`/memory modules by hand (see README.md's Technology Stack & Requirements).
 - **Two independent kinds of waiting — don't conflate them.** Invoking any operation *unconditionally* moves the activity to `running` with `Activity.pending_operation` set; when the result resolves, the runtime transitions it back to `ready` automatically (unambiguous 1:1 match, no `Percept`, no strategy code). A manual can *additionally* require waiting for a specific signal before the next step — that's `blocked`, entered/exited via `_suspend_`/`_resume_`, and requires a strategy to judge whether an observed signal satisfies it. Don't reintroduce an operation result as a `Percept` kind, and don't make `running`'s resolution manual-driven — both were tried and reverted.
+- **`signal_sink`/`result_sink` live on `DecisionCycle`, not `WorkingMemory`.** Both bridge asynchronous, off-cycle events into `tick()`, not settled state. `signal_sink` specifically has to sit next to `interrupt()`, since a pushed `Signal` can preempt the current phase — that control-flow role, not "where it eventually lands as a percept," is why it isn't a `WorkingMemory` field despite `WorkingMemory` already holding `focused_tools`.
 
 Module-to-concept map (from the API Sketch's own file markers — this is where each piece will land once Phase 1 creates it):
 
 | Module | Contains |
 |---|---|
-| `sora/types.py` | Shared value types (`ActionAck`, `OperationAck`, `Plan`, `Step`, `Invocation`, `PendingOperation`, ...) |
-| `sora/tool.py` | `Tool`, `Workspace`, `WorkspaceAdapter`, `EnvironmentRegistry` |
+| `sora/types.py` | Shared value types (`ActionAck`, `OperationAck`, `Plan`, `Step`, `OperationInvocation`, `PendingOperation`, ...) |
+| `sora/environment.py` | `Tool`, `Workspace`, `WorkspaceAdapter`, `EnvironmentRegistry` |
 | `sora/perception.py` | `Percept`, `Message`, `SignalSink`, `NotificationQueueSink` |
-| `sora/manual.py` | `Manual`, `ManualParser`, `WorkspaceRecord`, `ToolRecord` |
+| `sora/manual.py` | `Manual`, `ManualParser`, `WorkspaceRecord`, `ToolRecord`, `OperationSpecification`, `ObservablePropertySpecification`, `SignalSpecification` |
 | `sora/activity.py` | `Activity`, `ActivityState` |
 | `sora/action.py` | `InternalAction`, `ExternalAction`, `ActionRegistry`, the six predefined actions |
 | `sora/memory.py` | `MemoryBackend`, `WorkingMemory`, `SemanticMemory`, `ProceduralMemory`, `EpisodicMemory` |

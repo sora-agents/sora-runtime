@@ -37,14 +37,14 @@ Plan(
     goal="schedule meeting and reply to requester",
     steps=[
         Step(next_action="invoke",
-             params={"tool_id": "EmailApp", "operation": "list_emails",
+             params={"tool_id": "EmailApp", "operation_name": "list_emails",
                      "folder": "inbox", "limit": 5}),
         Step(next_action="invoke",
-             params={"tool_id": "CalendarApp", "operation": "get_calendar_events_from_to"}),
+             params={"tool_id": "CalendarApp", "operation_name": "get_calendar_events_from_to"}),
         Step(next_action="invoke",
-             params={"tool_id": "CalendarApp", "operation": "add_calendar_event"}),
+             params={"tool_id": "CalendarApp", "operation_name": "add_calendar_event"}),
         Step(next_action="invoke",
-             params={"tool_id": "EmailApp", "operation": "reply_to_email"}),
+             params={"tool_id": "EmailApp", "operation_name": "reply_to_email"}),
     ]
 )
 ```
@@ -78,7 +78,7 @@ agent:
     - origin: {adapter: mcp, address: "http://localhost:8080/sse"}
 ```
 
-The MCP adapter's `discover()` connects to the server, enumerates all app tools across all apps as S-ORA `Operation` objects, and returns a single `Workspace`. Each app becomes a separate `Tool` within that workspace — `EmailApp`, `CalendarApp`, `SandboxFileSystem` — each with its own manual derived from the MCP tool descriptions.
+The MCP adapter's `discover()` connects to the server, enumerates all app tools across all apps as S-ORA `OperationSpecification` objects, and returns a single `Workspace`. Each app becomes a separate `Tool` within that workspace — `EmailApp`, `CalendarApp`, `SandboxFileSystem` — each with its own manual derived from the MCP tool descriptions.
 
 ## Signals from ARE write operations
 
@@ -138,7 +138,7 @@ Two agents share this one workspace, each focusing a different subset of its too
 
 Because neither agent has everything it needs on its own, `arm-agent` asks `room-agent` what it sees — via a **message** — before it can plan where to move.
 
-This example uses `ObservableProperty`, `Signal`, `Operation`, `ActionAck`, `OperationAck`, `Step`, `Plan`, `Invocation`, `TickResult`, and `SendAction` as defined in the README's [API Sketch](README.md#api-sketch) — no redefinitions needed here.
+This example uses `ObservableProperty`, `Signal`, `ActionAck`, `OperationAck`, `Step`, `Plan`, `OperationInvocation`, `TickResult`, and `SendAction` as defined in the README's [API Sketch](README.md#api-sketch) — no redefinitions needed here.
 
 ## The `lab` workspace
 
@@ -256,8 +256,8 @@ class WoTWorkspaceAdapter:
             def __init__(self):
                 self.manual = manual
                 self.address = td.base if td.base != directory_uri else None   # None => rides the workspace's connection
-            async def invoke(self, operation: str, **params) -> OperationAck:
-                result = await client.invoke_action(operation, params)
+            async def invoke(self, operation_name: str, **params) -> OperationAck:
+                result = await client.invoke_action(operation_name, params)
                 return OperationAck(ok=True, result=result)
             async def focus(self, sink: SignalSink) -> None:
                 await client.subscribe_all(lambda name, data: sink.push(td.id, Signal(name, data)))
@@ -321,22 +321,22 @@ Identical on both agents — only the focus step afterward differs:
 
 ```python
 lab = WorkspaceOrigin(adapter="wot", address="http://lab.local/things")
-await JoinAction().execute(agent.tools, agent.cycle, origin=lab)
+await JoinAction().execute(agent.registry, agent.cycle, origin=lab)
 ```
 
-`JoinAction` connects via `EnvironmentRegistry.join()`, registers all three tools in `agent.tools`, and persists the `WorkspaceRecord` plus each tool's `Manual`/`ToolRecord` to `agent.semantic` — so a restart can `restore()` instead of rejoining from scratch. Every action takes `(tools, cycle)` rather than the whole `Agent` — narrower than `Agent`, and it's what lets `DecisionCycle.tick()` avoid storing a back-reference to its own `Agent` (see the README's Agent/DecisionCycle wiring).
+`JoinAction` connects via `EnvironmentRegistry.join()`, registers all three tools in `agent.registry`, and persists the `WorkspaceRecord` plus each tool's `Manual`/`ToolRecord` to `agent.semantic` — so a restart can `restore()` instead of rejoining from scratch. Every action takes `(tools, cycle)` rather than the whole `Agent` — narrower than `Agent`, and it's what lets `DecisionCycle.tick()` avoid storing a back-reference to its own `Agent` (see the README's Agent/DecisionCycle wiring).
 
 `room-agent` then focuses what it can see:
 
 ```python
-await FocusAction().execute(agent.tools, agent.cycle, tool_id="video-stream")
-await FocusAction().execute(agent.tools, agent.cycle, tool_id="blinds")
+await FocusAction().execute(agent.registry, agent.cycle, tool_id="video-stream")
+await FocusAction().execute(agent.registry, agent.cycle, tool_id="blinds")
 ```
 
 `arm-agent` focuses what it controls:
 
 ```python
-await FocusAction().execute(agent.tools, agent.cycle, tool_id="robotic-arm")
+await FocusAction().execute(agent.registry, agent.cycle, tool_id="robotic-arm")
 ```
 
 ## Perceiving the room
@@ -359,7 +359,7 @@ This lands in `room_agent.working.perceptions` — nobody asked for it, it's jus
 `arm-agent` sends the query as part of its `pick-up-block` activity:
 
 ```python
-await SendAction().execute(agent.tools, agent.cycle, to="room-agent",
+await SendAction().execute(agent.registry, agent.cycle, to="room-agent",
     content={"type": "query", "question": "what's in front of the robot?"})
 ```
 
@@ -374,7 +374,7 @@ Message(sender="arm-agent",
 `room-agent`'s reasoning strategy sees the message in `wm.messages`, reads the latest `scene` percept out of `wm.perceptions`, and answers:
 
 ```python
-await SendAction().execute(agent.tools, agent.cycle, to="arm-agent",
+await SendAction().execute(agent.registry, agent.cycle, to="arm-agent",
     content={"type": "reply",
              "answer": "There are two piles: in the first, a blue block is on top of a red block. "
                        "In the second, a green block is on top of a yellow block."})
@@ -387,7 +387,7 @@ await SendAction().execute(agent.tools, agent.cycle, to="arm-agent",
 `arm-agent`'s plan resolves to a target position over the blue block and issues the move:
 
 ```python
-await InvokeAction().execute(agent.tools, agent.cycle, activity_id="pick-up-block",
+await InvokeAction().execute(agent.registry, agent.cycle, activity_id="pick-up-block",
                               tool_id="robotic-arm", operation="move_to", x=120.0, y=45.0, z=30.0)
 ```
 
@@ -412,7 +412,7 @@ Percept(source="robotic-arm", kind="signal",
 Reflect/Situate notices this signal (a genuine judgment call — matching it against what the manual said to wait for — which is why *this* resume isn't automatic the way the operation-completion one was), and the activity becomes `ready` again. The plan advances to closing the gripper, which goes through the exact same implicit `running` → automatic-resolve cycle as `move_to` did — no percept, no suspend, since this tool's manual doesn't require waiting for anything beyond the operation's own result:
 
 ```python
-await InvokeAction().execute(agent.tools, agent.cycle, activity_id="pick-up-block",
+await InvokeAction().execute(agent.registry, agent.cycle, activity_id="pick-up-block",
                               tool_id="robotic-arm", operation="close_gripper")
 # ... a few cycles later, resolved automatically:
 activity.last_operation = OperationAck(ok=True, result={"gripper_state": "closed"})
@@ -435,13 +435,13 @@ class PickUpBlockStrategy:
                 activity.context["target"] = locate_blue_block(reply.content["answer"])
                 return TickResult(activity=activity, step=Step(
                     next_action="invoke",
-                    params={"tool_id": "robotic-arm", "operation": "move_to", **activity.context["target"]}))
+                    params={"tool_id": "robotic-arm", "operation_name": "move_to", **activity.context["target"]}))
             return TickResult(activity=activity, step=Step(
                 next_action="send",
                 params={"to": "room-agent", "content": {"type": "query", "question": "what's in front of the robot?"}}))
         if activity.context.get("gripper_state") != "closed":
             return TickResult(activity=activity, step=Step(
-                next_action="invoke", params={"tool_id": "robotic-arm", "operation": "close_gripper"}))
+                next_action="invoke", params={"tool_id": "robotic-arm", "operation_name": "close_gripper"}))
         return TickResult(activity=activity, step=Step(next_action="wait", params={}))
 ```
 
@@ -453,8 +453,8 @@ Once `activity.context["target"]` holds real coordinates, there's nothing left f
 
 ```python
                 return TickResult(activity=activity,
-                    step=Step(next_action="invoke", params={"tool_id": "robotic-arm", "operation": "move_to"}),
-                    invocation=Invocation(tool_id="robotic-arm", operation="move_to", params=activity.context["target"]))
+                    step=Step(next_action="invoke", params={"tool_id": "robotic-arm", "operation_name": "move_to"}),
+                    invocation=OperationInvocation(tool_id="robotic-arm", operation_name="move_to", params=activity.context["target"]))
 ```
 
 `DecisionCycle.tick()`'s `if result.invocation is None` guard sees this already set and never calls `act_strategy.bind()` that cycle — one call did Reason's and Act's jobs together. This is the concrete version of the runtime's general point: pluggability doesn't force any particular number of calls, and a strategy fuses forward only when it actually has the answer already — for a tool whose params need a lookup or unit conversion the reasoning strategy doesn't have handy, leaving `invocation=None` still routes to a separate, more constrained `ActStrategy` call instead.
@@ -472,7 +472,7 @@ class PickUpBlockStrategy:
         if activity.plan is None:
             activity.plan = await cycle.procedural.retrieve(activity) or Plan(
                 id=f"plan-{activity.id}", goal=activity.goal,
-                steps=[Step("send", {...}), Step("invoke", {"operation": "move_to"}), Step("invoke", {"operation": "close_gripper"})])
+                steps=[Step("send", {...}), Step("invoke", {"operation_name": "move_to"}), Step("invoke", {"operation_name": "close_gripper"})])
             activity.step_index = 0
         step = activity.plan.steps[activity.step_index]
         activity.step_index += 1
@@ -484,8 +484,8 @@ For the second stack, `cycle.procedural.retrieve()` hits — the *shape* of the 
 ## Shutting down
 
 ```python
-await UnfocusAction().execute(agent.tools, agent.cycle, tool_id="robotic-arm")
-await LeaveAction().execute(agent.tools, agent.cycle, workspace_id="lab")
+await UnfocusAction().execute(agent.registry, agent.cycle, tool_id="robotic-arm")
+await LeaveAction().execute(agent.registry, agent.cycle, workspace_id="lab")
 ```
 
 `LeaveAction` calls `workspace.close()`, tearing down the WoT client's subscriptions in one call rather than per tool, and deregisters every tool that came from `lab` in one step.

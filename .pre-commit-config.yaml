@@ -24,3 +24,12 @@ repos:
         additional_dependencies: []
         pass_filenames: false
         args: ["."]
+
+  - repo: local
+    hooks:
+      - id: readme-sync
+        name: README.md class-name sync check
+        entry: uv run python3 scripts/check_readme_sync.py
+        language: system
+        pass_filenames: false
+        files: ^(src/sora/.*\.py|README\.md)$

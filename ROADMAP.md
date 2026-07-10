@@ -23,14 +23,14 @@ Ordering principle for Phase 3: **fakes and determinism first, real networks and
 - [x] `git init`, initial commit
 - [x] Verify clean-machine bootstrap: `uv sync --all-extras --dev && uv run ruff check . && uv run ruff format --check . && uv run mypy . && uv run pytest` passes
 - [x] Confirm copyright holder name in `LICENSE` and contact emails in `SECURITY.md`/`CODE_OF_CONDUCT.md` (currently placeholders)
-- [ ] Push to `git@github.com:sora-agents/sora-runtime.git`; enable branch protection on `main` (require CI + review before merge)
+- [x] Push to `git@github.com:sora-agents/sora-runtime.git`; enable branch protection on `main` (require CI + review before merge)
 
 ## Phase 1 — Skeleton
 
-- [ ] Create every module named in the README's API sketch (`sora/types.py`, `tool.py`, `perception.py`, `manual.py`, `activity.py`, `action.py`, `memory.py`, `strategies.py`, `transport.py`, `cycle.py`, `cli.py`, `bootstrap.py`)
-- [ ] All `@dataclass(frozen=True)` value types and `Protocol` interfaces from the sketch, as-is
-- [ ] Stub concrete classes (`EnvironmentRegistry`, `DecisionCycle`, `Agent`, `ActionRegistry`, the six predefined actions, `NotificationQueueSink`, `DefaultObserveStrategy`, ...) with `...`/`NotImplementedError` bodies
-- [ ] **Done when:** package imports cleanly, `mypy --strict` passes with zero errors, smoke test passes
+- [x] Create every module named in the README's API sketch (`sora/types.py`, `environment.py`, `perception.py`, `manual.py`, `activity.py`, `action.py`, `memory.py`, `strategies.py`, `transport.py`, `cycle.py`, `cli.py`, `bootstrap.py`)
+- [x] All `@dataclass(frozen=True)` value types and `Protocol` interfaces from the sketch, as-is
+- [x] Stub concrete classes (`EnvironmentRegistry`, `DecisionCycle`, `Agent`, `ActionRegistry`, the six predefined actions, `NotificationQueueSink`, `DefaultObserveStrategy`, ...) with `...`/`NotImplementedError` bodies
+- [x] **Done when:** package imports cleanly, `mypy --strict` passes with zero errors, smoke test passes
 
 ## Phase 2 — Walking skeleton against ARE
 

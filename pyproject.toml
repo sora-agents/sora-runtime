@@ -26,6 +26,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "mypy>=1.11",
     "ruff>=0.7",
+    "pre-commit>=4.0",
 ]
 
 [project.scripts]
@@ -57,7 +58,7 @@ quote-style = "double"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src"]
+files = ["src/sora", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
