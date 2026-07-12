@@ -630,6 +630,11 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
                 cycle.working.messages.append(message)
             return TickResult()
 
+    # DefaultReflectStrategy / DefaultSituateStrategy / DefaultActStrategy: the mechanical, no-LLM
+    # defaults for the other decision-chain phases — same role as DefaultObserveStrategy (bodies
+    # provisional). Named here so the sketch matches the code's default set; wired in by bootstrap
+    # as sora.reflect.default / sora.situate.default / sora.act.default.
+
     # sora/transport.py
     class MessageTransport(Protocol): # pluggable: A2A, HTTP, in-process
         async def send(self, to: str, content: dict) -> None: ...

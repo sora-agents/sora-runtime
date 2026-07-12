@@ -14,11 +14,12 @@ uv run ruff check .               # lint
 uv run ruff format --check .      # format check (drop --check to auto-format)
 uv run mypy                       # type check (strict)
 uv run pytest                     # full test suite
+uv run python3 scripts/check_readme_sync.py   # README API Sketch names every src class
 uv run pytest tests/test_smoke.py::test_package_importable  # single test
 uv run pre-commit install         # one-time: run the same checks locally on commit
 ```
 
-CI (`.github/workflows/ci.yml`) runs all four checks above on Python 3.12 and 3.13 for every push/PR — treat a failure in any one of them as a real failure, not noise.
+CI (`.github/workflows/ci.yml`) runs all five checks above (ruff lint, ruff format, mypy, pytest, readme-sync) on Python 3.12 and 3.13 for every push/PR — treat a failure in any one of them as a real failure, not noise. Run the full set locally before committing/pushing (or `uv run pre-commit run --all-files`). `check_readme_sync.py` is the easiest to forget: it only runs on commit if `pre-commit install` has been done, so run it explicitly when you add or rename a class in `src/sora/*.py` without a local pre-commit.
 
 ## Architecture
 
