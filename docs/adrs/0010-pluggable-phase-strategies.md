@@ -1,6 +1,6 @@
 # Every phase has an independently pluggable strategy
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

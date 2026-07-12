@@ -1,6 +1,6 @@
 # Adapters import tools; the runtime never authors them
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

@@ -1,7 +1,7 @@
 # Phase fusion via a per-cycle threaded result
 
-* Status: accepted
-* Date: 2026-07-05
+* Status: proposed
+* Date: 2026-07-12
 
 ## Context and Problem Statement
 
@@ -21,6 +21,8 @@ With every phase independently pluggable ([ADR-0010](0010-pluggable-phase-strate
 ## Decision Outcome
 
 Chosen option: "One shared, per-cycle-scoped result value". Any fusion boundary (Observe-only, Reflect-through-Act, any subset) is representable by which fields a given phase happens to fill in, with no combinatorial set of interfaces required. `DecisionCycle.tick()` calls each phase's strategy only if the relevant field is still `None`. Because `TickResult`'s lifetime is exactly one `tick()` call, it also carries no risk of staleness across an interrupt — but that's a side effect of the value being scoped to a single call, not the reason for choosing this option over the combined-Protocol alternative.
+
+This gate is sound only because, for Reason and Act, the field is the phase's *entire* output: Reason's whole job is to produce `step`, Act's to produce `invocation`. So finding that field already filled — by an earlier phase that computed it in the same call — means nothing is left to do, and skipping is safe. That "an earlier phase pre-fills a later phase's field" is the fusion the gate exists for (e.g. one Situate call that also sets `step` and `invocation`, so Reason and Act are skipped). Situate is the exception: its `activity` field records only the *selection*, but Situate also mutates working memory (re-focusing tools, loading/unloading manuals, filtering percepts), which no field captures. So a filled `activity` does not mean Situate's work is done — Situate is therefore never skipped: it always runs, selecting only when `activity` is unset. The gate governs skipping a *later* phase whose output was fused forward, never re-entry of the head-of-chain phase. See [docs/phase-2-findings.md](../phase-2-findings.md).
 
 ### Positive Consequences
 

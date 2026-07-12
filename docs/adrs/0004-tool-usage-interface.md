@@ -1,6 +1,6 @@
 # Tool usage interface: properties, signals, operations — async by design
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

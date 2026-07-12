@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
+
+from sora.activity import ActivityState
+from sora.perception import Percept
+from sora.types import OperationInvocation, Step
 
 if TYPE_CHECKING:
     from sora.activity import Activity
     from sora.cycle import DecisionCycle
     from sora.manual import Manual
     from sora.memory import WorkingMemory
-    from sora.types import OperationInvocation, Step
 
 
 @dataclass(frozen=True)
@@ -109,8 +113,65 @@ class Strategies:  # bundles the five, so DecisionCycle.__init__ doesn't take fi
 
 
 class DefaultObserveStrategy:
-    """The runtime's built-in default — purely mechanical, no LLM. This is the exact logic
-    previously inlined in DecisionCycle._observe()."""
+    """The runtime's built-in default — purely mechanical, no LLM."""
 
     async def observe(self, cycle: DecisionCycle) -> TickResult:
-        raise NotImplementedError
+        wm = cycle.working
+        for tool in wm.focused_tools.values():
+            for prop in tool.observe():
+                wm.perceptions.append(Percept(tool.id, "property", prop, time.time()))
+        async for source, signal in cycle.signal_sink.drain():
+            wm.perceptions.append(Percept(source, "signal", signal, time.time()))
+        async for invocation_id, ack in cycle.result_sink.drain():
+            # Unambiguous 1:1 match: the invoke's own result resolves its activity automatically,
+            # never as a Percept, no strategy involved (see Activities in README).
+            for activity in wm.activities.values():
+                if activity.pending_operation and activity.pending_operation.id == invocation_id:
+                    activity.last_operation = ack
+                    activity.pending_operation = None
+                    activity.state = ActivityState.READY
+                    break
+        async for message in cycle.communication.receive():
+            wm.messages.append(message)
+        return TickResult()
+
+
+class DefaultReflectStrategy:
+    """Spike default: no completion judgment yet — a just-selected activity stays selectable.
+    The real episodic/procedural store-on-success logic isn't built yet."""
+
+    async def reflect(
+        self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
+    ) -> TickResult:
+        return result
+
+
+class DefaultSituateStrategy:
+    """Spike default: pick the first ready activity; no activity-creation-from-messages yet."""
+
+    async def situate(
+        self,
+        activities: list[Activity],
+        wm: WorkingMemory,
+        cycle: DecisionCycle,
+        result: TickResult,
+    ) -> TickResult:
+        if result.activity is not None or not activities:
+            return result
+        return replace(result, activity=activities[0])
+
+
+class DefaultActStrategy:
+    """Spike default: bind an ``invoke`` Step straight to an OperationInvocation, splitting the
+    tool_id/operation_name routing keys out of the bound params."""
+
+    async def bind(
+        self, step: Step, manual: Manual | None, cycle: DecisionCycle, result: TickResult
+    ) -> TickResult:
+        params = {k: v for k, v in step.params.items() if k not in ("tool_id", "operation_name")}
+        invocation = OperationInvocation(
+            tool_id=step.params["tool_id"],
+            operation_name=step.params["operation_name"],
+            params=params,
+        )
+        return replace(result, invocation=invocation)

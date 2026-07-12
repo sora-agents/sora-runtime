@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+import uuid
 from typing import TYPE_CHECKING, Any, Protocol
+
+from sora.activity import ActivityState
+from sora.types import ActionAck, OperationInvocation, PendingOperation
 
 if TYPE_CHECKING:
     from sora.cycle import DecisionCycle
-    from sora.environment import EnvironmentRegistry, WorkspaceOrigin
-    from sora.types import ActionAck
+    from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
 
 
 class InternalAction(Protocol):
@@ -36,13 +41,29 @@ class ExternalAction(Protocol):
 
 
 class ActionRegistry:
-    def register_internal(self, action: InternalAction) -> None: ...
+    def __init__(self) -> None:
+        self._internal: dict[str, InternalAction] = {}
+        self._external: dict[str, ExternalAction] = {}
 
-    def register_external(self, action: ExternalAction) -> None: ...
+    def register_internal(self, action: InternalAction) -> None:
+        self._internal[action.name] = action
+
+    def register_external(self, action: ExternalAction) -> None:
+        self._external[action.name] = action
+
+    def internal(self, name: str) -> InternalAction:
+        return self._internal[name]
+
+    def external(self, name: str) -> ExternalAction:
+        return self._external[name]
 
 
 class InvokeAction:  # predefined external action: _invoke_
     name = "invoke"
+
+    def __init__(self) -> None:
+        # Hold strong refs to in-flight background invokes so they aren't GC'd mid-flight.
+        self._tasks: set[asyncio.Task[None]] = set()
 
     async def execute(
         self,
@@ -50,11 +71,39 @@ class InvokeAction:  # predefined external action: _invoke_
         cycle: DecisionCycle,
         *,
         activity_id: str,
-        tool_id: str,
-        operation_name: str,
-        **params: Any,
+        **kwargs: Any,
     ) -> ActionAck:
-        raise NotImplementedError
+        # tool_id/operation_name ride in via **kwargs, keeping this a structural ExternalAction
+        # (the README sketch's explicit-param form isn't Protocol-compatible under mypy --strict —
+        # see docs/phase-2-findings.md).
+        tool_id = kwargs.pop("tool_id")
+        operation_name = kwargs.pop("operation_name")
+        params = kwargs
+        tool = registry.get(tool_id)
+        invocation = OperationInvocation(
+            tool_id=tool_id, operation_name=operation_name, params=params
+        )
+        invocation_id = uuid.uuid4().hex
+        activity = cycle.working.activities[activity_id]
+        activity.pending_operation = PendingOperation(
+            id=invocation_id, invocation=invocation, invoked_at=time.time()
+        )
+        activity.state = ActivityState.RUNNING  # implicit, unconditional — see Activities
+        task = asyncio.create_task(self._call(cycle, tool, operation_name, params, invocation_id))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return ActionAck(ok=True)  # immediate — the round-trip runs off-cycle, cycle never blocks
+
+    async def _call(
+        self,
+        cycle: DecisionCycle,
+        tool: Tool,
+        operation_name: str,
+        params: dict[str, Any],
+        invocation_id: str,
+    ) -> None:
+        ack = await tool.invoke(operation_name, **params)
+        cycle.result_sink.push(invocation_id, ack)  # keyed by invocation_id, not tool_id
 
 
 class FocusAction:  # predefined external action: _focus_

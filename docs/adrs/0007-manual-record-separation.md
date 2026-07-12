@@ -1,6 +1,6 @@
 # Manuals and tool/workspace records stored as separate entities
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

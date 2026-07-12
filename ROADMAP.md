@@ -46,10 +46,10 @@ explicitly throwaway/minimal: it gets replaced and properly test-driven in
 Phase 3, not polished here. Test coverage for this phase is a single
 integration-level test, not unit tests per layer.
 
-- [ ] Minimal types/actions/cycle wiring needed for exactly one `tick()` — only what this spike touches, not the full API sketch
-- [ ] Real MCP `WorkspaceAdapter` wired to ARE's local MCP server: `python are_simulation_mcp_server.py --scenario scenario_email_calendar --transport sse`
-- [ ] Hardcoded, deterministic `ReasonStrategy` that does just the *first* step of the `scenario_email_calendar` scenario — `invoke EmailApp.list_emails` — no LLM call, no multi-step plan yet
-- [ ] **Done when:** the single step completes end-to-end against the real ARE MCP server and is captured as one integration test; write up whatever design gaps this surfaces (new/updated ADRs if a decision needs to change) before continuing to Phase 3
+- [x] Minimal types/actions/cycle wiring needed for exactly one `tick()` — only what this spike touches, not the full API sketch
+- [x] Real MCP `WorkspaceAdapter` wired to ARE's local MCP server — over **stdio** via `python -m are.simulation.apps.mcp.server.are_simulation_mcp_server --apps are.simulation.apps.email_client.EmailClientApp --transport stdio` (the sketch's `--scenario scenario_email_calendar --transport sse` form doesn't exist as written — see [docs/phase-2-findings.md](docs/phase-2-findings.md))
+- [x] Hardcoded, deterministic `ReasonStrategy` that does just the *first* step — `invoke EmailClientApp.list_emails` (real tool is `EmailClientApp`, not `EmailApp`) — no LLM call, no multi-step plan yet
+- [x] **Done when:** the single step completes end-to-end against the real ARE MCP server, captured as one skip-gated integration test (`tests/test_are_walking_skeleton.py`); design gaps written up in [docs/phase-2-findings.md](docs/phase-2-findings.md) (two small typing corrections applied to `src/`; EXAMPLES.md/README diffs proposed, not yet applied; ADR candidates deferred to Phase 3 step 12)
 
 ## Phase 3 — TDD rollout
 
@@ -64,7 +64,7 @@ integration-level test, not unit tests per layer.
 - [ ] 9. Reflect and Situate default (deterministic) strategies
 - [ ] 10. Reason + Act end-to-end with a deterministic `ReasonStrategy` (no LLM)
 - [ ] 11. `Plan`/`Step` + `ProceduralMemory` retrieve/infer/store
-- [ ] 12. Harden the Phase 2 spike into the real, properly TDD'd MCP `WorkspaceAdapter`
+- [ ] 12. Harden the Phase 2 spike into the real, properly TDD'd MCP adapters — extract a protocol-only `McpWorkspaceAdapter` base from the ARE-specific `AreMcpWorkspaceAdapter` (grouping + name-assembly hooks; design the base's default grouping policy here, not from ARE alone — see [docs/phase-2-findings.md](docs/phase-2-findings.md) §5)
 - [ ] 13. `Agent` + `sora/bootstrap.py` + `agent.yaml` loading — reproduce EXAMPLES.md's full `scenario_email_calendar` scenario as running code (four-step plan, procedural-memory reuse across runs, signal-driven replanning on the mid-scenario follow-up email) — **target: tag `v0.1.0` here**
 - [ ] 14. First real, model-backed `ReasonStrategy`
 - [ ] 15. CLI polish (`TerminalSession`, `--verbose`, interrupt handling)

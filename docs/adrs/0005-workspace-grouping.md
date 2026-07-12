@@ -1,6 +1,6 @@
 # Workspace groups tools sharing a connection; per-tool address override
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

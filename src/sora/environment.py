@@ -73,7 +73,7 @@ class WorkspaceAdapter(Protocol):  # was ToolAdapter — it always operated at w
         ...
 
 
-class EnvironmentRegistry:  # was ToolRegistry — now tracks workspaces, not just flattened tools
+class EnvironmentRegistry:
     """Live, in-process handles for workspaces (and their tools) the agent currently has a
     connection to. Populated by join()/restore() — never persisted directly (see
     WorkspaceRecord/ToolRecord)."""
@@ -82,25 +82,43 @@ class EnvironmentRegistry:  # was ToolRegistry — now tracks workspaces, not ju
         """Keyed by the full origin (adapter + address), not just adapter name — an agent can
         join multiple workspaces that share a protocol (e.g. two separate MCP servers) without
         ambiguity."""
+        self._adapters: dict[WorkspaceOrigin, WorkspaceAdapter] = adapters or {}
+        self._workspaces: dict[str, Workspace] = {}
+        self._tools: dict[str, Tool] = {}
+        self._workspace_tools: dict[str, list[str]] = {}  # ws id -> its tool ids, for leave()
 
     def get(self, tool_id: str) -> Tool:
-        raise NotImplementedError
+        return self._tools[tool_id]
 
     def get_workspace(self, workspace_id: str) -> Workspace:
-        raise NotImplementedError
+        return self._workspaces[workspace_id]
 
     def all_tools(self) -> list[Tool]:
-        raise NotImplementedError
+        return list(self._tools.values())
 
     async def join(self, origin: WorkspaceOrigin) -> Workspace:
         """Predefined external action _join_: looks up the adapter registered for this exact origin,
         calls its discover() (config-scoped to just this target today), registers the workspace."""
-        raise NotImplementedError
+        adapter = self._adapters[origin]
+        workspace = (await adapter.discover())[0]  # config-scoped: exactly one workspace today
+        self._register(workspace)
+        return workspace
+
+    def _register(self, workspace: Workspace) -> None:
+        self._workspaces[workspace.id] = workspace
+        tool_ids = []
+        for tool in workspace.tools():
+            self._tools[tool.id] = tool
+            tool_ids.append(tool.id)
+        self._workspace_tools[workspace.id] = tool_ids
 
     async def leave(self, workspace_id: str) -> None:
         """Predefined external action _leave_: closes the workspace's connection, deregisters it
         and all its tools."""
-        raise NotImplementedError
+        workspace = self._workspaces.pop(workspace_id)
+        for tool_id in self._workspace_tools.pop(workspace_id, []):
+            self._tools.pop(tool_id, None)
+        await workspace.close()
 
     async def restore(
         self,
@@ -111,7 +129,7 @@ class EnvironmentRegistry:  # was ToolRegistry — now tracks workspaces, not ju
         """Reconnects to already-known workspaces via adapter.connect() — one call per workspace,
         looking up each one's adapter by workspace_record.origin, resolving each tool's manual from
         SemanticMemory first. Skips discovery entirely."""
-        raise NotImplementedError
+        raise NotImplementedError  # not built yet — untouched by the walking-skeleton spike
 
     def __repr__(self) -> str:
-        raise NotImplementedError  # return joined workspace ids
+        return f"EnvironmentRegistry(workspaces={sorted(self._workspaces)})"

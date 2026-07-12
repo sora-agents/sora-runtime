@@ -1,6 +1,6 @@
-"""Smoke test validating the Phase 0 toolchain (uv/ruff/mypy/pytest) is wired up correctly.
+"""Smoke test validating the toolchain (uv/ruff/mypy/pytest) is wired up correctly.
 
-Real tests start in Phase 1 once the API sketch has a package to test.
+Real tests start once the API sketch has a package to test.
 """
 
 import sora

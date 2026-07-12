@@ -1,6 +1,6 @@
 # Percepts and messages kept as two distinct channels
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

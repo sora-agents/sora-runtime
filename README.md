@@ -52,6 +52,8 @@ S-ORA does not define its own tool-authoring framework. Tools are expected to be
 
 Tools that share a connection or session — e.g., multiple operations exposed by one MCP server — are grouped into a workspace: a shared lifecycle boundary whose tools remain individually focusable, but whose underlying connection is established and torn down once, not per tool. A workspace's adapter fixes the tool-use protocol for everything inside it (e.g., all-MCP, all-WoT), but individual tools may still have their own connection address distinct from the workspace's — e.g., a hypermedia workspace for a lab could group virtual tools hosted on the workspace's own server alongside physical devices reachable at their own addresses in the same room.
 
+A tool's `address` is a _locator_ and may be absent — e.g., tools multiplexed over one MCP stdio connection have none — whereas its `id` is the stable _handle_ the agent uses to focus and invoke it, and is **globally unique**: because a tool is a shared object, two agents focusing the same tool, or messaging about it, must name it identically. The per-protocol adapter guarantees this by deriving the id from the tool's global identity — its URI where the protocol provides one, or a value synthesized from the workspace's global origin/address otherwise — deterministically, so a later `restore()` reproduces the same id. A single registry can only enforce the ids it sees (it rejects a collision within its own joined set rather than letting one workspace's tool shadow another's); global uniqueness itself rests on the adapter. See [ADR-0014](docs/adrs/0014-tool-identity-globally-unique.md).
+
 Joining and leaving a workspace are deliberate, agent-driven actions (_join_/_leave_), not the result of an eager, upfront scan of every configured target. Today, join targets are limited to workspaces declared in the agent's own configuration; open, dynamic discovery of previously-unknown workspaces (e.g., for open environments where not every tool is known in advance) is foreseen but deliberately deferred.
 
 We break down the process of using a tool into five phases:
@@ -246,9 +248,9 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     # sora/environment.py — usage interface + adapters (S-ORA does not author tools, only consumes them)
     class Tool(Protocol):
-        id: str
+        id: str               # globally unique, derived from the tool's global address/origin — see ADR-0014
         manual: Manual
-        address: str | None   # overrides the workspace's address when this tool has its own endpoint
+        address: str | None   # a locator (may be absent), not identity; overrides the workspace's address when this tool has its own endpoint
         async def invoke(self, operation_name: str, **params) -> OperationAck: ...
         async def focus(self, sink: SignalSink) -> None: ...
         async def unfocus(self) -> None: ...
@@ -273,7 +275,9 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
     class WorkspaceAdapter(Protocol):     # was ToolAdapter — it always operated at workspace granularity
         """Imports externally-defined tools (MCP, OpenAPI, WoT, ...) into the S-ORA usage interface.
         The tool-use protocol is fixed once per workspace (e.g. all-MCP, all-WoT); per-tool addressing
-        within that protocol (see Tool.address) is a separate, orthogonal concern."""
+        within that protocol (see Tool.address) is a separate, orthogonal concern. Each adapter assigns
+        globally-unique tool ids, derived deterministically from the tool's global address/origin so
+        restore() reproduces them (see ADR-0014)."""
         name: str    # e.g. "mcp" — matches WorkspaceOrigin.adapter
         async def discover(self) -> list[Workspace]:
             """Enumerates workspaces this adapter can reach. Today, each configured adapter instance is
@@ -291,12 +295,15 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         def __init__(self, adapters: dict[WorkspaceOrigin, WorkspaceAdapter] | None = None):
             """Keyed by the full origin (adapter + address), not just adapter name — an agent can join
             multiple workspaces that share a protocol (e.g. two separate MCP servers) without ambiguity."""
-        def get(self, tool_id: str) -> Tool: ...
+        def get(self, tool_id: str) -> Tool: ...   # tool_id is globally unique — ADR-0014
         def get_workspace(self, workspace_id: str) -> Workspace: ...
         def all_tools(self) -> list[Tool]: ...
         async def join(self, origin: WorkspaceOrigin) -> Workspace:
             """Predefined external action _join_: looks up the adapter registered for this exact origin,
-            calls its discover() (config-scoped to just this target today), registers the workspace."""
+            calls its discover() (config-scoped to just this target today), registers the workspace.
+            Raises if a discovered tool id collides with one already registered — the adapter must
+            guarantee globally-unique ids (ADR-0014), so a collision the registry can see is a bug,
+            not a silent overwrite (it can only see its own agent's joins)."""
         async def leave(self, workspace_id: str) -> None:
             """Predefined external action _leave_: closes the workspace's connection, deregisters it
             and all its tools."""
@@ -378,7 +385,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
     class ToolRecord:
         """Durable record of a discovered tool instance — many records can share one manual_id,
         and every record from the same connection shares one workspace_id."""
-        id: str            # instance id, matches Tool.id once live
+        id: str            # instance id, matches Tool.id once live; globally unique + stable across reconnect (ADR-0014)
         manual_id: str
         workspace_id: str   # references WorkspaceRecord.id
         address: str | None  # overrides WorkspaceRecord.origin.address; e.g. a physical device's own endpoint
@@ -563,13 +570,18 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
     class SituateStrategy(Protocol):
         async def situate(self, activities: list[Activity], wm: WorkingMemory, cycle: DecisionCycle,
                            result: TickResult) -> TickResult:
-            """Selects the next activity and adjusts wm for it. Only called if result.activity is still
-            None. Also responsible for activity creation: if wm.messages has one that doesn't correspond
-            to any existing activity, invokes the internal _create_activity_ action (via cycle) before
-            selecting. Head of the decision chain (Situate -> Reason -> Act) and the intended entry
-            point for fusing the remaining phases into one model call — it runs after this cycle's
-            percepts and messages are already in working memory. May additionally fill in
-            step/invocation, short-circuiting Reason/Act."""
+            """Selects the next activity and adjusts wm for it. Always runs — unlike Reason/Act it is
+            not gated on its own output field, because adjusting wm (selecting tools, loading/unloading
+            manuals, filtering percepts) must reflect this cycle's fresh percepts even for an
+            already-selected activity. Selects only if result.activity is still None; a pre-set
+            selection (uncommon — e.g. an Observe that pins the activity handling a critical signal) is
+            respected and situated, not overridden. Also responsible for activity creation: if
+            wm.messages has one that doesn't correspond to any existing activity, invokes the internal
+            _create_activity_ action (via cycle) before selecting. Head of the decision chain (Situate
+            -> Reason -> Act) and the intended entry point for fusing the remaining phases into one
+            model call — it runs after this cycle's percepts and messages are already in working memory.
+            May additionally fill in step/invocation, short-circuiting Reason/Act (those forward-fusion
+            gates remain; only Situate's own activity gate is removed)."""
 
     class ReasonStrategy(Protocol):   # pluggable; default targets 1 LLM call/cycle
         async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
@@ -647,9 +659,11 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
             result = await self.strategies.observe.observe(self)
             for activity in self.working.activities.values():
                 result = await self.strategies.reflect.reflect(activity, self.working, self, result)
-            if result.activity is None:
-                ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
-                result = await self.strategies.situate.situate(ready, self.working, self, result)
+            # Situate always runs: it re-situates wm for the (possibly already-selected) activity every
+            # cycle, and selects only if result.activity is still None. Unlike the step/invocation gates
+            # below — genuine forward-fusion short-circuits — Situate is not gated on its own field.
+            ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
+            result = await self.strategies.situate.situate(ready, self.working, self, result)
             if result.step is None:
                 result = await self.strategies.reason.reason(result.activity, self.working, self, result)
             if result.invocation is None and result.step.next_action == "invoke":

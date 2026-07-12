@@ -18,7 +18,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-mcp = []
+mcp = ["mcp>=1.0"]
 a2a = []
 wot = []
 dev = [
@@ -28,6 +28,13 @@ dev = [
     "ruff>=0.7",
     "pre-commit>=4.0",
 ]
+
+# Spike only: the ARE MCP server the walking-skeleton integration test drives.
+# Deliberately a dependency-group, NOT an extra — `uv sync --all-extras` (what CI runs) does not
+# pull groups, so the live integration test skips in CI and runs only when ARE is explicitly
+# installed via `uv sync --all-extras --group are`. See tests/test_are_walking_skeleton.py.
+[dependency-groups]
+are = ["meta-agents-research-environments>=1.2"]
 
 [project.scripts]
 sora = "sora.cli:main"
@@ -63,3 +70,10 @@ files = ["src/sora", "tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Integration tests (they spawn a real external server, e.g. ARE's MCP server) are opt-in: excluded
+# from the default run, and skip in CI anyway since the `are` dependency-group isn't installed there.
+# Run them explicitly with `uv run pytest -m integration` (needs `uv sync --all-extras --group are`).
+addopts = "-m 'not integration' --strict-markers"
+markers = [
+    "integration: spawns a real external server; opt-in via `-m integration`, excluded by default",
+]

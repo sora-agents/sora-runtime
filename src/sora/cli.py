@@ -20,6 +20,6 @@ class TerminalSession:
 
 def main() -> None:
     # Not in the README sketch — added so `[project.scripts] sora = "sora.cli:main"` resolves to a
-    # real callable. Real body (parse args, call build_agent, run a TerminalSession) lands in
-    # Phase 3 step 15 ("CLI polish").
+    # real callable. The real body (parse args, call build_agent, run a TerminalSession) isn't
+    # written yet.
     raise NotImplementedError

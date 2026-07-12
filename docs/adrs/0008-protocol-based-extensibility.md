@@ -1,6 +1,6 @@
 # Every extension point is an open Protocol, never a closed enum or base class
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

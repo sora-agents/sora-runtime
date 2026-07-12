@@ -1,6 +1,6 @@
 # Activity as the sole first-class construct (no explicit BDI states)
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

@@ -41,7 +41,16 @@ class NotificationQueueSink[T]:  # was QueueSink — too generic a name to keep
     def __init__(self) -> None:
         self._queue: asyncio.Queue[tuple[str, T]] = asyncio.Queue()
 
-    def push(self, source: str, item: T) -> None: ...
+    def push(self, source: str, item: T) -> None:
+        self._queue.put_nowait((source, item))
 
     async def drain(self) -> AsyncIterator[tuple[str, T]]:
-        raise NotImplementedError
+        """Yield everything queued *right now* and stop — one drain per cycle, never blocking on a
+        future push. `range(self._queue.qsize())` reads the depth exactly once, when the for-loop
+        builds the range, fixing the iteration count to the number of items present at that instant.
+        Anything a consumer pushes back while iterating (e.g. a re-queued signal) grows the queue
+        but not the range, so it waits for the next drain rather than starving this cycle.
+        (`get_nowait()` can't underflow here: this is the single consumer, and no other drain of the
+        same sink runs concurrently, so the count can only be reduced by this loop.)"""
+        for _ in range(self._queue.qsize()):
+            yield self._queue.get_nowait()

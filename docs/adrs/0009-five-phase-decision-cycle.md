@@ -1,6 +1,6 @@
 # Five fixed decision-cycle phases, one external action per cycle
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

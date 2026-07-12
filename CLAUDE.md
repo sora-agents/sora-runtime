@@ -54,7 +54,7 @@ Module-to-concept map (from the API Sketch's own file markers — this is where 
 ## Working on this repo
 
 - Still README-driven: propose changes/diffs to `README.md` or `EXAMPLES.md` before applying them, unless explicitly told to apply directly.
-- ADRs in [docs/adrs/](docs/adrs/) are append-only. Never edit an accepted ADR's decision in place — a changed decision gets a *new* ADR that supersedes the old one, with the old one's status line updated to `superseded by ADR-NNNN`. Index and conventions: [docs/adrs/README.md](docs/adrs/README.md).
+- ADRs in [docs/adrs/](docs/adrs/) are append-only *once accepted*. Never edit an accepted ADR's decision in place — a changed decision gets a *new* ADR that supersedes the old one, with the old one's status line updated to `superseded by ADR-NNNN`. During README-driven design, ADRs stay `proposed` and *may* be edited in place until realized in code — see the lifecycle note in [docs/adrs/README.md](docs/adrs/README.md) (also the index and conventions).
 - Follow TDD where practical, and prefer fakes/determinism over real network adapters or model-backed strategies until those specifically are what's being tested — see [ROADMAP.md](ROADMAP.md)'s Phase 2 ordering and rationale.
 
 ## Architectural habits to default to
@@ -79,3 +79,4 @@ General habits, not tied to one file — the kind of thing that's easy to reintr
 - Every type is either a `@dataclass(frozen=True)` (value types) or a `Protocol` (interfaces), fully type-hinted (`mypy --strict`).
 - Async-first: any method that touches I/O is `async def`.
 - Docstrings only for non-obvious invariants (the *why*, not the *what*) — most types and methods have none.
+- Don't reference ROADMAP phase/step labels (`Phase 2`, `Phase 3`, `ROADMAP step 12`, ...) in durable files — code comments, docstrings, or config like `pyproject.toml`. The ROADMAP will be restructured or deleted, leaving those references dangling and meaningless. Describe the thing itself instead: say *what* is stubbed/deferred and *why* (`# stubbed: resource_updated -> Signal wiring not built yet`), not *which planning phase* will do it. Dated historical records that exist to capture a moment (e.g. a findings write-up named after the phase that produced it, ADRs) are the exception — they're allowed to name the phase they document.

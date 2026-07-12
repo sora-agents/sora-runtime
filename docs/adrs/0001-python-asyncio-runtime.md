@@ -1,6 +1,6 @@
 # Python 3.12+ (asyncio) as the core runtime
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

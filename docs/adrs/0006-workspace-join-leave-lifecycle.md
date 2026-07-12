@@ -1,6 +1,6 @@
 # Join/leave as deliberate actions; discovery kept distinct from reconnection
 
-* Status: accepted
+* Status: proposed
 * Date: 2026-07-05
 
 ## Context and Problem Statement

@@ -80,6 +80,8 @@ agent:
 
 The MCP adapter's `discover()` connects to the server, enumerates all app tools across all apps as S-ORA `OperationSpecification` objects, and returns a single `Workspace`. Each app becomes a separate `Tool` within that workspace — `EmailApp`, `CalendarApp`, `SandboxFileSystem` — each with its own manual derived from the MCP tool descriptions.
 
+A single agent could join two ARE servers (two workspaces), each exposing an app of the same name — so the adapter derives each tool's **globally-unique** id from its server's origin (not the bare app name), keeping the flat `EnvironmentRegistry` collision-free and letting any agent that reaches the same server name the tool identically. See [ADR-0014](docs/adrs/0014-tool-identity-globally-unique.md). (The exact tool-name mapping is an adapter detail: ARE's real class is `EmailClientApp`, and the ARE MCP server exposes its operations namespaced as `EmailClientApp__list_emails`.)
+
 ## Signals from ARE write operations
 
 ARE's MCP server sends an MCP `resource_updated` notification (`app://{app_name}/state`) whenever a write operation completes — for example, when a scheduled event injects a new email into the inbox. The S-ORA MCP adapter translates these into `Signal` objects and pushes them to the `signal_sink` of the tool the agent is focused on:
@@ -89,7 +91,7 @@ ARE's MCP server sends an MCP `resource_updated` notification (`app://{app_name}
 async def focus(self, sink: SignalSink) -> None:
     self._session.set_resource_updated_handler(
         lambda uri: sink.push(
-            source=self._tool_id_for(uri),
+            source=self._tool_id_for(uri),   # the globally-unique id discover() assigned, not the bare app name — ADR-0014
             signal=Signal(name="state_updated", payload={"uri": str(uri)}),
         )
     )
@@ -286,6 +288,8 @@ tools = EnvironmentRegistry(adapters={
     WorkspaceOrigin(adapter="wot", address="http://lab.local/things"): WoTWorkspaceAdapter("http://lab.local/things"),
 })
 ```
+
+> Note: this example writes tool ids as bare names (`robotic-arm`, `blinds`, `video-stream`), which reads cleanly because they come from one shared WoT workspace whose Thing URIs are already global. Both agents naming `robotic-arm` identically is exactly the globally-unique-identity property from [ADR-0014](docs/adrs/0014-tool-identity-globally-unique.md) — here the "namespacing" is just the Thing's own URI.
 
 ## Agent configuration
 
