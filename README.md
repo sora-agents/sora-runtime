@@ -516,6 +516,14 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         async def put(self, key: str, value: Any) -> None: ...
         async def query(self, **filters) -> list[Any]: ...
 
+    class FileMemoryBackend:          # the default: one JSON file per key under a root directory
+        """Deals only in JSON-serializable values — the memory modules serialize their dataclasses
+        to/from dict/list/scalar, so the backend stays generic (a DB/vector-store backend is a true
+        drop-in). Reads re-parse from disk, so returned values are fresh copies, never live refs.
+        Writes are atomic (temp file + os.replace). Keys are quoted into safe filenames, so URI /
+        <App>__<op> tool ids work as keys."""
+        def __init__(self, root: str | Path): ...
+
     class WorkingMemory:              # transient, in-process, fast
         registry: EnvironmentView     # read-only view of the live joined workspaces/tools: the agent
                                        # reasons over what it's currently connected to; the durable

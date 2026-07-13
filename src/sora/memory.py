@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
+from urllib.parse import quote
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -19,6 +25,68 @@ class MemoryBackend(Protocol):  # pluggable: file, DB, vector store
     async def put(self, key: str, value: Any) -> None: ...
 
     async def query(self, **filters: Any) -> list[Any]: ...
+
+
+class FileMemoryBackend:
+    """The default persistent MemoryBackend: one JSON file per key under a root directory.
+
+    Deals only in JSON-serializable values — the memory modules (semantic/procedural/episodic)
+    convert their dataclasses to/from plain dict/list/scalar before touching this. Keeping the
+    backend generic is what makes a database/vector-store backend a true drop-in: it never learns
+    about sora's specific types.
+
+    Reading re-parses from disk, so a returned value is always a fresh copy — a caller can mutate
+    it without corrupting the store (unlike an in-memory dict backend that hands back live refs).
+    """
+
+    def __init__(self, root: str | Path) -> None:
+        self._root = Path(root)
+
+    def _path(self, key: str) -> Path:
+        # quote(safe="") encodes '/', ':', etc. so URI / <App>__<op> ids map to safe filenames.
+        return self._root / f"{quote(key, safe='')}.json"
+
+    async def get(self, key: str) -> Any:
+        return await asyncio.to_thread(self._read, self._path(key))
+
+    async def put(self, key: str, value: Any) -> None:
+        await asyncio.to_thread(self._write, key, value)
+
+    async def query(self, **filters: Any) -> list[Any]:
+        return await asyncio.to_thread(self._scan, filters)
+
+    @staticmethod
+    def _read(path: Path) -> Any:
+        try:
+            with path.open(encoding="utf-8") as f:
+                return json.load(f)["value"]
+        except FileNotFoundError:
+            return None
+
+    def _write(self, key: str, value: Any) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
+        # Atomic: write a temp file in the same dir, then rename over the target — a crash
+        # mid-write never leaves a half-written .json that a later query() would choke on.
+        fd, tmp = tempfile.mkstemp(dir=self._root, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"key": key, "value": value}, f)  # self-describing envelope
+            os.replace(tmp, self._path(key))
+        except BaseException:
+            os.unlink(tmp)
+            raise
+
+    def _scan(self, filters: dict[str, Any]) -> list[Any]:
+        if not self._root.exists():
+            return []
+        results = []
+        for path in sorted(self._root.glob("*.json")):  # *.tmp files are excluded by the glob
+            value = self._read(path)
+            if not filters or (
+                isinstance(value, dict) and all(value.get(k) == v for k, v in filters.items())
+            ):
+                results.append(value)
+        return results
 
 
 @dataclass
