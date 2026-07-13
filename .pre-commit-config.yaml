@@ -17,16 +17,19 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.13.0
-    hooks:
-      - id: mypy
-        additional_dependencies: []
-        pass_filenames: false
-        args: ["."]
-
   - repo: local
     hooks:
+      # mypy runs in the project venv via uv (not mirrors-mypy's isolated env) so it resolves the
+      # project's own deps — mcp, pytest, optional extras — exactly as CI's `uv run mypy` does.
+      # An isolated env would need every dependency re-declared under additional_dependencies,
+      # duplicating pyproject and drifting; this keeps one source of truth for the type environment.
+      - id: mypy
+        name: mypy (strict, project venv via uv — matches CI)
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
       - id: readme-sync
         name: README.md class-name sync check
         entry: uv run python3 scripts/check_readme_sync.py
