@@ -36,7 +36,12 @@ class MemoryBackend(Protocol):  # pluggable: file, DB, vector store
 
     async def put(self, key: str, value: Any) -> None: ...
 
-    async def query(self, **filters: Any) -> list[Any]: ...
+    async def query(self, **filters: Any) -> list[Any]:
+        """Returns stored values whose top-level fields match every filter (conjunctive exact
+        equality); non-dict values and any value missing/mismatching a filter are excluded, and no
+        filters returns everything. Callers (e.g. EpisodicMemory.consult) rely on this equality
+        contract, so a non-file backend must honor it rather than substitute fuzzy matching."""
+        ...
 
 
 class FileMemoryBackend:
@@ -225,10 +230,23 @@ class ProceduralMemory:
 
 
 class EpisodicMemory:
-    def __init__(self, backend: MemoryBackend) -> None: ...
+    """Records a summary of each completed activity and retrieves the ones relevant to a new
+    activity. Relevance is goal-equality — the same cheap, deterministic proxy ProceduralMemory
+    uses; embedding/LLM similarity is deferred so the default stays reproducible."""
+
+    def __init__(self, backend: MemoryBackend) -> None:
+        self._backend = backend
 
     async def learn(self, activity: Activity, summary: str) -> None:
-        raise NotImplementedError
+        # One episode per activity, keyed by its id: re-learning the same activity overwrites rather
+        # than accumulating duplicates. goal is stored top-level so consult can filter on it through
+        # the backend's exact-match query().
+        await self._backend.put(
+            activity.id,
+            {"activity_id": activity.id, "goal": activity.goal, "summary": summary},
+        )
 
     async def consult(self, activity: Activity) -> list[Any]:
-        raise NotImplementedError
+        # query() re-reads from disk, so results are fresh copies a caller can mutate without
+        # corrupting the store.
+        return await self._backend.query(goal=activity.goal)
