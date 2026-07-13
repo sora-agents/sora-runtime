@@ -3,7 +3,13 @@
 These cover exactly what one ``DecisionCycle.tick()`` touches, exercised against an in-process
 fake ``WorkspaceAdapter`` (no MCP, no subprocess). The single *real* end-to-end assertion against
 ARE lives in ``test_are_walking_skeleton.py``; this file keeps the wiring itself deterministic and
-instant. All of this is throwaway spike code — to be replaced with a proper TDD build-out.
+instant.
+
+This started as spike code, but most of these assertions are the natural first tests for the
+permanent build-out. ``docs/phase-3-test-triage.md`` records, per group, which assertions are
+promoted to permanent TDD tests (and under which task), which get re-driven, and which scaffolding
+is replaced. Each layer is lifted out of this file into its permanent module as it is re-driven;
+this file is deleted once the last group has moved.
 """
 
 from __future__ import annotations
