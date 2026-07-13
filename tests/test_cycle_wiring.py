@@ -168,6 +168,7 @@ def _cycle(
         strategies=strategies,
         communication=transport or NullTransport(),
         actions=actions,
+        registry=registry,
         working=working,
         semantic=SemanticMemory(backend),
         procedural=ProceduralMemory(backend),
@@ -238,6 +239,27 @@ async def test_registry_leave_closes_and_deregisters() -> None:
     assert ws.closed is True
     with pytest.raises(KeyError):
         registry.get("EmailClientApp")
+
+
+async def test_joined_workspaces_reflects_join_and_leave() -> None:
+    tool = FakeTool("EmailClientApp", "list_emails", {"emails": []})
+    registry, origin, ws = _registry_with(tool)
+    assert registry.joined_workspaces() == []
+    await registry.join(origin)
+    assert registry.joined_workspaces() == [ws]
+    await registry.leave("ws")
+    assert registry.joined_workspaces() == []
+
+
+async def test_working_memory_registry_is_the_shared_instance() -> None:
+    # WorkingMemory holds the same EnvironmentRegistry object (typed read-only as EnvironmentView),
+    # so a strategy reasons over the live joined set with no separate copy to keep in sync.
+    tool = FakeTool("EmailClientApp", "list_emails", {"emails": []})
+    registry, origin, ws = _registry_with(tool)
+    working = WorkingMemory(registry=registry)
+    await registry.join(origin)
+    assert working.registry is registry
+    assert working.registry.joined_workspaces() == [ws]
 
 
 # --------------------------------------------------------------------------------------------------

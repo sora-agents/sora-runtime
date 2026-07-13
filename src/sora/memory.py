@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from sora.activity import Activity
-    from sora.environment import EnvironmentRegistry, Tool
+    from sora.environment import EnvironmentView, Tool
     from sora.manual import Manual, ToolRecord, WorkspaceRecord
     from sora.perception import Message, Percept
     from sora.types import Plan
@@ -23,7 +23,10 @@ class MemoryBackend(Protocol):  # pluggable: file, DB, vector store
 
 @dataclass
 class WorkingMemory:  # transient, in-process, fast
-    registry: EnvironmentRegistry
+    # Read-only view of the live joined workspaces/tools: the agent reasons over what it's currently
+    # connected to; the durable WorkspaceRecord/ToolRecord knowledge stays in SemanticMemory. The
+    # concrete instance behind this is the shared EnvironmentRegistry (mutable on DecisionCycle).
+    registry: EnvironmentView
     activities: dict[str, Activity] = field(default_factory=dict)
     # stimuli from the environment: properties and signals only
     perceptions: list[Percept] = field(default_factory=list)

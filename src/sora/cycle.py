@@ -11,6 +11,7 @@ from sora.types import TOOL_ID, WAIT
 
 if TYPE_CHECKING:
     from sora.action import ActionRegistry
+    from sora.environment import EnvironmentRegistry
     from sora.memory import EpisodicMemory, ProceduralMemory, SemanticMemory, WorkingMemory
     from sora.strategies import Strategies
     from sora.transport import MessageTransport
@@ -23,6 +24,7 @@ class DecisionCycle:
         strategies: Strategies,
         communication: MessageTransport,
         actions: ActionRegistry,
+        registry: EnvironmentRegistry,
         working: WorkingMemory,
         semantic: SemanticMemory,
         procedural: ProceduralMemory,
@@ -31,6 +33,9 @@ class DecisionCycle:
         self.strategies = strategies
         self.communication = communication
         self.actions = actions
+        # The mutation-capable handle, passed to external actions at dispatch. WorkingMemory holds
+        # this same shared instance read-only (as EnvironmentView) for strategies to reason over.
+        self.registry = registry
         self.working = working
         self.semantic = semantic
         self.procedural = procedural
@@ -49,7 +54,7 @@ class DecisionCycle:
         so a fully-fused Observe (or Reflect) call can skip the rest of the cycle entirely.
         working/semantic/procedural/episodic/communication/registry are all shared with Agent,
         constructed once and passed to both — see sora/bootstrap.py."""
-        registry = self.working.registry
+        registry = self.registry  # mutable handle for dispatch (working.registry is read-only)
         result = await self.strategies.observe.observe(self)
         for activity in list(self.working.activities.values()):
             result = await self.strategies.reflect.reflect(activity, self.working, self, result)
@@ -93,19 +98,29 @@ class DecisionCycle:
 
 
 class Agent:
-    """Owns the pieces that are conceptually the agent's own — memory, transport — built from the
-    same shared instances as DecisionCycle, so e.g. agent.working.registry.restore(records,
-    agent.semantic) never needs to reach through agent.cycle."""
+    """Owns the pieces that are conceptually the agent's own — the shared EnvironmentRegistry,
+    memory, transport — built from the same shared instances as DecisionCycle, so e.g.
+    agent.registry.restore(records, agent.semantic) never needs to reach through agent.cycle.
+    (agent.registry is the mutation-capable handle; the same instance is exposed read-only as
+    agent.working.registry.)"""
 
     def __init__(
         self,
         cycle: DecisionCycle,
+        registry: EnvironmentRegistry,
         working: WorkingMemory,
         semantic: SemanticMemory,
         procedural: ProceduralMemory,
         episodic: EpisodicMemory,
         communication: MessageTransport,
-    ) -> None: ...
+    ) -> None:
+        self.cycle = cycle
+        self.registry = registry
+        self.working = working
+        self.semantic = semantic
+        self.procedural = procedural
+        self.episodic = episodic
+        self.communication = communication
 
     async def run(self) -> None:
         """Loop: await self.cycle.tick()"""

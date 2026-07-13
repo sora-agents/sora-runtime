@@ -110,6 +110,7 @@ async def test_walking_skeleton_list_emails_against_are() -> None:
         strategies=strategies,
         communication=NullTransport(),
         actions=actions,
+        registry=registry,
         working=working,
         semantic=SemanticMemory(backend),
         procedural=ProceduralMemory(backend),

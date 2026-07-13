@@ -73,10 +73,27 @@ class WorkspaceAdapter(Protocol):  # was ToolAdapter — it always operated at w
         ...
 
 
+class EnvironmentView(Protocol):
+    """Read-only projection of the live environment that WorkingMemory exposes to strategies: they
+    reason over the currently-joined workspaces and tools — a legitimate part of the agent's current
+    context — but cannot mutate connections through it (join/leave/restore live only in the action
+    space; mypy --strict enforces that). EnvironmentRegistry satisfies this structurally and adds
+    the mutators. See ADR-0013."""
+
+    def get(self, tool_id: str) -> Tool: ...
+
+    def get_workspace(self, workspace_id: str) -> Workspace: ...
+
+    def all_tools(self) -> list[Tool]: ...
+
+    def joined_workspaces(self) -> list[Workspace]: ...
+
+
 class EnvironmentRegistry:
     """Live, in-process handles for workspaces (and their tools) the agent currently has a
     connection to. Populated by join()/restore() — never persisted directly (see
-    WorkspaceRecord/ToolRecord)."""
+    WorkspaceRecord/ToolRecord). The single shared instance: DecisionCycle holds it mutation-capable
+    for action dispatch; WorkingMemory mirrors it read-only as an EnvironmentView."""
 
     def __init__(self, adapters: dict[WorkspaceOrigin, WorkspaceAdapter] | None = None) -> None:
         """Keyed by the full origin (adapter + address), not just adapter name — an agent can
@@ -95,6 +112,9 @@ class EnvironmentRegistry:
 
     def all_tools(self) -> list[Tool]:
         return list(self._tools.values())
+
+    def joined_workspaces(self) -> list[Workspace]:  # the live joined set (EnvironmentView)
+        return list(self._workspaces.values())
 
     async def join(self, origin: WorkspaceOrigin) -> Workspace:
         """Predefined external action _join_: looks up the adapter registered for this exact origin,
