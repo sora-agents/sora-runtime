@@ -53,24 +53,55 @@ integration-level test, not unit tests per layer.
 
 ## Phase 3 — TDD rollout
 
-- [ ] 1. Core value types + `WorkingMemory`
-- [ ] 2. `NotificationQueueSink` / `SignalSink`
-- [ ] 3. Memory modules against a file-backed `MemoryBackend`
-- [ ] 4. `Manual` + `ManualParser` (Markdown) — reuse EXAMPLES.md's manuals as fixtures
-- [ ] 5. `Tool`/`Workspace`/`WorkspaceAdapter` against a fake, in-process adapter
-- [ ] 6. `EnvironmentRegistry` (join/leave/restore) against the fake adapter
-- [ ] 7. The six predefined actions (Invoke/Focus/Unfocus/Join/Leave/Send)
-- [ ] 8. `DecisionCycle` — Observe only, `DefaultObserveStrategy`
-- [ ] 9. Reflect and Situate default (deterministic) strategies
-- [ ] 10. Reason + Act end-to-end with a deterministic `ReasonStrategy` (no LLM)
-- [ ] 11. `Plan`/`Step` + `ProceduralMemory` retrieve/infer/store
-- [ ] 12. Harden the Phase 2 spike into the real, properly TDD'd MCP adapters — extract a protocol-only `McpWorkspaceAdapter` base from the ARE-specific `AreMcpWorkspaceAdapter` (grouping + name-assembly hooks; design the base's default grouping policy here, not from ARE alone — see [docs/phase-2-findings.md](docs/phase-2-findings.md) §5)
-- [ ] 13. `Agent` + `sora/bootstrap.py` + `agent.yaml` loading — reproduce EXAMPLES.md's full `scenario_email_calendar` scenario as running code (four-step plan, procedural-memory reuse across runs, signal-driven replanning on the mid-scenario follow-up email) — **target: tag `v0.1.0` here**
-- [ ] 14. First real, model-backed `ReasonStrategy`
-- [ ] 15. CLI polish (`TerminalSession`, `--verbose`, interrupt handling)
+Reorganized after the Phase 2 spike (see [docs/phase-2-findings.md](docs/phase-2-findings.md)). Several
+items the original flat 1–15 list treated as greenfield already have *throwaway* spike
+implementations (`types.py`, `NotificationQueueSink`, `EnvironmentRegistry.join/leave`, `InvokeAction`,
+`DefaultObserveStrategy`, a working `tick()`), covered only by the explicitly-disposable
+`tests/test_cycle_wiring.py` — so those tasks are **re-drive as permanent, properly TDD'd code**, not
+build-from-scratch. The list is grouped into tracks; `[P]` marks tasks that can proceed in parallel
+once their track's gate is met. TDD is the default; two tasks flagged **⚠ harness-risk** are where the
+test harness may get complex enough to warrant a fake-vs-real tradeoff — notify before over-investing.
+
+### Track A — Foundations & reconciliation (land first; A1/A3/A4 parallel, A2 gates C/D signatures)
+
+- [x] A1. [P] Apply the Phase-2 *proposed but unapplied* README/EXAMPLES.md diffs — `EmailApp` → `EmailClientApp`, `--scenario scenario_email_calendar` → `--apps …EmailClientApp …CalendarApp`, note the `<App>__<operation>` namespacing and stdio as a valid transport ([docs/phase-2-findings.md](docs/phase-2-findings.md) gaps 1/3/4). Pure docs — parallel with everything.
+- [ ] A2. **Reconcile registry access (decided; README/ADR done, `src/` pending).** The agent reasons over what it has joined, so `EnvironmentRegistry` stays reachable from `WorkingMemory` (spike's call, kept — "currently-joined, live workspaces" is per-cycle contextual state, distinct from SemanticMemory's durable records). Refinement: `WorkingMemory` advertises it through a **read-only `EnvironmentView` Protocol** (`get`/`get_workspace`/`all_tools`/`joined_workspaces`) so strategies can reason over the live joined set but `mypy --strict` forbids mutating connections through `wm`; the concrete, mutation-capable `EnvironmentRegistry` remains the single shared instance (per [ADR-0013](docs/adrs/0013-shared-instances-narrow-dependencies.md)) that `tick()` dispatch and the Join/Leave actions use. **Done:** README `EnvironmentView`/`WorkingMemory`/`tick()`/`Agent`/`bootstrap` reconciled + ADR-0013 refined. **Remaining:** the matching `src/` change (add `EnvironmentView`, type `WorkingMemory.registry`, move the mutable handle onto `DecisionCycle`) lands with C2/D4, which it gates.
+- [x] A3. [P] De-stringify the cycle constants (§7c) — `Percept.kind` as a `PerceptKind` StrEnum, reuse `InvokeAction.name` instead of the literal `"invoke"`, `WAIT` sentinel for the cycle's no-op step, and `TOOL_ID`/`OPERATION_NAME` key constants. *(Chose named constants over a distinct invoke-param carrier dataclass — a carrier would near-duplicate `OperationInvocation`; the deeper `next_action == "invoke"` special-casing is left for D4/§7b, marked with an in-code NOTE.)* Behavior-preserving; guarded by the existing suite + `mypy --strict`.
+- [ ] A4. [P] Decide which `tests/test_cycle_wiring.py` assertions become permanent TDD tests vs. get replaced; drop the "throwaway spike" framing as each layer below is re-driven.
+
+### Track B — Long-term memory & manuals (B1 gates B2–B4; B2/B3/B4/B5 then parallel)
+
+- [ ] B1. File-backed `MemoryBackend` + round-trip tests. Gate for B2–B4.
+- [ ] B2. [P] `SemanticMemory` — manual + workspace/tool record store/retrieve/list (needed by Join/Leave and `restore()`).
+- [ ] B3. [P] `EpisodicMemory` — learn/consult.
+- [ ] B4. [P] `ProceduralMemory` retrieve/store (deterministic); `infer()` left as a stub until E3 (it's the LLM path).
+- [ ] B5. [P] `Manual` + Markdown `ManualParser` — reuse EXAMPLES.md's manuals as fixtures. Fully independent of A and B1.
+
+### Track C — Environment & actions (after A2; C3-join and C2-restore also need B2)
+
+- [ ] C1. [P] `Tool`/`Workspace`/`WorkspaceAdapter` fake in-process adapter, promoted from the spike into a reusable test fixture.
+- [ ] C2. `EnvironmentRegistry` — keep join/leave/get; add [ADR-0014](docs/adrs/0014-tool-identity-globally-unique.md) id-uniqueness enforcement (fail loud on duplicate id at join; `leave` never pops a shared id); implement `restore()` (needs B2).
+- [ ] C3. [P] The five still-stubbed predefined external actions — Focus/Unfocus (wire `focused_tools` + `signal_sink`), Join/Leave (wrap registry + persist records via B2), Send (needs transport). Independent of each other.
+- [ ] C4. [P] Re-drive `InvokeAction` (already implemented) as a permanent TDD test.
+
+### Track D — Decision cycle proper (mostly serial; needs A3 + the strategies)
+
+- [ ] D1. `DecisionCycle` Observe-only + `DefaultObserveStrategy`, re-driven as permanent.
+- [ ] D2. `DefaultReflectStrategy` — deterministic completion/failure judgment + store-on-success to episodic (B3) and procedural (B4).
+- [ ] D3. `DefaultSituateStrategy` — **fix §7a** (always run; select only if `result.activity is None`), activity-creation-from-message via the `_create_activity_` internal action, and wm adjustment (focus/load/unload/filter). Also update the stale `SituateStrategy` docstring in `src/sora/strategies.py`.
+- [ ] D4. Reason + Act end-to-end with a deterministic `ReasonStrategy` (no LLM) — **includes §7b**: introduce an `_act()` bind-then-dispatch boundary and drop the hardcoded `next_action == "invoke"` branch (let the action declare whether it needs binding). Fixes the lingering §7a `if result.activity is None` gate in `cycle.py`.
+- [ ] D5. The `_create_activity_` internal action that the default Situate depends on. (Blocked-state `_suspend_`/`_resume_` + the signal-satisfies-wait judgment moved to Phase 4 — v0.1.0's scenario drives replanning through Observe→Situate, not the blocked path.)
+
+### Track E — Integration & release tail (serial; real network/model)
+
+- [ ] E1. **⚠ harness-risk.** Harden the MCP adapters — extract a protocol-only `McpWorkspaceAdapter` base from `AreMcpWorkspaceAdapter` (grouping + name-assembly hooks; design the default grouping policy here, not from ARE alone — §5); wire resource → `ObservableProperty`/`Signal` and `resource_updated` → `focus()` signal delivery (gap 2); adapter-side ADR-0014 id derivation; write the candidate ADRs (stdio-as-origin, `<App>__` mapping canonical).
+- [ ] E2. **⚠ harness-risk.** `Agent` + `sora/bootstrap.py` + `agent.yaml` loading — reproduce EXAMPLES.md's full `scenario_email_calendar` as running code (four-step plan, procedural-memory reuse across runs, signal-driven replanning on the mid-scenario follow-up email). Pin the seeded ARE scenario to the installed ARE version, not the sketch. **Target: tag `v0.1.0` here.**
+- [ ] E3. First real, model-backed `ReasonStrategy` + `ProceduralMemory.infer()`. Keep behind a skip-gate / fake by default so the suite stays deterministic.
+- [ ] E4. CLI polish — `TerminalSession`, `--verbose`, and `DecisionCycle.interrupt()` (the 10ms hard-interrupt path, currently `NotImplementedError`).
 
 ## Phase 4 — Backlog / exploratory
 
+- [ ] Blocked-state machinery — the `_suspend_`/`_resume_` internal actions and the signal-satisfies-wait judgment (Situate/Reflect) that transitions a `blocked` activity back to `ready`. Deferred from Phase 3 D5: no v0.1.0 scenario needs a manual that waits on a specific signal.
 - [ ] WoT adapter and the two-agent lab scenario (EXAMPLES.md's additional example)
 - [ ] Multi-field `TickResult` fusion in practice, replanning-policy experiments
 

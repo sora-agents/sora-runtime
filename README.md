@@ -289,15 +289,29 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
             no re-fetching manuals. Per tool_record: uses tool_record.address if set, else falls back
             to workspace_record.origin.address."""
 
+    class EnvironmentView(Protocol):
+        """Read-only projection of the live environment that WorkingMemory exposes to strategies: they
+        reason over the currently-joined workspaces and tools — a legitimate part of the agent's current
+        context — but cannot mutate connections through it (join/leave/restore live only in the action
+        space; mypy --strict enforces the read-only boundary). EnvironmentRegistry satisfies this
+        structurally and adds the mutators. See ADR-0013."""
+        def get(self, tool_id: str) -> Tool: ...
+        def get_workspace(self, workspace_id: str) -> Workspace: ...
+        def all_tools(self) -> list[Tool]: ...
+        def joined_workspaces(self) -> list[Workspace]: ...   # the live joined set, for reasoning
+
     class EnvironmentRegistry:        # was ToolRegistry — now tracks workspaces, not just flattened tools
         """Live, in-process handles for workspaces (and their tools) the agent currently has a connection
-        to. Populated by join()/restore() — never persisted directly (see WorkspaceRecord/ToolRecord)."""
+        to. Populated by join()/restore() — never persisted directly (see WorkspaceRecord/ToolRecord).
+        The single shared instance (built in bootstrap): DecisionCycle holds it mutation-capable for
+        action dispatch, and WorkingMemory mirrors the same object read-only as an EnvironmentView."""
         def __init__(self, adapters: dict[WorkspaceOrigin, WorkspaceAdapter] | None = None):
             """Keyed by the full origin (adapter + address), not just adapter name — an agent can join
             multiple workspaces that share a protocol (e.g. two separate MCP servers) without ambiguity."""
         def get(self, tool_id: str) -> Tool: ...   # tool_id is globally unique — ADR-0014
         def get_workspace(self, workspace_id: str) -> Workspace: ...
         def all_tools(self) -> list[Tool]: ...
+        def joined_workspaces(self) -> list[Workspace]: ...   # satisfies EnvironmentView
         async def join(self, origin: WorkspaceOrigin) -> Workspace:
             """Predefined external action _join_: looks up the adapter registered for this exact origin,
             calls its discover() (config-scoped to just this target today), registers the workspace.
@@ -314,12 +328,16 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
             SemanticMemory first. Skips discovery entirely."""
 
     # sora/perception.py
+    class PerceptKind(StrEnum):   # closed set — one source of truth; each member == its str value
+        PROPERTY = "property"
+        SIGNAL = "signal"
+
     @dataclass(frozen=True)
     class Percept:
         source: str            # tool id
-        kind: str               # "property" | "signal" — genuine environment stimuli only; an invoked
-        payload: Any             # operation's own result is not a Percept (see Activity.pending_operation/
-        observed_at: float        # last_operation) and neither are agent messages (see WorkingMemory.messages)
+        kind: PerceptKind       # genuine environment stimuli only; an invoked operation's own result
+        payload: Any             # is not a Percept (see Activity.pending_operation/last_operation) and
+        observed_at: float        # neither are agent messages (see WorkingMemory.messages)
 
     @dataclass(frozen=True)
     class Message:
@@ -499,6 +517,10 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         async def query(self, **filters) -> list[Any]: ...
 
     class WorkingMemory:              # transient, in-process, fast
+        registry: EnvironmentView     # read-only view of the live joined workspaces/tools: the agent
+                                       # reasons over what it's currently connected to; the durable
+                                       # WorkspaceRecord/ToolRecord knowledge stays in SemanticMemory
+                                       # (what am I connected to now vs. what have I ever discovered)
         activities: dict[str, Activity]
         perceptions: list[Percept]    # stimuli from the environment: properties and signals only
         messages: list[Message]        # inbound agent-to-agent communication — kept distinct
@@ -643,9 +665,12 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
     # sora/cycle.py
     class DecisionCycle:
         def __init__(self, strategies: Strategies, communication: MessageTransport,
-                     actions: ActionRegistry, working: WorkingMemory,
-                     semantic: SemanticMemory, procedural: ProceduralMemory,
-                     episodic: EpisodicMemory):
+                     actions: ActionRegistry, registry: EnvironmentRegistry,
+                     working: WorkingMemory, semantic: SemanticMemory,
+                     procedural: ProceduralMemory, episodic: EpisodicMemory):
+            self.registry = registry   # the shared, mutation-capable handle, passed to external
+            #                            actions at dispatch; WorkingMemory holds the same instance
+            #                            read-only (as EnvironmentView) for strategies to reason over.
             # Both sinks live here rather than on WorkingMemory: they're the bridge from
             # asynchronous, off-cycle events into this engine's tick()/interrupt() — not settled
             # state. signal_sink specifically has to be co-located with interrupt() below, since
@@ -654,13 +679,13 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
             self.signal_sink: NotificationQueueSink[Signal] = NotificationQueueSink()        # tools push here via focus()
             self.result_sink: NotificationQueueSink[OperationAck] = NotificationQueueSink()  # InvokeAction pushes here — internal only
             ...
-        async def tick(self, registry: EnvironmentRegistry) -> None:
+        async def tick(self) -> None:
             """One Observe -> Reflect -> Situate -> Reason -> Act pass, threading a TickResult through
             all five phases and calling each phase's own strategy only for whatever's still missing —
-            so a fully-fused Observe (or Reflect) call can skip the rest of the cycle entirely. `tools`
-            is the only thing this doesn't already hold (working/semantic/procedural/episodic/
-            communication are shared with Agent, constructed once and passed to both — see
-            sora/bootstrap.py)."""
+            so a fully-fused Observe (or Reflect) call can skip the rest of the cycle entirely. Takes
+            no arguments: registry/working/semantic/procedural/episodic/communication are all shared
+            with Agent, constructed once and passed to both — see sora/bootstrap.py. (Dispatch uses
+            self.registry — the mutation-capable handle — not working.registry, which is read-only.)"""
             result = await self.strategies.observe.observe(self)
             for activity in self.working.activities.values():
                 result = await self.strategies.reflect.reflect(activity, self.working, self, result)
@@ -690,7 +715,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
                      procedural: ProceduralMemory, episodic: EpisodicMemory,
                      communication: MessageTransport): ...
         async def run(self) -> None:
-            """Loop: await self.cycle.tick(self.tools) — passes only what tick() doesn't already have."""
+            """Loop: await self.cycle.tick() — tick() holds everything it needs (shared instances)."""
         async def stop(self) -> None: ...
 
     # sora/cli.py — the runtime's minimal terminal interface
@@ -706,7 +731,9 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         wiring (which memory backend, which transport, which adapters, DecisionCycle <-> Agent sharing
         the same instances) actually happens — a developer implementing an agent never writes this."""
         config = load_yaml(config_path)
-        working = WorkingMemory()
+        adapters = {WorkspaceOrigin(**w["origin"]): adapter_for(w["origin"]) for w in config.workspaces}
+        registry = EnvironmentRegistry(adapters=adapters)   # the single shared instance...
+        working = WorkingMemory(registry=registry)          # ...held here read-only as EnvironmentView
         semantic = SemanticMemory(backend_for(config.memory.semantic))
         procedural = ProceduralMemory(backend_for(config.memory.procedural))
         episodic = EpisodicMemory(backend_for(config.memory.episodic))
@@ -719,10 +746,9 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
             act=import_object(config.strategies.get("act", "sora.act.default"))(),
         )
 
-        cycle = DecisionCycle(strategies=strategies, communication=communication, actions=default_action_registry(),
-                               working=working, semantic=semantic, procedural=procedural, episodic=episodic)
-        adapters = {WorkspaceOrigin(**w["origin"]): adapter_for(w["origin"]) for w in config.workspaces}
-        tools = EnvironmentRegistry(adapters=adapters)
-        return Agent(cycle=cycle, tools=tools, working=working, semantic=semantic,
+        cycle = DecisionCycle(strategies=strategies, communication=communication,
+                               actions=default_action_registry(), registry=registry, working=working,
+                               semantic=semantic, procedural=procedural, episodic=episodic)
+        return Agent(cycle=cycle, registry=registry, working=working, semantic=semantic,
                      procedural=procedural, episodic=episodic, communication=communication)
 ```

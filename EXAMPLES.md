@@ -20,7 +20,7 @@ A S-ORA agent fits naturally into ARE because both share the same structural vie
 
 ## Scenario: scheduling a meeting from email
 
-A Gaia2-style task, `scenario_email_calendar`: the scenario injects an email from Alice ("Can you set up a 30-minute team sync with Bob and Carol next Monday?"), then validates that the agent creates the correct calendar event and replies.
+A Gaia2-style task, `scenario_email_calendar`: the scenario injects an email from Alice ("Can you set up a 30-minute team sync with Bob and Carol next Monday?"), then validates that the agent creates the correct calendar event and replies. (`scenario_email_calendar` is an *illustrative* id — no such scenario ships in ARE 1.2.0; the real seeded scenario must be pinned against the installed ARE version. See the launch note below.)
 
 The scenario's initial user message arrives in `working_memory.messages`. The agent creates an activity:
 
@@ -37,14 +37,14 @@ Plan(
     goal="schedule meeting and reply to requester",
     steps=[
         Step(next_action="invoke",
-             params={"tool_id": "EmailApp", "operation_name": "list_emails",
+             params={"tool_id": "EmailClientApp", "operation_name": "list_emails",
                      "folder": "inbox", "limit": 5}),
         Step(next_action="invoke",
              params={"tool_id": "CalendarApp", "operation_name": "get_calendar_events_from_to"}),
         Step(next_action="invoke",
              params={"tool_id": "CalendarApp", "operation_name": "add_calendar_event"}),
         Step(next_action="invoke",
-             params={"tool_id": "EmailApp", "operation_name": "reply_to_email"}),
+             params={"tool_id": "EmailClientApp", "operation_name": "reply_to_email"}),
     ]
 )
 ```
@@ -56,8 +56,16 @@ Each step executes in a separate decision cycle. Concrete parameters (target dat
 ARE ships an MCP server that exposes any scenario's app tools as standard MCP tools. S-ORA connects using its built-in MCP adapter — no custom adapter code is needed for operations:
 
 ```bash
-# Start the ARE MCP server for a scenario
-python are_simulation_mcp_server.py --scenario scenario_email_calendar --transport sse
+# The walking skeleton drives apps directly with the deterministic, seed-free --apps form over
+# stdio — no port to bind and the adapter owns the subprocess lifecycle, which is far more robust
+# for a gated integration test. SSE (below) remains a valid transport.
+python -m are.simulation.apps.mcp.server.are_simulation_mcp_server \
+    --apps are.simulation.apps.email_client.EmailClientApp are.simulation.apps.calendar.CalendarApp \
+    --transport stdio
+
+# The full four-step reproduction instead needs a *seeded* multi-app scenario (bare --apps yields an
+# empty inbox). The exact scenario id and seeding are version-dependent — pin them to the installed
+# ARE version rather than to this sketch.
 ```
 
 `agent.yaml`:
@@ -78,7 +86,7 @@ agent:
     - origin: {adapter: mcp, address: "http://localhost:8080/sse"}
 ```
 
-The MCP adapter's `discover()` connects to the server, enumerates all app tools across all apps as S-ORA `OperationSpecification` objects, and returns a single `Workspace`. Each app becomes a separate `Tool` within that workspace — `EmailApp`, `CalendarApp`, `SandboxFileSystem` — each with its own manual derived from the MCP tool descriptions.
+The `mcp` origin above uses an SSE URL as its `address`, which locates the one MCP *server* — a workspace-level locator, not any per-app endpoint. A stdio origin instead carries the server's `command`/`args`, with `address` a nominal label (e.g. `stdio:are-email`), since stdio has no URL. Either way, the MCP adapter's `discover()` connects to the server, enumerates all app tools across all apps as S-ORA `OperationSpecification` objects, and returns a single `Workspace`. Each app becomes a separate `Tool` within that workspace — `EmailClientApp`, `CalendarApp`, `SandboxFileSystem` — each with its own manual derived from the MCP tool descriptions.
 
 A single agent could join two ARE servers (two workspaces), each exposing an app of the same name — so the adapter derives each tool's **globally-unique** id from its server's origin (not the bare app name), keeping the flat `EnvironmentRegistry` collision-free and letting any agent that reaches the same server name the tool identically. See [ADR-0014](docs/adrs/0014-tool-identity-globally-unique.md). (The exact tool-name mapping is an adapter detail: ARE's real class is `EmailClientApp`, and the ARE MCP server exposes its operations namespaced as `EmailClientApp__list_emails`.)
 
@@ -97,7 +105,7 @@ async def focus(self, sink: SignalSink) -> None:
     )
 ```
 
-On the next `observe()`, `DefaultObserveStrategy` drains the `signal_sink` and appends a `Percept(source="EmailApp", kind="signal", payload=Signal("state_updated", ...), ...)` to working memory. The reasoning strategy checks for that percept and decides to re-invoke `list_emails` to discover what changed.
+On the next `observe()`, `DefaultObserveStrategy` drains the `signal_sink` and appends a `Percept(source="EmailClientApp", kind="signal", payload=Signal("state_updated", ...), ...)` to working memory. The reasoning strategy checks for that percept and decides to re-invoke `list_emails` to discover what changed.
 
 For `USER_MESSAGE` entries from the ARE notification system — the initial task prompt the scenario delivers to the agent — the adapter routes these through S-ORA's `MessageTransport`, so they arrive in `working_memory.messages` just like any agent-to-agent message.
 
@@ -112,8 +120,8 @@ The next scenario with the same goal pattern hits `cycle.procedural.retrieve(act
 ARE scenarios can inject mid-scenario events — a follow-up email from Bob ("actually, can we push it to Tuesday?") arriving while the agent is mid-plan. In ARE's default ReAct agent this restarts the turn from scratch. In S-ORA:
 
 1. A scheduled ARE event injects a new email into the inbox.
-2. The MCP server sends `resource_updated` for `EmailApp/state`.
-3. `DefaultObserveStrategy` delivers it as `Percept(source="EmailApp", kind="signal", ...)`.
+2. The MCP server sends `resource_updated` for `EmailClientApp/state`.
+3. `DefaultObserveStrategy` delivers it as `Percept(source="EmailClientApp", kind="signal", ...)`.
 4. `ReflectStrategy` sees the signal and marks the current activity's plan stale.
 5. The next `reason()` call re-derives a plan from the updated working memory — new target date, same shape — and execution resumes from step 2 (`get_calendar_events_from_to` with the corrected date).
 
