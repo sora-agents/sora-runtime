@@ -6,15 +6,27 @@ import asyncio
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
 
+# Imported at runtime (not just for typing): SemanticMemory reconstructs these dataclasses from
+# the plain dicts the backend hands back. manual.py / environment.py only import their sora deps
+# under TYPE_CHECKING, so importing them here introduces no cycle.
+from sora.environment import WorkspaceOrigin
+from sora.manual import (
+    Manual,
+    ObservablePropertySpecification,
+    OperationSpecification,
+    SignalSpecification,
+    ToolRecord,
+    WorkspaceRecord,
+)
+
 if TYPE_CHECKING:
     from sora.activity import Activity
     from sora.environment import EnvironmentView, Tool
-    from sora.manual import Manual, ToolRecord, WorkspaceRecord
     from sora.perception import Message, Percept
     from sora.types import Plan
 
@@ -103,32 +115,92 @@ class WorkingMemory:  # transient, in-process, fast
     focused_tools: dict[str, Tool] = field(default_factory=dict)
 
 
+# Discriminators for the three record kinds sharing one backend. They serve double duty: as a
+# storage-key prefix (so the three independent id-spaces can't clobber each other's files) and as
+# a stored `kind` field (so a query() lists just one kind — see FileMemoryBackend.query).
+_MANUAL = "manual"
+_WORKSPACE_RECORD = "workspace_record"
+_TOOL_RECORD = "tool_record"
+
+
 class SemanticMemory:  # knowledge about the world: tool types, workspaces, instances
-    def __init__(self, backend: MemoryBackend) -> None: ...
+    """Durable store for manuals and workspace/tool records. Owns the dataclass<->dict
+    (de)serialization so the backend stays a generic key->JSON store: it converts to plain
+    dicts on the way in and rebuilds typed instances on the way out."""
+
+    def __init__(self, backend: MemoryBackend) -> None:
+        self._backend = backend
 
     async def retrieve_manual(self, manual_id: str) -> Manual | None:
-        raise NotImplementedError
+        value = await self._backend.get(f"{_MANUAL}:{manual_id}")
+        return None if value is None else _manual_from_dict(value)
 
     async def store_manual(self, manual: Manual) -> None:
-        raise NotImplementedError
+        await self._backend.put(f"{_MANUAL}:{manual.id}", {"kind": _MANUAL, **asdict(manual)})
 
     async def retrieve_workspace_record(self, workspace_id: str) -> WorkspaceRecord | None:
-        raise NotImplementedError
+        value = await self._backend.get(f"{_WORKSPACE_RECORD}:{workspace_id}")
+        return None if value is None else _workspace_record_from_dict(value)
 
     async def store_workspace_record(self, record: WorkspaceRecord) -> None:
-        raise NotImplementedError
+        key = f"{_WORKSPACE_RECORD}:{record.id}"
+        await self._backend.put(key, {"kind": _WORKSPACE_RECORD, **asdict(record)})
 
     async def list_workspace_records(self) -> list[WorkspaceRecord]:
-        raise NotImplementedError
+        values = await self._backend.query(kind=_WORKSPACE_RECORD)
+        return [_workspace_record_from_dict(v) for v in values]
 
     async def retrieve_tool_record(self, tool_id: str) -> ToolRecord | None:
-        raise NotImplementedError
+        value = await self._backend.get(f"{_TOOL_RECORD}:{tool_id}")
+        return None if value is None else _tool_record_from_dict(value)
 
     async def store_tool_record(self, record: ToolRecord) -> None:
-        raise NotImplementedError
+        key = f"{_TOOL_RECORD}:{record.id}"
+        await self._backend.put(key, {"kind": _TOOL_RECORD, **asdict(record)})
 
     async def list_tool_records(self) -> list[ToolRecord]:  # reconstitute known instances at boot
-        raise NotImplementedError
+        values = await self._backend.query(kind=_TOOL_RECORD)
+        return [_tool_record_from_dict(v) for v in values]
+
+
+# --- deserialization: rebuild typed instances from the plain dicts the backend returns ---------
+# asdict() flattens nested dataclasses to dicts on the way in; these undo exactly that, dropping the
+# stored `kind` discriminator (which isn't a dataclass field). A fresh instance per call is what
+# gives callers copy isolation even for the mutable lists inside a (frozen) Manual.
+
+
+def _manual_from_dict(d: dict[str, Any]) -> Manual:
+    return Manual(
+        id=d["id"],
+        metadata=d["metadata"],
+        description=d["description"],
+        observable_properties=[
+            ObservablePropertySpecification(**p) for p in d["observable_properties"]
+        ],
+        signals=[SignalSpecification(**s) for s in d["signals"]],
+        operations=[OperationSpecification(**o) for o in d["operations"]],
+        usage_protocols=d["usage_protocols"],
+    )
+
+
+def _workspace_record_from_dict(d: dict[str, Any]) -> WorkspaceRecord:
+    return WorkspaceRecord(
+        id=d["id"],
+        origin=WorkspaceOrigin(**d["origin"]),
+        discovered_at=d["discovered_at"],
+        last_seen_at=d["last_seen_at"],
+    )
+
+
+def _tool_record_from_dict(d: dict[str, Any]) -> ToolRecord:
+    return ToolRecord(
+        id=d["id"],
+        manual_id=d["manual_id"],
+        workspace_id=d["workspace_id"],
+        address=d["address"],
+        discovered_at=d["discovered_at"],
+        last_seen_at=d["last_seen_at"],
+    )
 
 
 class ProceduralMemory:
