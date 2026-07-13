@@ -5,18 +5,28 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from sora.types import Signal
 
 
+class PerceptKind(StrEnum):
+    """The closed set of percept kinds — genuine environment stimuli only. A StrEnum (not a bare
+    str) so mypy catches typos and there's a single source of truth; each member still compares
+    equal to its string value, so existing payloads/serialisations are unaffected."""
+
+    PROPERTY = "property"
+    SIGNAL = "signal"
+
+
 @dataclass(frozen=True)
 class Percept:
     source: str  # tool id
-    kind: str  # "property" | "signal" — genuine environment stimuli only; an invoked operation's
-    payload: Any  # own result is not a Percept (see Activity.pending_operation/last_operation)
-    observed_at: float  # and neither are agent messages (see WorkingMemory.messages)
+    kind: PerceptKind  # genuine environment stimuli only; an invoked operation's own result is
+    payload: Any  # not a Percept (see Activity.pending_operation/last_operation) and neither are
+    observed_at: float  # agent messages (see WorkingMemory.messages)
 
 
 @dataclass(frozen=True)

@@ -7,8 +7,8 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
 from sora.activity import ActivityState
-from sora.perception import Percept
-from sora.types import OperationInvocation, Step
+from sora.perception import Percept, PerceptKind
+from sora.types import OPERATION_NAME, TOOL_ID, OperationInvocation, Step
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -119,9 +119,9 @@ class DefaultObserveStrategy:
         wm = cycle.working
         for tool in wm.focused_tools.values():
             for prop in tool.observe():
-                wm.perceptions.append(Percept(tool.id, "property", prop, time.time()))
+                wm.perceptions.append(Percept(tool.id, PerceptKind.PROPERTY, prop, time.time()))
         async for source, signal in cycle.signal_sink.drain():
-            wm.perceptions.append(Percept(source, "signal", signal, time.time()))
+            wm.perceptions.append(Percept(source, PerceptKind.SIGNAL, signal, time.time()))
         async for invocation_id, ack in cycle.result_sink.drain():
             # Unambiguous 1:1 match: the invoke's own result resolves its activity automatically,
             # never as a Percept, no strategy involved (see Activities in README).
@@ -168,10 +168,10 @@ class DefaultActStrategy:
     async def bind(
         self, step: Step, manual: Manual | None, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
-        params = {k: v for k, v in step.params.items() if k not in ("tool_id", "operation_name")}
+        params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
         invocation = OperationInvocation(
-            tool_id=step.params["tool_id"],
-            operation_name=step.params["operation_name"],
+            tool_id=step.params[TOOL_ID],
+            operation_name=step.params[OPERATION_NAME],
             params=params,
         )
         return replace(result, invocation=invocation)

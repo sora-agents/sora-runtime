@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from sora.action import InvokeAction
 from sora.activity import ActivityState
 from sora.perception import NotificationQueueSink
+from sora.types import TOOL_ID, WAIT
 
 if TYPE_CHECKING:
     from sora.action import ActionRegistry
@@ -62,11 +64,14 @@ class DecisionCycle:
         step = result.step
         if step is None:
             return
-        if result.invocation is None and step.next_action == "invoke":
-            tool = registry.get(step.params["tool_id"])
+        # NOTE: this "invoke needs binding" special-case (and the WAIT no-op below) is a stopgap —
+        # whether a step needs Act-binding should be a property of the action, not a hardcoded
+        # branch in the generic cycle. Until that lands, at least name the constants, not literals.
+        if result.invocation is None and step.next_action == InvokeAction.name:
+            tool = registry.get(step.params[TOOL_ID])
             result = await self.strategies.act.bind(step, tool.manual, self, result)
-        # Dispatch this cycle's single external action (if any). "wait" is a no-op placeholder.
-        if step.next_action == "wait":
+        # Dispatch this cycle's single external action (if any). WAIT is a no-op placeholder.
+        if step.next_action == WAIT:
             return
         action = self.actions.external(step.next_action)
         invocation = result.invocation

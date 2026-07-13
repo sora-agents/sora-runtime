@@ -8,7 +8,13 @@ import uuid
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.activity import ActivityState
-from sora.types import ActionAck, OperationInvocation, PendingOperation
+from sora.types import (
+    OPERATION_NAME,
+    TOOL_ID,
+    ActionAck,
+    OperationInvocation,
+    PendingOperation,
+)
 
 if TYPE_CHECKING:
     from sora.cycle import DecisionCycle
@@ -76,8 +82,8 @@ class InvokeAction:  # predefined external action: _invoke_
         # tool_id/operation_name ride in via **kwargs, keeping this a structural ExternalAction
         # (the README sketch's explicit-param form isn't Protocol-compatible under mypy --strict —
         # see docs/phase-2-findings.md).
-        tool_id = kwargs.pop("tool_id")
-        operation_name = kwargs.pop("operation_name")
+        tool_id = kwargs.pop(TOOL_ID)
+        operation_name = kwargs.pop(OPERATION_NAME)
         params = kwargs
         tool = registry.get(tool_id)
         invocation = OperationInvocation(

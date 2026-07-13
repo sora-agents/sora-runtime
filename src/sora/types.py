@@ -55,3 +55,15 @@ class Plan:  # multi-step, goal-indexed, reusable — the thing ProceduralMemory
     id: str  # stable identity for storage/reuse
     goal: str  # matched against future activities' goals — the retrieval key
     steps: list[Step]
+
+
+# Named constants for Step.next_action values and invoke routing keys — one source of truth instead
+# of bare string literals scattered across the cycle/actions/strategies (typos there are invisible
+# to mypy). Registered ExternalActions are addressed by their own `.name` (e.g. InvokeAction.name);
+# WAIT is the one pseudo-action the cycle special-cases (it dispatches no ExternalAction).
+WAIT = "wait"
+
+# Keys under which an `invoke` Step carries its routing in Step.params (and in InvokeAction's
+# kwargs), before Act binds them into an OperationInvocation.
+TOOL_ID = "tool_id"
+OPERATION_NAME = "operation_name"
