@@ -23,12 +23,12 @@ from sora.manual import (
     ToolRecord,
     WorkspaceRecord,
 )
+from sora.types import Plan, Step
 
 if TYPE_CHECKING:
     from sora.activity import Activity
     from sora.environment import EnvironmentView, Tool
     from sora.perception import Message, Percept
-    from sora.types import Plan
 
 
 class MemoryBackend(Protocol):  # pluggable: file, DB, vector store
@@ -37,11 +37,11 @@ class MemoryBackend(Protocol):  # pluggable: file, DB, vector store
     async def put(self, key: str, value: Any) -> None: ...
 
     async def query(self, **filters: Any) -> list[Any]:
-        """Returns stored values whose top-level fields match every filter (conjunctive exact
-        equality); non-dict values and any value missing/mismatching a filter are excluded, and no
-        filters returns everything. Callers (e.g. EpisodicMemory.consult) rely on this equality
-        contract, so a non-file backend must honor it rather than substitute fuzzy matching."""
-        ...
+        """Every stored value matching all `filters`, ordered most-relevant-first with ties broken
+        deterministically — callers may treat `result[0]` as the single best match and the order as
+        stable across identical calls. Ranking backends (a vector store) order by relevance;
+        non-ranking ones (exact-match file storage) treat all matches as equally relevant and fall
+        back to a stable key order."""
 
 
 class FileMemoryBackend:
@@ -97,7 +97,9 @@ class FileMemoryBackend:
         if not self._root.exists():
             return []
         results = []
-        for path in sorted(self._root.glob("*.json")):  # *.tmp files are excluded by the glob
+        # Exact-equality filters give no relevance ranking, so honor query()'s deterministic-
+        # tiebreak clause with a stable on-disk-key order; the *.json glob excludes *.tmp files.
+        for path in sorted(self._root.glob("*.json")):
             value = self._read(path)
             if not filters or (
                 isinstance(value, dict) and all(value.get(k) == v for k, v in filters.items())
@@ -209,12 +211,23 @@ def _tool_record_from_dict(d: dict[str, Any]) -> ToolRecord:
 
 
 class ProceduralMemory:
-    def __init__(self, backend: MemoryBackend) -> None: ...
+    # Plans are keyed by their own stable id (the storage handle) and retrieved by an exact match
+    # on goal (the retrieval key) via backend.query — so two plans with distinct ids but the same
+    # goal coexist, and re-storing under the same id updates in place. The default is deterministic:
+    # exact goal-string equality, no embedding similarity (that would come with a vector-store
+    # backend, alongside infer()).
+    def __init__(self, backend: MemoryBackend) -> None:
+        self._backend = backend
 
     async def retrieve(self, activity: Activity) -> Plan | None:
         """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
         similarity, backend-dependent. The cheap path: skips infer() entirely when it hits."""
-        raise NotImplementedError
+        rows = await self._backend.query(goal=activity.goal)
+        if not rows:
+            return None
+        # query()'s contract is most-relevant-first with a deterministic tiebreak, so rows[0] is the
+        # canonical plan for this goal regardless of backend — no ordering assumption of our own.
+        return self._from_dict(rows[0])
 
     async def infer(self, activity: Activity) -> Plan:
         """Produces a new multi-step Plan when no cached one fits — the expensive path,
@@ -226,7 +239,16 @@ class ProceduralMemory:
         """Persists a Plan that was actually followed to completion, so future retrieve() calls
         for similar goals can reuse it. Called by ReflectStrategy on success only — a failed plan
         isn't something future activities should retrieve by default."""
-        raise NotImplementedError
+        await self._backend.put(plan.id, asdict(plan))
+
+    @staticmethod
+    def _from_dict(data: dict[str, Any]) -> Plan:
+        # Rebuild the dataclass graph the backend flattened to plain dict/list/scalar on store.
+        return Plan(
+            id=data["id"],
+            goal=data["goal"],
+            steps=[Step(**step) for step in data["steps"]],
+        )
 
 
 class EpisodicMemory:

@@ -153,6 +153,18 @@ async def test_query_with_filters_excludes_non_dict_values(tmp_path: Path) -> No
     assert await backend.query(kind="manual") == [{"kind": "manual"}]
 
 
+async def test_query_results_are_in_stable_key_order(tmp_path: Path) -> None:
+    # FileMemoryBackend has no relevance ranking, so it honors query()'s "deterministic tiebreak"
+    # clause by returning matches in stable on-disk-key order — the property ProceduralMemory relies
+    # on to treat result[0] as canonical.
+    backend = FileMemoryBackend(tmp_path)
+    for key in ["p3", "p1", "p2"]:
+        await backend.put(key, {"kind": "plan", "id": key})
+    ids = [v["id"] for v in await backend.query(kind="plan")]
+    assert ids == ["p1", "p2", "p3"]
+    assert ids == [v["id"] for v in await backend.query(kind="plan")]  # stable across calls
+
+
 # --------------------------------------------------------------------------------------------------
 # Copy isolation: a file backend re-reads from disk, so a caller can't mutate stored state
 # through a returned reference.

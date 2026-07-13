@@ -514,7 +514,13 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
     class MemoryBackend(Protocol):    # pluggable: file, DB, vector store
         async def get(self, key: str) -> Any: ...
         async def put(self, key: str, value: Any) -> None: ...
-        async def query(self, **filters) -> list[Any]: ...
+        async def query(self, **filters) -> list[Any]:
+            """Every stored value matching all `filters`, ordered most-relevant-first with ties
+            broken deterministically: a caller may treat `result[0]` as the single best/canonical
+            match and the order as stable across identical calls. Backends with a relevance notion
+            (a vector store) rank by it; backends without one (exact-match file storage) treat all
+            matches as equally relevant and fall back to a stable key order. This guarantee is what
+            lets ProceduralMemory.retrieve() take the top match without knowing the backend."""
 
     class FileMemoryBackend:          # the default: one JSON file per key under a root directory
         """Deals only in JSON-serializable values — the memory modules serialize their dataclasses
@@ -549,7 +555,9 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         def __init__(self, backend: MemoryBackend): ...
         async def retrieve(self, activity: Activity) -> Plan | None:
             """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
-            similarity, backend-dependent. The cheap path: skips infer() entirely when it hits."""
+            similarity, backend-dependent. Returns the backend's top-ranked match (query() orders
+            most-relevant-first — see MemoryBackend), so this stays one line regardless of backend.
+            The cheap path: skips infer() entirely when it hits."""
         async def infer(self, activity: Activity) -> Plan:
             """Produces a new multi-step Plan when no cached one fits — the expensive path, potentially
             an LLM call producing a whole sequence of Steps at once, not just the next one."""

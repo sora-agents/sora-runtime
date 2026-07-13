@@ -74,7 +74,7 @@ test harness may get complex enough to warrant a fake-vs-real tradeoff — notif
 - [x] B1. File-backed `MemoryBackend` + round-trip tests. Gate for B2–B4.
 - [x] B2. [P] `SemanticMemory` — manual + workspace/tool record store/retrieve/list (needed by Join/Leave and `restore()`).
 - [x] B3. [P] `EpisodicMemory` — learn/consult.
-- [ ] B4. [P] `ProceduralMemory` retrieve/store (deterministic); `infer()` left as a stub until E3 (it's the LLM path).
+- [x] B4. [P] `ProceduralMemory` retrieve/store (deterministic); `infer()` left as a stub until E3 (it's the LLM path).
 - [ ] B5. [P] `Manual` + Markdown `ManualParser` — reuse EXAMPLES.md's manuals as fixtures. Fully independent of A and B1.
 
 ### Track C — Environment & actions (after A2; C3-join and C2-restore also need B2)
