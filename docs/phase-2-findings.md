@@ -99,7 +99,7 @@ must match the Protocol. See [`src/sora/action.py`](../src/sora/action.py).
 ---
 
 ## 5. The adapter is ARE-specific — generic MCP base deferred to Phase 3
-The Phase-2 adapter speaks MCP as the wire protocol but bakes in ARE's own data model on top of it,
+The Phase-2 adapter speaks MCP as the application-layer (tool-use) protocol but bakes in ARE's own data model on top of it,
 so it is named and defined as an **ARE adapter** (`AreMcpWorkspaceAdapter`, `name = "are-mcp"`), not a
 general MCP adapter. What is ARE-specific vs. generic MCP:
 

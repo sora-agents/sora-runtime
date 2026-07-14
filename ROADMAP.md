@@ -75,13 +75,17 @@ test harness may get complex enough to warrant a fake-vs-real tradeoff — notif
 - [x] B2. [P] `SemanticMemory` — manual + workspace/tool record store/retrieve/list (needed by Join/Leave and `restore()`).
 - [x] B3. [P] `EpisodicMemory` — learn/consult.
 - [x] B4. [P] `ProceduralMemory` retrieve/store (deterministic); `infer()` left as a stub until E3 (it's the LLM path).
-- [ ] B5. [P] `Manual` + Markdown `ManualParser` — reuse EXAMPLES.md's manuals as fixtures. Fully independent of A and B1.
+- [ ] B5. [P] `Manual` + Markdown `ManualParser` — parse our clean Markdown format into `Manual`. Fully independent of A and B1. Requirements surfaced while consolidating the manual model:
+  - Parse the operation sub-bullet convention (`Preconditions:`/`Effects:`/`Behavior:`) and fold it into `OperationSpecification.description` for now — no new dataclass fields (discrete fields deferred until a strategy consumes them; see README §Tool Manuals). Preserve the full operation prose; never drop a sub-bullet. Operations may have zero sub-bullets (a bare one-liner) or several — accept both uniformly.
+  - Lift the light `(type, range)` property/param hints into a *minimal* JSON Schema in the `parameters`/`schema` dicts; support an **optional** inline-JSON-Schema block for full fidelity, but do not mandate it (adapter-imported tools get schema from the native format — see [ADR-0015](docs/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md)).
+  - Target our clean format only. Inherited manuals under `tests/fixtures/manuals/inherited/` are conversion *source material*, not input the parser must tolerate (normalize-not-tolerate); `water-pump.md` is the rich clean exemplar, `invalid/` the reject-on-no-id path.
+  - Scope boundary: `ManualParser` produces a `Manual` from Markdown only. Extracting a `Manual` from a native description (MCP tool list / WoT TD) is the `WorkspaceAdapter`'s job, not the parser's — the two are parallel `Manual` producers reconciled by `Manual.id` (ADR-0015).
 
 ### Track C — Environment & actions (after A2; C3-join and C2-restore also need B2)
 
 - [ ] C1. [P] `Tool`/`Workspace`/`WorkspaceAdapter` fake in-process adapter, promoted from the spike into a reusable test fixture. *(A4: absorbs the spike's `FakeTool`/`FakeWorkspace`/`FakeAdapter`.)*
 - [ ] C2. `EnvironmentRegistry` — keep join/leave/get; add [ADR-0014](docs/adrs/0014-tool-identity-globally-unique.md) id-uniqueness enforcement (fail loud on duplicate id at join; `leave` never pops a shared id); implement `restore()` (needs B2). *(A4: promotes + extends the spike's join/get/leave assertions → `tests/test_environment.py`.)*
-- [ ] C3. [P] The five still-stubbed predefined external actions — Focus/Unfocus (wire `focused_tools` + `signal_sink`), Join/Leave (wrap registry + persist records via B2), Send (needs transport). Independent of each other. *(A4: promotes the spike's `action_registry_lookup` alongside C4.)*
+- [ ] C3. [P] The five still-stubbed predefined external actions — Focus/Unfocus (wire `focused_tools` + `signal_sink`), Join/Leave (wrap registry + persist records via B2), Send (needs `MessageTransport`). Independent of each other. *(A4: promotes the spike's `action_registry_lookup` alongside C4.)*
 - [ ] C4. [P] Re-drive `InvokeAction` (already implemented) as a permanent TDD test. *(A4: promotes the spike's `invoke_action_sets_running_then_pushes_result` → `tests/test_action.py`.)*
 
 ### Track D — Decision cycle proper (mostly serial; needs A3 + the strategies)

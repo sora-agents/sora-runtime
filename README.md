@@ -75,6 +75,10 @@ Tools can be described by manuals. Any manual format can be used. S-ORA currentl
 5. Operations: definitions of commands to interact with the tool, including the commands' intended purposes, preconditions, and effects;
 6. Usage Protocols & Safety: operating instructions, including safety constraints (if any) or conditions under which an activity must be suspended (e.g., to wait for specific signals).
 
+In the Markdown rendering, Observable Properties, Signals, and Operations are `-` bullet lists. An operation bullet may additionally carry optional labeled sub-bullets — `Preconditions:`, `Effects:`, and `Behavior:` (whether the operation completes synchronously or is long-running, and which signal, if any, indicates completion) — expressing the operation semantics part 5 calls for. For now these are folded into the operation's single `description` (see `OperationSpecification` in the API Sketch): fully available to a reasoning strategy as text, but deliberately not lifted into discrete model fields until a strategy actually consumes them — the labels are the seams where that structure would later attach.
+
+Property, signal, and operation entries carry their data shapes as JSON Schema in the spec types' `schema`/`parameters` fields (see the API Sketch). A manual describes a tool *type* and stays protocol-agnostic: JSON Schema is data shape, not a protocol binding, so it is filled either by an adapter from a native description (an MCP tool schema, a WoT TD affordance schema) or, for a hand-authored manual, lifted from the light `(type, range)` hints above — with an optional inline JSON Schema where full fidelity is needed. The protocol binding — how to actually reach one instance — lives on the live `Tool`, never in the manual. See [ADR-0015](docs/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md).
+
 ### Memory
 
 The [CoALA framework](https://arxiv.org/abs/2309.02427) distinguishes between short and long-term memory.
@@ -362,7 +366,8 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
     @dataclass(frozen=True)
     class OperationSpecification:   # was Operation — renamed for symmetry with the two specs below
         name: str
-        description: str
+        description: str     # folds in any Preconditions/Effects/Behavior sub-bullets as prose (see
+                             #   Tool Manuals); discrete fields deferred until a strategy consumes them
         parameters: dict     # JSON-Schema-shaped
 
     @dataclass(frozen=True)

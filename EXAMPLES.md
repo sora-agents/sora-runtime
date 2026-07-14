@@ -224,7 +224,9 @@ A 6-axis robotic arm with a parallel gripper, mounted at the edge of the workben
 # Operations
 - open_gripper(): opens the gripper
 - close_gripper(): closes the gripper
-- move_to(x: float, y: float, z: float): moves the end-effector to the given coordinates
+- move_to(x: float, y: float, z: float): moves the end-effector to the given coordinates.
+  - Behavior: long-running — physical motion that takes real time; completion is signalled by target_reached.
+  - Effects: repositions the end-effector to [x, y, z] and updates the position property.
 
 # Usage Protocols & Safety
 move_to is a physical motion that takes real time: after invoking it, suspend the activity and wait
@@ -233,7 +235,9 @@ for the target_reached signal before invoking close_gripper, open_gripper, or an
 
 ## The adapter: `WoTWorkspaceAdapter`
 
-Implements `WorkspaceAdapter`. `discover()` builds the workspace fresh from the directory; `connect()` rebuilds it from cached records, using each tool's own address when it has one:
+Implements `WorkspaceAdapter`. `discover()` builds the workspace fresh from the directory; `connect()` rebuilds it from cached records, using each tool's own address when it has one.
+
+Note the boundary (see [ADR-0015](docs/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md)): the adapter takes the TD's *protocol bindings* (`wot_client_for(td)`) and pairs them with a protocol-agnostic `Manual`. Here that `Manual` is loaded from a hand-authored Markdown file keyed by `td.id` — the reasoning semantics a TD lacks — while the TD itself could equally feed the manual's JSON-Schema data shapes; the two provenance channels reconcile by `Manual.id`. Either way the protocol binding stays on the `Tool` and never enters the `Manual`:
 
 ```python
 class WoTWorkspaceAdapter:

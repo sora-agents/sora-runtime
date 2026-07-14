@@ -29,7 +29,8 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0012](0012-percepts-vs-messages.md) | Percepts and messages kept as two distinct channels | proposed | Decision cycle |
 | [0013](0013-shared-instances-narrow-dependencies.md) | Agent/DecisionCycle share instances; narrow explicit dependencies everywhere | proposed | Composition & wiring |
 | [0014](0014-tool-identity-globally-unique.md) | Tool identity is globally unique, guaranteed by the protocol adapter | proposed | Tool & workspace model |
+| [0015](0015-manuals-protocol-agnostic-adapter-boundary.md) | Manuals stay protocol-agnostic; protocol bindings live on the tool instance | proposed | Tool & workspace model |
 
 ## Planned
 
-None currently pending — 14 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
+None currently pending — 15 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
