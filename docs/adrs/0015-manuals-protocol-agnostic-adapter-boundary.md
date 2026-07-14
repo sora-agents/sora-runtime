@@ -5,68 +5,48 @@
 
 ## Context and Problem Statement
 
-A `Manual` describes a tool *type* and is meant to be reusable across instances and protocols (the same pump could be reached over MCP or CoAP). But the native descriptions adapters import from — an MCP tool list, a W3C WoT Thing Description (TD) — bundle *both* protocol-agnostic information (operation/property/signal names and their JSON-Schema data shapes) *and* protocol bindings (WoT TD `forms`/`securityDefinitions`; an MCP session plus the `<App>__op` name assembly). Where does each part land — what belongs in the `Manual`, what belongs elsewhere — and do we need a separate "instance description" abstraction alongside the `Manual`? The tension already exists in the design sketches: the ARE MCP adapter *synthesizes* a `Manual` from the MCP tool list (`_synth_manual`, `inputSchema → OperationSpecification.parameters`), while the WoT adapter sketch *loads a hand-authored Markdown manual* per Thing (`MarkdownManualParser().parse(load_manual(td.id))`) and uses the TD only for its protocol bindings.
+A `Manual` describes a tool *type*, reusable across instances and protocols (the same pump reachable over MCP or CoAP). But the native descriptions adapters import — an MCP tool list, a W3C WoT Thing Description (TD) — bundle *both* protocol-agnostic information (operation/property/signal names and their JSON-Schema data shapes) *and* protocol bindings (WoT TD `forms`/`securityDefinitions`; an MCP session plus `<App>__op` name assembly). Where does each part land, and do we need a separate "instance description" type alongside the `Manual`? The tension is already in the sketches: the ARE MCP adapter *synthesizes* a `Manual` from the tool list (`_synth_manual`, `inputSchema → OperationSpecification.parameters`), while the WoT sketch *loads a hand-authored Markdown manual* per Thing and uses the TD only for bindings.
 
 ## Decision Drivers
 
-* A `Manual` must stay protocol-agnostic so it is reusable across instances/protocols and shareable across agents (the A&A shared-tool model).
-* [ADR-0003](0003-adapters-not-tool-authoring.md): adapters extract whatever manual information the source provides — and no more; richness is capped by the source protocol.
-* Real native descriptions are uneven: a typical WoT TD document is schema-rich but semantics-thin — it can be enriched with semantic tags defined in some ontology, but there are no other descriptions, preconditions/effects, behavior, or safety — while our hand-authored Markdown is the mirror image (semantics-rich, schema-loose).
-* Avoid inventing a second model type where an existing boundary (the adapter) already splits the concern.
-
-## Considered Options
-
-* A separate `InstanceDescription`/protocol-binding model type held alongside each `Manual`.
-* Fold the protocol binding into the `Manual` (a `Manual` per instance, carrying its bindings).
-* Keep the protocol binding on the live `Tool` instance (adapter-owned); keep the `Manual` protocol-agnostic; let a `Manual` be produced by either adapter synthesis or Markdown authoring, reconciled by type-level `Manual.id`.
+* A `Manual` must stay protocol-agnostic — reusable across instances/protocols, shareable across agents (the A&A shared-tool model).
+* [ADR-0003](0003-adapters-not-tool-authoring.md): adapters extract whatever the source provides and no more; richness is capped by the source.
+* Native descriptions are uneven: a WoT TD is schema-rich but semantics-thin; hand-authored Markdown is the mirror image (semantics-rich, schema-loose).
+* Avoid inventing a second model type where the adapter boundary already splits the concern.
 
 ## Decision Outcome
 
-Chosen: **protocol bindings live on the live `Tool` instance (created and owned by the `WorkspaceAdapter`) and never enter the `Manual`; the `Manual` stays protocol-agnostic.** Here *protocol binding* means the concrete, per-instance access mechanism for the tool's **application-layer** protocol (WoT `forms` over HTTP/CoAP; MCP's JSON-RPC session and name assembly) — distinct from the **transport** it runs over (stdio, SSE, TCP). The split is by *content*, not by call-graph:
+**Protocol bindings live on the live `Tool` instance (adapter-owned) and never enter the `Manual`; the `Manual` stays protocol-agnostic.** *Protocol binding* means the per-instance access mechanism for the tool's **application-layer** protocol (WoT TD `forms` over HTTP/CoAP; MCP's JSON-RPC session and name assembly) — distinct from the **transport** it runs over (stdio, SSE, TCP). The split is by *content*:
 
-* **Protocol-binding (application-layer) → `Tool` instance (adapter-owned):** WoT TD `forms` (href, `htv:methodName`, `contentType`) and `securityDefinitions`; an MCP `ClientSession` and the `<App>__op` name assembly. These implement `invoke`/`focus`/`observe` and are never serialized into a `Manual`.
-* **Manual-level → `Manual`:** operation/property/signal names, natural-language semantics (functional description, preconditions, effects, behavior, usage protocols & safety), and **JSON-Schema data shapes** — which are protocol-agnostic and already have a home in the spec types' `parameters`/`schema` dicts.
+* **Binding → `Tool`:** WoT TD `forms` (href, method, contentType) and `securityDefinitions`; the MCP `ClientSession` and `<App>__op` assembly. These implement `invoke`/`focus`/`observe` and are never serialized into a `Manual`.
+* **Manual-level → `Manual`:** operation/property/signal names, natural-language semantics (functional description, preconditions, effects, behavior, usage protocols & safety), and JSON-Schema data shapes (the spec types' `parameters`/`schema` dicts).
 
-A `Manual` has two interchangeable **provenance channels**, both producing the same protocol-agnostic type:
+A `Manual` has two interchangeable **provenance channels** producing the same type, reconciled by type-level `Manual.id` ([ADR-0007](0007-manual-record-separation.md)):
 
-1. **Adapter synthesis** from a native description (MCP tool list, WoT TD document): reliably yields names + JSON Schema, plus whatever semantics the source carries (the ADR-0003 ceiling).
-2. **Markdown authoring** parsed by `ManualParser`, retrieved by `manual_id` from a repository or semantic memory: yields the rich natural language semantics native formats lack.
+1. **Adapter synthesis** from a native description — reliably yields names + JSON Schema, plus whatever semantics the source carries.
+2. **Markdown authoring** — yields the rich natural-language semantics native formats lack.
 
-The two reconcile by type-level `Manual.id` ([ADR-0007](0007-manual-record-separation.md)): an adapter may synthesize a thin manual and a curated repository may supply a richer one for the same id; or, as the WoT sketch shows, an adapter may itself load the authored Markdown for the Thing it is binding. `ManualParser` is therefore a shared `Manual` *producer*, not owned by either side — the invariant is what content goes where, not who calls whom.
+An adapter may synthesize a thin manual while a curated repository supplies a richer one for the same id; or, as the WoT sketch shows, an adapter may itself load the authored Markdown for the Thing it binds. `ManualParser` is thus a shared *producer*, owned by neither side. **No separate instance-description type is introduced** — the `WorkspaceAdapter` already splits the native description into (binding → `Tool`) + (data shape/semantics → `Manual`); a parallel type would re-implement that boundary.
 
-**No separate instance-description model type is introduced.** The native description *is* the complete description; the `WorkspaceAdapter` is precisely the component that splits it into (protocol binding → `Tool`) + (data shape / semantics → `Manual`). A parallel model type would re-implement that boundary.
+### How much the hand-authored channel extracts
 
-Because JSON Schema is manual-level, our Markdown format *may* carry it but need not: adapter-imported tools get their schema from the native format, and a hand-authored manual can rely on the clean format's light `(type, range)` hints (lifted into a minimal schema by the parser), with an optional inline-JSON-Schema escape hatch where full fidelity is required.
+Regex-lifting loose Markdown into rigid fields proved brittle (mis-cased/mistyped headings, indentation, or lowercase sub-markers silently drop affordances; a missing hint crashes), and no consumer reads the fine-grained fields today — `DefaultActStrategy` ignores its `manual`, and `_synth_manual` already leaves properties/signals/usage empty. Since adapter sources are born structured and only hand-authored manuals use Markdown, the parsing tax is paid eagerly for structure nothing reads. Therefore:
 
-### Positive Consequences
+* **Now:** the Markdown channel yields an **envelope** — `id`, `metadata`, `description`, `usage_protocols`, and verbatim `raw_text` — and does *not* lift bullet lists or `(type, range)` hints into `observable_properties`/`signals`/`operations`/schema. Those fields stay defined on `Manual` (the adapter channel fills them) but come back empty from Markdown until a consumer reads them. `raw_text` (not a reflowed rendering) is what feeds LLM context. This extends the "not lifted into discrete fields until a strategy consumes them" rule — already applied to operation sub-bullets — to properties and signals. Section-level slicing (e.g. only the Operations section for a binding, or Usage & Safety for a suspend judgment) is a lazy view over `raw_text` — split on `#` headings on demand — not stored chunks, so the whole manual is just `raw_text` with no reassembly to drift.
+* **Later:** when a consumer needs machine-readable schemas *from hand-authored manuals* (e.g. a deterministic `ActStrategy` validating params, a `SituateStrategy` reading `signals`), move that content to a **structured header + prose body** — YAML/TOML front-matter parsed and schema-validated, prose kept free-text — not more regex, not full JSON. This aligns the hand-authored path with the JSON Schema the adapter channel already carries.
 
-* `Manual`s stay portable across instances and protocols and shareable across agents; the protocol binding is an instance concern.
-* Reuses existing structure — `Manual.id` (type-level), the `parameters`/`schema` dicts, and the "retrieve manuals from external repositories" action — instead of a new abstraction.
-* Explains the two existing adapters cleanly: ARE (synthesis) and WoT (authored Markdown) are two provenance channels of one boundary, not a contradiction.
-* JSON Schema in Markdown becomes optional rather than mandatory, because the high-fidelity schema path is the adapter.
+### Consequences
 
-### Negative Consequences
+* `Manual`s stay portable and shareable; bindings are an instance concern; no new abstraction (reuses `Manual.id`, the `parameters`/`schema` dicts, and manual retrieval).
+* The two adapters — ARE (synthesis) and WoT (authored Markdown) — are two provenance channels of one boundary, not a contradiction.
+* The hand-authored channel has no fragile field extraction to fail silently; LLM context stays faithful via `raw_text`.
+* Deferred: a **merge policy** when both channels fire for one id (no runtime path needs it yet); adapter-synthesized manuals stay semantics-thin (ADR-0003), so LLM reasoning still needs authored Markdown; `Manual` gains a `raw_text` field, and full schema fidelity for hand-authored tools waits on the later structured-header format.
 
-* When both provenance channels fire for one `manual_id` (adapter-synthesized + repository-authored), a **merge policy** is required (which fields win). Deferred until a consumer needs it; no runtime path depends on merging today.
-* Adapter-synthesized manuals remain semantics-thin (capped by the source per ADR-0003), so LLM reasoning still depends on someone authoring Markdown.
-* The Markdown parser must optionally lift light type hints (and tolerate an optional inline schema) — a small added surface.
+## Considered Options
 
-## Pros and Cons of the Options
-
-### Separate `InstanceDescription` type
-
-* Good, because protocol bindings and semantics become explicitly separate types.
-* Bad, because it duplicates the split the adapter already performs, and forces every consumer to hold and correlate two objects where one protocol-agnostic `Manual` plus a live `Tool` already suffices.
-
-### Fold the protocol binding into the `Manual` (per-instance manuals)
-
-* Good, because a single object then carries everything needed to invoke a specific instance.
-* Bad, because it destroys the `Manual`'s protocol-agnosticism and cross-instance reuse, re-coupling the shared, agent-agnostic description to one application-layer (tool-use) protocol — against the A&A shared-tool model and ADR-0007's type-level `Manual.id`.
-
-### Protocol binding on the instance; protocol-agnostic `Manual` from either provenance (chosen)
-
-* Good, because it keeps the `Manual` reusable, needs no new type, and subsumes both existing adapters.
-* Bad, because it leaves a merge policy open and keeps adapter-synthesized manuals thin — both acceptable and deferrable.
+* **Separate `InstanceDescription` type** alongside each `Manual`. Rejected: duplicates the split the adapter already performs, forcing consumers to correlate two objects where a protocol-agnostic `Manual` plus a live `Tool` suffice.
+* **Fold the binding into the `Manual`** (a per-instance manual). Rejected: destroys protocol-agnosticism and cross-instance reuse, re-coupling the shared description to one application-layer protocol — against the A&A model and ADR-0007.
+* **Binding on the instance; protocol-agnostic `Manual` from either provenance (chosen).** Keeps the `Manual` reusable, needs no new type, subsumes both adapters; leaves a merge policy open and keeps synthesized manuals thin — both acceptable and deferrable.
 
 ## Links
 

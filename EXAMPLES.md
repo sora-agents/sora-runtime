@@ -139,7 +139,7 @@ A lab contains three devices, described in one hypermedia (WoT) workspace:
 
 - **`video-stream`** — a ceiling camera that does its own scene understanding and publishes a text description; observation-only, no operations.
 - **`blinds`** — motorized blinds; one operation, one observable property.
-- **`robotic-arm`** — a 6-axis arm with a gripper; opens/closes the gripper and moves to 3D coordinates; movement is physical and takes real time, so it emits a signal on completion.
+- **`robotic-arm`** — a 6-axis arm with a gripper; opens/closes the gripper and moves its tool-center point to a 6-DOF pose (position + orientation); movement is physical and takes real time, so it emits a signal on completion.
 
 Two agents share this one workspace, each focusing a different subset of its tools:
 
@@ -210,27 +210,43 @@ set_position completes synchronously; no suspension needed. Check `position` to 
 # Tool Metadata
 category: Lab / Manipulation
 id: robotic-arm
+wot_td: urn:cherrybot
 
 # Functional Description
-A 6-axis robotic arm with a parallel gripper, mounted at the edge of the workbench.
+A 6-axis robotic arm (the cherryBot) with a parallel gripper, mounted at the edge of the workbench.
+Its tool-center point (TCP) is a full 6-DOF pose: position plus orientation. This manual is the
+protocol-agnostic, semantic half of the tool's description; the matching WoT Thing Description
+(urn:cherrybot) carries the protocol binding — HTTP forms and API-key security. The two are
+complementary, reconciled by tool type — an adapter maps urn:cherrybot to this manual's id
+robotic-arm. See ADR-0015.
 
 # Observable Properties
-- gripper_state (string): "open" or "closed"
-- position (3 floats): current end-effector coordinates [x, y, z], in millimeters
+- tcp (object): current TCP pose — coordinate [x, y, z] in millimetres (x, y in -720..720; z in
+  -178.3..1010) and rotation [roll, pitch, yaw] in degrees (each in -180..180).
+- gripper (integer, 0-800): gripper aperture; 0 is fully closed, 800 is fully open.
 
 # Signals
-- target_reached: emitted when a move_to operation's target position is physically reached
+- target_reached: emitted when a move_to operation's target pose is physically reached. This is a
+  semantic affordance the manual adds: the cherryBot reports completion via a webhook the WoT TD
+  does not yet model, and the runtime surfaces it as this signal.
 
 # Operations
-- open_gripper(): opens the gripper
-- close_gripper(): closes the gripper
-- move_to(x: float, y: float, z: float): moves the end-effector to the given coordinates.
-  - Behavior: long-running — physical motion that takes real time; completion is signalled by target_reached.
-  - Effects: repositions the end-effector to [x, y, z] and updates the position property.
+- move_to(speed, target): moves the TCP to the given 6-DOF target pose at the given speed. speed is
+  an integer in 10..400; target is a pose object with the same coordinate + rotation shape as the
+  tcp property.
+  - Behavior: long-running — physical motion that takes real time; completion is signalled by
+    target_reached.
+  - Effects: repositions the TCP to target and updates the tcp property.
+- open_gripper(): opens the gripper fully (aperture 800).
+  - Effects: sets gripper to 800.
+- close_gripper(): closes the gripper fully (aperture 0).
+  - Effects: sets gripper to 0.
 
 # Usage Protocols & Safety
-move_to is a physical motion that takes real time: after invoking it, suspend the activity and wait
-for the target_reached signal before invoking close_gripper, open_gripper, or another move_to.
+An operator must be registered before the arm accepts motion commands (the cherryBot TD exposes
+registerOperator / removeOperator for this). move_to is a physical motion that takes real time:
+after invoking it, suspend the activity and wait for the target_reached signal before invoking
+close_gripper, open_gripper, or another move_to.
 ```
 
 ## The adapter: `WoTWorkspaceAdapter`
@@ -404,7 +420,9 @@ await SendAction().execute(agent.registry, agent.cycle, to="arm-agent",
 
 ```python
 await InvokeAction().execute(agent.registry, agent.cycle, activity_id="pick-up-block",
-                              tool_id="robotic-arm", operation="move_to", x=120.0, y=45.0, z=30.0)
+                              tool_id="robotic-arm", operation="move_to", speed=200,
+                              target={"coordinate": {"x": 120.0, "y": 45.0, "z": 30.0},
+                                      "rotation": {"roll": 0.0, "pitch": 90.0, "yaw": 0.0}})
 ```
 
 `InvokeAction` fires this as a background task — the cycle doesn't block for the seconds a physical move takes — and, unconditionally, transitions `pick-up-block` to `running` with `pending_operation` set to this call. This isn't manual-specific: *any* invoke does this, regardless of what the tool's manual says.
@@ -412,7 +430,9 @@ await InvokeAction().execute(agent.registry, agent.cycle, activity_id="pick-up-b
 A few cycles later, `move_to`'s own `OperationAck` comes back. This resolves automatically — an unambiguous match between the pending operation and its result, so the runtime clears `pending_operation`, sets `last_operation`, and returns the activity straight to `ready`, with no strategy code involved and no `Percept` produced:
 
 ```python
-activity.last_operation = OperationAck(ok=True, result={"position": [120.0, 45.0, 30.0]})
+activity.last_operation = OperationAck(ok=True, result={"tcp": {
+    "coordinate": {"x": 120.0, "y": 45.0, "z": 30.0},
+    "rotation": {"roll": 0.0, "pitch": 90.0, "yaw": 0.0}}})
 activity.pending_operation = None
 activity.state = ActivityState.READY
 ```
@@ -431,7 +451,7 @@ Reflect/Situate notices this signal (a genuine judgment call — matching it aga
 await InvokeAction().execute(agent.registry, agent.cycle, activity_id="pick-up-block",
                               tool_id="robotic-arm", operation="close_gripper")
 # ... a few cycles later, resolved automatically:
-activity.last_operation = OperationAck(ok=True, result={"gripper_state": "closed"})
+activity.last_operation = OperationAck(ok=True, result={"gripper": 0})
 ```
 
 ## A minimal reasoning strategy
@@ -451,17 +471,18 @@ class PickUpBlockStrategy:
                 activity.context["target"] = locate_blue_block(reply.content["answer"])
                 return TickResult(activity=activity, step=Step(
                     next_action="invoke",
-                    params={"tool_id": "robotic-arm", "operation_name": "move_to", **activity.context["target"]}))
+                    params={"tool_id": "robotic-arm", "operation_name": "move_to",
+                            "speed": 200, "target": activity.context["target"]}))
             return TickResult(activity=activity, step=Step(
                 next_action="send",
                 params={"to": "room-agent", "content": {"type": "query", "question": "what's in front of the robot?"}}))
-        if activity.context.get("gripper_state") != "closed":
+        if activity.context.get("gripper") != 0:
             return TickResult(activity=activity, step=Step(
                 next_action="invoke", params={"tool_id": "robotic-arm", "operation_name": "close_gripper"}))
         return TickResult(activity=activity, step=Step(next_action="wait", params={}))
 ```
 
-`locate_blue_block` (a stand-in for whatever turns "a blue block is on top of a red block" into coordinates) is out of scope here — the point is that `wm.messages` and `wm.perceptions` are both plain, readable inputs to `reason()`, kept separate but equally available. Note that marking the activity `TERMINATED` once the gripper is closed isn't this strategy's job anymore — that judgment now belongs to a `ReflectStrategy` (here, as simple as checking `activity.context.get("gripper_state") == "closed"`), not shown in full to keep this example focused on Reason and Act.
+`locate_blue_block` (a stand-in for whatever turns "a blue block is on top of a red block" into coordinates) is out of scope here — the point is that `wm.messages` and `wm.perceptions` are both plain, readable inputs to `reason()`, kept separate but equally available. Note that marking the activity `TERMINATED` once the gripper is closed isn't this strategy's job anymore — that judgment now belongs to a `ReflectStrategy` (here, as simple as checking `activity.context.get("gripper") == 0`), not shown in full to keep this example focused on Reason and Act.
 
 ## Fusing Reason into Act
 
@@ -470,7 +491,8 @@ Once `activity.context["target"]` holds real coordinates, there's nothing left f
 ```python
                 return TickResult(activity=activity,
                     step=Step(next_action="invoke", params={"tool_id": "robotic-arm", "operation_name": "move_to"}),
-                    invocation=OperationInvocation(tool_id="robotic-arm", operation_name="move_to", params=activity.context["target"]))
+                    invocation=OperationInvocation(tool_id="robotic-arm", operation_name="move_to",
+                        params={"speed": 200, "target": activity.context["target"]}))
 ```
 
 `DecisionCycle.tick()`'s `if result.invocation is None` guard sees this already set and never calls `act_strategy.bind()` that cycle — one call did Reason's and Act's jobs together. This is the concrete version of the runtime's general point: pluggability doesn't force any particular number of calls, and a strategy fuses forward only when it actually has the answer already — for a tool whose params need a lookup or unit conversion the reasoning strategy doesn't have handy, leaving `invocation=None` still routes to a separate, more constrained `ActStrategy` call instead.

@@ -186,7 +186,7 @@ def _manual_from_dict(d: dict[str, Any]) -> Manual:
         ],
         signals=[SignalSpecification(**s) for s in d["signals"]],
         operations=[OperationSpecification(**o) for o in d["operations"]],
-        usage_protocols=d["usage_protocols"],
+        raw_text=d.get("raw_text"),
     )
 
 

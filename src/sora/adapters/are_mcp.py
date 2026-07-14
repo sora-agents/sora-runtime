@@ -108,7 +108,7 @@ def _synth_manual(app: str, operations: list[OperationSpecification]) -> Manual:
         observable_properties=[],  # not built yet: derive from ARE's app://{app}/state resource
         signals=[],  # not built yet: derive from ARE's resource_updated notifications
         operations=operations,
-        usage_protocols="",
+        raw_text=None,  # synthesized from the MCP tool list, not authored Markdown
     )
 
 

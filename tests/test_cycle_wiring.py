@@ -53,7 +53,6 @@ def _manual(tool_id: str, op: str) -> Manual:
         observable_properties=[],
         signals=[],
         operations=[OperationSpecification(name=op, description="", parameters={})],
-        usage_protocols="",
     )
 
 

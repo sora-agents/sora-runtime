@@ -64,7 +64,7 @@ def make_manual(manual_id: str = "email-client") -> Manual:
                 parameters={"type": "object", "properties": {"to": {"type": "string"}}},
             ),
         ],
-        usage_protocols="Call list_emails before send_email.",
+        raw_text="Call list_emails before send_email.",
     )
 
 
@@ -132,7 +132,7 @@ async def test_store_manual_overwrites_same_id(tmp_path: Path) -> None:
         observable_properties=updated.observable_properties,
         signals=updated.signals,
         operations=updated.operations,
-        usage_protocols=updated.usage_protocols,
+        raw_text=updated.raw_text,
     )
     await mem.store_manual(updated)
     got = await mem.retrieve_manual("email-client")
