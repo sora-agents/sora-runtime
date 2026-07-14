@@ -36,3 +36,9 @@ repos:
         language: system
         pass_filenames: false
         files: ^(src/sora/.*\.py|README\.md)$
+      - id: manuals-sync
+        name: EXAMPLES.md / manual-fixtures sync check
+        entry: uv run python3 scripts/check_manuals_sync.py
+        language: system
+        pass_filenames: false
+        files: ^(EXAMPLES\.md|tests/fixtures/manuals/.*\.md)$

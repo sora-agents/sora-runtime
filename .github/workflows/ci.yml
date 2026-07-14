@@ -39,3 +39,6 @@ jobs:
 
       - name: README/code sync check
         run: uv run python3 scripts/check_readme_sync.py
+
+      - name: EXAMPLES/manuals sync check
+        run: uv run python3 scripts/check_manuals_sync.py
