@@ -48,10 +48,12 @@ class Workspace(Protocol):
     async def close(self) -> None: ...  # contained tools go stale together
 
 
-class WorkspaceAdapter(Protocol):  # was ToolAdapter — it always operated at workspace granularity
+class WorkspaceAdapter(Protocol):
     """Imports externally-defined tools (MCP, OpenAPI, WoT, ...) into the S-ORA usage interface.
     The tool-use protocol is fixed once per workspace (e.g. all-MCP, all-WoT); per-tool addressing
-    within that protocol (see Tool.address) is a separate, orthogonal concern."""
+    within that protocol (see Tool.address) is a separate, orthogonal concern.
+
+    The adapter is responsible for ensuring tools have globally unique ids (see ADR-0014)."""
 
     name: str  # e.g. "mcp" — matches WorkspaceOrigin.adapter
 
@@ -125,17 +127,32 @@ class EnvironmentRegistry:
         return workspace
 
     def _register(self, workspace: Workspace) -> None:
+        # ADR-0014 id-uniqueness enforcement, atomic and fail-loud: validate every id *before*
+        # mutating any state, so a rejected workspace never leaves a half-registered workspace or
+        # leaks a non-colliding tool. A registry can only enforce the ids it sees — global
+        # uniqueness rests on the adapter — but a collision it *can* see is a bug, not a silent
+        # overwrite (which today's live-layer flat id->Tool map would otherwise do).
+        if workspace.id in self._workspaces:
+            raise ValueError(f"workspace id {workspace.id!r} is already joined")
+        tools = workspace.tools()
+        seen: set[str] = set()
+        for tool in tools:
+            if tool.id in self._tools or tool.id in seen:
+                raise ValueError(
+                    f"duplicate tool id {tool.id!r} joining workspace {workspace.id!r} "
+                    f"(tool ids are globally unique — see ADR-0014)"
+                )
+            seen.add(tool.id)
         self._workspaces[workspace.id] = workspace
-        tool_ids = []
-        for tool in workspace.tools():
-            self._tools[tool.id] = tool
-            tool_ids.append(tool.id)
-        self._workspace_tools[workspace.id] = tool_ids
+        self._tools.update({tool.id: tool for tool in tools})
+        self._workspace_tools[workspace.id] = [tool.id for tool in tools]
 
     async def leave(self, workspace_id: str) -> None:
         """Predefined external action _leave_: closes the workspace's connection, deregisters it
         and all its tools."""
         workspace = self._workspaces.pop(workspace_id)
+        # ADR-0014: _register made these ids exclusive to this workspace, so popping them can't
+        # touch a sibling workspace's still-live tool (the cross-workspace deregistration hazard).
         for tool_id in self._workspace_tools.pop(workspace_id, []):
             self._tools.pop(tool_id, None)
         await workspace.close()
@@ -149,7 +166,21 @@ class EnvironmentRegistry:
         """Reconnects to already-known workspaces via adapter.connect() — one call per workspace,
         looking up each one's adapter by workspace_record.origin, resolving each tool's manual from
         SemanticMemory first. Skips discovery entirely."""
-        raise NotImplementedError  # not built yet — untouched by the walking-skeleton spike
+        restored: list[Workspace] = []
+        for ws_record in workspace_records:
+            adapter = self._adapters[ws_record.origin]
+            ws_tool_records = [t for t in tool_records if t.workspace_id == ws_record.id]
+            # manuals keyed by manual_id — many tool records can share one manual, so this dedups;
+            # adapter.connect() looks each tool's manual up by tool_record.manual_id.
+            manuals: dict[str, Manual] = {}
+            for tool_record in ws_tool_records:
+                manual = await semantic.retrieve_manual(tool_record.manual_id)
+                if manual is not None:
+                    manuals[tool_record.manual_id] = manual
+            workspace = await adapter.connect(ws_record, ws_tool_records, manuals)
+            self._register(workspace)  # same id-uniqueness enforcement as join
+            restored.append(workspace)
+        return restored
 
     def __repr__(self) -> str:
         return f"EnvironmentRegistry(workspaces={sorted(self._workspaces)})"
