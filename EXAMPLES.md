@@ -353,10 +353,11 @@ Identical on both agents — only the focus step afterward differs:
 
 ```python
 lab = WorkspaceOrigin(adapter="wot", address="http://lab.local/things")
-await JoinAction().execute(agent.registry, agent.cycle, origin=lab)
+ack = await JoinAction().execute(agent.registry, agent.cycle, origin=lab)
+# ack.result == {"workspace_id": "lab", "tool_ids": ["video-stream", "blinds", "robotic-arm"]}
 ```
 
-`JoinAction` connects via `EnvironmentRegistry.join()`, registers all three tools in `agent.registry`, and persists the `WorkspaceRecord` plus each tool's `Manual`/`ToolRecord` to `agent.semantic` — so a restart can `restore()` instead of rejoining from scratch. Every action takes `(tools, cycle)` rather than the whole `Agent` — narrower than `Agent`, and it's what lets `DecisionCycle.tick()` avoid storing a back-reference to its own `Agent` (see the README's Agent/DecisionCycle wiring).
+`JoinAction` connects via `EnvironmentRegistry.join()`, registers all three tools in `agent.registry`, and persists the `WorkspaceRecord` plus each tool's `Manual`/`ToolRecord` to `agent.semantic` — so a restart can `restore()` instead of rejoining from scratch. Its `ActionAck.result` carries `{"workspace_id", "tool_ids"}`: the `workspace_id` addresses the workspace for a later `_leave_`, while the `tool_ids` are a self-contained snapshot of what was gained — legible from an episodic trace after the workspace is left, or across an agent boundary, without dereferencing the live registry. Every action takes `(registry, cycle)` rather than the whole `Agent` — narrower than `Agent`, and it's what lets `DecisionCycle.tick()` avoid storing a back-reference to its own `Agent` (see the README's Agent/DecisionCycle wiring).
 
 `room-agent` then focuses what it can see:
 

@@ -8,6 +8,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.activity import ActivityState
+from sora.manual import ToolRecord, WorkspaceRecord
 from sora.types import (
     OPERATION_NAME,
     TOOL_ID,
@@ -112,62 +113,91 @@ class InvokeAction:  # predefined external action: _invoke_
         cycle.result_sink.push(invocation_id, ack)  # keyed by invocation_id, not tool_id
 
 
+# Every predefined external action takes the uniform (registry, cycle, **kwargs) signature and reads
+# its own params out of **kwargs, rather than declaring them as explicit keyword-only args. An extra
+# required keyword-only param would break the structural-subtype relation to ExternalAction under
+# mypy --strict, so ActionRegistry.register_external() wouldn't type-check. The README's explicit-
+# param form is illustration only (see InvokeAction, docs/phase-2-findings.md); activity_id, passed
+# by tick()'s dispatch, lands harmlessly in **kwargs for all but invoke.
+
+
 class FocusAction:  # predefined external action: _focus_
     name = "focus"
 
     async def execute(
-        self, registry: EnvironmentRegistry, cycle: DecisionCycle, *, tool_id: str, **kwargs: Any
+        self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        raise NotImplementedError
+        tool_id = kwargs[TOOL_ID]
+        tool = registry.get(tool_id)
+        await tool.focus(cycle.signal_sink)
+        cycle.working.focused_tools[tool_id] = tool
+        return ActionAck(ok=True)
 
 
 class UnfocusAction:  # predefined external action: _unfocus_
     name = "unfocus"
 
     async def execute(
-        self, registry: EnvironmentRegistry, cycle: DecisionCycle, *, tool_id: str, **kwargs: Any
+        self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        raise NotImplementedError
+        tool = cycle.working.focused_tools.pop(kwargs[TOOL_ID], None)
+        if tool is not None:
+            await tool.unfocus()
+        return ActionAck(ok=True)
 
 
 class JoinAction:  # predefined external action: _join_ — implies discover/connect
     name = "join"
 
     async def execute(
-        self,
-        registry: EnvironmentRegistry,
-        cycle: DecisionCycle,
-        *,
-        origin: WorkspaceOrigin,
-        **kwargs: Any,
+        self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        raise NotImplementedError
+        origin: WorkspaceOrigin = kwargs["origin"]
+        workspace = await registry.join(origin)
+        now = time.time()
+        await cycle.semantic.store_workspace_record(
+            WorkspaceRecord(id=workspace.id, origin=origin, discovered_at=now, last_seen_at=now)
+        )
+        for tool in workspace.tools():
+            await cycle.semantic.store_manual(tool.manual)
+            await cycle.semantic.store_tool_record(
+                ToolRecord(
+                    id=tool.id,
+                    manual_id=tool.manual.id,
+                    workspace_id=workspace.id,
+                    address=tool.address,  # None unless this tool overrides the workspace's address
+                    discovered_at=now,
+                    last_seen_at=now,
+                )
+            )
+        # workspace_id addresses it (for a later _leave_); tool_ids are a self-contained snapshot
+        # of what was gained, legible after leave / across an agent boundary (see EXAMPLES.md).
+        # the snapshot is useful for logging, e.g. saving an episode to memory
+        return ActionAck(
+            ok=True,
+            result={
+                "workspace_id": workspace.id,
+                "tool_ids": [tool.id for tool in workspace.tools()],
+            },
+        )
 
 
 class LeaveAction:  # predefined external action: _leave_ — implies close
     name = "leave"
 
     async def execute(
-        self,
-        registry: EnvironmentRegistry,
-        cycle: DecisionCycle,
-        *,
-        workspace_id: str,
-        **kwargs: Any,
+        self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        raise NotImplementedError
+        await registry.leave(kwargs["workspace_id"])
+        return ActionAck(ok=True)
 
 
 class SendAction:  # predefined external action: _send_
     name = "send"
 
     async def execute(
-        self,
-        registry: EnvironmentRegistry,
-        cycle: DecisionCycle,
-        *,
-        to: str,
-        content: dict[str, Any],
-        **kwargs: Any,
+        self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        raise NotImplementedError
+        # registry unused here — every ExternalAction still gets the same uniform signature.
+        await cycle.communication.send(kwargs["to"], kwargs["content"])
+        return ActionAck(ok=True)

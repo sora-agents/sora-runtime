@@ -466,7 +466,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         name = "invoke"
         async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            activity_id: str, tool_id: str, operation_name: str, **params) -> ActionAck:
-            tool = tools.get(tool_id)
+            tool = registry.get(tool_id)
             invocation = OperationInvocation(tool_id=tool_id, operation_name=operation_name, params=params)
             op_id = new_id()
             activity = cycle.working.activities[activity_id]
@@ -482,7 +482,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         name = "focus"
         async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            tool_id: str, **kwargs) -> ActionAck:
-            tool = tools.get(tool_id)
+            tool = registry.get(tool_id)
             await tool.focus(cycle.signal_sink)
             cycle.working.focused_tools[tool_id] = tool
             return ActionAck(ok=True)
@@ -500,7 +500,7 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         name = "join"
         async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            origin: WorkspaceOrigin, **kwargs) -> ActionAck:
-            workspace = await tools.join(origin)
+            workspace = await registry.join(origin)
             await cycle.semantic.store_workspace_record(WorkspaceRecord(
                 id=workspace.id, origin=origin,
                 discovered_at=now(), last_seen_at=now(),
@@ -512,21 +512,27 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
                     address=tool.address,   # None unless this tool overrides the workspace's address
                     discovered_at=now(), last_seen_at=now(),
                 ))
-            return ActionAck(ok=True, result=[tool.id for tool in workspace.tools()])
+            # workspace_id addresses it (for a later _leave_); tool_ids are a self-contained
+            # snapshot of what was gained, legible after leave / across an agent boundary.
+            # The snapshot is useful for logging (e.g., saving an episode to memory).
+            return ActionAck(ok=True, result={
+                "workspace_id": workspace.id,
+                "tool_ids": [tool.id for tool in workspace.tools()],
+            })
 
     class LeaveAction:                 # predefined external action: _leave_ — implies close
         name = "leave"
         async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            workspace_id: str, **kwargs) -> ActionAck:
-            await tools.leave(workspace_id)
+            await registry.leave(workspace_id)
             return ActionAck(ok=True)
 
     class SendAction:                  # predefined external action: _send_
         name = "send"
         async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            to: str, content: dict, **kwargs) -> ActionAck:
-            await cycle.communication.send(to, content)   # tools unused here — every ExternalAction still
-            return ActionAck(ok=True)                  # gets the same uniform (tools, cycle) signature
+            await cycle.communication.send(to, content)   # registry unused here — every ExternalAction still
+            return ActionAck(ok=True)                  # gets the same uniform (registry, cycle) signature
 
     # sora/memory.py
     class MemoryBackend(Protocol):    # pluggable: file, DB, vector store
