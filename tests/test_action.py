@@ -1,15 +1,27 @@
-"""Permanent TDD tests for the predefined external actions.
+"""Permanent TDD tests for the predefined action space and the ``ActionRegistry``.
 
-Covers the five still-stubbed actions — Focus/Unfocus (working.focused_tools + signal_sink wiring),
-Join/Leave (registry mutation + record persistence via SemanticMemory), Send (MessageTransport
-delegation). Each action's ``execute(...)`` is driven directly against the in-process fakes
-(``tests/fakes.py``) and a real ``FileMemoryBackend``, so the Join persistence path exercises the
-actual store/retrieve serialization round-trip rather than a mock. Also promotes the spike's
-``action_registry_lookup`` (triage rows 27, 87).
+Covers all six predefined external actions plus the registry that dispatches them:
+
+* **Invoke** — returns an immediate ``ActionAck`` (dispatch, not outcome), moves the activity to
+  ``RUNNING`` with a bound ``pending_operation`` (the implicit, unconditional wait), runs the tool
+  round-trip *off-cycle*, and lands the ``OperationAck`` on ``result_sink`` keyed by the per-invoke
+  ``invocation_id`` (never a ``Percept``), so Observe can resolve it 1:1.
+* **Focus/Unfocus** — ``working.focused_tools`` + ``signal_sink`` wiring.
+* **Join/Leave** — registry mutation + record persistence via ``SemanticMemory``.
+* **Send** — ``MessageTransport`` delegation.
+
+Each action's ``execute(...)`` is driven directly against the in-process fakes (``tests/fakes.py``)
+and a real ``FileMemoryBackend``, so the Join persistence path exercises the actual store/retrieve
+serialization round-trip rather than a mock. The ``DecisionCycle`` here is real (its constructor is
+the typed seam ``execute`` reaches through), but its strategies/transport are inert plumbing — these
+tests call ``execute`` directly, never ``tick()``. Promotes the spike's
+``invoke_action_sets_running_then_pushes_result`` and ``action_registry_lookup`` from
+``tests/test_cycle_wiring.py`` (triage rows in ``docs/phase-3-test-triage.md``).
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -27,6 +39,7 @@ from sora.action import (
     SendAction,
     UnfocusAction,
 )
+from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
 from sora.memory import (
@@ -113,6 +126,132 @@ def _cycle(
         episodic=EpisodicMemory(backend),
     )
     return cycle, working, semantic
+
+
+def _add_activity(cycle: DecisionCycle, activity_id: str) -> Activity:
+    """Invoke reads ``working.activities[activity_id]`` (unlike the other actions), so its tests
+    seed the activity first."""
+    activity = Activity(id=activity_id, goal="list emails", context={})
+    cycle.working.activities[activity_id] = activity
+    return activity
+
+
+# --------------------------------------------------------------------------------------------------
+# Invoke
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_invoke_returns_immediate_ack_and_sets_running(tmp_path: Path) -> None:
+    tool = FakeTool("EmailClientApp", invoke_results={"list_emails": {"emails": []}})
+    registry, _ = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, _, _ = _cycle(registry, tmp_path)
+    activity = _add_activity(cycle, "a1")
+
+    ack = await InvokeAction().execute(
+        registry, cycle, activity_id="a1", tool_id="EmailClientApp", operation_name="list_emails"
+    )
+
+    # The ack is dispatch, not outcome — immediate, with the tool's own result still in flight.
+    assert ack.ok is True
+    assert activity.state is ActivityState.RUNNING
+    assert activity.pending_operation is not None
+
+
+async def test_invoke_records_bound_invocation_on_pending_operation(tmp_path: Path) -> None:
+    tool = FakeTool("EmailClientApp", invoke_results={"list_emails": {"emails": []}})
+    registry, _ = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, _, _ = _cycle(registry, tmp_path)
+    _add_activity(cycle, "a1")
+
+    before = asyncio.get_running_loop().time()
+    await InvokeAction().execute(
+        registry, cycle, activity_id="a1", tool_id="EmailClientApp", operation_name="list_emails"
+    )
+
+    pending = cycle.working.activities["a1"].pending_operation
+    assert pending is not None
+    assert pending.id  # non-empty per-invoke id
+    assert pending.invocation.tool_id == "EmailClientApp"
+    assert pending.invocation.operation_name == "list_emails"
+    assert pending.invocation.params == {}
+    assert pending.invoked_at >= before  # a real timestamp, stamped at dispatch
+
+
+async def test_invoke_result_lands_off_cycle_keyed_by_invocation_id(tmp_path: Path) -> None:
+    tool = FakeTool("EmailClientApp", invoke_results={"list_emails": {"emails": [], "total": 0}})
+    registry, _ = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, _, _ = _cycle(registry, tmp_path)
+    activity = _add_activity(cycle, "a1")
+
+    await InvokeAction().execute(
+        registry, cycle, activity_id="a1", tool_id="EmailClientApp", operation_name="list_emails"
+    )
+    assert activity.pending_operation is not None
+    invocation_id = activity.pending_operation.id
+
+    # The round-trip runs off-cycle; yield so the background task lands its result on result_sink.
+    await asyncio.sleep(0)
+    drained = [item async for item in cycle.result_sink.drain()]
+
+    assert len(drained) == 1  # exactly one ack, and never delivered as a Percept
+    op_id, op_ack = drained[0]
+    assert op_id == invocation_id  # keyed by the invocation id, not the tool id
+    assert op_ack.ok is True
+    assert op_ack.result == {"emails": [], "total": 0}
+    assert tool.invoked_with == ("list_emails", {})
+
+
+async def test_invoke_passes_params_through_to_tool_and_invocation(tmp_path: Path) -> None:
+    tool = FakeTool("EmailClientApp", invoke_results={"search": ["hit"]})
+    registry, _ = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, _, _ = _cycle(registry, tmp_path)
+    activity = _add_activity(cycle, "a1")
+
+    await InvokeAction().execute(
+        registry,
+        cycle,
+        activity_id="a1",
+        tool_id="EmailClientApp",
+        operation_name="search",
+        folder="inbox",
+        query="invoice",
+    )
+
+    # Params (everything beyond tool_id/operation_name) flow to both the bound invocation...
+    assert activity.pending_operation is not None
+    assert activity.pending_operation.invocation.params == {"folder": "inbox", "query": "invoice"}
+    # ...and through to the tool call itself.
+    await asyncio.sleep(0)
+    assert tool.invoked_with == ("search", {"folder": "inbox", "query": "invoice"})
+
+
+async def test_concurrent_invokes_get_distinct_ids_and_both_land(tmp_path: Path) -> None:
+    tool = FakeTool("EmailClientApp", invoke_results={"list_emails": {"emails": []}})
+    registry, _ = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, _, _ = _cycle(registry, tmp_path)
+    a1 = _add_activity(cycle, "a1")
+    a2 = _add_activity(cycle, "a2")
+    invoke = InvokeAction()
+
+    await invoke.execute(
+        registry, cycle, activity_id="a1", tool_id="EmailClientApp", operation_name="list_emails"
+    )
+    await invoke.execute(
+        registry, cycle, activity_id="a2", tool_id="EmailClientApp", operation_name="list_emails"
+    )
+
+    assert a1.pending_operation is not None and a2.pending_operation is not None
+    assert a1.pending_operation.id != a2.pending_operation.id  # per-invoke, not per-tool
+
+    await asyncio.sleep(0)
+    drained = dict([item async for item in cycle.result_sink.drain()])
+    assert set(drained) == {a1.pending_operation.id, a2.pending_operation.id}
+    assert all(ack.ok for ack in drained.values())
 
 
 # --------------------------------------------------------------------------------------------------
@@ -230,8 +369,15 @@ async def test_send_delegates_to_transport(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# ActionRegistry lookup (promotes the spike's action_registry_lookup, generalized)
+# ActionRegistry lookup
 # --------------------------------------------------------------------------------------------------
+
+
+class _NoopInternal:
+    name = "noop"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> Any:
+        return None
 
 
 async def test_action_registry_lookup_external() -> None:
@@ -247,4 +393,19 @@ async def test_action_registry_lookup_external() -> None:
     for action in actions:
         reg.register_external(action)
     for action in actions:
-        assert reg.external(action.name) is action
+        assert reg.external(action.name) is action  # keyed by each action's own name constant
+
+
+async def test_action_registry_lookup_internal() -> None:
+    reg = ActionRegistry()
+    action = _NoopInternal()
+    reg.register_internal(action)
+    assert reg.internal("noop") is action
+
+
+async def test_action_registry_unknown_raises_keyerror() -> None:
+    reg = ActionRegistry()
+    with pytest.raises(KeyError):
+        reg.external("nope")
+    with pytest.raises(KeyError):
+        reg.internal("nope")

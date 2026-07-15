@@ -262,43 +262,6 @@ async def test_working_memory_registry_is_the_shared_instance() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Group: InvokeAction + ActionRegistry
-# --------------------------------------------------------------------------------------------------
-
-
-async def test_invoke_action_sets_running_then_pushes_result() -> None:
-    tool = FakeTool("EmailClientApp", "list_emails", {"emails": [], "total_emails": 0})
-    registry, origin, _ = _registry_with(tool)
-    await registry.join(origin)
-    cycle, working = _cycle(registry, ListEmailsReasonStrategy("EmailClientApp", "list_emails"))
-    activity = Activity(id="a1", goal="list emails", context={})
-    working.activities["a1"] = activity
-
-    ack = await InvokeAction().execute(
-        registry, cycle, activity_id="a1", tool_id="EmailClientApp", operation_name="list_emails"
-    )
-    assert ack.ok is True
-    assert activity.state is ActivityState.RUNNING
-    assert activity.pending_operation is not None
-
-    # The tool round-trip runs off-cycle; yield to the loop so the background task lands its result.
-    await asyncio.sleep(0)
-    drained = [item async for item in cycle.result_sink.drain()]
-    assert len(drained) == 1
-    op_id, op_ack = drained[0]
-    assert op_id == activity.pending_operation.id
-    assert op_ack.ok is True
-    assert tool.invoked_with == ("list_emails", {})
-
-
-async def test_action_registry_lookup() -> None:
-    reg = ActionRegistry()
-    invoke = InvokeAction()
-    reg.register_external(invoke)
-    assert reg.external("invoke") is invoke
-
-
-# --------------------------------------------------------------------------------------------------
 # Group: DefaultObserveStrategy resolves a RUNNING activity
 # --------------------------------------------------------------------------------------------------
 
