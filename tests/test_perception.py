@@ -18,11 +18,15 @@ from sora.perception import NotificationQueueSink, PerceptKind
 
 
 async def test_sink_push_then_drain_yields_in_order() -> None:
+    # FIFO order is deliberately *not* any sorted order, and a source repeats — so this fails a
+    # LIFO stack, a sort-by-source, a sort-by-value, and a dict-keyed-by-source implementation
+    # (a realistic case: one source pushing several items), not just a reversed queue.
     sink: NotificationQueueSink[int] = NotificationQueueSink()
-    sink.push("a", 1)
     sink.push("b", 2)
+    sink.push("a", 1)
+    sink.push("b", 3)
     drained = [item async for item in sink.drain()]
-    assert drained == [("a", 1), ("b", 2)]
+    assert drained == [("b", 2), ("a", 1), ("b", 3)]
 
 
 async def test_sink_drain_is_empty_after_draining() -> None:
