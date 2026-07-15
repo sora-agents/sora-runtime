@@ -592,7 +592,14 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
 
     class EpisodicMemory:
         def __init__(self, backend: MemoryBackend): ...
-        async def learn(self, activity: Activity, summary: str) -> None: ...
+        async def learn(self, activity: Activity, summary: str, *, succeeded: bool) -> None:
+            """Records one episode per activity (keyed by its id). Beyond the prose summary, the
+            stored record is a self-contained experience — outcome, the plan snapshot, step progress
+            (step_index/step_count), and the last operation result — capturing as much as survives
+            on the activity. `succeeded` is passed in because ActivityState.TERMINATED can't tell a
+            completed activity from a failed one; only the judging ReflectStrategy knows. The plan is
+            kept in full even on success (procedural memory holds it too): on failure it's the only 
+            copy, since procedural memory does not store failed plans."""
         async def consult(self, activity: Activity) -> list[Any]: ...
 
     # sora/strategies.py — one pluggable strategy per phase, threaded through a shared TickResult

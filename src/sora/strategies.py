@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.activity import ActivityState
 from sora.perception import Percept, PerceptKind
@@ -137,13 +139,66 @@ class DefaultObserveStrategy:
 
 
 class DefaultReflectStrategy:
-    """Spike default: no completion judgment yet — a just-selected activity stays selectable.
-    The real episodic/procedural store-on-success logic isn't built yet."""
+    """The runtime's built-in default — purely mechanical, no LLM.
+
+    Judges each activity completed or failed by two deterministic rules, and on a terminal outcome
+    records the experience: the state transition is synchronous (so Situate, which runs later this
+    cycle and selects only READY activities, never re-selects a just-terminated one), while the
+    episodic/procedural writes are dispatched as background tasks and never block the cycle (several
+    activities may terminate in the same cycle). Strong refs to the in-flight tasks are held so they
+    aren't GC'd mid-write — the same pattern as InvokeAction.
+
+    The two rules are deliberately asymmetric. **Failure** fires on any resolved-but-not-ok
+    ``last_operation``, independent of the plan: a failed operation is definite negative evidence,
+    so the activity terminates even mid-plan. **Completion** requires positive evidence that all
+    planned work is done — a plan present and fully consumed (``step_index >= len(plan.steps)``) —
+    so a plan-less activity is never auto-completed here (what a plan-following Reason, and any
+    application driving activities without a plan, relies on). Only completion stores the plan to
+    procedural memory; a failed plan isn't something future activities should retrieve as procedrual
+    knowledge."""
+
+    def __init__(self) -> None:
+        # Hold strong refs to in-flight background stores so they aren't GC'd mid-write.
+        self._tasks: set[asyncio.Task[None]] = set()
 
     async def reflect(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
+        # Only READY activities are judged: RUNNING has an operation still in flight (nothing to
+        # judge yet), BLOCKED is waiting on a signal, and TERMINATED was already recorded — skipping
+        # it is what makes reflect() idempotent across the cycles it runs on every activity.
+        if activity.state is not ActivityState.READY:
+            return result
+        last = activity.last_operation
+        if last is not None and not last.ok:
+            activity.state = ActivityState.TERMINATED  # synchronous — Situate sees it this cycle
+            self._dispatch(self._record_failure(cycle, activity))
+        elif activity.plan is not None and activity.step_index >= len(activity.plan.steps):
+            activity.state = ActivityState.TERMINATED
+            self._dispatch(self._record_success(cycle, activity))
+        # Reflect never fills in the decision fields (activity/step/invocation) — it threads
+        # `result` through untouched.
         return result
+
+    def _dispatch(self, coro: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _record_success(self, cycle: DecisionCycle, activity: Activity) -> None:
+        await cycle.episodic.learn(activity, _summarize(activity, succeeded=True), succeeded=True)
+        if activity.plan is not None:
+            await cycle.procedural.store(activity.plan)
+
+    async def _record_failure(self, cycle: DecisionCycle, activity: Activity) -> None:
+        await cycle.episodic.learn(activity, _summarize(activity, succeeded=False), succeeded=False)
+
+
+def _summarize(activity: Activity, *, succeeded: bool) -> str:
+    """A deterministic, no-LLM episode summary. A model-backed ReflectStrategy would substitute a
+    richer natural-language summary here; the mechanical default just states outcome and goal."""
+    outcome = "completed" if succeeded else "failed"
+    return f"{outcome}: {activity.goal}"
 
 
 class DefaultSituateStrategy:

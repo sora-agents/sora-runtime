@@ -259,13 +259,32 @@ class EpisodicMemory:
     def __init__(self, backend: MemoryBackend) -> None:
         self._backend = backend
 
-    async def learn(self, activity: Activity, summary: str) -> None:
+    async def learn(self, activity: Activity, summary: str, *, succeeded: bool) -> None:
         # One episode per activity, keyed by its id: re-learning the same activity overwrites rather
         # than accumulating duplicates. goal is stored top-level so consult can filter on it through
-        # the backend's exact-match query().
+        # the backend's exact-match query(). Beyond the prose summary, the episode captures a
+        # self-contained record of what was attempted — outcome, the plan snapshot, step progress,
+        # and the last operation result — reconstructing as much of the experience as survives on
+        # the activity. `succeeded` is passed in because ActivityState.TERMINATED alone can't tell a
+        # completed activity from a failed one — only the judging strategy knows. The plan is stored
+        # in full even on success (where procedural memory also holds it): the episode stays legible
+        # on its own, and on failure it's the only surviving copy, since procedural memory does not
+        # store failed plans.
+        plan = activity.plan
         await self._backend.put(
             activity.id,
-            {"activity_id": activity.id, "goal": activity.goal, "summary": summary},
+            {
+                "activity_id": activity.id,
+                "goal": activity.goal,
+                "succeeded": succeeded,
+                "summary": summary,
+                "step_index": activity.step_index,
+                "step_count": None if plan is None else len(plan.steps),
+                "last_result": (
+                    None if activity.last_operation is None else asdict(activity.last_operation)
+                ),
+                "plan": None if plan is None else asdict(plan),
+            },
         )
 
     async def consult(self, activity: Activity) -> list[Any]:
