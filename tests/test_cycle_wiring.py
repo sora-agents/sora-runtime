@@ -21,12 +21,12 @@ from typing import Any
 import pytest
 
 from sora.action import ActionRegistry, InvokeAction
-from sora.activity import Activity, ActivityState
+from sora.activity import Activity
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, Tool, Workspace, WorkspaceOrigin
 from sora.manual import Manual
 from sora.memory import EpisodicMemory, ProceduralMemory, SemanticMemory, WorkingMemory
-from sora.perception import Message, NotificationQueueSink
+from sora.perception import Message
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
@@ -177,38 +177,6 @@ def _cycle(
 
 
 # --------------------------------------------------------------------------------------------------
-# Group: NotificationQueueSink
-# --------------------------------------------------------------------------------------------------
-
-
-async def test_sink_push_then_drain_yields_in_order() -> None:
-    sink: NotificationQueueSink[int] = NotificationQueueSink()
-    sink.push("a", 1)
-    sink.push("b", 2)
-    drained = [item async for item in sink.drain()]
-    assert drained == [("a", 1), ("b", 2)]
-
-
-async def test_sink_drain_is_empty_after_draining() -> None:
-    sink: NotificationQueueSink[int] = NotificationQueueSink()
-    sink.push("a", 1)
-    assert [item async for item in sink.drain()] == [("a", 1)]
-    assert [item async for item in sink.drain()] == []
-
-
-async def test_sink_drain_snapshots_current_depth() -> None:
-    # An item pushed *during* a drain waits for the next drain (no starvation within a cycle).
-    sink: NotificationQueueSink[int] = NotificationQueueSink()
-    sink.push("a", 1)
-    seen = []
-    async for item in sink.drain():
-        seen.append(item)
-        sink.push("late", 99)  # must not be yielded by this same drain
-    assert seen == [("a", 1)]
-    assert [i async for i in sink.drain()] == [("late", 99)]
-
-
-# --------------------------------------------------------------------------------------------------
 # Group: EnvironmentRegistry join/get/leave
 # --------------------------------------------------------------------------------------------------
 
@@ -259,30 +227,6 @@ async def test_working_memory_registry_is_the_shared_instance() -> None:
     await registry.join(origin)
     assert working.registry is registry
     assert working.registry.joined_workspaces() == [ws]
-
-
-# --------------------------------------------------------------------------------------------------
-# Group: DefaultObserveStrategy resolves a RUNNING activity
-# --------------------------------------------------------------------------------------------------
-
-
-async def test_observe_resolves_running_activity() -> None:
-    tool = FakeTool("EmailClientApp", "list_emails", {"emails": []})
-    registry, origin, _ = _registry_with(tool)
-    await registry.join(origin)
-    cycle, working = _cycle(registry, ListEmailsReasonStrategy("EmailClientApp", "list_emails"))
-    activity = Activity(id="a1", goal="list emails", context={})
-    working.activities["a1"] = activity
-    await InvokeAction().execute(
-        registry, cycle, activity_id="a1", tool_id="EmailClientApp", operation_name="list_emails"
-    )
-    op_id = activity.pending_operation.id  # type: ignore[union-attr]
-    # Simulate the off-cycle result having landed, then observe.
-    cycle.result_sink.push(op_id, OperationAck(ok=True, result={"emails": []}))
-    await DefaultObserveStrategy().observe(cycle)
-    assert activity.state is ActivityState.READY
-    assert activity.pending_operation is None
-    assert activity.last_operation == OperationAck(ok=True, result={"emails": []})
 
 
 # --------------------------------------------------------------------------------------------------

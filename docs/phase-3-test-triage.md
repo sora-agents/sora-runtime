@@ -21,11 +21,11 @@ promoted assertions are permanent tests from the moment they land in their new h
 
 | Spike group (tests) | Fate | Owning task | Permanent home |
 |---|---|---|---|
-| **NotificationQueueSink** — `push_then_drain_yields_in_order`, `drain_is_empty_after_draining`, `drain_snapshots_current_depth` | **Promote (verbatim)** | independent (no gate); lands with D1, its first real consumer | `tests/test_perception.py` |
+| **NotificationQueueSink** — `push_then_drain_yields_in_order`, `drain_is_empty_after_draining`, `drain_snapshots_current_depth` | **Promote (verbatim)** — ✅ landed (D1) | independent (no gate); lands with D1, its first real consumer | `tests/test_perception.py` |
 | **EnvironmentRegistry** — `join_registers_workspace_and_tools`, `leave_closes_and_deregisters` | **Promote + extend** | **C2** | `tests/test_environment.py` |
 | **InvokeAction** — `invoke_action_sets_running_then_pushes_result` | **Promote** | **C4** | `tests/test_action.py` |
 | **ActionRegistry** — `action_registry_lookup` | **Promote** | **C3/C4** | `tests/test_action.py` |
-| **DefaultObserveStrategy** — `observe_resolves_running_activity` | **Promote** | **D1** | `tests/test_cycle.py` (or `test_strategies.py`) |
+| **DefaultObserveStrategy** — `observe_resolves_running_activity` | **Promote** — ✅ landed (D1) | **D1** | `tests/test_cycle.py` |
 | **DecisionCycle.tick end-to-end** — `tick_end_to_end_invoke_then_resolve` | **Re-drive** (rewrite harness, keep outcome assertions) | **D4** | `tests/test_cycle.py` |
 
 ## Per-group rationale
