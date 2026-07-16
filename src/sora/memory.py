@@ -120,6 +120,9 @@ class WorkingMemory:  # transient, in-process, fast
     # inbound agent-to-agent communication — kept distinct
     messages: list[Message] = field(default_factory=list)
     focused_tools: dict[str, Tool] = field(default_factory=dict)
+    # manuals pulled from SemanticMemory by _load_ (removed by _unload_) — distinct from
+    # focused_tools: focusing a tool is an external action, loading its manual is internal.
+    loaded_manuals: dict[str, Manual] = field(default_factory=dict)
 
 
 # Discriminators for the three record kinds sharing one backend. They serve double duty: as a

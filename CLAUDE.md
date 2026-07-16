@@ -43,7 +43,7 @@ Module-to-concept map (from the API Sketch's own file markers — this is where 
 | `sora/perception.py` | `Percept`, `Message`, `SignalSink`, `NotificationQueueSink` |
 | `sora/manual.py` | `Manual`, `ManualParser`, `WorkspaceRecord`, `ToolRecord`, `OperationSpecification`, `ObservablePropertySpecification`, `SignalSpecification` |
 | `sora/activity.py` | `Activity`, `ActivityState` |
-| `sora/action.py` | `InternalAction`, `ExternalAction`, `ActionRegistry`, the six predefined actions |
+| `sora/action.py` | `InternalAction`, `ExternalAction`, `ActionRegistry`, the predefined external actions (invoke/focus/unfocus/join/leave/send) and internal actions (create_activity/load/unload/filter), `default_action_registry()` |
 | `sora/memory.py` | `MemoryBackend`, `WorkingMemory`, `SemanticMemory`, `ProceduralMemory`, `EpisodicMemory` |
 | `sora/strategies.py` | `TickResult`, `Strategies`, the five phase-strategy Protocols, `DefaultObserveStrategy` |
 | `sora/transport.py` | `MessageTransport` |

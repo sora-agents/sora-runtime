@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from sora.action import ActionRegistry, InvokeAction
+from sora.action import default_action_registry
 from sora.activity import Activity
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
@@ -97,8 +97,7 @@ async def test_walking_skeleton_list_emails_against_are() -> None:
     registry = EnvironmentRegistry(adapters={origin: adapter})
     working = WorkingMemory(registry=registry)
     backend = DictBackend()
-    actions = ActionRegistry()
-    actions.register_external(InvokeAction())
+    actions = default_action_registry()
     strategies = Strategies(
         observe=DefaultObserveStrategy(),
         reflect=DefaultReflectStrategy(),

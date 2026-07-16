@@ -8,6 +8,12 @@ from collections.abc import Coroutine
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
+from sora.action import (
+    CreateActivityAction,
+    FilterPerceptionsAction,
+    LoadManualAction,
+    UnloadManualAction,
+)
 from sora.activity import ActivityState
 from sora.perception import Percept, PerceptKind
 from sora.types import OPERATION_NAME, TOOL_ID, OperationInvocation, Step
@@ -17,6 +23,7 @@ if TYPE_CHECKING:
     from sora.cycle import DecisionCycle
     from sora.manual import Manual
     from sora.memory import WorkingMemory
+    from sora.perception import Message
 
 
 @dataclass(frozen=True)
@@ -71,13 +78,18 @@ class SituateStrategy(Protocol):
         cycle: DecisionCycle,
         result: TickResult,
     ) -> TickResult:
-        """Selects the next activity and adjusts wm for it. Only called if result.activity is still
-        None. Also responsible for activity creation: if wm.messages has one that doesn't correspond
-        to any existing activity, invokes the internal _create_activity_ action (via cycle) before
-        selecting. Head of the decision chain (Situate -> Reason -> Act) and the intended entry
-        point for fusing the remaining phases into one model call — it runs after this cycle's
-        percepts and messages are already in working memory. May additionally fill in
-        step/invocation, short-circuiting Reason/Act."""
+        """Selects the next activity and adjusts wm for it. Always runs — unlike Reason/Act it is
+        not gated on its own output field, because adjusting wm (selecting tools, loading/unloading
+        manuals, filtering percepts) must reflect this cycle's fresh percepts even for an
+        already-selected activity. Selects only if result.activity is still None; a pre-set
+        selection (uncommon — e.g. an Observe that pins the activity handling a critical signal) is
+        respected and situated, not overridden. Also responsible for activity creation: if
+        wm.messages includes a new goal delegation, invokes the internal _create_activity_ action
+        (via cycle) before selecting. Head of the decision chain (Situate -> Reason -> Act) and the
+        intended entry point for fusing the remaining phases into one model call — it runs after
+        this cycle's percepts and messages are already in working memory. May additionally fill in
+        step/invocation, short-circuiting Reason/Act (those forward-fusion gates remain; only
+        Situate's own activity gate is removed)."""
         ...
 
 
@@ -201,8 +213,26 @@ def _summarize(activity: Activity, *, succeeded: bool) -> str:
     return f"{outcome}: {activity.goal}"
 
 
+def _goal_from_message(message: Message) -> str:
+    """The default's deterministic goal derivation from a message — no interpretation, no model
+    call: the message's own text if it carries a conventional ``text`` field, else the whole content
+    rendered. A model-backed Situate would derive a richer goal instead."""
+    text = message.content.get("text")
+    return text if isinstance(text, str) else str(message.content)
+
+
 class DefaultSituateStrategy:
-    """Spike default: pick the first ready activity; no activity-creation-from-messages yet."""
+    """The runtime's built-in default — mechanical, no LLM. Always runs: it adjusts working memory
+    for the joined workspaces every cycle (even for an already-selected activity), then selects only
+    if result.activity is still None. Creates an activity from any unhandled message (deduped by
+    derived goal) via the internal _create_activity_ action, and adjusts wm via the internal
+    working-memory actions — loads joined tools' manuals (_load_), unloads manuals no longer backed
+    by a joined tool (_unload_), and filters observable-property percepts to the joined workspaces'
+    tools (_filter_). _filter_ only prunes properties (a re-observed snapshot, safe to drop);
+    signals are retained regardless of source — they're fire-and-forget, and their retention and
+    eviction is consumption-driven, owned by the blocked-state machinery, not this prune. Focusing
+    tools is *not* done here: _focus_ is an external action, and the cycle dispatches at most one
+    external action per cycle (at Act), so a richer strategy emits focus as a plan step."""
 
     async def situate(
         self,
@@ -211,9 +241,49 @@ class DefaultSituateStrategy:
         cycle: DecisionCycle,
         result: TickResult,
     ) -> TickResult:
-        if result.activity is not None or not activities:
+        await self._create_activities_from_messages(wm, cycle)
+        await self._adjust_working_memory(wm, cycle)
+        if result.activity is not None:
+            return result  # a pre-set selection is respected, not overridden
+        # Recompute from wm (not the passed snapshot) so a just-created activity is selectable now.
+        # wm.activities preserves insertion (creation) order and is never reordered, so ready[0] is
+        # the *oldest still-ready* activity: selection is deterministic, static priority-by-age. It
+        # is not fair — an activity that stays READY across cycles (never going RUNNING/BLOCKED) is
+        # reselected every cycle and starves younger ones. A fair/round-robin selection policy is a
+        # separate strategy (see ROADMAP D3a), deliberately not folded into this mechanical default.
+        ready = [a for a in wm.activities.values() if a.state is ActivityState.READY]
+        if not ready:
             return result
-        return replace(result, activity=activities[0])
+        return replace(result, activity=ready[0])
+
+    @staticmethod
+    async def _create_activities_from_messages(wm: WorkingMemory, cycle: DecisionCycle) -> None:
+        if not wm.messages:
+            return  # nothing to handle -> the internal action is never required this cycle
+        create = cycle.actions.internal(CreateActivityAction.name)
+        goals = {a.goal for a in wm.activities.values()}
+        for message in wm.messages:
+            goal = _goal_from_message(message)
+            if goal not in goals:  # an unhandled message maps to no existing activity (by goal)
+                await create.execute(cycle, goal=goal)
+                goals.add(goal)
+
+    @staticmethod
+    async def _adjust_working_memory(wm: WorkingMemory, cycle: DecisionCycle) -> None:
+        tools = wm.registry.all_tools()
+        manual_ids = {tool.manual.id for tool in tools}
+        # Relevant = the tools of the joined workspaces. focused_tools is a subset — per A&A you can
+        # only focus a tool discovered by joining its workspace (FocusAction resolves it through the
+        # registry) — so it adds nothing here. Signals ignore this set: _filter_ never drops them.
+        relevant_ids = {tool.id for tool in tools}
+        load = cycle.actions.internal(LoadManualAction.name)
+        unload = cycle.actions.internal(UnloadManualAction.name)
+        filter_ = cycle.actions.internal(FilterPerceptionsAction.name)
+        for manual_id in manual_ids - wm.loaded_manuals.keys():
+            await load.execute(cycle, manual_id=manual_id)
+        for manual_id in wm.loaded_manuals.keys() - manual_ids:
+            await unload.execute(cycle, manual_id=manual_id)
+        await filter_.execute(cycle, tool_ids=relevant_ids)
 
 
 class DefaultActStrategy:

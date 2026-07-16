@@ -28,16 +28,21 @@ from typing import Any
 
 import pytest
 
-from fakes import FakeAdapter, FakeTool, FakeWorkspace
+from fakes import FakeAdapter, FakeTool, FakeWorkspace, fake_manual
 from sora.action import (
     ActionRegistry,
+    CreateActivityAction,
     ExternalAction,
+    FilterPerceptionsAction,
     FocusAction,
     InvokeAction,
     JoinAction,
     LeaveAction,
+    LoadManualAction,
     SendAction,
     UnfocusAction,
+    UnloadManualAction,
+    default_action_registry,
 )
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -49,7 +54,7 @@ from sora.memory import (
     SemanticMemory,
     WorkingMemory,
 )
-from sora.perception import Message
+from sora.perception import Message, Percept, PerceptKind
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
@@ -58,7 +63,7 @@ from sora.strategies import (
     Strategies,
     TickResult,
 )
-from sora.types import Signal
+from sora.types import ObservableProperty, Signal
 
 # --------------------------------------------------------------------------------------------------
 # Harness — the fakes plus a recording transport and a real FileMemoryBackend-backed DecisionCycle.
@@ -350,6 +355,22 @@ async def test_leave_closes_and_deregisters(tmp_path: Path) -> None:
         registry.get_workspace("ws")
 
 
+async def test_leave_unfocuses_the_workspaces_focused_tools(tmp_path: Path) -> None:
+    tool = FakeTool("EmailClientApp", signals_on_focus=[Signal("new_email", {"n": 1})])
+    registry, workspace = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, working, _ = _cycle(registry, tmp_path)
+    await FocusAction().execute(registry, cycle, activity_id="a1", tool_id="EmailClientApp")
+    assert "EmailClientApp" in working.focused_tools
+
+    await LeaveAction().execute(registry, cycle, activity_id="a1", workspace_id="ws")
+
+    # No stale focus survives leave: the handle is dropped and the subscription torn down.
+    assert "EmailClientApp" not in working.focused_tools
+    assert tool.focused is False
+    assert workspace.closed is True
+
+
 # --------------------------------------------------------------------------------------------------
 # Send
 # --------------------------------------------------------------------------------------------------
@@ -366,6 +387,104 @@ async def test_send_delegates_to_transport(tmp_path: Path) -> None:
 
     assert ack.ok is True
     assert transport.sent == [("agent-b", {"greeting": "hi"})]
+
+
+# --------------------------------------------------------------------------------------------------
+# Internal working-memory actions: _create_activity_ / _load_ / _unload_ / _filter_
+# These touch only memory (no EnvironmentRegistry) and take the (cycle, **kwargs) InternalAction
+# signature. Driven directly against the real FileMemoryBackend-backed cycle.
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_create_activity_adds_ready_activity_to_working_memory(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("EmailClientApp"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+
+    activity = await CreateActivityAction().execute(cycle, goal="list emails")
+
+    assert activity.goal == "list emails"
+    assert activity.state is ActivityState.READY
+    assert activity.id  # a generated, non-empty id
+    assert working.activities[activity.id] is activity
+
+
+async def test_create_activity_honors_explicit_id_and_context(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("EmailClientApp"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+
+    activity = await CreateActivityAction().execute(
+        cycle, goal="g", activity_id="act-1", context={"k": "v"}
+    )
+
+    assert activity.id == "act-1"
+    assert activity.context == {"k": "v"}
+    assert working.activities["act-1"] is activity
+
+
+async def test_load_manual_pulls_from_semantic_into_working_memory(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("EmailClientApp"))
+    cycle, working, semantic = _cycle(registry, tmp_path)
+    await semantic.store_manual(fake_manual("clock", ["get_time"]))
+
+    await LoadManualAction().execute(cycle, manual_id="clock")
+
+    # Loaded from the durable store (a fresh copy, so compare by id, not identity).
+    assert "clock" in working.loaded_manuals
+    assert working.loaded_manuals["clock"].id == "clock"
+
+
+async def test_load_manual_unknown_id_is_noop(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("EmailClientApp"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+
+    await LoadManualAction().execute(cycle, manual_id="missing")  # no raise
+
+    assert working.loaded_manuals == {}
+
+
+async def test_unload_manual_removes_from_working_memory(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("EmailClientApp"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+    working.loaded_manuals["clock"] = fake_manual("clock")
+
+    await UnloadManualAction().execute(cycle, manual_id="clock")
+
+    assert "clock" not in working.loaded_manuals
+
+
+async def test_unload_manual_absent_id_is_noop(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("EmailClientApp"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+
+    await UnloadManualAction().execute(cycle, manual_id="never-loaded")  # no raise
+
+    assert working.loaded_manuals == {}
+
+
+async def test_filter_keeps_only_relevant_source_percepts(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("EmailClientApp"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+    keep = Percept("EmailClientApp", PerceptKind.PROPERTY, ObservableProperty("unread", 1), 0.0)
+    drop = Percept("stranger", PerceptKind.PROPERTY, ObservableProperty("x", 2), 0.0)
+    working.perceptions.extend([keep, drop])
+
+    await FilterPerceptionsAction().execute(cycle, tool_ids={"EmailClientApp"})
+
+    assert working.perceptions == [keep]  # mutated in place, stranger dropped
+
+
+async def test_filter_retains_signals_regardless_of_source(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("EmailClientApp"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+    prop = Percept("stranger", PerceptKind.PROPERTY, ObservableProperty("x", 2), 0.0)
+    signal = Percept("stranger", PerceptKind.SIGNAL, Signal("new_email", {"n": 1}), 0.0)
+    working.perceptions.extend([prop, signal])
+
+    await FilterPerceptionsAction().execute(cycle, tool_ids={"EmailClientApp"})
+
+    # The property from an irrelevant source is pruned; the fire-and-forget signal is always kept
+    # (its lifecycle is consumption-driven, owned by the blocked-state machinery, not _filter_).
+    assert working.perceptions == [signal]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -409,3 +528,11 @@ async def test_action_registry_unknown_raises_keyerror() -> None:
         reg.external("nope")
     with pytest.raises(KeyError):
         reg.internal("nope")
+
+
+async def test_default_action_registry_has_all_predefined_actions() -> None:
+    reg = default_action_registry()
+    for name in ("invoke", "focus", "unfocus", "join", "leave", "send"):
+        assert reg.external(name).name == name
+    for name in ("create_activity", "load", "unload", "filter"):
+        assert reg.internal(name).name == name

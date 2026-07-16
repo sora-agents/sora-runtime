@@ -39,11 +39,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fakes import FakeTool
-from sora.action import ActionRegistry
+from fakes import FakeAdapter, FakeTool, FakeWorkspace
+from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
-from sora.environment import EnvironmentRegistry
+from sora.environment import EnvironmentRegistry, WorkspaceOrigin
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -124,10 +124,11 @@ def _cycle(
     *,
     reflect: Any = None,
     reason: Any = None,
+    registry: EnvironmentRegistry | None = None,
 ) -> tuple[DecisionCycle, WorkingMemory]:
     # One directory per memory module (mirroring agent.yaml): procedural/episodic both query by
     # `goal`, so a shared directory would let a plan and an episode with the same goal cross-match.
-    registry = EnvironmentRegistry()
+    registry = registry if registry is not None else EnvironmentRegistry()
     working = WorkingMemory(registry=registry)
     strategies = Strategies(
         observe=DefaultObserveStrategy(),
@@ -139,7 +140,7 @@ def _cycle(
     cycle = DecisionCycle(
         strategies=strategies,
         communication=transport or ScriptedTransport(),
-        actions=ActionRegistry(),
+        actions=default_action_registry(),
         registry=registry,
         working=working,
         semantic=SemanticMemory(FileMemoryBackend(tmp_path / "semantic")),
@@ -279,15 +280,22 @@ async def test_observe_ignores_unmatched_result_ack(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-async def test_tick_observes_then_returns_when_nothing_selectable(tmp_path: Path) -> None:
-    # With no ready activity, a real tick() still runs Observe (percepts + messages populated) but
-    # returns without dispatching any external action.
+async def test_tick_observes_then_returns_without_external_action(tmp_path: Path) -> None:
+    # A real tick() runs Observe (percepts + messages populated); the inbound message becomes an
+    # activity in Situate, but the inert Reason yields no step, so no external action is dispatched.
     prop = ObservableProperty(name="unread", value=3)
     tool = FakeTool("EmailClientApp", properties=[prop])
     signal = Signal(name="new_email", payload={"n": 1})
     message = Message(sender="agent-b", content={"greeting": "hi"}, received_at=0.0)
     transport = ScriptedTransport(inbound=[message])
-    cycle, working = _cycle(tmp_path, transport=transport)
+    # A tool can only be focused once its workspace is joined (per A&A) — so its property percept
+    # survives Situate's _filter_, which keeps only percepts from the joined workspaces' tools.
+    origin = WorkspaceOrigin(adapter="fake", address="fake://ws")
+    registry = EnvironmentRegistry(
+        adapters={origin: FakeAdapter("fake", FakeWorkspace("ws", origin, [tool]))}
+    )
+    cycle, working = _cycle(tmp_path, transport=transport, registry=registry)
+    await registry.join(origin)
     working.focused_tools["EmailClientApp"] = tool
     cycle.signal_sink.push("EmailClientApp", signal)
 
@@ -296,7 +304,7 @@ async def test_tick_observes_then_returns_when_nothing_selectable(tmp_path: Path
     kinds = {p.kind for p in working.perceptions}
     assert kinds == {PerceptKind.PROPERTY, PerceptKind.SIGNAL}
     assert working.messages == [message]
-    # No activity was selectable, so no external action was dispatched.
+    # The inert Reason produced no step, so no external action was dispatched.
     assert tool.invoked_with is None
 
 

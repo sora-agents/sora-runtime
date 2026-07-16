@@ -58,9 +58,11 @@ class DecisionCycle:
         result = await self.strategies.observe.observe(self)
         for activity in list(self.working.activities.values()):
             result = await self.strategies.reflect.reflect(activity, self.working, self, result)
-        if result.activity is None:
-            ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
-            result = await self.strategies.situate.situate(ready, self.working, self, result)
+        # Situate always runs: it re-adjusts wm for the (possibly already-selected) activity every
+        # cycle, and selects only if result.activity is still None. Unlike the step/invocation gates
+        # below — genuine forward-fusion short-circuits — Situate is not gated on its own field.
+        ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
+        result = await self.strategies.situate.situate(ready, self.working, self, result)
         selected = result.activity
         if selected is None:
             return  # nothing selectable this cycle — at most one action, never a mandatory one

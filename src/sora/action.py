@@ -7,8 +7,9 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, Protocol
 
-from sora.activity import ActivityState
+from sora.activity import Activity, ActivityState
 from sora.manual import ToolRecord, WorkspaceRecord
+from sora.perception import PerceptKind
 from sora.types import (
     OPERATION_NAME,
     TOOL_ID,
@@ -188,7 +189,16 @@ class LeaveAction:  # predefined external action: _leave_ — implies close
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        await registry.leave(kwargs["workspace_id"])
+        workspace_id = kwargs["workspace_id"]
+        # Unfocus any of this workspace's tools first: leaving deregisters them, and a tool can only
+        # be focused via its workspace (focused_tools ⊆ joined tools per A&A), so a departing
+        # workspace must not leave a stale focus (a live signal subscription + a dangling handle)
+        # behind. Read the tools before registry.leave() pops the workspace.
+        for tool in registry.get_workspace(workspace_id).tools():
+            focused = cycle.working.focused_tools.pop(tool.id, None)
+            if focused is not None:
+                await focused.unfocus()
+        await registry.leave(workspace_id)
         return ActionAck(ok=True)
 
 
@@ -201,3 +211,82 @@ class SendAction:  # predefined external action: _send_
         # registry unused here — every ExternalAction still gets the same uniform signature.
         await cycle.communication.send(kwargs["to"], kwargs["content"])
         return ActionAck(ok=True)
+
+
+# Predefined internal actions. Each takes the (cycle, **kwargs) InternalAction signature and only
+# ever touches memory (no EnvironmentRegistry) — the mechanism half of the working-memory levers
+# Situate drives (create/load/unload/filter); the *policy* (which goal, which manuals) lives in the
+# SituateStrategy. Params ride in via **kwargs, same reason as the external actions above.
+
+
+class CreateActivityAction:  # predefined internal action: _create_activity_
+    name = "create_activity"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> Activity:
+        # goal is the only required input; the strategy derives it from an unhandled message.
+        # context defaults empty and activity_id is generated unless the caller pins one.
+        activity = Activity(
+            id=kwargs.get("activity_id") or uuid.uuid4().hex,
+            goal=kwargs["goal"],
+            context=kwargs.get("context") or {},
+        )
+        cycle.working.activities[activity.id] = activity
+        return activity
+
+
+class LoadManualAction:  # predefined internal action: _load_
+    name = "load"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        manual_id = kwargs["manual_id"]
+        manual = await cycle.semantic.retrieve_manual(manual_id)
+        # unknown id -> no-op, so a stale reference doesn't blow up the cycle
+        if manual is not None:
+            cycle.working.loaded_manuals[manual_id] = manual
+
+
+class UnloadManualAction:  # predefined internal action: _unload_
+    name = "unload"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        cycle.working.loaded_manuals.pop(kwargs["manual_id"], None)  # absent id -> no-op
+
+
+class FilterPerceptionsAction:  # predefined internal action: _filter_
+    name = "filter"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        # Prune observable-property percepts to the relevant tools, in place (`tool_ids` is the
+        # relevant set — the default passes the joined workspaces' tools). Signals are retained
+        # regardless of source: they're fire-and-forget, so dropping one is unrecoverable, and it
+        # may still matter to another (or a blocked) activity. Signal retention/eviction is
+        # consumption-driven and owned by the blocked-state machinery, not this per-cycle prune.
+        tool_ids = kwargs["tool_ids"]
+        perceptions = cycle.working.perceptions
+        perceptions[:] = [
+            p for p in perceptions if p.kind is PerceptKind.SIGNAL or p.source in tool_ids
+        ]
+
+
+def default_action_registry() -> ActionRegistry:
+    """The predefined action space, assembled once: the six external actions plus the four internal
+    working-memory actions. bootstrap and test harnesses register everything through this rather
+    than naming each action inline."""
+    registry = ActionRegistry()
+    for external in (
+        InvokeAction(),
+        FocusAction(),
+        UnfocusAction(),
+        JoinAction(),
+        LeaveAction(),
+        SendAction(),
+    ):
+        registry.register_external(external)
+    for internal in (
+        CreateActivityAction(),
+        LoadManualAction(),
+        UnloadManualAction(),
+        FilterPerceptionsAction(),
+    ):
+        registry.register_internal(internal)
+    return registry

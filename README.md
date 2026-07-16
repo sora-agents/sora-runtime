@@ -208,6 +208,15 @@ so runs are reproducible. `uv run` executes inside that environment without manu
 
 Workspaces declared here are joined automatically at startup, before the first cycle runs — which is
 why the `[cycle 1]` trace above already has the clock manual loaded, with no explicit `_join_` shown.
+The joined workspaces *are* the toolset the default Situate works from: each cycle it loads their
+tools' manuals into working memory (`_load_`), unloads any no longer backed by a joined workspace
+(`_unload_`), and filters *observable-property* percepts down to the joined workspaces' tools
+(`_filter_`). `_filter_` prunes only properties — a re-observed snapshot, safe to drop and reproduced
+next cycle. Signals are **fire-and-forget** and are never dropped by `_filter_`: a signal may still
+matter to another (or a `blocked`) activity, so its retention/eviction is consumption-driven and
+owned by the blocked-state machinery, not a per-cycle prune. The default does not auto-*focus* —
+focusing is an external action (one per cycle, dispatched at Act), so an agent that needs to perceive
+a tool's properties/signals emits `_focus_` as a plan step.
 
 ## API Sketch
 
@@ -524,6 +533,10 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         name = "leave"
         async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            workspace_id: str, **kwargs) -> ActionAck:
+            for tool in registry.get_workspace(workspace_id).tools():   # unfocus first: leaving
+                focused = cycle.working.focused_tools.pop(tool.id, None) # deregisters these tools,
+                if focused is not None:                                  # so no stale focus (live
+                    await focused.unfocus()                             # subscription) is left behind
             await registry.leave(workspace_id)
             return ActionAck(ok=True)
 
@@ -533,6 +546,40 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
                            to: str, content: dict, **kwargs) -> ActionAck:
             await cycle.communication.send(to, content)   # registry unused here — every ExternalAction still
             return ActionAck(ok=True)                  # gets the same uniform (registry, cycle) signature
+
+    # Predefined internal actions — the (cycle, **kwargs) signature, memory-only (no registry). These
+    # are the *mechanism* half of the working-memory levers Situate drives; the *policy* (which goal,
+    # which manuals) lives in the SituateStrategy.
+    class CreateActivityAction:        # predefined internal action: _create_activity_
+        name = "create_activity"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> Activity:
+            activity = Activity(id=kwargs.get("activity_id") or new_id(),
+                                goal=kwargs["goal"], context=kwargs.get("context") or {})
+            cycle.working.activities[activity.id] = activity  # goal from an unhandled message
+            return activity
+
+    class LoadManualAction:            # predefined internal action: _load_
+        name = "load"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            manual = await cycle.semantic.retrieve_manual(kwargs["manual_id"])
+            if manual is not None:     # unknown id -> no-op (a stale reference can't crash the cycle)
+                cycle.working.loaded_manuals[kwargs["manual_id"]] = manual
+
+    class UnloadManualAction:          # predefined internal action: _unload_
+        name = "unload"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            cycle.working.loaded_manuals.pop(kwargs["manual_id"], None)   # absent id -> no-op
+
+    class FilterPerceptionsAction:     # predefined internal action: _filter_
+        name = "filter"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            tool_ids = kwargs["tool_ids"]        # prune observable-property percepts to relevant tools;
+            cycle.working.perceptions[:] = [     # signals are fire-and-forget -> always retained (their
+                p for p in cycle.working.perceptions   # eviction is consumption-driven, owned by the
+                if p.kind is PerceptKind.SIGNAL or p.source in tool_ids]  # blocked-state machinery)
+
+    def default_action_registry() -> ActionRegistry:   # the six external + four internal, assembled once
+        ...                                            # what bootstrap and test harnesses register through
 
     # sora/memory.py
     class MemoryBackend(Protocol):    # pluggable: file, DB, vector store
@@ -563,6 +610,9 @@ why the `[cycle 1]` trace above already has the clock manual loaded, with no exp
         perceptions: list[Percept]    # stimuli from the environment: properties and signals only
         messages: list[Message]        # inbound agent-to-agent communication — kept distinct
         focused_tools: dict[str, Tool]
+        loaded_manuals: dict[str, Manual]  # manuals pulled from SemanticMemory by _load_ (removed by
+                                            # _unload_) — distinct from focused_tools: focusing a tool
+                                            # is I/O (an external action), loading its manual is memory
 
     class SemanticMemory:              # knowledge about the world: tool types, workspaces, instances
         def __init__(self, backend: MemoryBackend): ...
