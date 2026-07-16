@@ -93,6 +93,19 @@ class SituateStrategy(Protocol):
         ...
 
 
+class ActivitySelectionStrategy(Protocol):
+    async def select(
+        self, ready: list[Activity], wm: WorkingMemory, cycle: DecisionCycle
+    ) -> Activity | None:
+        """Picks the activity to progress this cycle from the ready set (empty -> None). A
+        scheduling policy, not a phase: it decides *which* ready activity runs, nothing else — the
+        caller (Situate) folds the pick into TickResult; fusing step/invocation stays a full
+        SituateStrategy concern. `async` + the `cycle` handle are for a richer policy (priority,
+        aging, deadlines, or an LLM-based scheduler) that consults memory or a model; the mechanical
+        default consults neither."""
+        ...
+
+
 class ReasonStrategy(Protocol):  # pluggable; default targets 1 LLM call/cycle
     async def reason(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
@@ -241,6 +254,31 @@ def _goal_from_message(message: Message) -> str:
     return text if isinstance(text, str) else str(message.content)
 
 
+class RoundRobinActivitySelection:
+    """Deterministic anti-starvation default: rotate through the ready set by carrying a cursor
+    (last-selected activity id) across cycles. Cold start (or when the last pick is no longer ready)
+    falls back to ready[0] — the oldest — so behavior matches a static priority-by-age default until
+    an activity lingers READY, at which point selection rotates instead of pinning it. Genuine
+    cross-cycle state (unlike a stateless default), feasible because the strategy instance persists
+    for the agent's lifetime — cf. DefaultReflectStrategy's task set."""
+
+    def __init__(self) -> None:
+        self._last_id: str | None = None
+
+    async def select(
+        self, ready: list[Activity], wm: WorkingMemory, cycle: DecisionCycle
+    ) -> Activity | None:
+        if not ready:
+            return None
+        ids = [a.id for a in ready]
+        # Rotate off the last pick; wrap via modulo. Single-ready -> (0+1)%1 == 0 re-picks it (no
+        # starvation possible). Last pick gone from the ready set -> restart at the oldest.
+        nxt = (ids.index(self._last_id) + 1) % len(ids) if self._last_id in ids else 0
+        chosen = ready[nxt]
+        self._last_id = chosen.id
+        return chosen
+
+
 class DefaultSituateStrategy:
     """The runtime's built-in default — mechanical, no LLM. Always runs: it adjusts working memory
     for the joined workspaces every cycle (even for an already-selected activity), then selects only
@@ -252,7 +290,13 @@ class DefaultSituateStrategy:
     signals are retained regardless of source — they're fire-and-forget, and their retention and
     eviction is consumption-driven, owned by the blocked-state machinery, not this prune. Focusing
     tools is *not* done here: _focus_ is an external action, and the cycle dispatches at most one
-    external action per cycle (at Act), so a richer strategy emits focus as a plan step."""
+    external action per cycle (at Act), so a richer strategy emits focus as a plan step. Which ready
+    activity runs is delegated to a pluggable ActivitySelectionStrategy (default
+    RoundRobinActivitySelection — fair rotation over the ready set), so a richer scheduler can be
+    swapped in without re-authoring the mechanical activity-creation and wm-adjustment above."""
+
+    def __init__(self, selection: ActivitySelectionStrategy | None = None) -> None:
+        self._activity_selection = selection or RoundRobinActivitySelection()
 
     async def situate(
         self,
@@ -266,15 +310,11 @@ class DefaultSituateStrategy:
         if result.activity is not None:
             return result  # a pre-set selection is respected, not overridden
         # Recompute from wm (not the passed snapshot) so a just-created activity is selectable now.
-        # wm.activities preserves insertion (creation) order and is never reordered, so ready[0] is
-        # the *oldest still-ready* activity: selection is deterministic, static priority-by-age. It
-        # is not fair — an activity that stays READY across cycles (never going RUNNING/BLOCKED) is
-        # reselected every cycle and starves younger ones. A fair/round-robin selection policy is a
-        # separate strategy (see ROADMAP D3a), deliberately not folded into this mechanical default.
+        # wm.activities preserves insertion (creation) order and is never reordered, so the ready
+        # list is oldest-first; the pick itself is delegated to the selection sub-strategy.
         ready = [a for a in wm.activities.values() if a.state is ActivityState.READY]
-        if not ready:
-            return result
-        return replace(result, activity=ready[0])
+        selected = await self._activity_selection.select(ready, wm, cycle)
+        return result if selected is None else replace(result, activity=selected)
 
     @staticmethod
     async def _create_activities_from_messages(wm: WorkingMemory, cycle: DecisionCycle) -> None:

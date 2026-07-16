@@ -127,7 +127,7 @@ The decision cycle follows 5 steps:
 
 - Observe: the agent receives perceptual input and messages asynchronously, which are reflected in the agent's working memory
 - Reflect: for each activity, decides whether it has completed successfully or failed — and if so, executes an internal action to summarize and store the experience in episodic memory; "optional" means this decision itself is cheap by default and made fresh every cycle, not that the cycle is externally told when to check; the judgment is synchronous — it must land before Situate selects, so a just-completed activity is never re-selected the same cycle — while summarizing and storing run asynchronously and never block the cycle; several activities may terminate in the same cycle
-- Situate: the agent selects an activity and adjusts its working memory for that activity — for example, by selecting tools, loading required manuals, unloading obsolete ones, and filtering the perceptual input; if an unhandled message in working memory doesn't correspond to any existing activity, Situate creates one via the internal _create_activity_ action before selecting
+- Situate: the agent selects an activity and adjusts its working memory for that activity — for example, by loading required manuals, unloading obsolete ones, and filtering the perceptual input; if an unhandled message in working memory doesn't correspond to any existing activity, Situate creates one via the internal _create_activity_ action before selecting; which ready activity to select — the agent's scheduler — is its own pluggable sub-strategy, defaulting to fair round-robin rotation over the ready set (anti-starvation, still no model call) so richer policies (priority, aging, deadlines, an LLM-based scheduler) can replace just the pick without re-authoring the rest of Situate
 - Reason: the agent retrieves or infers a plan for the current activity — a multi-step, reusable artifact, not regenerated every cycle — and selects the next step to advance it; if the activity already has a valid plan, this is as cheap as reading its next step, no replanning involved; the Situate phase may suggest prerequisite external actions for situated reasoning, such as to retrieve tool manuals from an external repository, focus on or unfocus from tools; these prerequisite actions should take priority unless a more urgent action is needed — for example, to respond to a critical signal; if no prerequisite or urgent actions are required, the agent selects the next external action that advances the plan, which is either to send a message to another agent or invoke a tool operation
 - Act: binds the step to a concrete invocation and executes the external action; for external actions that invoke tool operations, if the tool's manual specifies waiting for a signal or an observable property change before completion, the agent invokes the suspend internal action to suspend the current activity; the activity can resume once the expected external event is received
 
@@ -705,6 +705,15 @@ a tool's properties/signals emits `_focus_` as a plan step.
             May additionally fill in step/invocation, short-circuiting Reason/Act (those forward-fusion
             gates remain; only Situate's own activity gate is removed)."""
 
+    class ActivitySelectionStrategy(Protocol):   # Situate's scheduler; own pluggable sub-strategy
+        async def select(self, ready: list[Activity], wm: WorkingMemory,
+                          cycle: DecisionCycle) -> Activity | None:
+            """Picks which ready activity progresses this cycle (empty -> None) — a scheduling
+            policy, not a phase. DefaultSituateStrategy delegates its pick here so a richer scheduler
+            (priority, aging, deadlines, an LLM-based one) swaps in without re-authoring Situate's
+            activity-creation and wm-adjustment. `async` + `cycle` let such a policy consult memory
+            or a model; the default (RoundRobinActivitySelection) consults neither."""
+
     class ReasonStrategy(Protocol):   # pluggable; default targets 1 LLM call/cycle
         async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
                           result: TickResult) -> TickResult:
@@ -766,6 +775,13 @@ a tool's properties/signals emits `_focus_` as a plan step.
     # defaults for the other decision-chain phases — same role as DefaultObserveStrategy (bodies
     # provisional). Named here so the sketch matches the code's default set; wired in by bootstrap
     # as sora.reflect.default / sora.situate.default / sora.act.default.
+
+    class RoundRobinActivitySelection:
+        """DefaultSituateStrategy's default selection sub-strategy: fair rotation over the ready set,
+        carrying a last-selected-id cursor across cycles (cold start / last-pick-gone -> oldest).
+        Deterministic, no LLM. Anti-starvation replacement for a static priority-by-age pick, which
+        reselects an activity that lingers READY every cycle and starves younger ones.
+        DefaultSituateStrategy(selection=RoundRobinActivitySelection()) delegates the pick to it."""
 
     # sora/transport.py
     class MessageTransport(Protocol): # pluggable: A2A, HTTP, in-process

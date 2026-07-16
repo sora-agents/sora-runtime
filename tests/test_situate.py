@@ -43,6 +43,7 @@ from sora.strategies import (
     DefaultObserveStrategy,
     DefaultReflectStrategy,
     DefaultSituateStrategy,
+    RoundRobinActivitySelection,
     Strategies,
     TickResult,
 )
@@ -189,6 +190,116 @@ async def test_situate_returns_no_activity_when_none_ready(tmp_path: Path) -> No
     result = await DefaultSituateStrategy().situate([], working, cycle, TickResult())
 
     assert result.activity is None
+
+
+# --------------------------------------------------------------------------------------------------
+# RoundRobinActivitySelection — the default selection sub-strategy, driven directly
+# --------------------------------------------------------------------------------------------------
+
+
+def _ready(*ids: str) -> list[Activity]:
+    return [Activity(id=i, goal=i, context={}) for i in ids]
+
+
+async def test_round_robin_rotates_across_persistently_ready_activities(tmp_path: Path) -> None:
+    registry, _ = _registry_with()
+    cycle, working, _ = _cycle(registry, tmp_path)
+    selection = RoundRobinActivitySelection()
+    ready = _ready("a", "b", "c")
+
+    picks = [await selection.select(ready, working, cycle) for _ in range(4)]
+
+    # Cold start picks the oldest, then the cursor advances and wraps: a -> b -> c -> a.
+    assert [p.id for p in picks if p is not None] == ["a", "b", "c", "a"]
+
+
+async def test_round_robin_single_ready_is_repicked_every_call(tmp_path: Path) -> None:
+    registry, _ = _registry_with()
+    cycle, working, _ = _cycle(registry, tmp_path)
+    selection = RoundRobinActivitySelection()
+    ready = _ready("solo")
+
+    picks = [await selection.select(ready, working, cycle) for _ in range(3)]
+
+    # (0 + 1) % 1 == 0 -> the sole activity is re-picked, never starved, never None.
+    assert [p.id for p in picks if p is not None] == ["solo", "solo", "solo"]
+
+
+async def test_round_robin_empty_ready_returns_none(tmp_path: Path) -> None:
+    registry, _ = _registry_with()
+    cycle, working, _ = _cycle(registry, tmp_path)
+
+    assert await RoundRobinActivitySelection().select([], working, cycle) is None
+
+
+async def test_round_robin_falls_back_to_oldest_when_last_pick_gone(tmp_path: Path) -> None:
+    registry, _ = _registry_with()
+    cycle, working, _ = _cycle(registry, tmp_path)
+    selection = RoundRobinActivitySelection()
+
+    first = await selection.select(_ready("a", "b"), working, cycle)  # cold start -> a
+    # 'a' is no longer ready next cycle; the cursor's target is gone -> restart at the oldest.
+    second = await selection.select(_ready("b", "c"), working, cycle)
+
+    assert first is not None and first.id == "a"
+    assert second is not None and second.id == "b"
+
+
+async def test_round_robin_cold_start_first_pick_is_oldest(tmp_path: Path) -> None:
+    registry, _ = _registry_with()
+    cycle, working, _ = _cycle(registry, tmp_path)
+
+    pick = await RoundRobinActivitySelection().select(_ready("a", "b", "c"), working, cycle)
+
+    # A fresh cursor reproduces the old priority-by-age behavior on its first pick.
+    assert pick is not None and pick.id == "a"
+
+
+# --------------------------------------------------------------------------------------------------
+# DefaultSituateStrategy delegates selection to its (pluggable) sub-strategy
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_situate_reused_instance_rotates_selection(tmp_path: Path) -> None:
+    registry, _ = _registry_with()
+    cycle, working, _ = _cycle(registry, tmp_path)
+    a1 = Activity(id="a1", goal="g1", context={})
+    a2 = Activity(id="a2", goal="g2", context={})
+    working.activities["a1"] = a1
+    working.activities["a2"] = a2
+    situate = DefaultSituateStrategy()  # one instance reused across cycles -> cursor persists
+
+    first = await situate.situate([a1, a2], working, cycle, TickResult())
+    second = await situate.situate([a1, a2], working, cycle, TickResult())
+
+    # Both stay READY, so a static priority-by-age default would pin a1 twice; the round-robin
+    # cursor on the Situate instance rotates to a2 instead — selection is delegated, not inlined.
+    assert first.activity is a1
+    assert second.activity is a2
+
+
+async def test_situate_uses_injected_selection_strategy(tmp_path: Path) -> None:
+    registry, _ = _registry_with()
+    cycle, working, _ = _cycle(registry, tmp_path)
+    a1 = Activity(id="a1", goal="g1", context={})
+    a2 = Activity(id="a2", goal="g2", context={})
+    working.activities["a1"] = a1
+    working.activities["a2"] = a2
+
+    class _PinSecond:
+        """A custom selection sub-strategy: always the second ready activity, never ready[0]."""
+
+        async def select(
+            self, ready: list[Activity], wm: WorkingMemory, cycle: DecisionCycle
+        ) -> Activity | None:
+            return ready[1] if len(ready) > 1 else None
+
+    result = await DefaultSituateStrategy(selection=_PinSecond()).situate(
+        [a1, a2], working, cycle, TickResult()
+    )
+
+    # The injected policy overrides the round-robin default end-to-end through situate().
+    assert result.activity is a2
 
 
 # --------------------------------------------------------------------------------------------------
