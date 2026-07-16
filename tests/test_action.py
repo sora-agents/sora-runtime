@@ -305,6 +305,25 @@ async def test_unfocus_unknown_tool_is_noop(tmp_path: Path) -> None:
     assert working.focused_tools == {}
 
 
+async def test_unfocus_removes_the_tools_property_percepts(tmp_path: Path) -> None:
+    # Unfocusing stops re-observing the tool, so its observable-property snapshot is permanently
+    # stale and must be dropped. Only *this* tool's PROPERTY percepts go: another source's
+    # properties and the tool's own (fire-and-forget) signals are retained.
+    tool = FakeTool("EmailClientApp")
+    registry, _ = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, working, _ = _cycle(registry, tmp_path)
+    await FocusAction().execute(registry, cycle, activity_id="a1", tool_id="EmailClientApp")
+    own_prop = Percept("EmailClientApp", PerceptKind.PROPERTY, ObservableProperty("unread", 3), 0.0)
+    other_prop = Percept("CalendarApp", PerceptKind.PROPERTY, ObservableProperty("busy", True), 0.0)
+    own_signal = Percept("EmailClientApp", PerceptKind.SIGNAL, Signal("new_email", {"n": 1}), 0.0)
+    working.perceptions.extend([own_prop, other_prop, own_signal])
+
+    await UnfocusAction().execute(registry, cycle, activity_id="a1", tool_id="EmailClientApp")
+
+    assert working.perceptions == [other_prop, own_signal]
+
+
 # --------------------------------------------------------------------------------------------------
 # Join / Leave
 # --------------------------------------------------------------------------------------------------

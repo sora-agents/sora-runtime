@@ -220,6 +220,67 @@ async def test_observe_appends_inbound_messages(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# Observe — properties are a replaced (source, name) snapshot; signals stay an append log
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_observe_replaces_property_snapshot_not_append(tmp_path: Path) -> None:
+    # A property is persistent, re-observed state: re-observing the same (source, name) replaces the
+    # prior percept (last value wins) rather than accumulating a growing history of stale values.
+    tool = FakeTool("EmailClientApp", properties=[ObservableProperty(name="unread", value=3)])
+    cycle, working = _cycle(tmp_path)
+    working.focused_tools["EmailClientApp"] = tool
+    strategy = DefaultObserveStrategy()
+
+    await strategy.observe(cycle)
+    tool._properties = [ObservableProperty(name="unread", value=5)]  # the live value moved on
+    await strategy.observe(cycle)
+
+    props = [p for p in working.perceptions if p.kind is PerceptKind.PROPERTY]
+    assert len(props) == 1
+    assert props[0].source == "EmailClientApp"
+    assert props[0].payload == ObservableProperty(name="unread", value=5)
+
+
+async def test_observe_snapshots_each_property_by_name(tmp_path: Path) -> None:
+    # The snapshot key is (source, name): distinct property names coexist, one entry each, and
+    # re-observing does not duplicate them.
+    tool = FakeTool(
+        "EmailClientApp",
+        properties=[
+            ObservableProperty(name="unread", value=3),
+            ObservableProperty(name="drafts", value=1),
+        ],
+    )
+    cycle, working = _cycle(tmp_path)
+    working.focused_tools["EmailClientApp"] = tool
+    strategy = DefaultObserveStrategy()
+
+    await strategy.observe(cycle)
+    await strategy.observe(cycle)
+
+    props = [p for p in working.perceptions if p.kind is PerceptKind.PROPERTY]
+    assert len(props) == 2
+    assert {p.payload.name for p in props} == {"unread", "drafts"}
+
+
+async def test_observe_keeps_signal_append_semantics(tmp_path: Path) -> None:
+    # Signals are the opposite of properties: transient and fire-and-forget, so they accumulate
+    # across cycles (never replaced), even from the same source with the same name.
+    cycle, working = _cycle(tmp_path)
+    strategy = DefaultObserveStrategy()
+
+    cycle.signal_sink.push("EmailClientApp", Signal(name="new_email", payload={"n": 1}))
+    await strategy.observe(cycle)
+    cycle.signal_sink.push("EmailClientApp", Signal(name="new_email", payload={"n": 2}))
+    await strategy.observe(cycle)
+
+    signals = [p for p in working.perceptions if p.kind is PerceptKind.SIGNAL]
+    assert len(signals) == 2
+    assert [p.payload.payload["n"] for p in signals] == [1, 2]
+
+
+# --------------------------------------------------------------------------------------------------
 # Observe — the automatic 1:1 running-resolution off result_sink
 # --------------------------------------------------------------------------------------------------
 

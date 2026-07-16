@@ -141,9 +141,17 @@ class UnfocusAction:  # predefined external action: _unfocus_
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        tool = cycle.working.focused_tools.pop(kwargs[TOOL_ID], None)
+        tool_id = kwargs[TOOL_ID]
+        tool = cycle.working.focused_tools.pop(tool_id, None)
         if tool is not None:
             await tool.unfocus()
+        # Unfocusing stops re-observing this tool, so its observable-property snapshot is
+        # permanently stale — drop it. Signals from the same source stay: they're fire-and-forget
+        # and may still matter elsewhere (same rationale as _filter_).
+        perceptions = cycle.working.perceptions
+        perceptions[:] = [
+            p for p in perceptions if not (p.kind is PerceptKind.PROPERTY and p.source == tool_id)
+        ]
         return ActionAck(ok=True)
 
 

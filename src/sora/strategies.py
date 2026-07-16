@@ -131,9 +131,7 @@ class DefaultObserveStrategy:
 
     async def observe(self, cycle: DecisionCycle) -> TickResult:
         wm = cycle.working
-        for tool in wm.focused_tools.values():
-            for prop in tool.observe():
-                wm.perceptions.append(Percept(tool.id, PerceptKind.PROPERTY, prop, time.time()))
+        self._snapshot_properties(wm)
         async for source, signal in cycle.signal_sink.drain():
             wm.perceptions.append(Percept(source, PerceptKind.SIGNAL, signal, time.time()))
         async for invocation_id, ack in cycle.result_sink.drain():
@@ -148,6 +146,28 @@ class DefaultObserveStrategy:
         async for message in cycle.communication.receive():
             wm.messages.append(message)
         return TickResult()
+
+    @staticmethod
+    def _snapshot_properties(wm: WorkingMemory) -> None:
+        """Represent observable properties as a replace-by-(source, name) snapshot: one percept per
+        property, last value wins. A property is persistent, re-observed state, so re-observing the
+        same (source, name) overwrites its percept in place rather than appending — otherwise
+        wm.perceptions would grow unbounded with stale duplicate values every cycle. Signals are the
+        opposite (transient, fire-and-forget) and keep append semantics, handled in observe()."""
+        index = {
+            (p.source, p.payload.name): i
+            for i, p in enumerate(wm.perceptions)
+            if p.kind is PerceptKind.PROPERTY
+        }
+        for tool in wm.focused_tools.values():
+            for prop in tool.observe():
+                percept = Percept(tool.id, PerceptKind.PROPERTY, prop, time.time())
+                key = (tool.id, prop.name)
+                if key in index:
+                    wm.perceptions[index[key]] = percept  # replace in place, position preserved
+                else:
+                    index[key] = len(wm.perceptions)
+                    wm.perceptions.append(percept)
 
 
 class DefaultReflectStrategy:
