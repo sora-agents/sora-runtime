@@ -503,6 +503,9 @@ a tool's properties/signals emits `_focus_` as a plan step.
             tool = cycle.working.focused_tools.pop(tool_id, None)
             if tool is not None:
                 await tool.unfocus()
+            # drop the tool's now-stale property snapshot (signals stay — fire-and-forget)
+            cycle.working.perceptions[:] = [p for p in cycle.working.perceptions
+                                            if not (p.kind == "property" and p.source == tool_id)]
             return ActionAck(ok=True)
 
     class JoinAction:                  # predefined external action: _join_ — implies discover/connect
@@ -732,11 +735,21 @@ a tool's properties/signals emits `_focus_` as a plan step.
         """The runtime's built-in default — purely mechanical, no LLM. This is the exact logic
         previously inlined in DecisionCycle._observe()."""
         async def observe(self, cycle: DecisionCycle) -> TickResult:
+            # Properties are persistent, re-observed state: one percept per (source, name),
+            # last value wins — a replaced snapshot, not a growing append log.
+            index = {(p.source, p.payload.name): i
+                     for i, p in enumerate(cycle.working.perceptions) if p.kind == "property"}
             for tool in cycle.working.focused_tools.values():
                 for prop in tool.observe():
-                    cycle.working.perceptions.append(Percept(tool.id, "property", prop, now()))
+                    percept = Percept(tool.id, "property", prop, now())
+                    key = (tool.id, prop.name)
+                    if key in index:
+                        cycle.working.perceptions[index[key]] = percept   # replace in place
+                    else:
+                        index[key] = len(cycle.working.perceptions)
+                        cycle.working.perceptions.append(percept)
             async for source, signal in cycle.signal_sink.drain():
-                cycle.working.perceptions.append(Percept(source, "signal", signal, now()))
+                cycle.working.perceptions.append(Percept(source, "signal", signal, now()))  # append
             async for op_id, ack in cycle.result_sink.drain():
                 # unambiguous 1:1 match — resolved automatically, never a Percept, no strategy involved
                 activity = next((a for a in cycle.working.activities.values()
