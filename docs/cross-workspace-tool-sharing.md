@@ -1,6 +1,6 @@
 # Sharing one tool across two workspaces — analysis and open question
 
-Design note behind Track C's cross-workspace-tool-sharing task (C6). Records why the registry
+Design note behind the cross-workspace-tool-sharing task. Records why the registry
 currently forbids the same tool from appearing in two workspaces, why the Web/hypermedia framing makes
 that constraint look too strict, and the options for relaxing it. No decision is made here — this is
 the analysis that motivates the task; the decision belongs in an ADR that refines
@@ -73,7 +73,7 @@ registry to treat any duplicate id as a collision. Those conflict exactly here.
 4. **Which handle/manual wins?** "Same id" ≠ "same `Tool` object": each adapter builds its own handle,
    but `_tools[id]` holds one. The registry must pick a canonical handle and, if the two workspaces
    carry *different* manuals for it (authored vs. adapter-synthesized), reconcile them — which is the
-   two-channel `Manual` merge deferred to E5. Sharing drags E5 forward.
+   two-channel `Manual` merge deferred to Manual reconciliation. Sharing drags that work forward.
 
 ## The clean boundary (candidate synthesis)
 
@@ -100,7 +100,7 @@ sound, and only relaxes lifecycle for tools the workspace never owned.
    global identity for legitimate shared tools.
 2. **Allow verified sharing, scoped to self-addressed tools** (the synthesis above). Enables the Web
    use case with sound verification and refcounted lifecycle; costs registry bookkeeping + URI
-   canonicalization + partial E5 coupling.
+   canonicalization + partial Manual-reconciliation coupling.
 3. **Explicit aliasing/linking** — a workspace declares a *reference* to a tool owned elsewhere,
    distinct from owning it (closer to CArtAgO's `linkArtifacts`). Most explicit semantics, most
    machinery.
@@ -109,7 +109,7 @@ sound, and only relaxes lifecycle for tools the workspace never owned.
 
 Not needed for v0.1.0 — the ARE email/calendar scenario has no shared tools. The case only bites with
 the WoT adapter and the two-agent lab (Phase 4 backlog). Building refcounting + canonicalization now
-would be speculative and would prematurely entangle E5. Record the container-vs-index resolution and
+would be speculative and would prematurely entangle Manual reconciliation. Record the container-vs-index resolution and
 the "shareable ⟺ self-addressed + canonical-address match" rule as an ADR refining ADR-0014, to be
 realized when the WoT adapter lands. Shares the registry-bookkeeping surface (refcounted membership)
-with the C5 dynamic-environments work ([docs/restore-drift-reconciliation.md](restore-drift-reconciliation.md)).
+with the dynamic-environments work ([docs/restore-drift-reconciliation.md](restore-drift-reconciliation.md)).

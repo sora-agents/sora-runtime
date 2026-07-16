@@ -1,6 +1,6 @@
 # `restore()` and environment drift — analysis and open gap
 
-Design note behind Track C's dynamic-environments task (C5). Records why `restore()` does **not**
+Design note behind the dynamic-environments / restore-drift task. Records why `restore()` does **not**
 handle a workspace whose live tool set has changed since it was last joined, what actually happens
 when it drifts, and the options for closing the gap. No decision is made here — this is the analysis
 that motivates the task; the decision belongs in an adapter ADR once the shape is chosen (it depends
@@ -69,4 +69,4 @@ Options to weigh (not yet decided):
 Cross-references: builds on the ADR-0014 identity model and the join/leave lifecycle
 ([ADR-0006](adrs/0006-workspace-join-leave-lifecycle.md)); the removed-tool `connect()` semantics
 couple to the MCP-adapter hardening in Track E. The manual-drift row also touches the two-channel
-`Manual` reconciliation deferred to E5.
+`Manual` reconciliation deferred to the Manual-reconciliation task.
