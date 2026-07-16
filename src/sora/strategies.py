@@ -124,9 +124,13 @@ class ActStrategy(Protocol):
     async def bind(
         self, step: Step, manual: Manual | None, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
-        """Only called if result.invocation is still None. Binds an abstract Step to a concrete,
-        schema-conformant OperationInvocation. `cycle` is available for implementations that cache
-        bindings (e.g. belief-state -> params) rather than re-deriving one every time."""
+        """Only called if result.invocation is still None. This is *parameter binding*: grounding
+        an abstract Step into a concrete, schema-conformant OperationInvocation (the tool-
+        hallucination-prone step — where "email the boss" becomes validated `{to, subject, ...}`).
+        Distinct from a *protocol binding* (WoT forms/security, an MCP session), which is how the
+        adapter's Tool actually reaches the instance and never surfaces here — see ADR-0015. `cycle`
+        is available for implementations that cache bindings (e.g. belief-state -> params) rather
+        than re-deriving one every time."""
         ...
 
 
@@ -347,8 +351,11 @@ class DefaultSituateStrategy:
 
 
 class DefaultActStrategy:
-    """Spike default: bind an ``invoke`` Step straight to an OperationInvocation, splitting the
-    tool_id/operation_name routing keys out of the bound params."""
+    """The mechanical, no-LLM default for *parameter binding* (not protocol binding — see
+    ActStrategy): bind an ``invoke`` Step straight to an OperationInvocation, splitting the
+    tool_id/operation_name routing keys out of the operation's own params. A model-backed
+    ActStrategy would instead ground under-specified params against the manual's schema here; the
+    default assumes the Step already carries concrete params, so binding is just the key-split."""
 
     async def bind(
         self, step: Step, manual: Manual | None, cycle: DecisionCycle, result: TickResult

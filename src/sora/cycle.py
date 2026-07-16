@@ -4,18 +4,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sora.action import InvokeAction
 from sora.activity import ActivityState
 from sora.perception import NotificationQueueSink
 from sora.types import TOOL_ID, WAIT
 
 if TYPE_CHECKING:
     from sora.action import ActionRegistry
+    from sora.activity import Activity
     from sora.environment import EnvironmentRegistry
     from sora.memory import EpisodicMemory, ProceduralMemory, SemanticMemory, WorkingMemory
-    from sora.strategies import Strategies
+    from sora.strategies import Strategies, TickResult
     from sora.transport import MessageTransport
-    from sora.types import OperationAck, Signal
+    from sora.types import OperationAck, Signal, Step
 
 
 class DecisionCycle:
@@ -53,8 +53,8 @@ class DecisionCycle:
         all five phases and calling each phase's own strategy only for whatever's still missing —
         so a fully-fused Observe (or Reflect) call can skip the rest of the cycle entirely.
         working/semantic/procedural/episodic/communication/registry are all shared with Agent,
-        constructed once and passed to both — see sora/bootstrap.py."""
-        registry = self.registry  # mutable handle for dispatch (working.registry is read-only)
+        constructed once and passed to both — see sora/bootstrap.py. (Dispatch in _act() uses
+        self.registry — the mutation-capable handle — not working.registry, which is read-only.)"""
         result = await self.strategies.observe.observe(self)
         for activity in list(self.working.activities.values()):
             result = await self.strategies.reflect.reflect(activity, self.working, self, result)
@@ -71,20 +71,30 @@ class DecisionCycle:
         step = result.step
         if step is None:
             return
-        # NOTE: this "invoke needs binding" special-case (and the WAIT no-op below) is a stopgap —
-        # whether a step needs Act-binding should be a property of the action, not a hardcoded
-        # branch in the generic cycle. Until that lands, at least name the constants, not literals.
-        if result.invocation is None and step.next_action == InvokeAction.name:
-            tool = registry.get(step.params[TOOL_ID])
-            result = await self.strategies.act.bind(step, tool.manual, self, result)
-        # Dispatch this cycle's single external action (if any). WAIT is a no-op placeholder.
+        await self._act(selected, step, result)
+
+    async def _act(self, selected: Activity, step: Step, result: TickResult) -> None:
+        """Act's bind-then-dispatch boundary. "Bind" here is *parameter binding* — grounding the
+        abstract step into a concrete OperationInvocation (not a protocol binding, which is the
+        adapter's Tool concern) — done iff its *action* declares it needs binding; then dispatch
+        this cycle's single external action, with the bound invocation's routing keys + params when
+        present, else the raw step params.
+
+        WAIT is the cycle's own no-op sentinel, not a registered ExternalAction, so it's guarded
+        first — before the registry lookup that would otherwise KeyError on it. Which steps need
+        binding is the action's property (`requires_binding`), not a hardcoded `next_action` branch:
+        that keeps the generic cycle uncoupled from any one action's name and lets a custom binding
+        action bind too."""
         if step.next_action == WAIT:
             return
         action = self.actions.external(step.next_action)
+        if result.invocation is None and action.requires_binding:
+            tool = self.registry.get(step.params[TOOL_ID])
+            result = await self.strategies.act.bind(step, tool.manual, self, result)
         invocation = result.invocation
         if invocation is not None:
             await action.execute(
-                registry,
+                self.registry,
                 self,
                 activity_id=selected.id,
                 tool_id=invocation.tool_id,
@@ -92,7 +102,7 @@ class DecisionCycle:
                 **invocation.params,
             )
         else:
-            await action.execute(registry, self, activity_id=selected.id, **step.params)
+            await action.execute(self.registry, self, activity_id=selected.id, **step.params)
 
     async def interrupt(self, signal: Signal) -> None:
         """Preempts the current phase for a high-priority event (10ms target)."""

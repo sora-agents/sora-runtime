@@ -35,12 +35,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeTool, FakeWorkspace
-from sora.action import default_action_registry
+from sora.action import SendAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
@@ -61,6 +61,10 @@ from sora.strategies import (
     TickResult,
 )
 from sora.types import (
+    OPERATION_NAME,
+    TOOL_ID,
+    WAIT,
+    ActionAck,
     ObservableProperty,
     OperationAck,
     OperationInvocation,
@@ -124,6 +128,7 @@ def _cycle(
     *,
     reflect: Any = None,
     reason: Any = None,
+    act: Any = None,
     registry: EnvironmentRegistry | None = None,
 ) -> tuple[DecisionCycle, WorkingMemory]:
     # One directory per memory module (mirroring agent.yaml): procedural/episodic both query by
@@ -135,7 +140,7 @@ def _cycle(
         reflect=reflect or DefaultReflectStrategy(),
         situate=DefaultSituateStrategy(),
         reason=reason or _InertReason(),
-        act=DefaultActStrategy(),
+        act=act or DefaultActStrategy(),
     )
     cycle = DecisionCycle(
         strategies=strategies,
@@ -576,3 +581,203 @@ async def test_tick_reflect_terminates_completed_activity_and_is_not_reselected(
     await _drain(reflect)
     assert len(await cycle.episodic.consult(activity)) == 1
     assert await cycle.procedural.retrieve(activity) is not None
+
+
+# --------------------------------------------------------------------------------------------------
+# Reason + Act — the decision chain's tail (§7b: the _act() bind-then-dispatch boundary)
+# --------------------------------------------------------------------------------------------------
+#
+# The cycle no longer special-cases `next_action == "invoke"`. Act binds a step iff its *action*
+# declares `requires_binding`, then dispatches exactly one external action (the bound invocation's
+# routing keys + params when present, else the raw step params). WAIT stays the cycle's no-op
+# sentinel — it is not a registered ExternalAction, so it is guarded before any registry lookup.
+#
+# Reason is driven here by a deterministic, no-LLM *test fixture* (a seeded plan the cycle
+# advances), not a shipped default: planning needs inference, so the real default is model-backed
+# and lands with ProceduralMemory.infer() (kept out of this deterministic suite). This fixture
+# replaces the walking-skeleton spike's string-typed ListEmailsReasonStrategy; the end-to-end test
+# below re-drives that spike's last group (its assertions survive; the harness is rebuilt),
+# retiring tests/test_cycle_wiring.py.
+
+
+class _PlanFollowingReason:
+    """Deterministic, no-LLM Reason fixture: reads the selected activity's current plan step and
+    advances step_index; emits WAIT once the plan is exhausted (or absent). No procedural retrieval
+    — the test seeds the plan directly. Stands in for the app-specific/LLM Reason the runtime does
+    not ship a mechanical default for."""
+
+    async def reason(
+        self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
+    ) -> TickResult:
+        plan = activity.plan
+        if plan is None or activity.step_index >= len(plan.steps):
+            return replace(result, step=Step(next_action=WAIT, params={}))
+        step = plan.steps[activity.step_index]
+        activity.step_index += 1
+        return replace(result, step=step)
+
+
+class _SpyAct:
+    """Wraps DefaultActStrategy, counting bind() calls — so a test can assert the cycle binds based
+    on the action's own requires_binding, not the removed `next_action == "invoke"` hardcode."""
+
+    def __init__(self) -> None:
+        self.bind_calls = 0
+        self._inner = DefaultActStrategy()
+
+    async def bind(
+        self, step: Step, manual: Any, cycle: DecisionCycle, result: TickResult
+    ) -> TickResult:
+        self.bind_calls += 1
+        return await self._inner.bind(step, manual, cycle, result)
+
+
+class _BindingProbeAction:
+    """A custom external action (named "probe", *not* "invoke") that declares requires_binding=True,
+    to prove the cycle's decision to bind is the action's own — the old hardcode only ever bound
+    "invoke", so it would never bind this one."""
+
+    name = "probe"
+    requires_binding = True
+
+    def __init__(self) -> None:
+        self.received: OperationInvocation | None = None
+
+    async def execute(
+        self,
+        registry: EnvironmentRegistry,
+        cycle: DecisionCycle,
+        *,
+        activity_id: str,
+        **kwargs: Any,
+    ) -> ActionAck:
+        self.received = OperationInvocation(
+            tool_id=kwargs["tool_id"],
+            operation_name=kwargs["operation_name"],
+            params={k: v for k, v in kwargs.items() if k not in (TOOL_ID, OPERATION_NAME)},
+        )
+        return ActionAck(ok=True)
+
+
+def _registry_with(tool: FakeTool) -> tuple[EnvironmentRegistry, WorkspaceOrigin]:
+    origin = WorkspaceOrigin(adapter="fake", address="fake://ws")
+    registry = EnvironmentRegistry(
+        adapters={origin: FakeAdapter("fake", FakeWorkspace("ws", origin, [tool]))}
+    )
+    return registry, origin
+
+
+async def test_default_act_binds_invoke_step_splitting_routing_keys(tmp_path: Path) -> None:
+    # DefaultActStrategy.bind lifts the routing keys out of the step params into the invocation's
+    # tool_id/operation_name, leaving only the operation's own params behind.
+    cycle, _ = _cycle(tmp_path)
+    step = invoke_step("clock", "get_time", tz="UTC")
+
+    result = await DefaultActStrategy().bind(step, None, cycle, TickResult())
+
+    assert result.invocation == OperationInvocation(
+        tool_id="clock", operation_name="get_time", params={"tz": "UTC"}
+    )
+
+
+async def test_tick_binds_when_action_requires_binding(tmp_path: Path) -> None:
+    # The action declares it needs binding, so Act binds it — even though it is not "invoke". This
+    # fails on the pre-§7b cycle, whose hardcoded `next_action == "invoke"` branch never bound it.
+    tool = FakeTool("clock", invoke_results={"get_time": "10:00"})
+    registry, origin = _registry_with(tool)
+    spy = _SpyAct()
+    probe = _BindingProbeAction()
+    cycle, working = _cycle(tmp_path, reason=_PlanFollowingReason(), act=spy, registry=registry)
+    cycle.actions.register_external(probe)
+    await registry.join(origin)  # so bind can resolve the tool's manual through the registry
+    plan = Plan(
+        id="p1",
+        goal="g",
+        steps=[
+            Step(
+                next_action="probe",
+                params={TOOL_ID: "clock", OPERATION_NAME: "get_time", "tz": "UTC"},
+            )
+        ],
+    )
+    working.activities["a1"] = Activity(id="a1", goal="g", context={}, plan=plan)
+
+    await cycle.tick()
+
+    assert spy.bind_calls == 1  # bound because the action declared requires_binding, not by name
+    assert probe.received == OperationInvocation(
+        tool_id="clock", operation_name="get_time", params={"tz": "UTC"}
+    )
+
+
+async def test_tick_skips_bind_for_non_binding_action(tmp_path: Path) -> None:
+    # A non-binding external action (send) is dispatched straight from the step params — Act.bind is
+    # never called, and the raw params reach the action.
+    transport = ScriptedTransport()
+    spy = _SpyAct()
+    cycle, working = _cycle(tmp_path, transport=transport, reason=_PlanFollowingReason(), act=spy)
+    plan = Plan(
+        id="p1",
+        goal="notify",
+        steps=[
+            Step(next_action=SendAction.name, params={"to": "agent-b", "content": {"text": "hi"}})
+        ],
+    )
+    working.activities["a1"] = Activity(id="a1", goal="notify", context={}, plan=plan)
+
+    await cycle.tick()
+
+    assert spy.bind_calls == 0  # send declares no binding
+    assert transport.sent == [("agent-b", {"text": "hi"})]
+
+
+async def test_tick_end_to_end_invoke_then_resolve(tmp_path: Path) -> None:
+    # Re-drives the walking-skeleton spike's last group: a one-step invoke plan runs end-to-end
+    # through the real tick() — Situate selects, Reason yields the invoke step, Act binds and
+    # dispatches, the off-cycle result lands on result_sink, and the next Observe resolves it.
+    tool = FakeTool(
+        "EmailClientApp", invoke_results={"list_emails": {"emails": [], "total_emails": 0}}
+    )
+    registry, origin = _registry_with(tool)
+    reflect = DefaultReflectStrategy()
+    cycle, working = _cycle(
+        tmp_path, reason=_PlanFollowingReason(), reflect=reflect, registry=registry
+    )
+    await registry.join(origin)
+    plan = Plan(
+        id="p1",
+        goal="list emails",
+        steps=[invoke_step("EmailClientApp", "list_emails")],
+    )
+    working.activities["a1"] = Activity(id="a1", goal="list emails", context={}, plan=plan)
+
+    # Drive the cycle until the single step resolves (Observe picks up the off-cycle result).
+    for _ in range(5):
+        await cycle.tick()
+        await asyncio.sleep(0)  # let the off-cycle invoke task land before the next observe
+        if working.activities["a1"].last_operation is not None:
+            break
+
+    activity = working.activities["a1"]
+    assert activity.last_operation is not None
+    assert activity.last_operation.ok is True
+    assert activity.last_operation.result == {"emails": [], "total_emails": 0}
+    assert tool.invoked_with == ("list_emails", {})
+    await _drain(reflect)  # settle the async success store so no task dangles past the test
+
+
+async def test_tick_wait_step_dispatches_no_action(tmp_path: Path) -> None:
+    # WAIT is the cycle's no-op sentinel, not a registered ExternalAction: reaching it must dispatch
+    # nothing and must not raise (it is guarded before the registry lookup). A plan-less activity
+    # makes Reason emit WAIT (and Reflect never auto-terminates a plan-less activity, so it is
+    # selected and reaches Reason).
+    tool = FakeTool("clock", invoke_results={"get_time": "10:00"})
+    registry, origin = _registry_with(tool)
+    cycle, working = _cycle(tmp_path, reason=_PlanFollowingReason(), registry=registry)
+    await registry.join(origin)
+    working.activities["a1"] = Activity(id="a1", goal="g", context={})  # no plan -> WAIT
+
+    await cycle.tick()
+
+    assert tool.invoked_with is None
+    assert working.activities["a1"].state is ActivityState.READY

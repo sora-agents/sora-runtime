@@ -43,6 +43,7 @@ from sora.action import (
     UnfocusAction,
     UnloadManualAction,
     default_action_registry,
+    invoke_step,
 )
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -63,7 +64,7 @@ from sora.strategies import (
     Strategies,
     TickResult,
 )
-from sora.types import ObservableProperty, Signal
+from sora.types import OPERATION_NAME, TOOL_ID, ObservableProperty, Signal
 
 # --------------------------------------------------------------------------------------------------
 # Harness — the fakes plus a recording transport and a real FileMemoryBackend-backed DecisionCycle.
@@ -555,3 +556,32 @@ async def test_default_action_registry_has_all_predefined_actions() -> None:
         assert reg.external(name).name == name
     for name in ("create_activity", "load", "unload", "filter"):
         assert reg.internal(name).name == name
+
+
+# --------------------------------------------------------------------------------------------------
+# requires_binding — the action declares whether the cycle's Act phase binds its step
+# --------------------------------------------------------------------------------------------------
+
+
+def test_requires_binding_only_for_invoke() -> None:
+    # The cycle binds a step into a concrete OperationInvocation iff its action declares
+    # requires_binding — only invoke does. This replaces the removed `next_action == "invoke"`
+    # hardcode in tick(): binding is now a property of the action, not a branch in the cycle.
+    assert InvokeAction().requires_binding is True
+    for action in (FocusAction(), UnfocusAction(), JoinAction(), LeaveAction(), SendAction()):
+        assert action.requires_binding is False
+
+
+def test_invoke_step_packs_routing_and_args() -> None:
+    # invoke_step is the one-source-of-truth constructor for an `invoke` Step: it packs the routing
+    # keys (tool_id, operation_name) alongside the operation arguments in params, under the
+    # TOOL_ID/OPERATION_NAME constants — so no call site hand-writes that magic-keyed dict.
+    step = invoke_step("EmailClientApp", "search_emails", query="urgent", limit=5)
+
+    assert step.next_action == InvokeAction.name
+    assert step.params == {
+        TOOL_ID: "EmailClientApp",
+        OPERATION_NAME: "search_emails",
+        "query": "urgent",
+        "limit": 5,
+    }

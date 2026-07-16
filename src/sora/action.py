@@ -16,6 +16,7 @@ from sora.types import (
     ActionAck,
     OperationInvocation,
     PendingOperation,
+    Step,
 )
 
 if TYPE_CHECKING:
@@ -33,6 +34,11 @@ class InternalAction(Protocol):
 
 class ExternalAction(Protocol):
     name: str
+    # Whether the cycle's Act phase must do *parameter binding* on this step before dispatch —
+    # grounding its abstract Step into a concrete, schema-conformant OperationInvocation (not a
+    # *protocol binding*, which is the adapter's Tool concern — see ADR-0015). Only _invoke_ does;
+    # every other external action dispatches straight from its Step params.
+    requires_binding: bool
 
     async def execute(
         self,
@@ -68,6 +74,7 @@ class ActionRegistry:
 
 class InvokeAction:  # predefined external action: _invoke_
     name = "invoke"
+    requires_binding = True  # abstract Step -> a concrete, schema-conformant OperationInvocation
 
     def __init__(self) -> None:
         # Hold strong refs to in-flight background invokes so they aren't GC'd mid-flight.
@@ -114,6 +121,18 @@ class InvokeAction:  # predefined external action: _invoke_
         cycle.result_sink.push(invocation_id, ack)  # keyed by invocation_id, not tool_id
 
 
+def invoke_step(tool_id: str, operation_name: str, **op_args: Any) -> Step:
+    """Assemble an `invoke` Step. tool_id/operation_name are *routing* (decided at Reason time);
+    they ride in Step.params under the TOOL_ID/OPERATION_NAME keys alongside the operation's own
+    arguments, which Act binds. `invoke` is the one Step whose params bag mixes routing with
+    arguments (DefaultActStrategy.bind splits them apart) — use this factory instead of hand-writing
+    that magic-keyed dict at every call site."""
+    return Step(
+        next_action=InvokeAction.name,
+        params={TOOL_ID: tool_id, OPERATION_NAME: operation_name, **op_args},
+    )
+
+
 # Every predefined external action takes the uniform (registry, cycle, **kwargs) signature and reads
 # its own params out of **kwargs, rather than declaring them as explicit keyword-only args. An extra
 # required keyword-only param would break the structural-subtype relation to ExternalAction under
@@ -124,6 +143,7 @@ class InvokeAction:  # predefined external action: _invoke_
 
 class FocusAction:  # predefined external action: _focus_
     name = "focus"
+    requires_binding = False
 
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
@@ -137,6 +157,7 @@ class FocusAction:  # predefined external action: _focus_
 
 class UnfocusAction:  # predefined external action: _unfocus_
     name = "unfocus"
+    requires_binding = False
 
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
@@ -157,6 +178,7 @@ class UnfocusAction:  # predefined external action: _unfocus_
 
 class JoinAction:  # predefined external action: _join_ — implies discover/connect
     name = "join"
+    requires_binding = False
 
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
@@ -193,6 +215,7 @@ class JoinAction:  # predefined external action: _join_ — implies discover/con
 
 class LeaveAction:  # predefined external action: _leave_ — implies close
     name = "leave"
+    requires_binding = False
 
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
@@ -212,6 +235,7 @@ class LeaveAction:  # predefined external action: _leave_ — implies close
 
 class SendAction:  # predefined external action: _send_
     name = "send"
+    requires_binding = False
 
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any

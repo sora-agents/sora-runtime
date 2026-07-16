@@ -244,8 +244,11 @@ a tool's properties/signals emits `_focus_` as a plan step.
 
     @dataclass(frozen=True)
     class Step:
-        next_action: str      # e.g. "invoke", "send", "focus", "wait"
-        params: dict
+        next_action: str      # an ExternalAction.name ("invoke", "send", "focus", ...) or the WAIT sentinel
+        params: dict          # the action's own argument bag, passed through opaquely and destructured by
+        #                       the action — shape is per-action (send -> {to, content}, focus -> {tool_id}).
+        #                       `invoke` mixes routing (tool_id/operation_name, under the TOOL_ID/OPERATION_NAME
+        #                       keys) with the operation's args; Act's bind splits them. Build one via invoke_step().
 
     @dataclass(frozen=True)
     class Plan:                # multi-step, goal-indexed, reusable — the thing ProceduralMemory stores
@@ -461,6 +464,10 @@ a tool's properties/signals emits `_focus_` as a plan step.
 
     class ExternalAction(Protocol):
         name: str
+        requires_binding: bool     # whether Act must do *parameter binding* on this step — grounding its
+        #                            abstract Step into a concrete OperationInvocation (not a *protocol
+        #                            binding*, the adapter's Tool concern) — before dispatch. Only _invoke_
+        #                            does; every other action dispatches straight from its Step params.
         async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            activity_id: str, **kwargs) -> ActionAck:
             """Narrower than passing a whole Agent: tools (Agent-owned) + cycle (memory/transport/sinks),
@@ -473,6 +480,7 @@ a tool's properties/signals emits `_focus_` as a plan step.
 
     class InvokeAction:                # predefined external action: _invoke_
         name = "invoke"
+        requires_binding = True        # abstract Step -> a concrete, schema-conformant OperationInvocation
         async def execute(self, registry: EnvironmentRegistry, cycle: DecisionCycle, *,
                            activity_id: str, tool_id: str, operation_name: str, **params) -> ActionAck:
             tool = registry.get(tool_id)
@@ -486,6 +494,14 @@ a tool's properties/signals emits `_focus_` as a plan step.
         async def _call(self, cycle: DecisionCycle, tool: Tool, operation_name: str, params: dict, op_id: str) -> None:
             ack = await tool.invoke(operation_name, **params)
             cycle.result_sink.push(op_id, ack)   # keyed by op_id, not tool_id — see DefaultObserveStrategy
+
+    def invoke_step(tool_id: str, operation_name: str, **op_args) -> Step:
+        """Constructor for an `invoke` Step: packs the routing keys (tool_id, operation_name) alongside
+        the operation arguments in Step.params under the TOOL_ID/OPERATION_NAME constants — the one Step
+        whose params bag mixes routing with arguments (DefaultActStrategy.bind splits them). Use this
+        rather than hand-writing that magic-keyed dict."""
+        return Step(next_action=InvokeAction.name,
+                    params={TOOL_ID: tool_id, OPERATION_NAME: operation_name, **op_args})
 
     class FocusAction:                # predefined external action: _focus_
         name = "focus"
@@ -728,9 +744,12 @@ a tool's properties/signals emits `_focus_` as a plan step.
     class ActStrategy(Protocol):
         async def bind(self, step: Step, manual: Manual | None, cycle: DecisionCycle,
                         result: TickResult) -> TickResult:
-            """Only called if result.invocation is still None. Binds an abstract Step to a concrete,
-            schema-conformant OperationInvocation. `cycle` is available for implementations that
-            cache bindings (e.g. belief-state -> params) rather than re-deriving one every time."""
+            """Only called if result.invocation is still None. This is *parameter binding*: grounding
+            an abstract Step into a concrete, schema-conformant OperationInvocation (the tool-
+            hallucination-prone step). Distinct from a *protocol binding* (WoT forms/security, an MCP
+            session) — how the adapter's Tool reaches the instance, never surfaced here (ADR-0015).
+            `cycle` is available for implementations that cache bindings (e.g. belief-state -> params)
+            rather than re-deriving one every time."""
 
     @dataclass(frozen=True)
     class Strategies:          # bundles the five, so DecisionCycle.__init__ doesn't take five loose params
@@ -820,14 +839,29 @@ a tool's properties/signals emits `_focus_` as a plan step.
             # below — genuine forward-fusion short-circuits — Situate is not gated on its own field.
             ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
             result = await self.strategies.situate.situate(ready, self.working, self, result)
+            if result.activity is None:
+                return               # nothing selectable this cycle — at most one action, never a mandatory one
             if result.step is None:
                 result = await self.strategies.reason.reason(result.activity, self.working, self, result)
-            if result.invocation is None and result.step.next_action == "invoke":
-                manual = self.working.focused_tools[result.step.params["tool_id"]].manual
-                result = await self.strategies.act.bind(result.step, manual, self, result)
-            # dispatch result.invocation (if set) or result.step.params to the matching registered
-            # ExternalAction via self.actions, always passing activity_id=result.activity.id — elided,
-            # same as the rest of Act's action-lookup today
+            if result.step is not None:
+                await self._act(result.activity, result.step, result)   # bind-then-dispatch boundary
+
+        async def _act(self, selected: Activity, step: Step, result: TickResult) -> None:
+            """WAIT is the cycle's no-op sentinel — guarded first, before the registry lookup that
+            would otherwise KeyError on it. Otherwise resolve the step's ExternalAction and let *it*
+            declare whether the step needs binding (requires_binding) — only _invoke_ does, so the
+            generic cycle stays uncoupled from any one action's name and a custom binding action binds
+            too — then dispatch exactly one external action: the bound invocation's routing keys +
+            params when present, else the raw step params (invoke resolves its tool through the
+            registry, not the focus set)."""
+            if step.next_action == "wait":
+                return
+            action = self.actions.external(step.next_action)
+            if result.invocation is None and action.requires_binding:
+                tool = self.registry.get(step.params["tool_id"])
+                result = await self.strategies.act.bind(step, tool.manual, self, result)
+            # dispatch result.invocation (if set) or step.params to `action` via action.execute,
+            # always passing activity_id=selected.id — elided, same as the rest of Act's dispatch today
             ...
         async def interrupt(self, signal: Signal) -> None:
             """Preempts the current phase for a high-priority event (10ms target)."""

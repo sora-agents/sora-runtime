@@ -46,7 +46,15 @@ class OperationAck:  # returned by Tool.invoke() — the tool's ack, arrives asy
 
 @dataclass(frozen=True)
 class Step:
-    next_action: str  # e.g. "invoke", "send", "focus", "wait"
+    # next_action names the external action to dispatch (an ExternalAction.name — "invoke", "send",
+    # "focus", ...) or the WAIT sentinel. params is that action's own argument bag: the cycle passes
+    # it through opaquely and each action destructures it, so its shape is per-action — send ->
+    # {to, content}, focus -> {tool_id}, join -> {origin}, and so on. `invoke` is the one whose bag
+    # mixes *routing* (tool_id/operation_name, under the TOOL_ID/OPERATION_NAME keys) with the
+    # operation's own arguments; DefaultActStrategy.bind splits the routing back out into an
+    # OperationInvocation. Build an invoke Step with action.invoke_step() rather than hand-writing
+    # those keys.
+    next_action: str
     params: dict[str, Any]
 
 
