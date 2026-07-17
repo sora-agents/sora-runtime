@@ -33,6 +33,10 @@ Chosen option: "Consume tools from external ecosystems via adapters", because it
 * Most existing ecosystems expose only operations, so adapters must approximate observable properties and signals (e.g., via polling) where no richer model is available
 * Tool richness is capped by what each source protocol actually exposes
 
+### Worked example: MCP
+
+A plain MCP server maps to one workspace; each MCP tool maps to one S-ORA tool with a single operation and no observable properties or signals — MCP exposes only model-controlled functions, and its resources are application-controlled, so a faithful mapping surfaces no observables by default (see README's "Tool Model and Use"). A *curating* adapter approximates more only where it has grounds to: the ARE adapter groups a server's `<App>__<operation>` tools into one tool per app and maps that app's `app://{app}/state` resource to a documented observable property + signal. This is "approximate the missing pieces where the source lacks them" applied — richness is bounded by what the adapter author can responsibly curate, not invented from raw resources.
+
 ## Links
 
 * Depends on [ADR-0001](0001-python-asyncio-runtime.md)

@@ -9,8 +9,8 @@ It is **opt-in and skip-gated**: marked ``integration`` (excluded from the defau
 see pyproject ``addopts``), so run it explicitly with ``uv run pytest -m integration``. It also
 needs both the ``mcp`` extra and the ARE package (a PEP 735 ``are`` dependency-group, deliberately
 not pulled by ``uv sync --all-extras``), so CI skips it and it runs only when ARE is installed
-(``uv sync --all-extras --group are``). Everything here is throwaway spike code — to be replaced
-with a proper TDD build-out that hardens the adapter.
+(``uv sync --all-extras --group are``). It exercises the (now hardened) adapter end-to-end against
+the real server; the deterministic per-layer contract lives in ``test_mcp_adapter.py``.
 """
 
 from __future__ import annotations
@@ -65,7 +65,12 @@ class DictBackend:
 
 
 class ListEmailsReasonStrategy:
-    """The hardcoded spike ReasonStrategy: the scenario's single first step, nothing more."""
+    """The hardcoded spike ReasonStrategy: the scenario's single first step, nothing more. The tool
+    id is now origin-qualified (ADR-0014), so it's injected rather than a bare ``"EmailClientApp"``
+    literal."""
+
+    def __init__(self, tool_id: str) -> None:
+        self._tool_id = tool_id
 
     async def reason(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
@@ -76,7 +81,7 @@ class ListEmailsReasonStrategy:
             activity=activity,
             step=Step(
                 next_action="invoke",
-                params={"tool_id": "EmailClientApp", "operation_name": "list_emails"},
+                params={"tool_id": self._tool_id, "operation_name": "list_emails"},
             ),
         )
 
@@ -88,6 +93,9 @@ async def test_walking_skeleton_list_emails_against_are() -> None:
     from sora.adapters.are_mcp import AreMcpWorkspaceAdapter
 
     origin = WorkspaceOrigin(adapter="are-mcp", address="stdio:are-email")
+    # Tool ids are origin-qualified (ADR-0014) and derived deterministically, so the expected id is
+    # known before the connection exists.
+    email_tool_id = f"{origin.address}/EmailClientApp"
     adapter = AreMcpWorkspaceAdapter(
         command=sys.executable,
         args=["-m", SERVER, "--apps", EMAIL_APP, "--transport", "stdio"],
@@ -102,7 +110,7 @@ async def test_walking_skeleton_list_emails_against_are() -> None:
         observe=DefaultObserveStrategy(),
         reflect=DefaultReflectStrategy(),
         situate=DefaultSituateStrategy(),
-        reason=ListEmailsReasonStrategy(),
+        reason=ListEmailsReasonStrategy(email_tool_id),
         act=DefaultActStrategy(),
     )
     cycle = DecisionCycle(
@@ -118,7 +126,7 @@ async def test_walking_skeleton_list_emails_against_are() -> None:
 
     workspace = await registry.join(origin)  # spawns + connects to the real ARE MCP server
     try:
-        assert "EmailClientApp" in [t.id for t in workspace.tools()]
+        assert email_tool_id in [t.id for t in workspace.tools()]
 
         working.activities["schedule"] = Activity(
             id="schedule", goal="list emails from the inbox", context={}

@@ -52,6 +52,8 @@ S-ORA does not define its own tool-authoring framework. Tools are expected to be
 
 Tools that share a connection or session — e.g., multiple operations exposed by one MCP server — are grouped into a workspace: a shared lifecycle boundary whose tools remain individually focusable, but whose underlying connection is established and torn down once, not per tool. A workspace's adapter fixes the tool-use protocol for everything inside it (e.g., all-MCP, all-WoT), but individual tools may still have their own connection address distinct from the workspace's — e.g., a hypermedia workspace for a lab could group virtual tools hosted on the workspace's own server alongside physical devices reachable at their own addresses in the same room.
 
+How finely a server's primitives map to tools is the adapter's call. A plain MCP adapter maps each MCP tool to one S-ORA tool with a single operation and no observable properties or signals (its resources being application-controlled, per the preceding paragraph); a _curating_ adapter can lift a richer abstraction on top — e.g., the ARE adapter groups a server's `<App>__<operation>` tools into one tool per app and surfaces that app's state resource as a curated observable/signal. The `<App>__` convention is that adapter's own curation, not canonical MCP.
+
 A tool's `address` is a _locator_ and may be absent — e.g., tools multiplexed over one MCP stdio connection have none — whereas its `id` is the stable _handle_ the agent uses to focus and invoke it, and is **globally unique**: because a tool is a shared object, two agents focusing the same tool, or messaging about it, must name it identically. The per-protocol adapter guarantees this by deriving the id from the tool's global identity — its URI where the protocol provides one, or a value synthesized from the workspace's global origin/address otherwise — deterministically, so a later `restore()` reproduces the same id. A single registry can only enforce the ids it sees (it rejects a collision within its own joined set rather than letting one workspace's tool shadow another's); global uniqueness itself rests on the adapter. See [ADR-0014](docs/adrs/0014-tool-identity-globally-unique.md).
 
 Joining and leaving a workspace are deliberate, agent-driven actions (_join_/_leave_), not the result of an eager, upfront scan of every configured target. Today, join targets are limited to workspaces declared in the agent's own configuration; open, dynamic discovery of previously-unknown workspaces (e.g., for open environments where not every tool is known in advance) is foreseen but deliberately deferred.
@@ -282,7 +284,9 @@ a tool's properties/signals emits `_focus_` as a plan step.
     class WorkspaceOrigin:
         """The part of a WorkspaceRecord only the adapter can know: how to (re)connect."""
         adapter: str    # e.g. "mcp", "wot" — matches WorkspaceAdapter.name
-        address: str      # e.g. an MCP server URI, or a WoT directory's base href
+        address: str      # e.g. an MCP server URI, or a WoT directory's base href; for a stdio-spawned
+                          # server it's a stable nominal label, not a locator — the adapter holds the
+                          # command/args and is keyed by origin, so restore() reconnects without them
 
     class Workspace(Protocol):
         """A shared connection/lifecycle and tool-use-protocol boundary: e.g. one MCP session, or one
