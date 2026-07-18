@@ -21,6 +21,10 @@ dependencies = []
 mcp = ["mcp>=1.0"]
 a2a = []
 wot = []
+# The shipped default LLMClient (AnthropicLLMClient) is backed by the official Anthropic SDK.
+# Optional so the core stays dependency-free: the LLMClient Protocol lives in core, its concrete
+# provider client under sora/adapters, installed only when inference is actually wired.
+llm = ["anthropic>=0.40"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

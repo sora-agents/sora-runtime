@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from sora.manual import ManualParseError, MarkdownManualParser
+from sora.manual import ManualParseError, ManualSection, MarkdownManualParser
 
 MANUALS = Path(__file__).parent / "fixtures" / "manuals"
 
@@ -87,17 +87,17 @@ def test_structured_lists_are_empty_from_markdown_channel() -> None:
 # ------------------------------------------------------------------------------------------------
 def test_section_returns_operations_prose() -> None:
     m = MarkdownManualParser().parse(load("robotic-arm.md"))
-    ops = m.section("Operations")
+    ops = m.section(ManualSection.OPERATIONS)
     assert ops is not None
     assert "move_to" in ops and "open_gripper" in ops and "close_gripper" in ops
     # section text is scoped to that section only
-    assert "Tool Metadata" not in ops
+    assert ManualSection.METADATA not in ops
     assert "target_reached" in ops  # the Behavior sub-bullet is part of the Operations prose
 
 
 def test_section_returns_usage_and_safety() -> None:
     m = MarkdownManualParser().parse(load("water-pump.md"))
-    usage = m.section("Usage Protocols & Safety")
+    usage = m.section(ManualSection.USAGE_AND_SAFETY)
     assert usage is not None
     assert "water hammer" in usage
     assert "Sequence:" in usage
@@ -105,12 +105,13 @@ def test_section_returns_usage_and_safety() -> None:
 
 def test_section_of_none_sentinel_is_empty_text() -> None:
     m = MarkdownManualParser().parse(load("clock.md"))
-    props = m.section("Observable Properties")
+    props = m.section(ManualSection.OBSERVABLE_PROPERTIES)
     assert props is not None
     assert props.strip() == "(none)"
 
 
 def test_section_absent_returns_none() -> None:
+    # section() is a generic slicer: a non-canonical heading (a bare string) just returns None.
     m = MarkdownManualParser().parse(load("clock.md"))
     assert m.section("Nonexistent Section") is None
 
@@ -118,7 +119,7 @@ def test_section_absent_returns_none() -> None:
 def test_section_without_raw_text_returns_none() -> None:
     # A Manual with no authored source (e.g. adapter-synthesized) has nothing to slice.
     m = MarkdownManualParser().parse(load("clock.md"))
-    assert replace(m, raw_text=None).section("Operations") is None
+    assert replace(m, raw_text=None).section(ManualSection.OPERATIONS) is None
 
 
 # ------------------------------------------------------------------------------------------------

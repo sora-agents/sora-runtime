@@ -30,6 +30,8 @@ htmlcov/
 # Environment
 .env
 .env.*
+# keep the committed template (real secrets go in the ignored .env)
+!.env.example
 
 # Editors / OS
 .DS_Store

@@ -85,7 +85,7 @@ Property, signal, and operation entries carry their data shapes as JSON Schema i
 
 `MarkdownManualParser` (the default `ManualParser`) parses this format; malformed input raises `ManualParseError`. The document is a flat sequence of `# `-level sections whose headings are the six parts above (`# Tool Metadata`, `# Functional Description`, `# Observable Properties`, `# Signals`, `# Operations`, `# Usage Protocols & Safety`). `# Tool Metadata` is `key: value` lines — `id:` is **required** (it becomes `Manual.id`; a manual with no `id` is rejected), every other key lands in `metadata`; the remaining sections are free prose, with the observable-property / signal / operation lists written as `-` bullets (or the literal `(none)` when empty).
 
-The parser yields a `Manual` **envelope**: it fills `id`, `metadata`, `description` (from Functional Description), and the verbatim `raw_text`, and leaves the structured `observable_properties` / `signals` / `operations` fields empty — those are the *adapter* channel's to fill from a native description's schemas (see [ADR-0015](docs/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md)). Hand-authored prose is not lifted into typed fields (that extraction was brittle and unread); a consumer that wants one section — the operations for a binding, usage & safety for a suspend judgment — reads `manual.section("Operations")`, a lazy slice of `raw_text` on its `#` headings, and the whole manual is just `raw_text`. When a consumer eventually needs machine-readable schemas *from* hand-authored manuals, that content moves to a structured header (front-matter) rather than being regex-lifted from prose.
+The parser yields a `Manual` **envelope**: it fills `id`, `metadata`, `description` (from Functional Description), and the verbatim `raw_text`, and leaves the structured `observable_properties` / `signals` / `operations` fields empty — those are the *adapter* channel's to fill from a native description's schemas (see [ADR-0015](docs/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md)). Hand-authored prose is not lifted into typed fields (that extraction was brittle and unread); a consumer that wants one section — the operations for a binding, usage & safety for a suspend judgment — reads `manual.section(ManualSection.OPERATIONS)` (the six canonical section titles are the `ManualSection` StrEnum — one source of truth, no literals to mistype), a lazy slice of `raw_text` on its `#` headings, and the whole manual is just `raw_text`. When a consumer eventually needs machine-readable schemas *from* hand-authored manuals, that content moves to a structured header (front-matter) rather than being regex-lifted from prose.
 
 ### Memory
 
@@ -149,8 +149,14 @@ Every phase has a pluggable strategy. A strategy may short-circuit later phases 
   the next Observe phase — terminal input is user communication, not environment stimuli, so it's never
   a `Percept`. Similar in spirit to existing coding-agent CLIs: a persistent terminal session, not a
   one-shot command. Richer UIs are out of scope for the runtime and belong to whatever agent consumes it.
-- **LLM access**: no hard dependency on a single provider SDK; the default `ReasonStrategy` targets any
-  async HTTP chat-completions endpoint. Provider SDKs are optional extras.
+- **LLM access**: the runtime's one seam onto a model is the wire-format-neutral `LLMClient`
+  Protocol (`sora/llm.py`) — system + prompt in, text out, committing to no provider shape — so no
+  hard dependency on a single provider SDK. The shipped default client targets the Anthropic
+  Messages API via the optional `[llm]` extra (model id is a config value, never hardcoded; the
+  provider API key is supplied through the environment — e.g. `ANTHROPIC_API_KEY` — never committed
+  to `agent.yaml`, see [Configuring the LLM](#configuring-the-llm-and-its-api-key)). Provider SDKs
+  are optional extras. The model call itself lives in `ProceduralMemory.infer`, behind the default
+  `ReasonStrategy`; the text→`Plan` conversion there is the anti-corruption boundary.
 - **Protocol adapters** (MCP, A2A, OpenAPI) ship as optional extras (e.g. `pip install sora-runtime[mcp]`)
   so the core package stays dependency-light.
 - **Manual parsing**: pluggable `ManualParser` per format — Markdown by default, XML as an alternative.
@@ -170,7 +176,8 @@ Every phase has a pluggable strategy. A strategy may short-circuit later phases 
       manuals/clock.md
 
     $ cd my-agent
-    $ uv sync --extra mcp
+    $ uv sync --extra mcp --extra llm        # llm extra: the model-backed default Reason strategy
+    $ export ANTHROPIC_API_KEY=sk-ant-...     # credentials via the environment (see Configuring the LLM)
     $ uv run sora run
     > what time is it?
     [invoking clock.get_time...]
@@ -219,6 +226,29 @@ matter to another (or a `blocked`) activity, so its retention/eviction is consum
 owned by the blocked-state machinery, not a per-cycle prune. The default does not auto-*focus* —
 focusing is an external action (one per cycle, dispatched at Act), so an agent that needs to perceive
 a tool's properties/signals emits `_focus_` as a plan step.
+
+### Configuring the LLM and its API key
+
+The default `ReasonStrategy` is **model-backed** — Reason is the one phase with no mechanical default,
+since planning needs a model — so running an agent with it requires an LLM. Install the provider extra
+and supply credentials through the **environment**, never through `agent.yaml`:
+
+    $ uv sync --extra llm                    # the default AnthropicLLMClient (official Anthropic SDK)
+    $ export ANTHROPIC_API_KEY=sk-ant-...     # the secret lives in the environment, not in any file
+    $ uv run sora run
+
+The API key is a **secret — keep it out of version control.** `agent.yaml` is committed, so it names
+the *model* (a config value you can swap freely, e.g. `claude-opus-4-8`) but never the key. The
+shipped `AnthropicLLMClient` reads the key from the environment via the Anthropic SDK's standard
+resolution — `ANTHROPIC_API_KEY`, or an `ant auth login` profile for local dev — so the client needs
+no key in code or config. Only pass one explicitly (`AnthropicLLMClient(api_key=...)`) when you must
+inject a specific key programmatically. In production, load the key from a secrets manager or a
+`.gitignore`d `.env` at start-up; never paste keys into `agent.yaml`, manuals, prompts, or source.
+
+For local development, **copy `.env.example` to `.env`** and set `ANTHROPIC_API_KEY` there — `sora run`
+loads a local `.env` automatically when present, so you don't need to `export` it each time. `.env`
+is gitignored, and **real environment variables still take precedence** (a `.env` value is used only
+when the variable isn't already set), so it never silently overrides a key you exported deliberately.
 
 ## API Sketch
 
@@ -385,6 +415,11 @@ a tool's properties/signals emits `_focus_` as a plan step.
         async def drain(self) -> AsyncIterator[tuple[str, T]]: ...
 
     # sora/manual.py
+    class ManualSection(StrEnum):   # the six canonical `#`-headed manual sections — one source of truth
+        METADATA = "Tool Metadata"; DESCRIPTION = "Functional Description"
+        OBSERVABLE_PROPERTIES = "Observable Properties"; SIGNALS = "Signals"
+        OPERATIONS = "Operations"; USAGE_AND_SAFETY = "Usage Protocols & Safety"
+
     @dataclass(frozen=True)
     class OperationSpecification:   # was Operation — renamed for symmetry with the two specs below
         name: str
@@ -604,6 +639,17 @@ a tool's properties/signals emits `_focus_` as a plan step.
     def default_action_registry() -> ActionRegistry:   # the six external + four internal, assembled once
         ...                                            # what bootstrap and test harnesses register through
 
+    # sora/llm.py — the one seam onto a language model; wire-format-neutral on purpose
+    class LLMClient(Protocol):
+        """A single completion round-trip: a system instruction + a prompt in, text out. Commits to
+        no provider shape (not OpenAI chat/completions, not Anthropic messages), so the reasoning
+        path stays SDK-independent and the concrete client (an optional extra under sora/adapters —
+        AnthropicLLMClient, model id from config) is the only place a wire format appears. Owns
+        *only* the round-trip: retries, streaming, credential refresh, prompt caching, and interrupt
+        are the cycle/agent's. The text -> Plan anti-corruption boundary is ProceduralMemory.infer,
+        not here."""
+        async def complete(self, *, system: str, prompt: str) -> str: ...
+
     # sora/memory.py
     class MemoryBackend(Protocol):    # pluggable: file, DB, vector store
         async def get(self, key: str) -> Any: ...
@@ -648,16 +694,30 @@ a tool's properties/signals emits `_focus_` as a plan step.
         async def store_tool_record(self, record: ToolRecord) -> None: ...
         async def list_tool_records(self) -> list[ToolRecord]: ...   # reconstitute known instances at startup
 
+    class PlanPrompt(Protocol):   # builds infer()'s (system, user) prompt from (activity, tools)
+        def __call__(self, activity: Activity, tools: dict[str, Manual]) -> tuple[str, str]: ...
+        #   default_plan_prompt is the built-in one; PLAN_SYSTEM_PROMPT / render_tools are reusable
+        #   pieces a custom PlanPrompt can lean on. The response contract ({"steps":[...]}) stays
+        #   fixed — customize the *prompt*, not the parse.
+
     class ProceduralMemory:
-        def __init__(self, backend: MemoryBackend): ...
+        def __init__(self, backend: MemoryBackend, llm: LLMClient | None = None,
+                     prompt: PlanPrompt = default_plan_prompt): ...
+        #   llm is the model behind infer(); None keeps store/retrieve usable with no LLM. prompt is
+        #   the pluggable PlanPrompt — the knob for planning *content* (custom instructions/few-shot/
+        #   rendering).
         async def retrieve(self, activity: Activity) -> Plan | None:
             """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
             similarity, backend-dependent. Returns the backend's top-ranked match (query() orders
             most-relevant-first — see MemoryBackend), so this stays one line regardless of backend.
             The cheap path: skips infer() entirely when it hits."""
-        async def infer(self, activity: Activity) -> Plan:
-            """Produces a new multi-step Plan when no cached one fits — the expensive path, potentially
-            an LLM call producing a whole sequence of Steps at once, not just the next one."""
+        async def infer(self, activity: Activity, tools: dict[str, Manual]) -> Plan:
+            """Produces a new multi-step Plan when no cached one fits — the model path: one LLMClient
+            call producing a whole sequence of Steps at once. This is procedural memory querying its
+            'implicit knowledge encoded in LLM weights'. `tools` (id -> its Manual) is the planning
+            catalog, passed in by the caller that holds the live registry (a memory module never
+            reaches into the environment). Converts the model's JSON answer into Plan/Step (the
+            anti-corruption boundary); malformed output raises ValueError. No llm -> raises."""
         async def store(self, plan: Plan) -> None:
             """Persists a Plan that was actually followed to completion, so future retrieve() calls for
             similar goals can reuse it. Called by ReflectStrategy on success only — a failed plan isn't
@@ -799,6 +859,16 @@ a tool's properties/signals emits `_focus_` as a plan step.
     # provisional). Named here so the sketch matches the code's default set; wired in by bootstrap
     # as sora.reflect.default / sora.situate.default / sora.act.default.
 
+    class DefaultReasonStrategy:
+        """Reason's default — the effective default Reason strategy (Reason has no *mechanical*
+        default; planning is inherently the model path). Deterministic orchestration around the one
+        model call, which is isolated in ProceduralMemory.infer: cheap path advances an existing
+        plan's step_index (no model, no lookup); else reuse a cached plan (procedural.retrieve) or
+        infer a fresh one (procedural.infer, passing the joined tools id->Manual as the catalog); an
+        exhausted plan yields no step. Wired in by bootstrap as sora.reason.default."""
+        async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
+                         result: TickResult) -> TickResult: ...
+
     class RoundRobinActivitySelection:
         """DefaultSituateStrategy's default selection sub-strategy: fair rotation over the ready set,
         carrying a last-selected-id cursor across cycles (cold start / last-pick-gone -> oldest).
@@ -894,6 +964,7 @@ a tool's properties/signals emits `_focus_` as a plan step.
         """What `sora run` calls before handing off to TerminalSession. This is the one place all the
         wiring (which memory backend, which transport, which adapters, DecisionCycle <-> Agent sharing
         the same instances) actually happens — a developer implementing an agent never writes this."""
+        load_dotenv()   # convenience: pick up ANTHROPIC_API_KEY etc. from a local .env if present
         config = load_yaml(config_path)
         adapters = {WorkspaceOrigin(**w["origin"]): adapter_for(w["origin"]) for w in config.workspaces}
         registry = EnvironmentRegistry(adapters=adapters)   # the single shared instance...

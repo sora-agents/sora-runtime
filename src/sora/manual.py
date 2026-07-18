@@ -3,10 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from sora.environment import WorkspaceOrigin
+
+
+class ManualSection(StrEnum):
+    """The six canonical `#`-headed sections of a tool manual (README's manual structure). Each
+    member's value is the exact heading text, so it is both the key `Manual.section()` slices by and
+    the heading the parser matches — one source of truth, so no section-title string literal can
+    drift or be mistyped across the parser and its consumers."""
+
+    METADATA = "Tool Metadata"
+    DESCRIPTION = "Functional Description"
+    OBSERVABLE_PROPERTIES = "Observable Properties"
+    SIGNALS = "Signals"
+    OPERATIONS = "Operations"
+    USAGE_AND_SAFETY = "Usage Protocols & Safety"
 
 
 @dataclass(frozen=True)
@@ -44,8 +59,9 @@ class Manual:
     raw_text: str | None = None  # verbatim authored source (Markdown channel); None if synthesized
 
     def section(self, name: str) -> str | None:
-        """A `#`-headed section of the authored manual (e.g. "Operations", "Usage Protocols &
-        Safety"), sliced lazily from raw_text. None if there is no raw_text or no such section."""
+        """A `#`-headed section of the authored manual, sliced lazily from raw_text; None if there
+        is no raw_text or no such section. Pass a `ManualSection` for a canonical section (the
+        common case, typo-proof); a bare string still works for slicing any heading."""
         if self.raw_text is None:
             return None
         body = _split_sections(self.raw_text).get(name)
@@ -123,20 +139,20 @@ def _parse_metadata(block: str) -> tuple[str, dict[str, Any]]:
         else:
             metadata[key] = value
     if not manual_id:
-        raise ManualParseError("manual has no `id:` in its `# Tool Metadata` section")
+        raise ManualParseError(f"manual has no `id:` in its `# {ManualSection.METADATA}` section")
     return manual_id, metadata
 
 
 class MarkdownManualParser:  # satisfies the ManualParser Protocol (Markdown is the default format)
     def parse(self, raw: str) -> Manual:
         sections = _split_sections(raw)
-        if "Tool Metadata" not in sections:
-            raise ManualParseError("manual is missing its `# Tool Metadata` section")
-        manual_id, metadata = _parse_metadata(sections["Tool Metadata"])
+        if ManualSection.METADATA not in sections:
+            raise ManualParseError(f"manual is missing its `# {ManualSection.METADATA}` section")
+        manual_id, metadata = _parse_metadata(sections[ManualSection.METADATA])
         return Manual(
             id=manual_id,
             metadata=metadata,
-            description=sections.get("Functional Description", "").strip(),
+            description=sections.get(ManualSection.DESCRIPTION, "").strip(),
             observable_properties=[],
             signals=[],
             operations=[],

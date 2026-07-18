@@ -147,6 +147,25 @@ wheels = [
 ]
 
 [[package]]
+name = "anthropic"
+version = "0.117.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "docstring-parser" },
+    { name = "httpx" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/41/0d/8f71d535edb0d438f023bd825fb65f67c14fa88a2bd6b75f292a58a63de4/anthropic-0.117.0.tar.gz", hash = "sha256:98107f2b76439641e0ae2a1754087534b8f178dbab99d6eb1bc4b7bc8c744496", size = 989933, upload-time = "2026-07-16T19:36:13.07Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/4c/917d21d6619a4475cdafc6d13a69fdb3b901ddac57e76caca5a25c117b6d/anthropic-0.117.0-py3-none-any.whl", hash = "sha256:451a0a6905f11dff7663d13e4ee5dbf909eb8942b1d049803c7b937a13ac47ec", size = 998327, upload-time = "2026-07-16T19:36:11.225Z" },
+]
+
+[[package]]
 name = "anyio"
 version = "4.14.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2336,6 +2355,9 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
+llm = [
+    { name = "anthropic" },
+]
 mcp = [
     { name = "mcp" },
 ]
@@ -2347,6 +2369,7 @@ are = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anthropic", marker = "extra == 'llm'", specifier = ">=0.40" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0" },
@@ -2354,7 +2377,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7" },
 ]
-provides-extras = ["mcp", "a2a", "wot", "dev"]
+provides-extras = ["mcp", "a2a", "wot", "llm", "dev"]
 
 [package.metadata.requires-dev]
 are = [{ name = "meta-agents-research-environments", specifier = ">=1.2" }]

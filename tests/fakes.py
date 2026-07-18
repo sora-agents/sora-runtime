@@ -13,6 +13,7 @@ pinned by ``tests/test_fakes.py``.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -82,6 +83,31 @@ class FakeTool:
 
     def observe(self) -> list[ObservableProperty]:
         return list(self._properties)
+
+
+class FakeLLMClient:
+    """Deterministic, subprocess-free stand-in for a real ``LLMClient`` (see ``sora.llm``). Records
+    every ``(system, prompt)`` call so a test can assert what the LLM was asked, and replays canned
+    completion text. A single response string is reused for every call; a list is consumed in order
+    with the last entry sticking once the queue is down to one. Structurally satisfies the
+    ``LLMClient`` Protocol (enforced by ``mypy --strict`` at its use sites), so it plugs straight
+    into ``ProceduralMemory(llm=...)``."""
+
+    def __init__(self, response: str | Sequence[str] = "") -> None:
+        self._responses = [response] if isinstance(response, str) else list(response)
+        self.calls: list[tuple[str, str]] = []  # (system, prompt) per call, for assertions
+
+    async def complete(self, *, system: str, prompt: str) -> str:
+        self.calls.append((system, prompt))
+        if not self._responses:
+            raise AssertionError("FakeLLMClient has no configured response")
+        return self._responses[0] if len(self._responses) == 1 else self._responses.pop(0)
+
+
+def plan_json(*steps: dict[str, Any]) -> str:
+    """Render a ``{"steps": [...]}`` planning response the way ``ProceduralMemory.infer`` expects to
+    parse it — the JSON contract a real model is prompted to emit."""
+    return json.dumps({"steps": list(steps)})
 
 
 class FakeWorkspace:

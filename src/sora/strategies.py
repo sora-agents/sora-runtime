@@ -350,6 +350,42 @@ class DefaultSituateStrategy:
         await filter_.execute(cycle, tool_ids=relevant_ids)
 
 
+class DefaultReasonStrategy:
+    """The runtime's Reason default. Reason is the one phase with no *mechanical* default —
+    planning inherently needs a model — so this is deterministic orchestration around the single
+    model call, which is isolated in ``ProceduralMemory.infer``:
+
+    * an activity that already has a plan with steps left is the cheap path — read the current step
+      and advance ``step_index``: no model call, no procedural lookup;
+    * an activity with no plan gets one by *reuse* first (``procedural.retrieve`` — a plan some past
+      activity with this goal actually followed) and only *infers* a fresh one on a miss, passing
+      the currently-joined tools (id -> Manual) as the planning catalog (the strategy holds the live
+      registry; a memory module never reaches into the environment itself);
+    * an exhausted plan yields no step — the cycle returns, and Reflect terminates the activity the
+      next cycle on the same "plan present and fully consumed" rule (so this branch is normally only
+      reached by a just-inferred empty plan).
+
+    Mutates the activity (plan/step_index) in place, like the other phase defaults. The model itself
+    lives behind ``ProceduralMemory.infer``; this strategy makes zero model calls on the cheap
+    path."""
+
+    async def reason(
+        self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
+    ) -> TickResult:
+        if activity.plan is None:
+            plan = await cycle.procedural.retrieve(activity)  # reuse across runs (cheap)
+            if plan is None:
+                catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
+                plan = await cycle.procedural.infer(activity, catalog)  # the model call
+            activity.plan = plan
+            activity.step_index = 0
+        if activity.step_index >= len(activity.plan.steps):
+            return result  # exhausted -> no step this cycle
+        step = activity.plan.steps[activity.step_index]
+        activity.step_index += 1
+        return replace(result, activity=activity, step=step)
+
+
 class DefaultActStrategy:
     """The mechanical, no-LLM default for *parameter binding* (not protocol binding — see
     ActStrategy): bind an ``invoke`` Step straight to an OperationInvocation, splitting the

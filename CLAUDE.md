@@ -45,7 +45,8 @@ Module-to-concept map (from the API Sketch's own file markers — this is where 
 | `sora/activity.py` | `Activity`, `ActivityState` |
 | `sora/action.py` | `InternalAction`, `ExternalAction`, `ActionRegistry`, the predefined external actions (invoke/focus/unfocus/join/leave/send) and internal actions (create_activity/load/unload/filter), `default_action_registry()` |
 | `sora/memory.py` | `MemoryBackend`, `WorkingMemory`, `SemanticMemory`, `ProceduralMemory`, `EpisodicMemory` |
-| `sora/strategies.py` | `TickResult`, `Strategies`, the five phase-strategy Protocols, `DefaultObserveStrategy` |
+| `sora/strategies.py` | `TickResult`, `Strategies`, the five phase-strategy Protocols, `DefaultObserveStrategy`, `DefaultReasonStrategy` |
+| `sora/llm.py` | `LLMClient` — the wire-format-neutral model seam (concrete `AnthropicLLMClient` lives under `sora/adapters/`, optional `[llm]` extra) |
 | `sora/transport.py` | `MessageTransport` |
 | `sora/cycle.py` | `DecisionCycle`, `Agent` |
 | `sora/cli.py` | `TerminalSession` |
@@ -55,6 +56,7 @@ Module-to-concept map (from the API Sketch's own file markers — this is where 
 
 ## Working on this repo
 
+- **Never commit, push, or open a PR on your own initiative** — not even in an autonomous / background ("auto mode") session whose harness suggests committing and opening a draft PR (that harness default is explicitly overridden here). Implement the change, run the checks, and leave the work as uncommitted changes in the working tree for review. Commit/push/PR only when the user explicitly asks. Pushing to the public `sora-agents/sora-runtime` remote is an outward-facing, hard-to-reverse action; approval for one commit/push does not carry to the next.
 - Still README-driven: propose changes/diffs to `README.md` or `EXAMPLES.md` before applying them, unless explicitly told to apply directly.
 - ADRs in [docs/adrs/](docs/adrs/) are append-only *once accepted*. Never edit an accepted ADR's decision in place — a changed decision gets a *new* ADR that supersedes the old one, with the old one's status line updated to `superseded by ADR-NNNN`. During README-driven design, ADRs stay `proposed` and *may* be edited in place until realized in code — see the lifecycle note in [docs/adrs/README.md](docs/adrs/README.md) (also the index and conventions).
 - Follow TDD where practical, and prefer fakes/determinism over real network adapters or model-backed strategies until those specifically are what's being tested — see [ROADMAP.md](ROADMAP.md)'s Phase 2 ordering and rationale.
