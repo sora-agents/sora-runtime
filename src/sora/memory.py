@@ -26,7 +26,7 @@ from sora.manual import (
     ToolRecord,
     WorkspaceRecord,
 )
-from sora.types import Plan, Step
+from sora.types import CompletedOperation, Plan, Step
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -239,7 +239,15 @@ PLAN_SYSTEM_PROMPT = (
     "appear in the provided tool list. Invoking an operation does not require focusing the tool "
     "first — focus a tool only to perceive its observable properties and signals, and unfocus once "
     "you no longer need them. Respect any usage protocols & safety constraints listed for a tool "
-    "when choosing and ordering steps."
+    "when choosing and ordering steps.\n"
+    "When a parameter's value depends on the RESULT of an earlier step (e.g. an id or address you "
+    "only learn by first listing/searching), you do NOT know it yet — never invent a literal. "
+    "Instead reference the earlier result:\n"
+    '  {"$from": "<operation_name>", "path": "<dotted path into that result>"} '
+    '(e.g. {"$from": "search_emails", "path": "emails.0.id"}), or\n'
+    '  {"$decide": "<what value is needed>"} when picking the value needs judgement.\n'
+    "Prefer a narrowing step first (e.g. search for the specific item) so a $from reference points "
+    "at an unambiguous result."
 )
 
 
@@ -257,12 +265,7 @@ def render_tools(tools: dict[str, Manual]) -> str:
         if manual.description:
             header += f": {manual.description}"
         lines = [header]
-        lines += _render_affordances(
-            "operations (invoke)",
-            "operation",
-            [(op.name, op.description) for op in manual.operations],
-            manual.section(ManualSection.OPERATIONS),
-        )
+        lines += _render_operations(manual)
         lines += _render_affordances(
             "observable properties (focus to perceive)",
             "property",
@@ -287,6 +290,43 @@ def render_tools(tools: dict[str, Manual]) -> str:
             ]
         blocks.append("\n".join(lines))
     return "\n".join(blocks)
+
+
+def _render_operations(manual: Manual) -> list[str]:
+    """Operations block for ``render_tools``. Unlike properties/signals, each operation also renders
+    its *parameter schema* (names, types, required-ness, and any format hint in the JSON-schema
+    description) — without it the planner guesses param names/formats and the invoke fails against
+    the real tool (e.g. ARE wants ``start_datetime`` in ``YYYY-MM-DD HH:MM:SS``, not a made-up
+    ``start``). Falls back to the authored Markdown ``Operations`` section when the adapter channel
+    filled no structured specs (a hand-authored manual), same rule as ``_render_affordances``."""
+    if manual.operations:
+        out = ["    operations (invoke):"]
+        for op in manual.operations:
+            head = f"      - operation `{op.name}`"
+            out.append(head + (f": {op.description}" if op.description else ""))
+            out += _render_params(op.parameters)
+        return out
+    body = _prose(manual.section(ManualSection.OPERATIONS))
+    return ["    operations (invoke):", f"      {body}"] if body is not None else []
+
+
+def _render_params(schema: dict[str, Any]) -> list[str]:
+    """Render an operation's JSON-schema ``parameters`` (object with ``properties``/``required``) as
+    a compact bullet list the planner can bind against. Empty/absent schema -> nothing."""
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict) or not properties:
+        return []
+    required = set(schema.get("required", []) or [])
+    out = ["          params:"]
+    for name, spec in properties.items():
+        spec = spec if isinstance(spec, dict) else {}
+        kind = spec.get("type", "any")
+        flag = ", required" if name in required else ""
+        description = spec.get("description", "")
+        out.append(
+            f"            - {name} ({kind}{flag})" + (f": {description}" if description else "")
+        )
+    return out
 
 
 def _render_affordances(
@@ -362,6 +402,95 @@ def _strip_code_fences(text: str) -> str:
     return body.strip()
 
 
+# --- parameter grounding (the Reason-phase escalation, packaged here like infer) ------------------
+
+GROUND_SYSTEM_PROMPT = (
+    "You are grounding the parameters of a SINGLE tool operation about to be invoked. You are "
+    "given the goal, the operation and its parameter schema, a partial set of parameters (some "
+    "values may still be references to earlier results), and the results of the operations already "
+    "executed. Produce the final, concrete parameters: fill every value that depends on a prior "
+    "result from the ACTUAL data in those results, and keep already-concrete values as given.\n"
+    'Respond with ONLY a JSON object of the form {"params": { ... }} and nothing else — no prose, '
+    "no markdown fences. Use only parameter names from the schema."
+)
+
+
+class GroundPrompt(Protocol):
+    """Builds the ``(system, user_prompt)`` pair ``ground()`` sends to the LLM — the grounding
+    counterpart to ``PlanPrompt``, injected into ``ProceduralMemory`` so grounding *content* is
+    customizable. The response must parse as the fixed ``{"params": {...}}`` contract."""
+
+    def __call__(
+        self,
+        activity: Activity,
+        operation_name: str,
+        manual: Manual | None,
+        partial_params: dict[str, Any],
+    ) -> tuple[str, str]: ...
+
+
+def render_history(history: list[CompletedOperation]) -> str:
+    """Render an activity's executed operations + results for a grounding prompt. Public so a custom
+    ``GroundPrompt`` can reuse it."""
+    if not history:
+        return "(nothing executed yet)"
+    lines = []
+    for completed in history:
+        outcome = completed.ack.result if completed.ack.ok else f"ERROR: {completed.ack.result}"
+        args = json.dumps(completed.invocation.params)
+        lines.append(f"- {completed.invocation.operation_name}({args}) -> {_truncate(outcome)}")
+    return "\n".join(lines)
+
+
+def _render_operation_schema(manual: Manual | None, operation_name: str) -> str:
+    """The single operation's name/description + parameter schema (reuses ``_render_params``)."""
+    if manual is None:
+        return f"operation `{operation_name}` (no schema available)"
+    op = next((o for o in manual.operations if o.name == operation_name), None)
+    if op is None:
+        return f"operation `{operation_name}` (not described in the manual)"
+    lines = [f"operation `{op.name}`" + (f": {op.description}" if op.description else "")]
+    lines += _render_params(op.parameters)
+    return "\n".join(lines)
+
+
+def default_ground_prompt(
+    activity: Activity,
+    operation_name: str,
+    manual: Manual | None,
+    partial_params: dict[str, Any],
+) -> tuple[str, str]:
+    """The built-in ``GroundPrompt``: goal + the operation schema + the partial params + the
+    execution history. Reuse ``GROUND_SYSTEM_PROMPT`` / ``render_history`` in a custom one."""
+    user = (
+        f"Goal: {activity.goal}\n\n"
+        f"Operation to invoke:\n{_render_operation_schema(manual, operation_name)}\n\n"
+        f"Partial parameters (resolve any references, keep concrete values):\n"
+        f"{json.dumps(partial_params, indent=2)}\n\n"
+        f"Results of operations already executed:\n{render_history(activity.history)}"
+    )
+    return GROUND_SYSTEM_PROMPT, user
+
+
+def _parse_params(text: str) -> dict[str, Any]:
+    try:
+        data = json.loads(_strip_code_fences(text))
+        params = data["params"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(
+            f"could not parse grounded params from model output: {exc!r}\n---\n{text}"
+        ) from exc
+    if not isinstance(params, dict):
+        raise ValueError(f"grounded params is not a JSON object: {params!r}")
+    return params
+
+
+def _truncate(value: Any, limit: int = 400) -> str:
+    """One-line, length-capped rendering of a result for a prompt/log line."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 class ProceduralMemory:
     # Plans are keyed by their own stable id (the storage handle) and retrieved by an exact match
     # on goal (the retrieval key) via backend.query — so two plans with distinct ids but the same
@@ -373,15 +502,16 @@ class ProceduralMemory:
         backend: MemoryBackend,
         llm: LLMClient | None = None,
         prompt: PlanPrompt = default_plan_prompt,
+        ground_prompt: GroundPrompt = default_ground_prompt,
     ) -> None:
-        # `llm` is the model behind infer() — procedural memory "includes implicit knowledge encoded
-        # in LLM weights" (README), and infer() is a *query* against it (CoALA), not a planner. None
-        # keeps the deterministic store/retrieve half usable without a model (or a provider SDK).
-        # `prompt` is the pluggable PlanPrompt that builds infer()'s (system, user) pair — the knob
-        # for planning *content* (custom instructions, few-shot, catalog rendering).
+        # `llm` is the model behind infer()/ground() — procedural memory "includes implicit
+        # knowledge encoded in LLM weights", both *query* against it (CoALA). `None` keeps
+        # the deterministic store/retrieve half usable without a model. `prompt` / `ground_prompt`
+        # are the pluggable knobs for planning / grounding *content* (custom instructions etc.).
         self._backend = backend
         self._llm = llm
         self._prompt = prompt
+        self._ground_prompt = ground_prompt
 
     async def retrieve(self, activity: Activity) -> Plan | None:
         """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
@@ -411,6 +541,30 @@ class ProceduralMemory:
         system, user = self._prompt(activity, tools)  # the injected PlanPrompt
         text = await self._llm.complete(system=system, prompt=user)
         return Plan(id=uuid.uuid4().hex, goal=activity.goal, steps=_parse_plan_steps(text))
+
+    async def ground(
+        self,
+        activity: Activity,
+        operation_name: str,
+        manual: Manual | None,
+        partial_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Decide an operation's concrete parameters from the execution context — the escalation
+        the Reason phase calls when a param reference can't be resolved *mechanically* (an ambiguous
+        pick, or an unknown/mis-guessed result shape). One model call: a prompt from the goal,
+        the operation schema, the partial params, and the activity's history (via the injected
+        ``GroundPrompt``), then converts the model's JSON answer to a concrete params dict — the
+        anti-corruption boundary (malformed -> ``ValueError``). Reuses the same ``LLMClient`` seam
+        as ``infer``; no LLM -> raises. (Grounding a step is an Act-adjacent reasoning act; it
+        lives here only because procedural memory currently owns the model handle — the eventual
+        home is a client injected per strategy. See ADR-0017.)"""
+        if self._llm is None:
+            raise RuntimeError(
+                "ProceduralMemory has no LLM configured; cannot ground parameters. Pass a client."
+            )
+        system, user = self._ground_prompt(activity, operation_name, manual, partial_params)
+        text = await self._llm.complete(system=system, prompt=user)
+        return _parse_params(text)
 
     async def store(self, plan: Plan) -> None:
         """Persists a Plan that was actually followed to completion, so future retrieve() calls

@@ -45,6 +45,16 @@ class OperationAck:  # returned by Tool.invoke() — the tool's ack, arrives asy
 
 
 @dataclass(frozen=True)
+class CompletedOperation:  # one resolved invocation + its ack, retained on Activity.history
+    # The per-step execution trace a later step grounds against: e.g., a `reply_to_email`'s
+    # email_id is resolved from an earlier `list_emails`/`search_emails` result. Kept because
+    # last_operation holds only the *most recent* result (overwritten each step), which loses
+    # earlier ones.
+    invocation: OperationInvocation
+    ack: OperationAck
+
+
+@dataclass(frozen=True)
 class Step:
     # next_action names the external action to dispatch (an ExternalAction.name — "invoke", "send",
     # "focus", ...) or the WAIT sentinel. params is that action's own argument bag: the cycle passes

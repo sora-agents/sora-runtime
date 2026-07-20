@@ -31,6 +31,7 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0014](0014-tool-identity-globally-unique.md) | Tool identity is globally unique, guaranteed by the protocol adapter | proposed | Tool & workspace model |
 | [0015](0015-manuals-protocol-agnostic-adapter-boundary.md) | Manuals stay protocol-agnostic; protocol bindings live on the tool instance | proposed | Tool & workspace model |
 | [0016](0016-pluggable-activity-selection.md) | Activity selection is Situate's own pluggable sub-strategy, defaulting to round-robin | proposed | Decision cycle |
+| [0017](0017-parameter-grounding-in-reason.md) | Parameter grounding is a Reason decision (references + escalation); Act stays mechanistic | proposed | Decision cycle |
 
 ## Planned
 

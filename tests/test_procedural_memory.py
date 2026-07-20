@@ -27,13 +27,14 @@ from sora.manual import (
     SignalSpecification,
 )
 from sora.memory import (
+    GROUND_SYSTEM_PROMPT,
     PLAN_SYSTEM_PROMPT,
     FileMemoryBackend,
     ProceduralMemory,
     default_plan_prompt,
     render_tools,
 )
-from sora.types import Plan, Step
+from sora.types import CompletedOperation, OperationAck, OperationInvocation, Plan, Step
 
 
 def _activity(goal: str) -> Activity:
@@ -319,6 +320,40 @@ def test_render_tools_surfaces_properties_and_signals_to_motivate_focus() -> Non
     assert "focus to perceive" in rendered and "focus to receive" in rendered
 
 
+def test_render_tools_surfaces_operation_parameter_schema() -> None:
+    # Without the parameter schema in the prompt the planner guesses param names/formats and the
+    # invoke fails against the real tool (e.g. ARE wants `start_datetime` in YYYY-MM-DD HH:MM:SS,
+    # not a made-up `start`). The schema lives on OperationSpecification.parameters — render it.
+    manual = Manual(
+        id="CalendarApp",
+        metadata={},
+        description="a calendar",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(
+                "get_events",
+                "list events in a range",
+                {
+                    "type": "object",
+                    "properties": {
+                        "start_datetime": {
+                            "type": "string",
+                            "description": "range start in YYYY-MM-DD HH:MM:SS",
+                        },
+                        "limit": {"type": "int", "description": "max events, default 10"},
+                    },
+                    "required": ["start_datetime"],
+                },
+            )
+        ],
+    )
+    rendered = render_tools({"CalendarApp": manual})
+    assert "start_datetime (string, required): range start in YYYY-MM-DD HH:MM:SS" in rendered
+    assert "limit (int): max events, default 10" in rendered  # optional param -> no "required"
+    assert "required" not in rendered.split("limit (int)")[1].split("\n")[0]
+
+
 def test_render_tools_omits_absent_affordance_groups() -> None:
     # An invoke-only tool (no observables/signals) shows operations only — nothing to focus.
     manual = Manual(
@@ -376,3 +411,92 @@ def test_render_tools_surfaces_usage_protocols_and_safety() -> None:
     assert "usage protocols & safety" in rendered.lower()
     assert "intake valve is closed" in rendered  # the safety constraint reaches the planner
     assert "safety" in PLAN_SYSTEM_PROMPT.lower()  # and the model is told to respect it
+
+
+def test_plan_prompt_instructs_references_for_runtime_dependent_params() -> None:
+    # The planner must emit references (not invented literals) for values only known at runtime.
+    assert "$from" in PLAN_SYSTEM_PROMPT and "$decide" in PLAN_SYSTEM_PROMPT
+
+
+# --------------------------------------------------------------------------------------------------
+# ground(): the escalation model call — decide an operation's params from execution history
+# --------------------------------------------------------------------------------------------------
+
+
+def _params_json(**params: object) -> str:
+    import json
+
+    return json.dumps({"params": params})
+
+
+def _activity_with_history(goal: str, operation_name: str, result: object) -> Activity:
+    inv = OperationInvocation("EmailClientApp", operation_name, {"query": "Alice"})
+    return Activity(
+        id=f"act-{goal}",
+        goal=goal,
+        context={},
+        history=[CompletedOperation(inv, OperationAck(ok=True, result=result))],
+    )
+
+
+async def test_ground_without_llm_raises(tmp_path: Path) -> None:
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path))  # store/retrieve only, no model
+    with pytest.raises(RuntimeError, match="no LLM configured"):
+        await mem.ground(_activity_with_history("g", "search", {}), "reply", None, {})
+
+
+async def test_ground_returns_concrete_params(tmp_path: Path) -> None:
+    llm = FakeLLMClient(_params_json(email_id=42, body="hi Alice"))
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm)
+    activity = _activity_with_history("reply", "search_emails", {"emails": [{"id": 42}]})
+
+    params = await mem.ground(
+        activity, "reply_to_email", None, {"email_id": {"$decide": "Alice's id"}}
+    )
+
+    assert params == {"email_id": 42, "body": "hi Alice"}
+
+
+async def test_ground_prompt_carries_operation_schema_and_history(tmp_path: Path) -> None:
+    llm = FakeLLMClient(_params_json(email_id=42))
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm)
+    manual = Manual(
+        id="EmailClientApp",
+        metadata={},
+        description="email",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(
+                "reply_to_email",
+                "reply to a message",
+                {
+                    "type": "object",
+                    "properties": {"email_id": {"type": "int", "description": "id to reply to"}},
+                    "required": ["email_id"],
+                },
+            )
+        ],
+    )
+    activity = _activity_with_history("reply", "search_emails", {"emails": [{"id": 42}]})
+
+    await mem.ground(activity, "reply_to_email", manual, {"email_id": {"$decide": "x"}})
+
+    system, user = llm.calls[0]
+    assert system == GROUND_SYSTEM_PROMPT
+    assert "email_id" in user and "id to reply to" in user  # the operation schema
+    assert "search_emails" in user and "42" in user  # the prior result (history)
+
+
+async def test_ground_rejects_non_json(tmp_path: Path) -> None:
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=FakeLLMClient("sorry, no"))
+    with pytest.raises(ValueError, match="could not parse grounded params"):
+        await mem.ground(_activity_with_history("g", "s", {}), "op", None, {})
+
+
+async def test_ground_rejects_output_without_params_key(tmp_path: Path) -> None:
+    import json
+
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=FakeLLMClient(json.dumps({"x": 1})))
+    with pytest.raises(ValueError, match="could not parse grounded params"):
+        await mem.ground(_activity_with_history("g", "s", {}), "op", None, {})

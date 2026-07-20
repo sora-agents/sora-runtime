@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from sora.types import OperationAck, PendingOperation, Plan
+    from sora.types import CompletedOperation, OperationAck, PendingOperation, Plan
 
 
 class ActivityState(Enum):
@@ -27,6 +27,10 @@ class Activity:
     step_index: int = 0
     pending_operation: PendingOperation | None = None  # set while RUNNING; cleared on resolve
     last_operation: OperationAck | None = None  # most recently resolved result, for Reason to read
+    # Append-only trace of resolved operations this activity ran — a later step grounds its params
+    # against it (last_operation keeps only the newest, overwritten each step). Transient:
+    # not persisted, and episodic learn() captures selectively, not a blind asdict(activity).
+    history: list[CompletedOperation] = field(default_factory=list)
     # context is exclusively for strategy-author data — the runtime itself never writes into it,
     # which is what keeps pending_operation/last_operation as dedicated fields instead of context
     # keys with a naming convention: no shared namespace means no collision to avoid in the first

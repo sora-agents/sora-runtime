@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, replace
@@ -11,12 +12,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 from sora.action import (
     CreateActivityAction,
     FilterPerceptionsAction,
+    InvokeAction,
     LoadManualAction,
     UnloadManualAction,
 )
 from sora.activity import ActivityState
 from sora.perception import Percept, PerceptKind
-from sora.types import OPERATION_NAME, TOOL_ID, OperationInvocation, Step
+from sora.types import OPERATION_NAME, TOOL_ID, CompletedOperation, OperationInvocation, Step
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -24,6 +26,8 @@ if TYPE_CHECKING:
     from sora.manual import Manual
     from sora.memory import WorkingMemory
     from sora.perception import Message
+
+log = logging.getLogger("sora.strategies")
 
 
 @dataclass(frozen=True)
@@ -151,17 +155,30 @@ class DefaultObserveStrategy:
         self._snapshot_properties(wm)
         async for source, signal in cycle.signal_sink.drain():
             wm.perceptions.append(Percept(source, PerceptKind.SIGNAL, signal, time.time()))
+            log.info("observe: signal %s from %s", signal.name, source)
         async for invocation_id, ack in cycle.result_sink.drain():
             # Unambiguous 1:1 match: the invoke's own result resolves its activity automatically,
             # never as a Percept, no strategy involved (see Activities in README).
             for activity in wm.activities.values():
                 if activity.pending_operation and activity.pending_operation.id == invocation_id:
+                    invocation = activity.pending_operation.invocation
+                    op = invocation.operation_name
                     activity.last_operation = ack
+                    activity.history.append(
+                        CompletedOperation(invocation, ack)
+                    )  # belief to ground on
                     activity.pending_operation = None
                     activity.state = ActivityState.READY
+                    if ack.ok:
+                        log.info("observe: resolved %s -> ok", op)
+                    else:
+                        # Surface *why*: a failed op terminates the activity in Reflect, and without
+                        # the error the trace just says failed with no cause (e.g. a schema error).
+                        log.warning("observe: resolved %s -> FAILED: %s", op, _truncate(ack.result))
                     break
         async for message in cycle.communication.receive():
             wm.messages.append(message)
+            log.info("observe: message from %s: %r", message.sender, _goal_from_message(message))
         return TickResult()
 
     @staticmethod
@@ -221,9 +238,11 @@ class DefaultReflectStrategy:
         last = activity.last_operation
         if last is not None and not last.ok:
             activity.state = ActivityState.TERMINATED  # synchronous — Situate sees it this cycle
+            log.info("reflect: activity %s failed; storing episode", activity.id)
             self._dispatch(self._record_failure(cycle, activity))
         elif activity.plan is not None and activity.step_index >= len(activity.plan.steps):
             activity.state = ActivityState.TERMINATED
+            log.info("reflect: activity %s completed; storing episode + plan", activity.id)
             self._dispatch(self._record_success(cycle, activity))
         # Reflect never fills in the decision fields (activity/step/invocation) — it threads
         # `result` through untouched.
@@ -248,6 +267,13 @@ def _summarize(activity: Activity, *, succeeded: bool) -> str:
     richer natural-language summary here; the mechanical default just states outcome and goal."""
     outcome = "completed" if succeeded else "failed"
     return f"{outcome}: {activity.goal}"
+
+
+def _truncate(value: Any, limit: int = 300) -> str:
+    """One-line, length-capped rendering of an operation result for a log line (a tool error can be
+    a long multi-line traceback)."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _goal_from_message(message: Message) -> str:
@@ -350,6 +376,74 @@ class DefaultSituateStrategy:
         await filter_.execute(cycle, tool_ids=relevant_ids)
 
 
+# --- parameter grounding: references + a deterministic resolver ----------------------------------
+# A plan is a reusable *skeleton*; a param whose value depends on a prior step's result can't be a
+# literal at plan time, so the planner emits a *reference* the Reason phase grounds each run against
+# the activity's execution history. Two forms (see ADR-0017):
+#   hard: {"$from": "<operation_name>", "path": "<dotted path>"}  -> resolved deterministically
+#   soft: {"$decide": "<natural-language description>"}           -> always escalates to the model
+_REF_FROM = "$from"
+_REF_PATH = "path"
+_REF_DECIDE = "$decide"
+_MISSING = object()  # sentinel: no matching history entry (distinct from a genuine None result)
+
+
+def _is_reference(value: Any) -> bool:
+    return isinstance(value, dict) and (_REF_FROM in value or _REF_DECIDE in value)
+
+
+def _latest_result(history: list[CompletedOperation], operation_name: str) -> Any:
+    """The result of the most recent completed operation with this name, or _MISSING."""
+    for completed in reversed(history):
+        if completed.invocation.operation_name == operation_name:
+            return completed.ack.result
+    return _MISSING
+
+
+def _walk_path(value: Any, path: str) -> Any:
+    """Walk a dotted path into a nested result — a numeric segment indexes a list, else a dict."""
+    for segment in filter(None, path.split(".")):
+        value = value[int(segment)] if segment.isdigit() else value[segment]
+    return value
+
+
+def _manual_for(wm: WorkingMemory, tool_id: str | None) -> Manual | None:
+    """The joined tool's manual (the operation schema the model grounds against), or None."""
+    if tool_id is None:
+        return None
+    try:
+        return wm.registry.get(tool_id).manual
+    except KeyError:
+        return None
+
+
+def resolve_references(
+    op_params: dict[str, Any], history: list[CompletedOperation]
+) -> tuple[dict[str, Any], list[str]]:
+    """Resolve a step's operation params against execution history. Non-reference values pass
+    through; a hard reference is resolved deterministically; anything that can't be resolved
+    mechanically (soft ref, missing step, bad path) is left in place and its key returned in
+    ``unresolved`` for the caller to escalate. Never raises an exception on a bad path — that's
+    an escalation signal, not an error."""
+    resolved = dict(op_params)
+    unresolved: list[str] = []
+    for key, value in op_params.items():
+        if not _is_reference(value):
+            continue
+        if _REF_DECIDE in value:
+            unresolved.append(key)
+            continue
+        result = _latest_result(history, value.get(_REF_FROM))
+        if result is _MISSING:
+            unresolved.append(key)
+            continue
+        try:
+            resolved[key] = _walk_path(result, value.get(_REF_PATH, ""))
+        except (KeyError, IndexError, TypeError, ValueError):
+            unresolved.append(key)
+    return resolved, unresolved
+
+
 class DefaultReasonStrategy:
     """The runtime's Reason default. Reason is the one phase with no *mechanical* default —
     planning inherently needs a model — so this is deterministic orchestration around the single
@@ -376,14 +470,47 @@ class DefaultReasonStrategy:
             plan = await cycle.procedural.retrieve(activity)  # reuse across runs (cheap)
             if plan is None:
                 catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
+                log.info("reason: inferring a plan for %r (%d tools)", activity.goal, len(catalog))
                 plan = await cycle.procedural.infer(activity, catalog)  # the model call
+                log.info("reason: inferred plan with %d steps", len(plan.steps))
+            else:
+                log.info(
+                    "reason: reusing cached plan (%d steps) for %r", len(plan.steps), activity.goal
+                )
             activity.plan = plan
             activity.step_index = 0
         if activity.step_index >= len(activity.plan.steps):
             return result  # exhausted -> no step this cycle
         step = activity.plan.steps[activity.step_index]
         activity.step_index += 1
-        return replace(result, activity=activity, step=step)
+        grounded = await self._ground(step, activity, wm, cycle)
+        return replace(result, activity=activity, step=grounded)
+
+    async def _ground(
+        self, step: Step, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle
+    ) -> Step:
+        """Ground a step's operation params against this run's execution history for *this cycle*,
+        leaving the stored plan's references intact so procedural reuse keeps a reusable skeleton.
+        Deciding a param value is a *reasoning* act, so it lives here, not in Act (which stays
+        mechanistic). Hybrid: resolve references deterministically; escalate to one model call
+        (``procedural.ground``) only for what can't be resolved mechanically. A step with
+        no references is a pure no-op — the cheap path makes no model call."""
+        if step.next_action != InvokeAction.name:
+            return step  # only invoke steps carry an operation param bag to ground
+        routing = {k: v for k, v in step.params.items() if k in (TOOL_ID, OPERATION_NAME)}
+        op_params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
+        resolved, unresolved = resolve_references(op_params, activity.history)
+        if unresolved:
+            log.info(
+                "reason: grounding %s params %s via the model", routing[OPERATION_NAME], unresolved
+            )
+            manual = _manual_for(wm, routing.get(TOOL_ID))
+            resolved = await cycle.procedural.ground(
+                activity, routing[OPERATION_NAME], manual, resolved
+            )
+        if resolved == op_params:
+            return step  # no references -> unchanged, reuse the original Step
+        return replace(step, params={**routing, **resolved})
 
 
 class DefaultActStrategy:
