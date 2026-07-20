@@ -12,10 +12,13 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from fakes import FakeAdapter, FakeTool, FakeWorkspace
 from sora.action import default_action_registry
 from sora.cycle import Agent, DecisionCycle
-from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.environment import EnvironmentRegistry, Workspace, WorkspaceOrigin
+from sora.manual import Manual, ToolRecord, WorkspaceRecord
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -93,6 +96,40 @@ async def test_run_joins_at_startup_then_stop_leaves(tmp_path: Path) -> None:
     await task
 
     assert workspace.closed is True  # left on teardown
+    assert registry.joined_workspaces() == []
+
+
+class _FailingAdapter:
+    """A configured adapter whose join fails — proving a partial startup join is cleaned up."""
+
+    name = "fake"
+
+    async def discover(self) -> list[Workspace]:
+        raise RuntimeError("second workspace is unavailable")
+
+    async def connect(
+        self,
+        workspace_record: WorkspaceRecord,
+        tool_records: list[ToolRecord],
+        manuals: dict[str, Manual],
+    ) -> Workspace:
+        raise RuntimeError("unused")  # pragma: no cover
+
+
+async def test_run_partial_startup_join_failure_still_closes_joined_workspaces(
+    tmp_path: Path,
+) -> None:
+    # A second configured workspace whose join raises: _start() joins the first, then fails on the
+    # second. run()'s finally must still leave (close) the first — otherwise its live MCP subprocess
+    # would leak, since the exception escapes run() before the loop's teardown could run.
+    agent, registry, workspace = _build_agent(tmp_path)
+    bad_origin = WorkspaceOrigin(adapter="fake", address="fake://bad")
+    registry._adapters[bad_origin] = _FailingAdapter()  # configured after the good one -> joins 2nd
+
+    with pytest.raises(RuntimeError, match="second workspace is unavailable"):
+        await agent.run()
+
+    assert workspace.closed is True  # the already-joined workspace was closed despite the failure
     assert registry.joined_workspaces() == []
 
 

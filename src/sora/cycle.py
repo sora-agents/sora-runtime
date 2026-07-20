@@ -160,11 +160,13 @@ class Agent:
         """Join the configured workspaces once (startup), then drive the decision cycle until
         stop() is called. The join happens here — not in bootstrap — because it is async I/O and
         bootstrap stays synchronous; it is what makes the configured tools already available on the
-        first cycle. Leaving the workspaces (closing MCP sessions/subprocesses) happens in the
-        finally block, after the loop exits — so there's no race with an in-flight tick, unlike
-        leaving from stop()."""
-        await self._start()
+        first cycle. Both the startup join and the loop run inside the try, so the finally leaves
+        (closes MCP sessions/subprocesses) whatever managed to join — even a *partial* startup join
+        that then failed (otherwise an already-joined workspace's subprocess would leak). Leaving in
+        the finally, after the loop exits, also avoids racing an in-flight tick — unlike leaving
+        from stop()."""
         try:
+            await self._start()
             while not self._stopped:
                 await self.cycle.tick()
                 await asyncio.sleep(self._tick_interval)
