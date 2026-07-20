@@ -227,6 +227,28 @@ owned by the blocked-state machinery, not a per-cycle prune. The default does no
 focusing is an external action (one per cycle, dispatched at Act), so an agent that needs to perceive
 a tool's properties/signals emits `_focus_` as a plan step.
 
+#### Connecting to an MCP server: remote vs. local
+
+An `mcp` (or `are-mcp`) workspace connects over whichever transport its entry describes — the runtime
+does **not** have to deploy the server itself:
+
+    workspaces:
+      # Remote: connect to an already-running server (nothing is spawned). `address` is the URL;
+      # SSE is the default, or add `transport: streamable-http`.
+      - origin: {adapter: mcp, address: "http://localhost:8080/sse"}
+        workspace_id: remote-tools
+
+      # Local: the adapter spawns and owns a stdio subprocess. Give it a `command` (+ `args`);
+      # `address` is then just a nominal label.
+      - origin: {adapter: mcp, address: "stdio:clock"}
+        workspace_id: clock
+        command: uvx
+        args: ["mcp-server-clock"]
+
+The rule is simply: an entry with a `command` runs a local stdio subprocess; otherwise `address` is
+treated as the URL of an existing server to connect to. Either way `discover()` enumerates the
+server's tools and `restore()` reconnects the same way — the transport is the only thing that differs.
+
 ### Configuring the LLM and its API key
 
 The default `ReasonStrategy` is **model-backed** — Reason is the one phase with no mechanical default,

@@ -332,3 +332,116 @@ async def test_two_joined_workspaces_have_globally_unique_ids() -> None:
 
     ids = [t.id for t in registry.all_tools()]
     assert len(ids) == len(set(ids)) == 4  # 2 apps x 2 workspaces, all distinct
+
+
+# ------------------------------------------------------------------------------------------------
+# Transport selection: stdio (spawns/owns a subprocess) vs a remote SSE / streamable-HTTP server
+# ------------------------------------------------------------------------------------------------
+
+
+def test_transport_is_stdio_when_command_given() -> None:
+    adapter = McpWorkspaceAdapter(
+        workspace_id="s", origin=_origin("stdio:x", "mcp"), command="python", args=["-m", "srv"]
+    )
+    assert adapter._transport == "stdio"
+
+
+def test_transport_defaults_to_sse_when_url_given() -> None:
+    adapter = McpWorkspaceAdapter(
+        workspace_id="s", origin=_origin("http://h/sse", "mcp"), url="http://h/sse"
+    )
+    assert adapter._transport == "sse"
+
+
+def test_transport_streamable_http_when_requested() -> None:
+    adapter = McpWorkspaceAdapter(
+        workspace_id="s",
+        origin=_origin("http://h/mcp", "mcp"),
+        url="http://h/mcp",
+        transport="streamable-http",
+    )
+    assert adapter._transport == "streamable-http"
+
+
+def test_transport_requires_a_source() -> None:
+    with pytest.raises(ValueError, match="needs a transport"):
+        McpWorkspaceAdapter(workspace_id="s", origin=_origin("x", "mcp"))
+
+
+async def test_sse_transport_connects_to_the_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, str] = {}
+
+    @asynccontextmanager
+    async def fake_sse(url: str) -> AsyncIterator[tuple[str, str]]:
+        seen["url"] = url
+        yield ("read", "write")
+
+    monkeypatch.setattr("sora.adapters.mcp.sse_client", fake_sse)
+    adapter = McpWorkspaceAdapter(
+        workspace_id="s", origin=_origin("http://remote/sse", "mcp"), url="http://remote/sse"
+    )
+    async with adapter._open_transport() as streams:
+        assert streams == ("read", "write")
+    assert seen["url"] == "http://remote/sse"  # connected to the existing server, nothing spawned
+
+
+async def test_streamable_http_transport_drops_the_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def fake_http(url: str) -> AsyncIterator[tuple[str, str, str]]:
+        yield ("read", "write", "session-id-callback")  # streamable-http yields a 3rd element
+
+    monkeypatch.setattr("sora.adapters.mcp.streamablehttp_client", fake_http)
+    adapter = McpWorkspaceAdapter(
+        workspace_id="s",
+        origin=_origin("http://remote/mcp", "mcp"),
+        url="http://remote/mcp",
+        transport="streamable-http",
+    )
+    async with adapter._open_transport() as streams:
+        assert streams == ("read", "write")  # the session-id element is dropped for ClientSession
+
+
+# ------------------------------------------------------------------------------------------------
+# adapter_for wiring: agent.yaml chooses stdio vs remote by what the workspace entry carries
+# ------------------------------------------------------------------------------------------------
+
+
+def test_adapter_for_remote_url_needs_no_command() -> None:
+    from sora.bootstrap import adapter_for
+
+    origin, adapter = adapter_for(
+        {"origin": {"adapter": "mcp", "address": "http://host:8080/sse"}, "workspace_id": "remote"}
+    )
+    assert isinstance(adapter, McpWorkspaceAdapter)
+    assert adapter._transport == "sse"  # remote, no subprocess deployed
+
+
+def test_adapter_for_remote_transport_passthrough() -> None:
+    from sora.bootstrap import adapter_for
+
+    _origin_, adapter = adapter_for(
+        {
+            "origin": {"adapter": "are-mcp", "address": "http://host/mcp"},
+            "workspace_id": "remote",
+            "transport": "streamable-http",
+        }
+    )
+    assert isinstance(adapter, AreMcpWorkspaceAdapter)
+    assert adapter._transport == "streamable-http"
+
+
+def test_adapter_for_stdio_still_spawns_a_command() -> None:
+    from sora.bootstrap import adapter_for
+
+    _origin_, adapter = adapter_for(
+        {
+            "origin": {"adapter": "mcp", "address": "stdio:local"},
+            "workspace_id": "local",
+            "command": "python",
+            "args": ["-m", "srv"],
+        }
+    )
+    assert isinstance(adapter, McpWorkspaceAdapter)
+    assert adapter._transport == "stdio"

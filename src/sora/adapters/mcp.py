@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import ResourceUpdatedNotification, ServerNotification, TextContent
 
 from sora.manual import (
@@ -91,24 +93,49 @@ class _ToolBlueprint:
 
 class McpWorkspaceAdapter:
     """Directly usable for vanilla MCP; a base for curating adapters. One instance is config-scoped
-    to exactly one workspace (see ``WorkspaceAdapter.discover``)."""
+    to exactly one workspace (see ``WorkspaceAdapter.discover``).
+
+    Connects over any MCP transport: ``command``/``args`` spawns and owns a local **stdio**
+    subprocess, while ``url`` connects to an **already-running remote** server (**SSE** by default,
+    or **streamable-HTTP** via ``transport="streamable-http"``) — nothing is deployed in that case.
+    ``discover``/``connect`` are transport-agnostic; only ``_open_transport`` differs."""
 
     name = "mcp"  # matches WorkspaceOrigin.adapter
 
     def __init__(
         self,
         *,
-        command: str,
-        args: list[str],
         workspace_id: str,
         origin: WorkspaceOrigin,
+        command: str | None = None,
+        args: list[str] | None = None,
         env: dict[str, str] | None = None,
+        url: str | None = None,
+        transport: str | None = None,
         session_factory: McpSessionFactory | None = None,
     ) -> None:
-        self._params = StdioServerParameters(command=command, args=args, env=env)
         self._workspace_id = workspace_id
         self._origin = origin
         self._session_factory = session_factory
+        # Transport selection — exactly one source, resolved once:
+        #   * an injected session_factory wins (tests / a custom transport);
+        #   * else `command` spawns and owns a local stdio subprocess;
+        #   * else `url` connects to an already-running remote server — SSE by default, or
+        #     streamable-HTTP (`transport="streamable-http"`).
+        self._url = url
+        self._params: StdioServerParameters | None = None
+        if session_factory is not None:
+            self._transport = "custom"
+        elif command is not None:
+            self._transport = "stdio"
+            self._params = StdioServerParameters(command=command, args=args or [], env=env)
+        elif url is not None:
+            self._transport = transport or "sse"
+        else:
+            raise ValueError(
+                "McpWorkspaceAdapter needs a transport: `command` (stdio), `url` (sse / "
+                "streamable-http), or an injected `session_factory`"
+            )
 
     # -- WorkspaceAdapter Protocol -------------------------------------------------------------
 
@@ -215,10 +242,30 @@ class McpWorkspaceAdapter:
             ):
                 await on_update(str(message.root.params.uri))
 
-        async with stdio_client(self._params) as (read, write):
+        async with self._open_transport() as (read, write):
             async with ClientSession(read, write, message_handler=message_handler) as session:
                 await session.initialize()
                 yield session
+
+    def _open_transport(self) -> AbstractAsyncContextManager[Any]:
+        """The chosen transport's read/write stream pair. stdio spawns/owns a subprocess; sse and
+        streamable-http connect to an already-running server at ``self._url`` (streamable-http
+        yields a third session-id element the client protocol doesn't need, so it's dropped)."""
+        if self._transport == "stdio":
+            assert self._params is not None
+            return stdio_client(self._params)
+        if self._transport == "sse":
+            assert self._url is not None
+            return sse_client(self._url)
+        if self._transport == "streamable-http":
+            assert self._url is not None
+            return self._http_streams(self._url)
+        raise ValueError(f"unknown MCP transport {self._transport!r}")
+
+    @asynccontextmanager
+    async def _http_streams(self, url: str) -> AsyncIterator[tuple[Any, Any]]:
+        async with streamablehttp_client(url) as (read, write, _get_session_id):
+            yield read, write
 
     def _derive_tool_id(self, seed: str) -> str:
         # ADR-0014: globally unique, adapter-derived, deterministic. MCP gives no per-tool global

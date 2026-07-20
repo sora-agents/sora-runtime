@@ -139,8 +139,13 @@ def backend_for(spec: str) -> MemoryBackend:
 def adapter_for(entry: dict[str, Any]) -> tuple[WorkspaceOrigin, WorkspaceAdapter]:
     """Build one workspace's ``(origin, adapter)`` from its agent.yaml entry. Dispatch is on
     ``origin.adapter``. Adapter SDKs are optional extras, so their imports are lazy (importing
-    bootstrap must not require the ``mcp`` extra). The ``fake`` kind — plus any custom adapter — is
-    an escape hatch: name a factory ``(origin) -> WorkspaceAdapter`` via ``factory:`` and it's
+    bootstrap must not require the ``mcp`` extra).
+
+    For ``mcp``/``are-mcp`` the *transport* is chosen by what the entry carries: a ``command``
+    (with ``args``) spawns and owns a local **stdio** subprocess; otherwise ``origin.address`` is
+    the URL of an **already-running remote** server (SSE by default, or streamable-HTTP via
+    ``transport: streamable-http``) and nothing is deployed. The ``fake`` kind — plus any custom
+    adapter — is an escape hatch: name a factory ``(origin) -> WorkspaceAdapter`` via ``factory:``
     resolved through ``import_object`` (the test/showcase seam)."""
     origin = WorkspaceOrigin(**entry["origin"])
     kind = origin.adapter
@@ -149,12 +154,20 @@ def adapter_for(entry: dict[str, Any]) -> tuple[WorkspaceOrigin, WorkspaceAdapte
             from sora.adapters.mcp import McpWorkspaceAdapter as _Adapter
         else:
             from sora.adapters.are_mcp import AreMcpWorkspaceAdapter as _Adapter
+        if "command" in entry:  # local stdio subprocess the adapter owns
+            return origin, _Adapter(
+                workspace_id=entry["workspace_id"],
+                origin=origin,
+                command=entry["command"],
+                args=list(entry.get("args", [])),
+                env=entry.get("env"),
+            )
+        # remote: connect to an already-running server at origin.address
         return origin, _Adapter(
-            command=entry["command"],
-            args=list(entry["args"]),
             workspace_id=entry["workspace_id"],
             origin=origin,
-            env=entry.get("env"),
+            url=origin.address,
+            transport=entry.get("transport"),
         )
     if "factory" in entry:
         factory = import_object(entry["factory"])
