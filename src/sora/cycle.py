@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import TYPE_CHECKING
 
+from sora.action import JoinAction
 from sora.activity import ActivityState
 from sora.perception import NotificationQueueSink
 from sora.types import TOOL_ID, WAIT
+
+log = logging.getLogger("sora.cycle")
 
 if TYPE_CHECKING:
     from sora.action import ActionRegistry
@@ -47,6 +52,13 @@ class DecisionCycle:
         # eventually lands as a percept," is why it isn't a WorkingMemory field.
         self.signal_sink: NotificationQueueSink[Signal] = NotificationQueueSink()
         self.result_sink: NotificationQueueSink[OperationAck] = NotificationQueueSink()
+        # Monotonic count of ticks run, for observability (the README's `[cycle N]` trace). Read via
+        # cycle_count; a richer per-phase presenter (the --verbose CLI) is deferred to CLI polish.
+        self._cycle_count = 0
+
+    @property
+    def cycle_count(self) -> int:
+        return self._cycle_count
 
     async def tick(self) -> None:
         """One Observe -> Reflect -> Situate -> Reason -> Act pass, threading a TickResult through
@@ -55,6 +67,8 @@ class DecisionCycle:
         working/semantic/procedural/episodic/communication/registry are all shared with Agent,
         constructed once and passed to both — see sora/bootstrap.py. (Dispatch in _act() uses
         self.registry — the mutation-capable handle — not working.registry, which is read-only.)"""
+        self._cycle_count += 1
+        log.debug("[cycle %d] begin", self._cycle_count)
         result = await self.strategies.observe.observe(self)
         for activity in list(self.working.activities.values()):
             result = await self.strategies.reflect.reflect(activity, self.working, self, result)
@@ -125,6 +139,8 @@ class Agent:
         procedural: ProceduralMemory,
         episodic: EpisodicMemory,
         communication: MessageTransport,
+        *,
+        tick_interval: float = 0.05,
     ) -> None:
         self.cycle = cycle
         self.registry = registry
@@ -133,9 +149,44 @@ class Agent:
         self.procedural = procedural
         self.episodic = episodic
         self.communication = communication
+        # Seconds slept between ticks — the pace at which the agent yields to off-cycle I/O (an
+        # invoke resolving, an inbound message). Small, not zero, so a mostly-idle agent doesn't
+        # busy-spin; tests pass 0 to run the loop as fast as the event loop allows.
+        self._tick_interval = tick_interval
+        self._stopped = False
+        self._started = False
 
     async def run(self) -> None:
-        """Loop: await self.cycle.tick()"""
-        raise NotImplementedError
+        """Join the configured workspaces once (startup), then drive the decision cycle until
+        stop() is called. The join happens here — not in bootstrap — because it is async I/O and
+        bootstrap stays synchronous; it is what makes the configured tools already available on the
+        first cycle. Leaving the workspaces (closing MCP sessions/subprocesses) happens in the
+        finally block, after the loop exits — so there's no race with an in-flight tick, unlike
+        leaving from stop()."""
+        await self._start()
+        try:
+            while not self._stopped:
+                await self.cycle.tick()
+                await asyncio.sleep(self._tick_interval)
+        finally:
+            for workspace in list(self.registry.joined_workspaces()):
+                await self.registry.leave(workspace.id)
 
-    async def stop(self) -> None: ...
+    async def _start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        # Join through the predefined _join_ action (not registry.join directly) so the connection
+        # *and* its persistence — WorkspaceRecord/ToolRecord/manuals into SemanticMemory — happen
+        # together, exactly as a mid-run _join_ would; that's what lets the default Situate's _load_
+        # find each tool's manual, and sets up restore() across runs. activity_id is absorbed (join
+        # doesn't use it). Idempotent: origins already joined are skipped.
+        join = self.cycle.actions.external(JoinAction.name)
+        already_joined = {ws.origin for ws in self.registry.joined_workspaces()}
+        for origin in self.registry.configured_origins():
+            if origin not in already_joined:
+                log.info("startup: joining workspace %s (%s)", origin.address, origin.adapter)
+                await join.execute(self.registry, self.cycle, activity_id="", origin=origin)
+
+    async def stop(self) -> None:
+        self._stopped = True

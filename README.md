@@ -300,6 +300,11 @@ when the variable isn't already set), so it never silently overrides a key you e
         invocation: OperationInvocation
         invoked_at: float
 
+    @dataclass(frozen=True)
+    class CompletedOperation:   # one resolved invocation + its ack — an entry in Activity.history
+        invocation: OperationInvocation   # a later step can ground its params against it: a
+        ack: OperationAck                 # $from reference reads an earlier operation's result here
+
     # sora/environment.py — usage interface + adapters (S-ORA does not author tools, only consumes them)
     class Tool(Protocol):
         id: str               # globally unique, derived from the tool's global address/origin — see ADR-0014
@@ -491,9 +496,12 @@ when the variable isn't already set), so it never silently overrides a key you e
         step_index: int = 0
         pending_operation: PendingOperation | None = None  # set while RUNNING; runtime clears it on resolve
         last_operation: OperationAck | None = None          # most recently resolved result, for Reason to read
-        # context is exclusively for strategy-author data — the runtime itself never writes into it,
-        # which is what keeps pending_operation/last_operation as dedicated fields instead of context
-        # keys with a naming convention: no shared namespace means no collision to avoid in the first place
+        history: list[CompletedOperation] = []              # append-only trace of resolved ops — a later step
+        #                                                     grounds param references against it (see Reason
+        #                                                     grounding); last_operation keeps only the newest
+        # context and is exclusively for strategy-author data — the runtime itself never writes into it,
+        # which is what keeps pending_operation/last_operation as dedicated fields instead of context keys
+        # with a naming convention (no shared namespace means no collision to avoid in the first place)
 
     # sora/action.py — extensible action space
     class InternalAction(Protocol):
@@ -698,14 +706,22 @@ when the variable isn't already set), so it never silently overrides a key you e
         def __call__(self, activity: Activity, tools: dict[str, Manual]) -> tuple[str, str]: ...
         #   default_plan_prompt is the built-in one; PLAN_SYSTEM_PROMPT / render_tools are reusable
         #   pieces a custom PlanPrompt can lean on. The response contract ({"steps":[...]}) stays
-        #   fixed — customize the *prompt*, not the parse.
+        #   fixed — customize the *prompt*, not the parse. PLAN_SYSTEM_PROMPT also tells the model to
+        #   emit a *reference* — {"$from": "<op>", "path": "<dotted path>"} or {"$decide": "..."} —
+        #   for a param whose value depends on an earlier step's result, never a made-up literal.
+
+    class GroundPrompt(Protocol):   # builds ground()'s (system, user) prompt — grounding's counterpart
+        def __call__(self, activity: Activity, operation_name: str, manual: Manual | None,
+                     partial_params: dict) -> tuple[str, str]: ...
+        #   default_ground_prompt is the built-in one; GROUND_SYSTEM_PROMPT / render_history are the
+        #   reusable pieces. Response contract is fixed ({"params": {...}}).
 
     class ProceduralMemory:
         def __init__(self, backend: MemoryBackend, llm: LLMClient | None = None,
-                     prompt: PlanPrompt = default_plan_prompt): ...
-        #   llm is the model behind infer(); None keeps store/retrieve usable with no LLM. prompt is
-        #   the pluggable PlanPrompt — the knob for planning *content* (custom instructions/few-shot/
-        #   rendering).
+                     prompt: PlanPrompt = default_plan_prompt,
+                     ground_prompt: GroundPrompt = default_ground_prompt): ...
+        #   llm is the model behind infer()/ground(); None keeps store/retrieve usable with no LLM.
+        #   prompt / ground_prompt are the knobs for planning / grounding *content*.
         async def retrieve(self, activity: Activity) -> Plan | None:
             """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
             similarity, backend-dependent. Returns the backend's top-ranked match (query() orders
@@ -718,6 +734,14 @@ when the variable isn't already set), so it never silently overrides a key you e
             catalog, passed in by the caller that holds the live registry (a memory module never
             reaches into the environment). Converts the model's JSON answer into Plan/Step (the
             anti-corruption boundary); malformed output raises ValueError. No llm -> raises."""
+        async def ground(self, activity: Activity, operation_name: str, manual: Manual | None,
+                         partial_params: dict) -> dict:
+            """The Reason-phase grounding *escalation*: decide an operation's concrete params from the
+            execution context when a reference can't be resolved mechanically. One LLMClient call over
+            the operation schema + partial params + the activity's history; parses {"params": {...}}
+            (anti-corruption); no llm -> raises. Packaged here (like infer) because procedural memory
+            owns the model handle; grounding a step is really an Act-adjacent reasoning act — see
+            ADR-0017. (The mechanical reference resolver lives in Reason, not here.)"""
         async def store(self, plan: Plan) -> None:
             """Persists a Plan that was actually followed to completion, so future retrieve() calls for
             similar goals can reuse it. Called by ReflectStrategy on success only — a failed plan isn't
@@ -801,19 +825,22 @@ when the variable isn't already set), so it never silently overrides a key you e
             already set and still valid, just read activity.plan.steps[activity.step_index] and advance
             the index — no model call. Otherwise, retrieve a cached Plan via cycle.procedural.retrieve()
             or infer a new one (the expensive path), reset step_index to 0, and use its first Step.
-            Deciding when a plan counts as invalidated is entirely up to the implementation. May
-            additionally fill in invocation, short-circuiting Act — this is where the historical 'tool
-            hallucination' risk lives if it does."""
+            Deciding when a plan counts as invalidated is entirely up to the implementation. Also
+            *grounds* the step: a param whose value depends on an earlier result is a reference the
+            default resolves against activity.history, escalating to cycle.procedural.ground() only
+            when it can't be resolved mechanically — deciding a value is reasoning, so it lives here
+            (ADR-0017). May additionally fill in invocation, short-circuiting Act — this is where the
+            historical 'tool hallucination' risk lives if it does."""
 
     class ActStrategy(Protocol):
         async def bind(self, step: Step, manual: Manual | None, cycle: DecisionCycle,
                         result: TickResult) -> TickResult:
-            """Only called if result.invocation is still None. This is *parameter binding*: grounding
-            an abstract Step into a concrete, schema-conformant OperationInvocation (the tool-
-            hallucination-prone step). Distinct from a *protocol binding* (WoT forms/security, an MCP
-            session) — how the adapter's Tool reaches the instance, never surfaced here (ADR-0015).
-            `cycle` is available for implementations that cache bindings (e.g. belief-state -> params)
-            rather than re-deriving one every time."""
+            """Only called if result.invocation is still None. *Parameter binding*: split an invoke
+            Step's routing keys from its (by now already-grounded) params into a concrete
+            OperationInvocation. Mechanistic — deciding param *values* is Reason's grounding, not
+            Act's (ADR-0017). Distinct from a *protocol binding* (WoT forms/security, an MCP session)
+            — how the adapter's Tool reaches the instance, never surfaced here (ADR-0015). `cycle` is
+            available for implementations that cache bindings rather than re-deriving one each time."""
 
     @dataclass(frozen=True)
     class Strategies:          # bundles the five, so DecisionCycle.__init__ doesn't take five loose params
@@ -879,7 +906,14 @@ when the variable isn't already set), so it never silently overrides a key you e
     # sora/transport.py
     class MessageTransport(Protocol): # pluggable: A2A, HTTP, in-process
         async def send(self, to: str, content: dict) -> None: ...
-        async def receive(self) -> AsyncIterator[Message]: ...
+        def receive(self) -> AsyncIterator[Message]: ...   # non-async: returns an async generator
+
+    class InProcessTransport:
+        """The single-agent default: an in-process inbox, no network. receive() drains what's queued
+        now; whoever holds the agent (CLI/showcase/test) delivers inbound goals via submit(). 
+        send() records outbound content. A peer-to-peer transport (A2A/HTTP, transport.peers) is the 
+        multi-agent case."""
+        def submit(self, message: Message) -> None: ...
 
     # sora/cycle.py
     class DecisionCycle:
@@ -947,9 +981,13 @@ when the variable isn't already set), so it never silently overrides a key you e
         def __init__(self, cycle: DecisionCycle, registry: EnvironmentRegistry,
                      working: WorkingMemory, semantic: SemanticMemory,
                      procedural: ProceduralMemory, episodic: EpisodicMemory,
-                     communication: MessageTransport): ...
+                     communication: MessageTransport, *, tick_interval: float = 0.05): ...
         async def run(self) -> None:
-            """Loop: await self.cycle.tick() — tick() holds everything it needs (shared instances)."""
+            """Join the configured workspaces once at startup (through the _join_ action, so records/
+            manuals persist and the tools are already available on the first cycle — README's
+            'joined automatically at startup'), then loop await self.cycle.tick() until stop(),
+            leaving the workspaces finally. The join lives here, not in the synchronous
+            bootstrap, because it is async I/O."""
         async def stop(self) -> None: ...
 
     # sora/cli.py — the runtime's minimal terminal interface
@@ -960,25 +998,45 @@ when the variable isn't already set), so it never silently overrides a key you e
         async def run(self) -> None: ...
 
     # sora/bootstrap.py — internal; developers implement protocols, they don't call this directly
+    @dataclass(frozen=True)
+    class AgentConfig:
+        """The parsed agent.yaml `agent:` block. strategies/memory are dotted-path / URI maps
+        resolved during build_agent; workspaces is the raw list (each entry: an `origin` plus
+        adapter-specific keys like command/args); llm is optional (absent -> no model)."""
+        name: str
+        strategies: dict[str, str]
+        memory: dict[str, str]
+        workspaces: list[dict]
+        transport: dict | None = None
+        llm: dict | None = None
+
+    def import_object(path: str) -> Any: ...        # resolve a dotted (pkg.mod.Attr) / module:attr path
+    def load_yaml(config_path: str) -> AgentConfig: ...  # parse agent.yaml; require strategies.reason
+    def backend_for(spec: str) -> MemoryBackend: ...     # file://<path> (or bare path) -> FileMemoryBackend
+    def adapter_for(entry: dict) -> tuple[WorkspaceOrigin, WorkspaceAdapter]: ...  # dispatch on origin.adapter
+    def llm_for(config: AgentConfig) -> LLMClient | None: ...  # the llm: block -> a client, else None
+    def transport_for(config: AgentConfig) -> MessageTransport: ...  # InProcessTransport (peers -> raise)
+
     def build_agent(config_path: str) -> Agent:
         """What `sora run` calls before handing off to TerminalSession. This is the one place all the
         wiring (which memory backend, which transport, which adapters, DecisionCycle <-> Agent sharing
-        the same instances) actually happens — a developer implementing an agent never writes this."""
-        load_dotenv()   # convenience: pick up ANTHROPIC_API_KEY etc. from a local .env if present
+        the same instances) actually happens — a developer implementing an agent never writes this.
+        Stays synchronous: the async startup join runs in Agent.run()."""
+        load_dotenv()   # convenience for development
         config = load_yaml(config_path)
-        adapters = {WorkspaceOrigin(**w["origin"]): adapter_for(w["origin"]) for w in config.workspaces}
+        adapters = dict(adapter_for(entry) for entry in config.workspaces)
         registry = EnvironmentRegistry(adapters=adapters)   # the single shared instance...
         working = WorkingMemory(registry=registry)          # ...held here read-only as EnvironmentView
-        semantic = SemanticMemory(backend_for(config.memory.semantic))
-        procedural = ProceduralMemory(backend_for(config.memory.procedural))
-        episodic = EpisodicMemory(backend_for(config.memory.episodic))
-        communication = HttpTransport(self=config.transport.self, peers=config.transport.peers)
+        semantic = SemanticMemory(backend_for(config.memory["semantic"]))
+        procedural = ProceduralMemory(backend_for(config.memory["procedural"]), llm=llm_for(config))
+        episodic = EpisodicMemory(backend_for(config.memory["episodic"]))
+        communication = transport_for(config)
         strategies = Strategies(
-            observe=import_object(config.strategies.get("observe", "sora.observe.default"))(),
-            reflect=import_object(config.strategies.get("reflect", "sora.reflect.default"))(),
-            situate=import_object(config.strategies.get("situate", "sora.situate.default"))(),
-            reason=import_object(config.strategies["reason"])(),   # the one most agents actually override
-            act=import_object(config.strategies.get("act", "sora.act.default"))(),
+            observe=import_object(config.strategies.get("observe", "sora.strategies.DefaultObserveStrategy"))(),
+            reflect=import_object(config.strategies.get("reflect", "sora.strategies.DefaultReflectStrategy"))(),
+            situate=import_object(config.strategies.get("situate", "sora.strategies.DefaultSituateStrategy"))(),
+            reason=import_object(config.strategies["reason"])(),   # required — Reason has no default
+            act=import_object(config.strategies.get("act", "sora.strategies.DefaultActStrategy"))(),
         )
 
         cycle = DecisionCycle(strategies=strategies, communication=communication,

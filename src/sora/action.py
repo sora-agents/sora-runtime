@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Protocol
@@ -22,6 +23,8 @@ from sora.types import (
 if TYPE_CHECKING:
     from sora.cycle import DecisionCycle
     from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
+
+log = logging.getLogger("sora.action")
 
 
 class InternalAction(Protocol):
@@ -104,6 +107,7 @@ class InvokeAction:  # predefined external action: _invoke_
             id=invocation_id, invocation=invocation, invoked_at=time.time()
         )
         activity.state = ActivityState.RUNNING  # implicit, unconditional — see Activities
+        log.info("act: invoke %s.%s%s", tool_id, operation_name, f" {params}" if params else "")
         task = asyncio.create_task(self._call(cycle, tool, operation_name, params, invocation_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -204,13 +208,9 @@ class JoinAction:  # predefined external action: _join_ — implies discover/con
         # workspace_id addresses it (for a later _leave_); tool_ids are a self-contained snapshot
         # of what was gained, legible after leave / across an agent boundary (see EXAMPLES.md).
         # the snapshot is useful for logging, e.g. saving an episode to memory
-        return ActionAck(
-            ok=True,
-            result={
-                "workspace_id": workspace.id,
-                "tool_ids": [tool.id for tool in workspace.tools()],
-            },
-        )
+        tool_ids = [tool.id for tool in workspace.tools()]
+        log.info("joined workspace %s (tools: %s)", workspace.id, ", ".join(tool_ids))
+        return ActionAck(ok=True, result={"workspace_id": workspace.id, "tool_ids": tool_ids})
 
 
 class LeaveAction:  # predefined external action: _leave_ — implies close
@@ -263,6 +263,7 @@ class CreateActivityAction:  # predefined internal action: _create_activity_
             context=kwargs.get("context") or {},
         )
         cycle.working.activities[activity.id] = activity
+        log.info("situate: created activity %s from goal %r", activity.id, activity.goal)
         return activity
 
 

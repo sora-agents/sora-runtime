@@ -1,10 +1,14 @@
-"""Tests for bootstrap's ``.env`` convenience loader.
+"""Tests for bootstrap's ``.env`` convenience loader and config-wiring helpers.
 
 ``load_dotenv`` picks up a local ``.env`` (e.g. ``ANTHROPIC_API_KEY``) into the environment without
 an explicit ``export`` — called first by ``build_agent`` so a model-backed agent finds credentials.
 The one invariant that matters for correctness: **real environment variables always win** over the
 file. Each test isolates ``os.environ`` (a per-test copy via monkeypatch) so the loader's writes
 don't leak across tests.
+
+The rest of this module pins the small pure helpers ``build_agent`` is assembled from —
+``import_object``, ``load_yaml``, ``backend_for``, ``adapter_for``, ``llm_for``, ``transport_for`` —
+independently of the full wiring (which ``test_build_agent.py`` covers).
 """
 
 from __future__ import annotations
@@ -14,7 +18,20 @@ from pathlib import Path
 
 import pytest
 
-from sora.bootstrap import load_dotenv
+from sora.bootstrap import (
+    AgentConfig,
+    adapter_for,
+    backend_for,
+    import_object,
+    llm_for,
+    load_dotenv,
+    load_yaml,
+    transport_for,
+)
+from sora.environment import WorkspaceOrigin
+from sora.memory import FileMemoryBackend
+from sora.strategies import DefaultReasonStrategy
+from sora.transport import InProcessTransport
 
 
 @pytest.fixture
@@ -67,3 +84,141 @@ def test_load_dotenv_ignores_comments_blanks_and_normalizes(
     assert os.environ["SORA_B"] == "exported"
     assert os.environ["SORA_C"] == "single-quoted"
     assert os.environ["SORA_D"] == "has=equals=signs"
+
+
+# --------------------------------------------------------------------------------------------------
+# import_object — both dotted-path forms
+# --------------------------------------------------------------------------------------------------
+
+
+def test_import_object_resolves_dotted_and_colon_forms() -> None:
+    assert import_object("sora.strategies.DefaultReasonStrategy") is DefaultReasonStrategy
+    assert import_object("sora.strategies:DefaultReasonStrategy") is DefaultReasonStrategy
+
+
+def test_import_object_rejects_bare_name() -> None:
+    with pytest.raises(ValueError, match="dotted import path"):
+        import_object("DefaultReasonStrategy")
+
+
+def test_import_object_missing_attribute_raises() -> None:
+    with pytest.raises(AttributeError):
+        import_object("sora.strategies.NoSuchStrategy")
+
+
+# --------------------------------------------------------------------------------------------------
+# load_yaml — parse the `agent:` block, require `reason`
+# --------------------------------------------------------------------------------------------------
+
+
+def _write_yaml(tmp_path: Path, body: str) -> Path:
+    p = tmp_path / "agent.yaml"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_load_yaml_parses_agent_block(tmp_path: Path) -> None:
+    config = load_yaml(
+        _write_yaml(
+            tmp_path,
+            "agent:\n"
+            "  name: demo\n"
+            "  strategies:\n"
+            "    reason: sora.strategies.DefaultReasonStrategy\n"
+            "  memory:\n"
+            "    semantic: file://./s\n"
+            "  workspaces: []\n"
+            "  llm:\n"
+            "    model: claude-opus-4-8\n",
+        )
+    )
+    assert config.name == "demo"
+    assert config.strategies["reason"] == "sora.strategies.DefaultReasonStrategy"
+    assert config.memory["semantic"] == "file://./s"
+    assert config.workspaces == []
+    assert config.llm == {"model": "claude-opus-4-8"}
+
+
+def test_load_yaml_requires_reason_strategy(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="strategies.reason is required"):
+        load_yaml(_write_yaml(tmp_path, "agent:\n  name: demo\n  strategies: {}\n"))
+
+
+# --------------------------------------------------------------------------------------------------
+# backend_for
+# --------------------------------------------------------------------------------------------------
+
+
+def test_backend_for_file_uri_and_bare_path() -> None:
+    assert isinstance(backend_for("file:///tmp/x"), FileMemoryBackend)
+    assert isinstance(backend_for("/tmp/x"), FileMemoryBackend)
+
+
+def test_backend_for_empty_path_raises() -> None:
+    with pytest.raises(ValueError, match="empty memory backend path"):
+        backend_for("file://")
+
+
+# --------------------------------------------------------------------------------------------------
+# adapter_for — dispatch on origin.adapter, factory escape hatch
+# --------------------------------------------------------------------------------------------------
+
+
+def _fake_adapter_factory(origin: WorkspaceOrigin) -> object:
+    from fakes import FakeAdapter, FakeWorkspace
+
+    return FakeAdapter("fake", FakeWorkspace("ws", origin, []))
+
+
+def test_adapter_for_resolves_factory() -> None:
+    origin, adapter = adapter_for(
+        {
+            "origin": {"adapter": "fake", "address": "fake://ws"},
+            "factory": "test_bootstrap._fake_adapter_factory",
+        }
+    )
+    assert origin == WorkspaceOrigin(adapter="fake", address="fake://ws")
+    assert adapter.name == "fake"
+
+
+def test_adapter_for_unknown_adapter_without_factory_raises() -> None:
+    with pytest.raises(ValueError, match="no adapter for"):
+        adapter_for({"origin": {"adapter": "carrier-pigeon", "address": "x"}})
+
+
+# --------------------------------------------------------------------------------------------------
+# llm_for / transport_for
+# --------------------------------------------------------------------------------------------------
+
+
+def _config(
+    *, llm: dict[str, object] | None = None, transport: dict[str, object] | None = None
+) -> AgentConfig:
+    return AgentConfig(
+        name="demo",
+        strategies={"reason": "sora.strategies.DefaultReasonStrategy"},
+        memory={},
+        workspaces=[],
+        transport=transport,
+        llm=llm,
+    )
+
+
+def test_llm_for_absent_block_is_none() -> None:
+    assert llm_for(_config(llm=None)) is None
+
+
+def test_llm_for_builds_named_client_with_kwargs() -> None:
+    from fakes import FakeLLMClient
+
+    client = llm_for(_config(llm={"client": "fakes.FakeLLMClient", "response": "hi"}))
+    assert isinstance(client, FakeLLMClient)
+
+
+def test_transport_for_defaults_to_in_process() -> None:
+    assert isinstance(transport_for(_config()), InProcessTransport)
+
+
+def test_transport_for_rejects_peers() -> None:
+    with pytest.raises(NotImplementedError, match="agent-to-agent"):
+        transport_for(_config(transport={"peers": {"other": "http://x"}}))

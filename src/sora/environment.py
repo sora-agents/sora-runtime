@@ -118,6 +118,12 @@ class EnvironmentRegistry:
     def joined_workspaces(self) -> list[Workspace]:  # the live joined set (EnvironmentView)
         return list(self._workspaces.values())
 
+    def configured_origins(self) -> list[WorkspaceOrigin]:
+        """The origins this registry has an adapter for — i.e. the workspaces declared in
+        agent.yaml. Agent.run() joins these at startup (before the first cycle). Not part of the
+        read-only EnvironmentView (a strategy reasons over what's *joined*, not configured)."""
+        return list(self._adapters)
+
     async def join(self, origin: WorkspaceOrigin) -> Workspace:
         """Predefined external action _join_: looks up the adapter registered for this exact origin,
         calls its discover() (config-scoped to just this target today), registers the workspace."""

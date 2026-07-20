@@ -15,7 +15,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Typing :: Typed",
 ]
-dependencies = []
+# Config loading (agent.yaml) is core runtime function, so PyYAML is a core dependency — the
+# "dependency-light core" invariant is about *provider* SDKs (MCP/LLM), which stay optional extras.
+dependencies = ["pyyaml>=6"]
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
@@ -31,6 +33,7 @@ dev = [
     "mypy>=1.11",
     "ruff>=0.7",
     "pre-commit>=4.0",
+    "types-PyYAML>=6",
 ]
 
 # Spike only: the ARE MCP server the walking-skeleton integration test drives.
