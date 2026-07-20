@@ -61,7 +61,7 @@ packages = ["src/sora"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "examples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "ASYNC"]
@@ -72,11 +72,22 @@ quote-style = "double"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src/sora", "tests"]
+files = ["src/sora", "tests", "examples"]
+
+# ARE (meta-agents-research-environments) is an optional, untyped dependency-group (not installed in
+# CI), used only by the skip-gated integration tests and the gaia2 showcase's seeded MCP launcher.
+# Treat its imports as Any so those files type-check without the package present.
+[[tool.mypy.overrides]]
+module = "are.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Repo root on sys.path so the `examples.*` showcase packages import by their dotted path — both
+# directly (the deterministic reproduction test reuses the example's strategy) and via bootstrap's
+# import_object (the skip-gated real-ARE test builds the agent from examples/.../agent.yaml).
+pythonpath = ["."]
 # Integration tests (they spawn a real external server, e.g. ARE's MCP server) are opt-in: excluded
 # from the default run, and skip in CI anyway since the `are` dependency-group isn't installed there.
 # Run them explicitly with `uv run pytest -m integration` (needs `uv sync --all-extras --group are`).

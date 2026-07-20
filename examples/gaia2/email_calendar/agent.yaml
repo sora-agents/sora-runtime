@@ -1,0 +1,33 @@
+# Gaia2 email/calendar showcase — schedule a meeting from an email and reply.
+#
+# Run on demand against real ARE apps + real Claude:
+#     uv sync --all-extras --group are        # installs the ARE package + the llm/mcp extras
+#     export ANTHROPIC_API_KEY=sk-ant-...      # or put it in a .gitignored .env
+#     uv run python -m examples.gaia2.email_calendar.run   # run from the repo root
+#
+# The workspace is served by our own *seeded* ARE MCP launcher (are_server.py): the stock ARE MCP
+# server starts apps empty (emails/tasks are delivered by the simulation's event timeline, which the
+# MCP server doesn't run), so we seed an inbox email from Alice directly and serve the live apps over
+# stdio. That's why `list_emails` returns a real email with a real id for the agent to reply to.
+agent:
+  name: gaia2-email-calendar
+  strategies:
+    # The one custom strategy: model-backed planning (the runtime default) + signal-driven replan.
+    reason: examples.gaia2.email_calendar.ScheduleFromEmailStrategy
+  memory:
+    # File-backed so a followed plan persists and is reused across runs (procedural memory).
+    semantic: file://./.sora/memory/semantic
+    procedural: file://./.sora/memory/procedural
+    episodic: file://./.sora/memory/episodic
+  llm:
+    # model id is config (swap freely); the API key stays in the environment, never here.
+    model: claude-opus-4-8
+  workspaces:
+    - origin: { adapter: are-mcp, address: "stdio:are-email-calendar" }
+      workspace_id: are
+      # `python -m examples...are_server` runs from the repo root (so `examples` is importable) and
+      # resolves to the project venv (so `are.simulation` is importable) under `uv run`.
+      command: python
+      args:
+        - -m
+        - examples.gaia2.email_calendar.are_server
