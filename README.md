@@ -479,11 +479,23 @@ when the variable isn't already set), so it never silently overrides a key you e
         def section(self, name: str) -> str | None: ...   # lazy `#`-section slice of raw_text
 
     class ManualParser(Protocol):     # Markdown by default, XML pluggable
-        def parse(self, raw: str) -> Manual: ...
+        def parse(self, raw: str) -> Manual: ...   # Manual envelope; also lifts an optional per-section
+                                                   #   ```yaml interface block (names + required) if present
 
     class ManualParseError(ValueError): ...   # e.g. a manual with no derivable id
     class MarkdownManualParser:               # the default ManualParser (clean Markdown format)
         def parse(self, raw: str) -> Manual: ...   # yields a Manual envelope (raw_text; specs empty)
+
+    class ManualMergeError(ValueError): ...   # ids mismatch, or authored interface diverges from adapter's
+    # Reconcile a Manual's two provenance channels by id (ADR-0018): adapter owns the structured specs
+    # + JSON Schema, authored Markdown owns raw_text/description; validates a declared authored interface.
+    def merge_manuals(adapter: Manual, authored: Manual) -> Manual: ...
+
+    class ManualSource(Protocol):     # resolve a Manual.id to a hand-authored Manual (adapter pairing seam)
+        async def get(self, manual_id: str) -> Manual | None: ...
+    class DirectoryManualSource:      # the default ManualSource: *.md in a dir, indexed by parsed Manual.id
+        def __init__(self, root, parser: ManualParser | None = None) -> None: ...
+        async def get(self, manual_id: str) -> Manual | None: ...
 
     @dataclass(frozen=True)
     class WorkspaceRecord:

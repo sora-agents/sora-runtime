@@ -186,6 +186,33 @@ def test_adapter_for_unknown_adapter_without_factory_raises() -> None:
         adapter_for({"origin": {"adapter": "carrier-pigeon", "address": "x"}})
 
 
+def test_adapter_for_wires_manual_source_from_manuals_dir(tmp_path: Path) -> None:
+    from sora.manual import DirectoryManualSource
+
+    _origin_, adapter = adapter_for(
+        {
+            "origin": {"adapter": "mcp", "address": "stdio:local"},
+            "workspace_id": "local",
+            "command": "python",
+            "args": ["-m", "srv"],
+            "manuals": str(tmp_path),
+        }
+    )
+    assert isinstance(adapter._manual_source, DirectoryManualSource)  # type: ignore[attr-defined]
+
+
+def test_adapter_for_without_manuals_key_has_no_manual_source() -> None:
+    _origin_, adapter = adapter_for(
+        {
+            "origin": {"adapter": "mcp", "address": "stdio:local"},
+            "workspace_id": "local",
+            "command": "python",
+            "args": ["-m", "srv"],
+        }
+    )
+    assert adapter._manual_source is None  # type: ignore[attr-defined]
+
+
 # --------------------------------------------------------------------------------------------------
 # llm_for / transport_for
 # --------------------------------------------------------------------------------------------------

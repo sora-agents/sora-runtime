@@ -32,9 +32,11 @@ from mcp.types import ResourceUpdatedNotification, ServerNotification, TextConte
 
 from sora.manual import (
     Manual,
+    ManualSource,
     ObservablePropertySpecification,
     OperationSpecification,
     SignalSpecification,
+    merge_manuals,
 )
 from sora.types import ObservableProperty, OperationAck, Signal
 
@@ -113,10 +115,12 @@ class McpWorkspaceAdapter:
         url: str | None = None,
         transport: str | None = None,
         session_factory: McpSessionFactory | None = None,
+        manual_source: ManualSource | None = None,
     ) -> None:
         self._workspace_id = workspace_id
         self._origin = origin
         self._session_factory = session_factory
+        self._manual_source = manual_source
         # Transport selection — exactly one source, resolved once:
         #   * an injected session_factory wins (tests / a custom transport);
         #   * else `command` spawns and owns a local stdio subprocess;
@@ -144,7 +148,9 @@ class McpWorkspaceAdapter:
         stack = AsyncExitStack()
         session = await stack.enter_async_context(self._open(router))
         listed = await session.list_tools()
-        tools = [self._build_tool(bp, session, router) for bp in self._group(list(listed.tools))]
+        tools = [
+            await self._build_tool(bp, session, router) for bp in self._group(list(listed.tools))
+        ]
         return [_McpWorkspace(self._workspace_id, self._origin, tools, stack)]
 
     async def connect(
@@ -273,16 +279,27 @@ class McpWorkspaceAdapter:
         # records rebuild the same id, keeping restore() valid.
         return f"{self._origin.address}/{seed}"
 
-    def _build_tool(
+    async def _build_tool(
         self, blueprint: _ToolBlueprint, session: McpSession, router: _SignalRouter
     ) -> Tool:
+        manual = self._synth_manual(blueprint, self._observable_bindings(blueprint.seed))
         return self._make_tool(
             tool_id=self._derive_tool_id(blueprint.seed),
             seed=blueprint.seed,
-            manual=self._synth_manual(blueprint, self._observable_bindings(blueprint.seed)),
+            manual=await self._paired_manual(blueprint.manual_id, manual),
             session=session,
             router=router,
         )
+
+    async def _paired_manual(self, manual_id: str, adapter_manual: Manual) -> Manual:
+        """Pair the adapter-synthesized manual with a hand-authored one for the same id, if
+        ``manual_source`` resolves one (ADR-0018). No source, or no authored manual for this id ->
+        the adapter manual alone, unchanged. The merged manual is what the tool carries and Join
+        persists, so ``connect()`` rebuilds from it with no re-pairing."""
+        if self._manual_source is None:
+            return adapter_manual
+        authored = await self._manual_source.get(manual_id)
+        return adapter_manual if authored is None else merge_manuals(adapter_manual, authored)
 
     def _make_tool(
         self,

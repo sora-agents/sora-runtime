@@ -21,7 +21,17 @@ from pathlib import Path
 
 import pytest
 
-from sora.manual import ManualParseError, ManualSection, MarkdownManualParser
+from sora.manual import (
+    DirectoryManualSource,
+    Manual,
+    ManualMergeError,
+    ManualParseError,
+    ManualSection,
+    MarkdownManualParser,
+    ObservablePropertySpecification,
+    OperationSpecification,
+    merge_manuals,
+)
 
 MANUALS = Path(__file__).parent / "fixtures" / "manuals"
 
@@ -132,3 +142,249 @@ def test_all_clean_fixtures_parse_to_envelopes() -> None:
         assert isinstance(m.id, str) and m.id
         assert m.raw_text == raw
         assert m.description  # every fixture has a Functional Description
+
+
+# ------------------------------------------------------------------------------------------------
+# Authored interface block (ADR-0018) — an optional per-section fenced ```yaml block declaring
+# names-level structure (operation/property/signal names + their required keys), lifted into the
+# structured spec fields the adapter channel otherwise owns exclusively.
+# ------------------------------------------------------------------------------------------------
+_INTERFACE_MANUAL = """# Tool Metadata
+id: thermostat
+
+# Functional Description
+Controls ambient temperature.
+
+# Observable Properties
+```yaml
+- name: temperature
+  required: [unit]
+```
+- temperature (integer): current reading in the configured unit.
+
+# Signals
+(none)
+
+# Operations
+```yaml
+- name: set_temperature
+  required: [value]
+- name: set_mode
+```
+- set_temperature(value): sets the target temperature.
+- set_mode(mode): switches operating mode.
+
+# Usage Protocols & Safety
+No special precautions.
+"""
+
+
+def test_interface_block_lifts_operation_names_and_required_keys() -> None:
+    m = MarkdownManualParser().parse(_INTERFACE_MANUAL)
+    ops = {op.name: op.parameters for op in m.operations}
+    assert set(ops) == {"set_temperature", "set_mode"}
+    assert ops["set_temperature"] == {"properties": {"value": {}}, "required": ["value"]}
+    assert ops["set_mode"] == {"properties": {}, "required": []}
+
+
+def test_interface_block_lifts_observable_property_names_and_required_keys() -> None:
+    m = MarkdownManualParser().parse(_INTERFACE_MANUAL)
+    assert [p.name for p in m.observable_properties] == ["temperature"]
+    assert m.observable_properties[0].schema == {"properties": {"unit": {}}, "required": ["unit"]}
+
+
+def test_signals_section_without_a_block_stays_empty() -> None:
+    m = MarkdownManualParser().parse(_INTERFACE_MANUAL)
+    assert m.signals == []  # "(none)" prose, no fenced block
+
+
+def test_no_interface_block_leaves_structured_specs_empty() -> None:
+    m = MarkdownManualParser().parse(load("water-pump.md"))  # no fenced yaml block in this fixture
+    assert m.operations == []
+    assert m.observable_properties == []
+    assert m.signals == []
+
+
+def test_raw_text_stays_verbatim_including_interface_block() -> None:
+    m = MarkdownManualParser().parse(_INTERFACE_MANUAL)
+    assert m.raw_text == _INTERFACE_MANUAL
+    ops_prose = m.section(ManualSection.OPERATIONS)
+    assert ops_prose is not None and "```yaml" in ops_prose  # the prose view keeps the block too
+
+
+def test_malformed_interface_block_raises_parse_error() -> None:
+    bad = _INTERFACE_MANUAL.replace(
+        "- name: set_temperature\n  required: [value]", "not: [valid, yaml, {"
+    )
+    with pytest.raises(ManualParseError, match="malformed interface block"):
+        MarkdownManualParser().parse(bad)
+
+
+# ------------------------------------------------------------------------------------------------
+# merge_manuals — reconciling the adapter and hand-authored provenance channels (ADR-0015/ADR-0018)
+# ------------------------------------------------------------------------------------------------
+def _adapter_manual(
+    *,
+    manual_id: str = "pump",
+    operations: list[OperationSpecification] | None = None,
+    observable_properties: list[ObservablePropertySpecification] | None = None,
+) -> Manual:
+    return Manual(
+        id=manual_id,
+        metadata={"source": "mcp"},
+        description="adapter description",
+        observable_properties=observable_properties or [],
+        signals=[],
+        operations=operations
+        if operations is not None
+        else [
+            OperationSpecification(
+                name="open_valve",
+                description="",
+                parameters={"properties": {"force": {}}, "required": ["force"]},
+            )
+        ],
+        raw_text=None,
+    )
+
+
+def _authored_manual(
+    *,
+    manual_id: str = "pump",
+    description: str = "",
+    raw_text: str | None = "authored raw",
+    metadata: dict[str, object] | None = None,
+    operations: list[OperationSpecification] | None = None,
+    observable_properties: list[ObservablePropertySpecification] | None = None,
+) -> Manual:
+    return Manual(
+        id=manual_id,
+        metadata=metadata or {},
+        description=description,
+        observable_properties=observable_properties or [],
+        signals=[],
+        operations=operations or [],
+        raw_text=raw_text,
+    )
+
+
+def test_merge_adapter_owns_structured_specs_authored_owns_raw_text() -> None:
+    adapter = _adapter_manual()
+    authored = _authored_manual(description="authored description", metadata={"category": "Fluids"})
+    merged = merge_manuals(adapter, authored)
+    assert merged.id == "pump"
+    assert merged.operations == adapter.operations
+    assert merged.raw_text == "authored raw"
+    assert merged.description == "authored description"
+    assert merged.metadata == {
+        "source": "mcp",
+        "category": "Fluids",
+    }  # union, authored wins conflict
+
+
+def test_merge_falls_back_to_adapter_description_when_authored_is_empty() -> None:
+    merged = merge_manuals(_adapter_manual(), _authored_manual(description=""))
+    assert merged.description == "adapter description"
+
+
+def test_merge_falls_back_to_adapter_raw_text_when_authored_has_none() -> None:
+    adapter = replace(_adapter_manual(), raw_text="adapter raw")
+    merged = merge_manuals(adapter, _authored_manual(raw_text=None))
+    assert merged.raw_text == "adapter raw"
+
+
+def test_merge_rejects_mismatched_ids() -> None:
+    with pytest.raises(ManualMergeError, match="different ids"):
+        merge_manuals(_adapter_manual(manual_id="pump"), _authored_manual(manual_id="valve"))
+
+
+def test_merge_passes_through_kind_left_undeclared() -> None:
+    adapter = _adapter_manual(
+        observable_properties=[
+            ObservablePropertySpecification(name="pressure", description="", schema={})
+        ]
+    )
+    merged = merge_manuals(
+        adapter, _authored_manual()
+    )  # authored declares no properties -> opt-in skip
+    assert merged.observable_properties == adapter.observable_properties
+
+
+def test_merge_validates_declared_operation_names_match() -> None:
+    adapter = _adapter_manual()  # only "open_valve"
+    authored = _authored_manual(
+        operations=[OperationSpecification(name="close_valve", description="", parameters={})]
+    )
+    with pytest.raises(ManualMergeError, match="operation names diverge"):
+        merge_manuals(adapter, authored)
+
+
+def test_merge_validates_required_keys_present_in_adapter_schema() -> None:
+    adapter = _adapter_manual(
+        operations=[
+            OperationSpecification(
+                name="open_valve",
+                description="",
+                parameters={"properties": {"force": {}}, "required": []},
+            )
+        ]
+    )
+    authored = _authored_manual(
+        operations=[
+            OperationSpecification(
+                name="open_valve", description="", parameters={"required": ["torque"]}
+            )
+        ]
+    )
+    with pytest.raises(ManualMergeError, match="requires"):
+        merge_manuals(adapter, authored)
+
+
+def test_merge_skips_required_check_when_adapter_schema_has_no_properties_key() -> None:
+    # ARE's synthesized observable properties carry an empty {} schema — no "properties" key at
+    # all — so required-key checking can't run, but the name still validates.
+    adapter = _adapter_manual(
+        observable_properties=[
+            ObservablePropertySpecification(name="state", description="", schema={})
+        ]
+    )
+    authored = _authored_manual(
+        observable_properties=[
+            ObservablePropertySpecification(
+                name="state", description="", schema={"required": ["unread"]}
+            )
+        ]
+    )
+    merged = merge_manuals(adapter, authored)  # does not raise
+    assert merged.observable_properties == adapter.observable_properties
+
+
+# ------------------------------------------------------------------------------------------------
+# DirectoryManualSource — the default ManualSource: *.md in a dir, indexed by parsed Manual.id
+# ------------------------------------------------------------------------------------------------
+async def test_directory_manual_source_resolves_by_parsed_id(tmp_path: Path) -> None:
+    (tmp_path / "pump.md").write_text(load("water-pump.md"), encoding="utf-8")
+    source = DirectoryManualSource(tmp_path)
+    manual = await source.get("hydraulic_control")  # the fixture's parsed id, not the filename
+    assert manual is not None
+    assert manual.id == "hydraulic_control"
+
+
+async def test_directory_manual_source_missing_id_returns_none(tmp_path: Path) -> None:
+    (tmp_path / "pump.md").write_text(load("water-pump.md"), encoding="utf-8")
+    assert await DirectoryManualSource(tmp_path).get("no-such-id") is None
+
+
+async def test_directory_manual_source_missing_directory_returns_none(tmp_path: Path) -> None:
+    source = DirectoryManualSource(tmp_path / "does-not-exist")
+    assert await source.get("anything") is None
+
+
+async def test_directory_manual_source_builds_index_once(tmp_path: Path) -> None:
+    (tmp_path / "pump.md").write_text(load("water-pump.md"), encoding="utf-8")
+    source = DirectoryManualSource(tmp_path)
+    await source.get("hydraulic_control")
+    (tmp_path / "clock.md").write_text(
+        load("clock.md"), encoding="utf-8"
+    )  # added after first lookup
+    assert await source.get("clock") is None  # index already built — lazily, only once

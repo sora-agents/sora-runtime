@@ -19,6 +19,7 @@ import yaml
 from sora.action import default_action_registry
 from sora.cycle import Agent, DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.manual import DirectoryManualSource
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -144,9 +145,12 @@ def adapter_for(entry: dict[str, Any]) -> tuple[WorkspaceOrigin, WorkspaceAdapte
     For ``mcp``/``are-mcp`` the *transport* is chosen by what the entry carries: a ``command``
     (with ``args``) spawns and owns a local **stdio** subprocess; otherwise ``origin.address`` is
     the URL of an **already-running remote** server (SSE by default, or streamable-HTTP via
-    ``transport: streamable-http``) and nothing is deployed. The ``fake`` kind — plus any custom
-    adapter — is an escape hatch: name a factory ``(origin) -> WorkspaceAdapter`` via ``factory:``
-    resolved through ``import_object`` (the test/showcase seam)."""
+    ``transport: streamable-http``) and nothing is deployed. An optional ``manuals:`` directory path
+    is wired into a ``DirectoryManualSource``, given to the adapter so it can pair hand-authored
+    manuals with the ones it synthesizes for the same id (ADR-0018); absent -> no pairing, unchanged
+    adapter-only manuals. The ``fake`` kind — plus any custom adapter — is an escape hatch: name a
+    factory ``(origin) -> WorkspaceAdapter`` via ``factory:`` resolved through ``import_object``
+    (the test/showcase seam)."""
     origin = WorkspaceOrigin(**entry["origin"])
     kind = origin.adapter
     if kind in ("mcp", "are-mcp"):
@@ -154,6 +158,7 @@ def adapter_for(entry: dict[str, Any]) -> tuple[WorkspaceOrigin, WorkspaceAdapte
             from sora.adapters.mcp import McpWorkspaceAdapter as _Adapter
         else:
             from sora.adapters.are_mcp import AreMcpWorkspaceAdapter as _Adapter
+        manual_source = DirectoryManualSource(entry["manuals"]) if "manuals" in entry else None
         if "command" in entry:  # local stdio subprocess the adapter owns
             return origin, _Adapter(
                 workspace_id=entry["workspace_id"],
@@ -161,6 +166,7 @@ def adapter_for(entry: dict[str, Any]) -> tuple[WorkspaceOrigin, WorkspaceAdapte
                 command=entry["command"],
                 args=list(entry.get("args", [])),
                 env=entry.get("env"),
+                manual_source=manual_source,
             )
         # remote: connect to an already-running server at origin.address
         return origin, _Adapter(
@@ -168,6 +174,7 @@ def adapter_for(entry: dict[str, Any]) -> tuple[WorkspaceOrigin, WorkspaceAdapte
             origin=origin,
             url=origin.address,
             transport=entry.get("transport"),
+            manual_source=manual_source,
         )
     if "factory" in entry:
         factory = import_object(entry["factory"])

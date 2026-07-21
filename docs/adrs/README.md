@@ -32,6 +32,7 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0015](0015-manuals-protocol-agnostic-adapter-boundary.md) | Manuals stay protocol-agnostic; protocol bindings live on the tool instance | proposed | Tool & workspace model |
 | [0016](0016-pluggable-activity-selection.md) | Activity selection is Situate's own pluggable sub-strategy, defaulting to round-robin | proposed | Decision cycle |
 | [0017](0017-parameter-grounding-in-reason.md) | Parameter grounding is a Reason decision (references + escalation); Act stays mechanistic | proposed | Decision cycle |
+| [0018](0018-manual-merge-policy-and-authored-interface.md) | Manual merge policy (adapter owns interface, author owns prose) + optional names-level authored interface | proposed | Tool & workspace model |
 
 ## Planned
 

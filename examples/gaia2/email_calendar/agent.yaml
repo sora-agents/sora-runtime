@@ -9,6 +9,10 @@
 # server starts apps empty (emails/tasks are delivered by the simulation's event timeline, which the
 # MCP server doesn't run), so we seed an inbox email from Alice directly and serve the live apps over
 # stdio. That's why `list_emails` returns a real email with a real id for the agent to reply to.
+#
+# `manuals:` pairs each app's adapter-synthesized manual (operation names + JSON Schema from MCP)
+# with a hand-authored one from manuals/ for the same id (ADR-0018) — usage guidance an MCP schema
+# alone can't carry (e.g. "email_id always comes from a prior list_emails/search_emails call").
 agent:
   name: gaia2-email-calendar
   strategies:
@@ -31,3 +35,4 @@ agent:
       args:
         - -m
         - examples.gaia2.email_calendar.are_server
+      manuals: examples/gaia2/email_calendar/manuals

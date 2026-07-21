@@ -276,6 +276,70 @@ async def test_unfocus_unsubscribes_and_clears_properties() -> None:
 
 
 # ------------------------------------------------------------------------------------------------
+# manual_source pairing — merge a hand-authored manual with the adapter-synthesized one (ADR-0018)
+# ------------------------------------------------------------------------------------------------
+class _FakeManualSource:
+    def __init__(self, manuals: dict[str, Manual]) -> None:
+        self._manuals = manuals
+
+    async def get(self, manual_id: str) -> Manual | None:
+        return self._manuals.get(manual_id)
+
+
+async def test_discover_merges_authored_manual_when_manual_source_resolves_one() -> None:
+    origin = _origin(address="mcp://localhost/weather", adapter="mcp")
+    session = FakeMcpSession(tools=[_mcp_tool("get_forecast")])
+    authored = Manual(
+        id="get_forecast",
+        metadata={"category": "Weather"},
+        description="Forecasts the weather.",
+        observable_properties=[],
+        signals=[],
+        operations=[],
+        raw_text="# Tool Metadata\nid: get_forecast\n\n# Usage Protocols & Safety\nBe kind.\n",
+    )
+    adapter = McpWorkspaceAdapter(
+        command="python",
+        args=["-m", "server"],
+        workspace_id="srv",
+        origin=origin,
+        session_factory=_factory_for(session),
+        manual_source=_FakeManualSource({"get_forecast": authored}),
+    )
+    workspace = (await adapter.discover())[0]
+    tool = workspace.tools()[0]
+
+    assert tool.manual.raw_text == authored.raw_text  # authored channel supplies raw_text
+    assert tool.manual.description == "Forecasts the weather."
+    assert [op.name for op in tool.manual.operations] == [
+        "get_forecast"
+    ]  # adapter still owns specs
+    assert tool.manual.metadata == {"source": "mcp", "category": "Weather"}  # union, authored wins
+
+
+async def test_discover_leaves_manual_adapter_only_when_no_authored_manual_for_id() -> None:
+    origin = _origin(address="mcp://localhost/weather", adapter="mcp")
+    session = FakeMcpSession(tools=[_mcp_tool("get_forecast")])
+    adapter = McpWorkspaceAdapter(
+        command="python",
+        args=["-m", "server"],
+        workspace_id="srv",
+        origin=origin,
+        session_factory=_factory_for(session),
+        manual_source=_FakeManualSource({}),  # no manual for "get_forecast"
+    )
+    workspace = (await adapter.discover())[0]
+    assert workspace.tools()[0].manual.raw_text is None  # unmerged, adapter-synthesized manual
+
+
+async def test_discover_without_manual_source_is_unchanged() -> None:
+    origin = _origin(address="mcp://localhost/weather", adapter="mcp")
+    session = FakeMcpSession(tools=[_mcp_tool("get_forecast")])
+    workspace = (await _vanilla_adapter(session, origin).discover())[0]  # no manual_source passed
+    assert workspace.tools()[0].manual.raw_text is None
+
+
+# ------------------------------------------------------------------------------------------------
 # 9. connect() — restore from records + manuals (lazy rebuild)
 # ------------------------------------------------------------------------------------------------
 async def test_connect_rebuilds_tool_from_records_and_manual() -> None:
