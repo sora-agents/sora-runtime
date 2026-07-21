@@ -4,16 +4,21 @@
     export ANTHROPIC_API_KEY=sk-ant-...          # or a .gitignored .env
     uv run python -m examples.gaia2.email_calendar.run
 
-Builds the agent from ``agent.yaml``, seeds the scenario's initial task as a user message (ARE's own
-USER_MESSAGE routing into the transport is not wired yet — deferred), drives the decision cycle
-until the activity terminates, and prints the trajectory. A docs showcase, not a test: it needs a
-live model and the ARE package, so it is deliberately outside the pytest suite.
+Builds the agent from ``agent.yaml``, seeds the scenario's initial task (``task.txt``) as a user
+message (ARE's own USER_MESSAGE routing into the transport is not wired yet — deferred), drives the
+decision cycle until the activity terminates, and prints the trajectory. A docs showcase, not a
+test: it needs a live model and the ARE package, so it is deliberately outside the pytest suite.
+It's also a reference for driving an ``Agent`` programmatically — see README's "Driving an agent
+programmatically" — as opposed to `TerminalSession`/`sora run`, the CLI path this same scenario is
+also runnable through:
 
-Note on output: the runtime does not log yet, so ``--verbose``-style per-phase tracing (README)
-isn't available here. To watch progress, set the log level — this surfaces the runtime's own records
-once logging lands, and today shows the ARE server + MCP logs:
+    uv run sora run examples/gaia2/email_calendar/agent.yaml \
+        --task-file examples/gaia2/email_calendar/task.txt --verbose
 
-    LOGLEVEL=INFO uv run python -m examples.gaia2.email_calendar.run
+Note on output: the runtime's own INFO trace (join / plan / invoke / resolve / terminate) prints by
+default. Mute it, or raise/lower the level, via LOGLEVEL:
+
+    LOGLEVEL=WARNING uv run python -m examples.gaia2.email_calendar.run
 """
 
 from __future__ import annotations
@@ -29,8 +34,10 @@ from sora.bootstrap import build_agent
 from sora.perception import Message
 from sora.transport import InProcessTransport
 
+log = logging.getLogger(__name__)
+
 CONFIG = Path(__file__).with_name("agent.yaml")
-TASK = "Set up a 30-minute team sync with Bob and Carol next Monday, then reply to Alice."
+TASK = Path(__file__).with_name("task.txt").read_text(encoding="utf-8").strip()
 _MAX_WAIT_S = 90.0
 _POLL_S = 0.1
 
@@ -63,10 +70,15 @@ async def main() -> None:
         await agent.stop()
         if not runner.done():
             runner.cancel()  # unblock a stuck join/tick so teardown can't hang forever
-        try:
-            await runner  # re-raises any real failure from run()
-        except asyncio.CancelledError:
-            pass
+            try:
+                await runner
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+                # Cancelling mid-join/mid-tick can surface as a messy anyio BaseExceptionGroup
+                # (from the MCP stdio client's own task group), not a plain CancelledError — since
+                # *we* triggered this cancellation, treat it as shutdown noise, not a crash.
+                log.debug("run() raised during cancel-triggered shutdown: %r", exc)
+        else:
+            await runner  # finished on its own — a real failure here should propagate
 
     print("\n--- trajectory ---")
     for activity in agent.working.activities.values():

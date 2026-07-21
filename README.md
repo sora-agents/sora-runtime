@@ -176,19 +176,27 @@ Every phase has a pluggable strategy. A strategy may short-circuit later phases 
       manuals/clock.md
 
     $ cd my-agent
-    $ uv sync --extra mcp --extra llm        # llm extra: the model-backed default Reason strategy
+    $ uv sync --extra mcp --extra llm         # llm extra: the model-backed default Reason strategy
     $ export ANTHROPIC_API_KEY=sk-ant-...     # credentials via the environment (see Configuring the LLM)
     $ uv run sora run
-    > what time is it?
+    +----------------------------------------------+
+    | S-ORA -- minimal terminal interface          |
+    |                                              |
+    | Type a goal in plain English to delegate it. |
+    | Type 'exit' or 'quit' to quit.               |
+    +----------------------------------------------+
+    what time is it?
     [invoking clock.get_time...]
     It's 14:32.
-    >
 
-`sora run` starts a persistent terminal session: it drives the decision cycle continuously, streams
+`sora run [config]` starts a persistent terminal session: it drives the decision cycle continuously, streams
 external actions and messages as they happen, and reads terminal input as a `Message` (sender `"user"`)
 for the next Observe phase — goals can be typed in at any point, not just at startup; Situate turns an
-unhandled one into a new activity via _create_activity_. Use `--verbose` to print each decision-cycle
-phase instead of just the conversational output:
+unhandled one into a new activity via _create_activity_. There's deliberately no `"> "` prompt — in a
+plain line-buffered terminal it can't survive asynchronous output landing mid-line, so it would just be
+misleading; the startup banner explains how to interact instead. `config` is an optional path to a
+different `agent.yaml` (defaults to `agent.yaml` in the current directory, e.g. `sora run other-agent.yaml`).
+Use `--verbose` to print each decision-cycle phase instead of just the conversational output:
 
     [cycle 1] Observe  - message from user: "what time is it?"
     [cycle 1] Situate  - created activity=ask-time from message; loaded manual: clock
@@ -196,6 +204,11 @@ phase instead of just the conversational output:
     [cycle 1] Act      - invoked clock.get_time -> ack
     [cycle 2] Observe  - perceived signal: clock.time_reported
     [cycle 2] Reflect  - activity ask-time completed; stored to episodic memory
+
+Type `exit` or `quit` for a clean shutdown (leaves joined workspaces, closes any MCP subprocess);
+Ctrl-D (EOF) does the same. `--task "..."` (or `--task-file path`) submits an initial goal at
+startup, before you'd type anything yourself — useful for scripting a run non-interactively, e.g.
+`sora run agent.yaml --task-file task.txt`, without needing to type it in by hand.
 
 `uv sync` installs pinned dependencies into a project-local `.venv` per `uv.lock` — commit the lockfile
 so runs are reproducible. `uv run` executes inside that environment without manual activation.
@@ -226,6 +239,16 @@ matter to another (or a `blocked`) activity, so its retention/eviction is consum
 owned by the blocked-state machinery, not a per-cycle prune. The default does not auto-*focus* —
 focusing is an external action (one per cycle, dispatched at Act), so an agent that needs to perceive
 a tool's properties/signals emits `_focus_` as a plan step.
+
+#### Driving an agent programmatically
+
+`sora run` is one way to run an `Agent` — the terminal CLI. Embedding S-ORA in your own program
+(a test harness, an evaluation runner, a service) instead means calling `build_agent()` and
+`Agent.run()`/`stop()` directly, without `TerminalSession` at all — `examples/gaia2/email_calendar/run.py`
+is a runnable reference for that shape: build the agent, `transport.submit()` an initial `Message`
+(what `sora run --task` does for you at the CLI), drive `agent.run()` as a background task, poll for
+the condition you care about (an activity reaching `TERMINATED`, a timeout), then `await agent.stop()`
+and cancel/await the task in a `finally` for teardown.
 
 #### Connecting to an MCP server: remote vs. local
 
@@ -1030,6 +1053,14 @@ when the variable isn't already set), so it never silently overrides a key you e
         since terminal input is user communication, not environment stimuli. No UI beyond this."""
         def __init__(self, agent: Agent, verbose: bool = False): ...
         async def run(self) -> None: ...
+
+    # _Presenter (private, sora/cli.py): a logging.Handler that formats the runtime's existing
+    # sora.* log records into TerminalSession's --verbose `[cycle N] Phase - ...` trace, adding no
+    # new log call sites — not part of the public API.
+
+    # _Console (private, sora/cli.py): tracks whether the terminal cursor sits at the start of a
+    # line, so lines printed through it are always cleanly newline-separated — not part of the
+    # public API.
 
     # sora/bootstrap.py — internal; developers implement protocols, they don't call this directly
     @dataclass(frozen=True)
