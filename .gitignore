@@ -26,6 +26,7 @@ htmlcov/
 # S-ORA runtime state (e.g. file-backed semantic/procedural/episodic memory stores) —
 # namespaced under .sora/ to avoid colliding with unrelated "memory" conventions
 .sora/
+my-agent/
 
 # Environment
 .env

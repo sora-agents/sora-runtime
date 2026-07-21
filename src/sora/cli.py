@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from sora import scaffold
 from sora.activity import ActivityState
 from sora.bootstrap import build_agent
 from sora.perception import Message
@@ -217,26 +218,7 @@ def _trajectory(activity: Activity) -> str:
     return "\n".join(lines)
 
 
-def main() -> None:
-    # Not in the README sketch — added so `[project.scripts] sora = "sora.cli:main"` resolves to a
-    # real callable. Only `run` is implemented; `sora init` (project scaffolding, also shown in
-    # README's walkthrough) is a separate, unbuilt feature.
-    parser = argparse.ArgumentParser(prog="sora")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    run_parser = subparsers.add_parser("run", help="Start a persistent terminal session")
-    run_parser.add_argument("config", nargs="?", default="agent.yaml", help="Path to agent.yaml")
-    run_parser.add_argument(
-        "--verbose", action="store_true", help="Print the per-phase decision-cycle trace"
-    )
-    task_group = run_parser.add_mutually_exclusive_group()
-    task_group.add_argument(
-        "--task", help="Submit this text as the initial user message at startup"
-    )
-    task_group.add_argument(
-        "--task-file", help="Read the initial user message from this file at startup"
-    )
-    args = parser.parse_args()
-
+def _run(args: argparse.Namespace) -> None:
     # A console-script entry point (unlike `python -m`) doesn't put the current directory on
     # sys.path, but agent.yaml's dotted strategy/adapter-factory paths are meant to resolve
     # project-local code from wherever `sora run` is invoked — import_object's own docstring
@@ -254,3 +236,46 @@ def main() -> None:
         asyncio.run(session.run())
     except KeyboardInterrupt:
         pass
+
+
+def _init(args: argparse.Namespace) -> None:
+    project_dir = Path(args.dir)
+    scaffold.write_project(project_dir)
+    print(f"Created {project_dir}/")
+    for path in sorted(project_dir.rglob("*")):
+        if path.is_file():
+            print(f"  {path.relative_to(project_dir)}")
+    print()
+    print(f"  cd {project_dir}")
+    print("  uv sync --extra llm")
+    print("  export ANTHROPIC_API_KEY=sk-ant-...")
+    print("  uv run sora run")
+
+
+def main() -> None:
+    # Not in the README sketch — added so `[project.scripts] sora = "sora.cli:main"` resolves to a
+    # real callable.
+    parser = argparse.ArgumentParser(prog="sora")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Start a persistent terminal session")
+    run_parser.add_argument("config", nargs="?", default="agent.yaml", help="Path to agent.yaml")
+    run_parser.add_argument(
+        "--verbose", action="store_true", help="Print the per-phase decision-cycle trace"
+    )
+    task_group = run_parser.add_mutually_exclusive_group()
+    task_group.add_argument(
+        "--task", help="Submit this text as the initial user message at startup"
+    )
+    task_group.add_argument(
+        "--task-file", help="Read the initial user message from this file at startup"
+    )
+
+    init_parser = subparsers.add_parser("init", help="Scaffold a minimal example agent")
+    init_parser.add_argument("dir", help="Directory to create (must not already exist)")
+
+    args = parser.parse_args()
+    if args.command == "run":
+        _run(args)
+    elif args.command == "init":
+        _init(args)

@@ -169,14 +169,17 @@ Every phase has a pluggable strategy. A strategy may short-circuit later phases 
 
 ## Running S-ORA
 
-    $ uvx --from sora-runtime sora init my-agent --template minimal
-    Created my-agent/
-      pyproject.toml
+    $ git clone https://github.com/sora-agents/sora-runtime.git && cd sora-runtime
+    $ uv sync --all-extras --dev
+    $ uv run sora init ~/path/to/my-agent
+    Created ~/path/to/my-agent/
       agent.yaml
+      clock_tool.py
       manuals/clock.md
+      pyproject.toml
 
-    $ cd my-agent
-    $ uv sync --extra mcp --extra llm         # llm extra: the model-backed default Reason strategy
+    $ cd ~/path/to/my-agent
+    $ uv sync --extra llm                     # the model-backed default Reason strategy
     $ export ANTHROPIC_API_KEY=sk-ant-...     # credentials via the environment (see Configuring the LLM)
     $ uv run sora run
     +----------------------------------------------+
@@ -188,6 +191,13 @@ Every phase has a pluggable strategy. A strategy may short-circuit later phases 
     what time is it?
     [invoking clock.get_time...]
     It's 14:32.
+
+`sora init <dir>` scaffolds a minimal, immediately-runnable example agent — `agent.yaml`, a
+hand-authored `manuals/clock.md`, and `clock_tool.py` (a small `WorkspaceAdapter`/`Workspace`/`Tool`
+trio implementing the clock tool directly, not via a real external server — there isn't one to
+depend on for this). Real integrations import tools through an adapter (MCP, WoT, ...) instead of
+hand-writing one — see [ADR-0003](docs/adrs/0003-adapters-not-tool-authoring.md) — `clock_tool.py` is
+a deliberate, self-contained exception so the example needs nothing beyond an LLM key to run.
 
 `sora run [config]` starts a persistent terminal session: it drives the decision cycle continuously, streams
 external actions and messages as they happen, and reads terminal input as a `Message` (sender `"user"`)
@@ -262,11 +272,12 @@ does **not** have to deploy the server itself:
         workspace_id: remote-tools
 
       # Local: the adapter spawns and owns a stdio subprocess. Give it a `command` (+ `args`);
-      # `address` is then just a nominal label.
-      - origin: {adapter: mcp, address: "stdio:clock"}
-        workspace_id: clock
+      # `address` is then just a nominal label. `mcp-server-time` is the official MCP project's
+      # reference time server (github.com/modelcontextprotocol/servers/tree/main/src/time).
+      - origin: {adapter: mcp, address: "stdio:time"}
+        workspace_id: time
         command: uvx
-        args: ["mcp-server-clock"]
+        args: ["mcp-server-time"]
 
 The rule is simply: an entry with a `command` runs a local stdio subprocess; otherwise `address` is
 treated as the URL of an existing server to connect to. Either way `discover()` enumerates the
@@ -1061,6 +1072,12 @@ when the variable isn't already set), so it never silently overrides a key you e
     # _Console (private, sora/cli.py): tracks whether the terminal cursor sits at the start of a
     # line, so lines printed through it are always cleanly newline-separated — not part of the
     # public API.
+
+    # sora/scaffold.py — `sora init`'s file generator
+    def write_project(project_dir: Path) -> None:
+        """Scaffolds a minimal, immediately-runnable example agent into project_dir: pyproject.toml,
+        agent.yaml, manuals/clock.md, and clock_tool.py. Refuses to touch an already-existing
+        target."""
 
     # sora/bootstrap.py — internal; developers implement protocols, they don't call this directly
     @dataclass(frozen=True)

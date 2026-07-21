@@ -624,3 +624,37 @@ def test_main_run_makes_the_cwd_importable_for_agent_yaml_dotted_paths(
     main()  # must not raise ModuleNotFoundError: No module named 'local_strategy'
 
     assert _FakeSession.last_calls["agent"] is not None
+
+
+# ---------------------------------------------------------------------------
+# main() — `sora init` dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_main_init_scaffolds_the_named_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["sora", "init", "my-agent"])
+
+    main()
+
+    project = tmp_path / "my-agent"
+    assert (project / "pyproject.toml").is_file()
+    assert (project / "agent.yaml").is_file()
+    assert (project / "manuals" / "clock.md").is_file()
+    assert (project / "clock_tool.py").is_file()
+    out = capsys.readouterr().out
+    assert "my-agent" in out
+    assert "uv run sora run" in out
+
+
+def test_main_init_reports_an_already_existing_target_clearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "my-agent").mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["sora", "init", "my-agent"])
+
+    with pytest.raises(FileExistsError, match="my-agent"):
+        main()
