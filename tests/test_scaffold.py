@@ -36,6 +36,18 @@ def test_write_project_pyproject_names_the_project_after_the_directory(tmp_path:
     assert 'name = "my-agent"' in (project / "pyproject.toml").read_text()
 
 
+def test_write_project_pyproject_depends_on_the_git_repo_not_an_unpublished_pypi_name(
+    tmp_path: Path,
+) -> None:
+    # sora-runtime isn't on PyPI yet -- a bare "sora-runtime[llm]" version constraint is
+    # unresolvable (uv: "No solution found ... there are no versions of sora-runtime[llm]").
+    # Regression for that: the dependency must pin a git source instead.
+    project = tmp_path / "my-agent"
+    write_project(project)
+    text = (project / "pyproject.toml").read_text()
+    assert "sora-runtime[llm] @ git+https://github.com/sora-agents/sora-runtime.git" in text
+
+
 def test_write_project_agent_yaml_wires_the_clock_factory(tmp_path: Path) -> None:
     project = tmp_path / "my-agent"
     write_project(project)

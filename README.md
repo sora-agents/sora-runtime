@@ -179,7 +179,7 @@ Every phase has a pluggable strategy. A strategy may short-circuit later phases 
       pyproject.toml
 
     $ cd ~/path/to/my-agent
-    $ uv sync --extra llm                     # the model-backed default Reason strategy
+    $ uv sync                                 # the llm extra is already pinned into the dependency
     $ export ANTHROPIC_API_KEY=sk-ant-...     # credentials via the environment (see Configuring the LLM)
     $ uv run sora run
     +----------------------------------------------+

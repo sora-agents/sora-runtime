@@ -14,7 +14,10 @@ _PYPROJECT_TEMPLATE = """\
 name = "{name}"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["sora-runtime[llm]"]
+# sora-runtime isn't published to PyPI yet, so the dependency points straight at the git repo (no
+# release tag exists yet either, so this tracks `main` -- switch to a bare "sora-runtime[llm]"
+# version constraint once a real release exists).
+dependencies = ["sora-runtime[llm] @ git+https://github.com/sora-agents/sora-runtime.git"]
 """
 
 _AGENT_YAML_TEMPLATE = """\
