@@ -220,6 +220,36 @@ def test_malformed_interface_block_raises_parse_error() -> None:
         MarkdownManualParser().parse(bad)
 
 
+# The operations interface block may additionally declare `completes_on: <signal>` — the domain
+# signal that marks a long-running op's real completion. Lifted into OperationSpecification so the
+# blocked-state machinery can mechanically suspend/resume; absent means a synchronous op (None).
+_COMPLETION_MANUAL = """# Tool Metadata
+id: robotic-arm
+
+# Functional Description
+A robotic arm.
+
+# Operations
+```yaml
+- name: move_to
+  required: [speed, target]
+  completes_on: target_reached
+- name: open_gripper
+```
+- move_to(speed, target): long-running motion; completion signalled by target_reached.
+- open_gripper(): opens the gripper.
+
+# Usage Protocols & Safety
+Suspend after move_to until target_reached.
+"""
+
+
+def test_interface_block_lifts_operation_completion_signal() -> None:
+    m = MarkdownManualParser().parse(_COMPLETION_MANUAL)
+    ops = {op.name: op.completion_signal for op in m.operations}
+    assert ops == {"move_to": "target_reached", "open_gripper": None}
+
+
 # ------------------------------------------------------------------------------------------------
 # merge_manuals — reconciling the adapter and hand-authored provenance channels (ADR-0015/ADR-0018)
 # ------------------------------------------------------------------------------------------------
@@ -338,6 +368,25 @@ def test_merge_validates_required_keys_present_in_adapter_schema() -> None:
     )
     with pytest.raises(ManualMergeError, match="requires"):
         merge_manuals(adapter, authored)
+
+
+def test_merge_keeps_authored_completion_signal_over_adapter() -> None:
+    # completion_signal is author-owned semantics a native description can't express, so the merged
+    # operation carries the authored value even though the adapter otherwise owns operations.
+    adapter = _adapter_manual(
+        operations=[OperationSpecification(name="open_valve", description="adapter", parameters={})]
+    )
+    authored = _authored_manual(
+        operations=[
+            OperationSpecification(
+                name="open_valve", description="", parameters={}, completion_signal="valve_settled"
+            )
+        ]
+    )
+    merged = merge_manuals(adapter, authored)
+    assert [(op.description, op.completion_signal) for op in merged.operations] == [
+        ("adapter", "valve_settled")  # adapter owns description/params; authored owns completion
+    ]
 
 
 def test_merge_skips_required_check_when_adapter_schema_has_no_properties_key() -> None:

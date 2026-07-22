@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sora.perception import PerceptKind
 from sora.strategies import DefaultReasonStrategy
 
 if TYPE_CHECKING:
@@ -28,7 +27,9 @@ log = logging.getLogger("examples.gaia2.email_calendar")
 
 # Strategy-owned bookkeeping stored on activity.context (the runtime never writes there): how many
 # signal percepts this strategy has already reacted to, so a *new* one — not an already-seen one —
-# triggers a replan. Signals accumulate append-only in wm.perceptions, so the count only grows.
+# triggers a replan. wm.signals is never shrunk by a matched completion signal (see ADR-0019) — this
+# example's manuals declare none anyway — so the count only grows in practice, bounded only by the
+# blocked-state machinery's fixed retention cap (a burst this example's scale never approaches).
 _REACTED_SIGNALS = "_reacted_signals"
 
 
@@ -41,7 +42,7 @@ class ScheduleFromEmailStrategy:
     async def reason(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
-        signal_count = sum(1 for p in wm.perceptions if p.kind is PerceptKind.SIGNAL)
+        signal_count = len(wm.signals)
         reacted = activity.context.get(_REACTED_SIGNALS, 0)
         if activity.plan is not None and signal_count > reacted:
             # A fresh state-change signal arrived while a plan was in flight -> invalidate it so the

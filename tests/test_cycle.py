@@ -34,12 +34,11 @@ only for their non-dispatch, not their own behavior (their own tests come with t
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
-from fakes import FakeAdapter, FakeTool, FakeWorkspace
+from fakes import FakeAdapter, FakeTool, FakeWorkspace, ScriptedTransport
 from sora.action import SendAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -51,7 +50,7 @@ from sora.memory import (
     SemanticMemory,
     WorkingMemory,
 )
-from sora.perception import Message, PerceptKind
+from sora.perception import Message
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
@@ -77,25 +76,6 @@ from sora.types import (
 # --------------------------------------------------------------------------------------------------
 # Harness — the shared fakes plus a scripted transport and a real FileMemoryBackend-backed cycle.
 # --------------------------------------------------------------------------------------------------
-
-
-class ScriptedTransport:
-    """Satisfies MessageTransport: ``receive()`` drains a preset inbound list (so a second tick
-    doesn't re-yield the same messages); ``send()`` logs its args."""
-
-    def __init__(self, inbound: list[Message] | None = None) -> None:
-        self._inbound = list(inbound or [])
-        self.sent: list[tuple[str, dict[str, Any]]] = []
-
-    async def send(self, to: str, content: dict[str, Any]) -> None:
-        self.sent.append((to, content))
-
-    def receive(self) -> AsyncIterator[Message]:
-        async def _drain() -> AsyncIterator[Message]:
-            while self._inbound:
-                yield self._inbound.pop(0)
-
-        return _drain()
 
 
 class _InertReason:
@@ -193,10 +173,9 @@ async def test_observe_emits_property_percepts_from_focused_tools(tmp_path: Path
 
     await DefaultObserveStrategy().observe(cycle)
 
-    assert len(working.perceptions) == 1
-    percept = working.perceptions[0]
+    assert len(working.properties) == 1
+    percept = working.properties[(tool.id, "unread")]
     assert percept.source == tool.id
-    assert percept.kind is PerceptKind.PROPERTY
     assert percept.payload == prop
 
 
@@ -207,10 +186,9 @@ async def test_observe_emits_signal_percepts_from_signal_sink(tmp_path: Path) ->
 
     await DefaultObserveStrategy().observe(cycle)
 
-    assert len(working.perceptions) == 1
-    percept = working.perceptions[0]
+    assert len(working.signals) == 1
+    percept = working.signals[0]
     assert percept.source == "EmailClientApp"
-    assert percept.kind is PerceptKind.SIGNAL
     assert percept.payload == signal
 
 
@@ -241,7 +219,7 @@ async def test_observe_replaces_property_snapshot_not_append(tmp_path: Path) -> 
     tool._properties = [ObservableProperty(name="unread", value=5)]  # the live value moved on
     await strategy.observe(cycle)
 
-    props = [p for p in working.perceptions if p.kind is PerceptKind.PROPERTY]
+    props = list(working.properties.values())
     assert len(props) == 1
     assert props[0].source == "EmailClientApp"
     assert props[0].payload == ObservableProperty(name="unread", value=5)
@@ -264,9 +242,10 @@ async def test_observe_snapshots_each_property_by_name(tmp_path: Path) -> None:
     await strategy.observe(cycle)
     await strategy.observe(cycle)
 
-    props = [p for p in working.perceptions if p.kind is PerceptKind.PROPERTY]
+    props = list(working.properties.values())
     assert len(props) == 2
     assert {p.payload.name for p in props} == {"unread", "drafts"}
+    assert set(working.properties) == {("EmailClientApp", "unread"), ("EmailClientApp", "drafts")}
 
 
 async def test_observe_keeps_signal_append_semantics(tmp_path: Path) -> None:
@@ -280,7 +259,7 @@ async def test_observe_keeps_signal_append_semantics(tmp_path: Path) -> None:
     cycle.signal_sink.push("EmailClientApp", Signal(name="new_email", payload={"n": 2}))
     await strategy.observe(cycle)
 
-    signals = [p for p in working.perceptions if p.kind is PerceptKind.SIGNAL]
+    signals = working.signals
     assert len(signals) == 2
     assert [p.payload.payload["n"] for p in signals] == [1, 2]
 
@@ -303,7 +282,8 @@ async def test_observe_resolves_running_activity(tmp_path: Path) -> None:
     assert activity.pending_operation is None
     assert activity.last_operation == ack
     # A resolved operation result is never surfaced as a Percept.
-    assert working.perceptions == []
+    assert working.properties == {}
+    assert working.signals == []
 
 
 async def test_observe_resolves_only_the_matching_activity(tmp_path: Path) -> None:
@@ -337,7 +317,8 @@ async def test_observe_ignores_unmatched_result_ack(tmp_path: Path) -> None:
     assert activity.state is ActivityState.RUNNING
     assert activity.pending_operation is not None
     assert activity.last_operation is None
-    assert working.perceptions == []
+    assert working.properties == {}
+    assert working.signals == []
     assert cycle.result_sink._queue.empty()
 
 
@@ -367,8 +348,8 @@ async def test_tick_observes_then_returns_without_external_action(tmp_path: Path
 
     await cycle.tick()
 
-    kinds = {p.kind for p in working.perceptions}
-    assert kinds == {PerceptKind.PROPERTY, PerceptKind.SIGNAL}
+    assert [p.payload for p in working.properties.values()] == [prop]
+    assert [p.payload for p in working.signals] == [signal]
     assert working.messages == [message]
     # The inert Reason produced no step, so no external action was dispatched.
     assert tool.invoked_with is None

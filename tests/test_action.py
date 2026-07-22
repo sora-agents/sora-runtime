@@ -39,7 +39,9 @@ from sora.action import (
     JoinAction,
     LeaveAction,
     LoadManualAction,
+    ResumeAction,
     SendAction,
+    SuspendAction,
     UnfocusAction,
     UnloadManualAction,
     default_action_registry,
@@ -55,7 +57,7 @@ from sora.memory import (
     SemanticMemory,
     WorkingMemory,
 )
-from sora.perception import Message, Percept, PerceptKind
+from sora.perception import Message, Percept
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
@@ -64,7 +66,7 @@ from sora.strategies import (
     Strategies,
     TickResult,
 )
-from sora.types import OPERATION_NAME, TOOL_ID, ObservableProperty, Signal
+from sora.types import OPERATION_NAME, TOOL_ID, ObservableProperty, Signal, SignalWait
 
 # --------------------------------------------------------------------------------------------------
 # Harness — the fakes plus a recording transport and a real FileMemoryBackend-backed DecisionCycle.
@@ -308,21 +310,24 @@ async def test_unfocus_unknown_tool_is_noop(tmp_path: Path) -> None:
 
 async def test_unfocus_removes_the_tools_property_percepts(tmp_path: Path) -> None:
     # Unfocusing stops re-observing the tool, so its observable-property snapshot is permanently
-    # stale and must be dropped. Only *this* tool's PROPERTY percepts go: another source's
-    # properties and the tool's own (fire-and-forget) signals are retained.
+    # stale and must be dropped. Only *this* tool's properties go: another source's properties and
+    # the tool's own (fire-and-forget) signals are retained (signals live in their own store).
     tool = FakeTool("EmailClientApp")
     registry, _ = _registry_with(tool)
     await registry.join(_ORIGIN)
     cycle, working, _ = _cycle(registry, tmp_path)
     await FocusAction().execute(registry, cycle, activity_id="a1", tool_id="EmailClientApp")
-    own_prop = Percept("EmailClientApp", PerceptKind.PROPERTY, ObservableProperty("unread", 3), 0.0)
-    other_prop = Percept("CalendarApp", PerceptKind.PROPERTY, ObservableProperty("busy", True), 0.0)
-    own_signal = Percept("EmailClientApp", PerceptKind.SIGNAL, Signal("new_email", {"n": 1}), 0.0)
-    working.perceptions.extend([own_prop, other_prop, own_signal])
+    own_prop = Percept("EmailClientApp", ObservableProperty("unread", 3), 0.0)
+    other_prop = Percept("CalendarApp", ObservableProperty("busy", True), 0.0)
+    own_signal = Percept("EmailClientApp", Signal("new_email", {"n": 1}), 0.0)
+    working.properties[("EmailClientApp", "unread")] = own_prop
+    working.properties[("CalendarApp", "busy")] = other_prop
+    working.signals.append(own_signal)
 
     await UnfocusAction().execute(registry, cycle, activity_id="a1", tool_id="EmailClientApp")
 
-    assert working.perceptions == [other_prop, own_signal]
+    assert working.properties == {("CalendarApp", "busy"): other_prop}
+    assert working.signals == [own_signal]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -484,27 +489,61 @@ async def test_unload_manual_absent_id_is_noop(tmp_path: Path) -> None:
 async def test_filter_keeps_only_relevant_source_percepts(tmp_path: Path) -> None:
     registry, _ = _registry_with(FakeTool("EmailClientApp"))
     cycle, working, _ = _cycle(registry, tmp_path)
-    keep = Percept("EmailClientApp", PerceptKind.PROPERTY, ObservableProperty("unread", 1), 0.0)
-    drop = Percept("stranger", PerceptKind.PROPERTY, ObservableProperty("x", 2), 0.0)
-    working.perceptions.extend([keep, drop])
+    keep = Percept("EmailClientApp", ObservableProperty("unread", 1), 0.0)
+    drop = Percept("stranger", ObservableProperty("x", 2), 0.0)
+    working.properties[("EmailClientApp", "unread")] = keep
+    working.properties[("stranger", "x")] = drop
 
     await FilterPerceptionsAction().execute(cycle, tool_ids={"EmailClientApp"})
 
-    assert working.perceptions == [keep]  # mutated in place, stranger dropped
+    assert working.properties == {("EmailClientApp", "unread"): keep}  # stranger dropped
 
 
 async def test_filter_retains_signals_regardless_of_source(tmp_path: Path) -> None:
     registry, _ = _registry_with(FakeTool("EmailClientApp"))
     cycle, working, _ = _cycle(registry, tmp_path)
-    prop = Percept("stranger", PerceptKind.PROPERTY, ObservableProperty("x", 2), 0.0)
-    signal = Percept("stranger", PerceptKind.SIGNAL, Signal("new_email", {"n": 1}), 0.0)
-    working.perceptions.extend([prop, signal])
+    prop = Percept("stranger", ObservableProperty("x", 2), 0.0)
+    signal = Percept("stranger", Signal("new_email", {"n": 1}), 0.0)
+    working.properties[("stranger", "x")] = prop
+    working.signals.append(signal)
 
     await FilterPerceptionsAction().execute(cycle, tool_ids={"EmailClientApp"})
 
     # The property from an irrelevant source is pruned; the fire-and-forget signal is always kept
     # (its lifecycle is consumption-driven, owned by the blocked-state machinery, not _filter_).
-    assert working.perceptions == [signal]
+    assert working.properties == {}
+    assert working.signals == [signal]
+
+
+async def test_suspend_moves_activity_to_blocked_recording_the_wait(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("robotic-arm"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+    activity = Activity(id="a1", goal="g", context={}, state=ActivityState.READY)
+    working.activities["a1"] = activity
+    wait = SignalWait(signal_name="target_reached", source="robotic-arm")
+
+    await SuspendAction().execute(cycle, activity_id="a1", wait=wait)
+
+    assert activity.state is ActivityState.BLOCKED
+    assert activity.blocked_on == wait
+
+
+async def test_resume_moves_activity_to_ready_clearing_the_wait(tmp_path: Path) -> None:
+    registry, _ = _registry_with(FakeTool("robotic-arm"))
+    cycle, working, _ = _cycle(registry, tmp_path)
+    activity = Activity(
+        id="a1",
+        goal="g",
+        context={},
+        state=ActivityState.BLOCKED,
+        blocked_on=SignalWait(signal_name="target_reached", source="robotic-arm"),
+    )
+    working.activities["a1"] = activity
+
+    await ResumeAction().execute(cycle, activity_id="a1")
+
+    assert activity.state is ActivityState.READY
+    assert activity.blocked_on is None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -554,7 +593,7 @@ async def test_default_action_registry_has_all_predefined_actions() -> None:
     reg = default_action_registry()
     for name in ("invoke", "focus", "unfocus", "join", "leave", "send"):
         assert reg.external(name).name == name
-    for name in ("create_activity", "load", "unload", "filter"):
+    for name in ("create_activity", "load", "unload", "filter", "suspend", "resume"):
         assert reg.internal(name).name == name
 
 

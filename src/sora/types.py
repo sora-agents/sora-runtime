@@ -19,6 +19,18 @@ class Signal:
 
 
 @dataclass(frozen=True)
+class SignalWait:  # what a `blocked` activity is waiting for — see Activity.blocked_on
+    # The specific signal that must be observed before a blocked activity returns to `ready`. Set
+    # by the _suspend_ internal action when a long-running operation declares a completion signal
+    # (OperationSpecification.completion_signal); matched mechanically in Observe by name (+ source
+    # when scoped to the completing tool). A future variant will wait on an observable property
+    # reaching a state instead of a signal — deferred; this is why Activity.blocked_on is named
+    # generally rather than blocked_on_signal.
+    signal_name: str
+    source: str | None = None  # tool id the signal must come from; None matches any source
+
+
+@dataclass(frozen=True)
 class OperationInvocation:  # the concrete call, different from Step's abstract decision
     tool_id: str
     operation_name: str

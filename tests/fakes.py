@@ -14,12 +14,12 @@ pinned by ``tests/test_fakes.py``.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Any
 
 from sora.environment import Tool, Workspace, WorkspaceOrigin
 from sora.manual import Manual, OperationSpecification, ToolRecord, WorkspaceRecord
-from sora.perception import SignalSink
+from sora.perception import Message, SignalSink
 from sora.types import ObservableProperty, OperationAck, Signal
 
 
@@ -83,6 +83,25 @@ class FakeTool:
 
     def observe(self) -> list[ObservableProperty]:
         return list(self._properties)
+
+
+class ScriptedTransport:
+    """Satisfies MessageTransport: ``receive()`` drains a preset inbound list (so a second tick
+    doesn't re-yield the same messages); ``send()`` logs its args."""
+
+    def __init__(self, inbound: list[Message] | None = None) -> None:
+        self._inbound = list(inbound or [])
+        self.sent: list[tuple[str, dict[str, Any]]] = []
+
+    async def send(self, to: str, content: dict[str, Any]) -> None:
+        self.sent.append((to, content))
+
+    def receive(self) -> AsyncIterator[Message]:
+        async def _drain() -> AsyncIterator[Message]:
+            while self._inbound:
+                yield self._inbound.pop(0)
+
+        return _drain()
 
 
 class FakeLLMClient:

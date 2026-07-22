@@ -7,7 +7,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from sora.types import CompletedOperation, OperationAck, PendingOperation, Plan
+    from sora.types import CompletedOperation, OperationAck, PendingOperation, Plan, SignalWait
 
 
 class ActivityState(Enum):
@@ -27,6 +27,11 @@ class Activity:
     step_index: int = 0
     pending_operation: PendingOperation | None = None  # set while RUNNING; cleared on resolve
     last_operation: OperationAck | None = None  # most recently resolved result, for Reason to read
+    # set while BLOCKED; the specific signal the activity waits for before returning to READY. Set
+    # by _suspend_, cleared by _resume_. Orthogonal to pending_operation: RUNNING waits on an
+    # operation result (automatic 1:1 resolve), BLOCKED waits on a declared signal (matched in
+    # Observe).
+    blocked_on: SignalWait | None = None
     # Append-only trace of resolved operations this activity ran — a later step grounds its params
     # against it (last_operation keeps only the newest, overwritten each step). Transient:
     # not persisted, and episodic learn() captures selectively, not a blind asdict(activity).

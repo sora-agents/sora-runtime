@@ -9,7 +9,7 @@ is still ``None``. The deterministic default:
   by derived goal) via the internal ``_create_activity_`` action;
 * **adjusts** working memory for the currently-joined workspaces — loads their tools' manuals into
   ``wm.loaded_manuals`` (``_load_``), unloads manuals no longer backed by a joined tool
-  (``_unload_``), and filters ``wm.perceptions`` down to joined-tool sources (``_filter_``);
+  (``_unload_``), and filters ``wm.properties`` down to joined-tool sources (``_filter_``);
 * **selects** the first ready activity if none is pre-set.
 
 Focusing tools is *not* done here — ``_focus_`` is an external action (one external action per
@@ -37,7 +37,7 @@ from sora.memory import (
     SemanticMemory,
     WorkingMemory,
 )
-from sora.perception import Message, Percept, PerceptKind
+from sora.perception import Message, Percept
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
@@ -364,10 +364,12 @@ async def test_situate_filters_properties_but_retains_signals(tmp_path: Path) ->
     await registry.join(_ORIGIN)
     cycle, working, semantic = _cycle(registry, tmp_path)
     await semantic.store_manual(tool.manual)
-    keep_prop = Percept("clock", PerceptKind.PROPERTY, ObservableProperty("time", "10:00"), 0.0)
-    drop_prop = Percept("stranger", PerceptKind.PROPERTY, ObservableProperty("x", 1), 0.0)
-    keep_signal = Percept("stranger", PerceptKind.SIGNAL, Signal("blip", {}), 0.0)
-    working.perceptions.extend([keep_prop, drop_prop, keep_signal])
+    keep_prop = Percept("clock", ObservableProperty("time", "10:00"), 0.0)
+    drop_prop = Percept("stranger", ObservableProperty("x", 1), 0.0)
+    keep_signal = Percept("stranger", Signal("blip", {}), 0.0)
+    working.properties[("clock", "time")] = keep_prop
+    working.properties[("stranger", "x")] = drop_prop
+    working.signals.append(keep_signal)
     a1 = Activity(id="a1", goal="g", context={})
     working.activities["a1"] = a1
 
@@ -375,7 +377,8 @@ async def test_situate_filters_properties_but_retains_signals(tmp_path: Path) ->
 
     # The property from an unengaged source is pruned; the joined tool's property and the
     # fire-and-forget signal (even from an unengaged source) are retained.
-    assert working.perceptions == [keep_prop, keep_signal]
+    assert working.properties == {("clock", "time"): keep_prop}
+    assert working.signals == [keep_signal]
 
 
 # --------------------------------------------------------------------------------------------------

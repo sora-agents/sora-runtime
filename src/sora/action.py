@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.activity import Activity, ActivityState
 from sora.manual import ToolRecord, WorkspaceRecord
-from sora.perception import PerceptKind
 from sora.types import (
     OPERATION_NAME,
     TOOL_ID,
@@ -171,12 +170,9 @@ class UnfocusAction:  # predefined external action: _unfocus_
         if tool is not None:
             await tool.unfocus()
         # Unfocusing stops re-observing this tool, so its observable-property snapshot is
-        # permanently stale — drop it. Signals from the same source stay: they're fire-and-forget
-        # and may still matter elsewhere (same rationale as _filter_).
-        perceptions = cycle.working.perceptions
-        perceptions[:] = [
-            p for p in perceptions if not (p.kind is PerceptKind.PROPERTY and p.source == tool_id)
-        ]
+        # permanently stale — drop it. Signals from the same source stay (their own store, left
+        # untouched): fire-and-forget, they may still matter elsewhere (same rationale as _filter_).
+        cycle.working.drop_properties(lambda source: source != tool_id)
         return ActionAck(ok=True)
 
 
@@ -290,19 +286,41 @@ class FilterPerceptionsAction:  # predefined internal action: _filter_
 
     async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
         # Prune observable-property percepts to the relevant tools, in place (`tool_ids` is the
-        # relevant set — the default passes the joined workspaces' tools). Signals are retained
-        # regardless of source: they're fire-and-forget, so dropping one is unrecoverable, and it
-        # may still matter to another (or a blocked) activity. Signal retention/eviction is
-        # consumption-driven and owned by the blocked-state machinery, not this per-cycle prune.
+        # relevant set — the default passes the joined workspaces' tools).
         tool_ids = kwargs["tool_ids"]
-        perceptions = cycle.working.perceptions
-        perceptions[:] = [
-            p for p in perceptions if p.kind is PerceptKind.SIGNAL or p.source in tool_ids
-        ]
+        cycle.working.drop_properties(lambda source: source in tool_ids)
+
+
+class SuspendAction:  # predefined internal action: _suspend_
+    name = "suspend"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        # Move a READY activity to BLOCKED, recording the signal it waits for. The *decision* to
+        # suspend (a long-running op declared a completion signal not yet observed) is the caller's
+        # — mechanically Observe's; this action is just the state flip. Layered on top of the
+        # automatic RUNNING->READY resolve, not fused with it (see Activities in README).
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        activity.state = ActivityState.BLOCKED
+        activity.blocked_on = kwargs["wait"]  # a SignalWait
+        log.info("observe: suspended activity %s until %s", activity.id, activity.blocked_on)
+
+
+class ResumeAction:  # predefined internal action: _resume_
+    name = "resume"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        # Move a BLOCKED activity back to READY once its awaited signal was observed (the caller
+        # matched it — the signal itself is left in working memory, not evicted, so it can still
+        # satisfy another activity blocked on the same wait). Clears blocked_on so it's selectable
+        # again next Situate.
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        activity.state = ActivityState.READY
+        activity.blocked_on = None
+        log.info("observe: resumed activity %s", activity.id)
 
 
 def default_action_registry() -> ActionRegistry:
-    """The predefined action space, assembled once: the six external actions plus the four internal
+    """The predefined action space, assembled once: the six external actions plus the six internal
     working-memory actions. bootstrap and test harnesses register everything through this rather
     than naming each action inline."""
     registry = ActionRegistry()
@@ -320,6 +338,8 @@ def default_action_registry() -> ActionRegistry:
         LoadManualAction(),
         UnloadManualAction(),
         FilterPerceptionsAction(),
+        SuspendAction(),
+        ResumeAction(),
     ):
         registry.register_internal(internal)
     return registry

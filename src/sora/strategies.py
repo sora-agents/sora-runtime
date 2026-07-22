@@ -14,11 +14,28 @@ from sora.action import (
     FilterPerceptionsAction,
     InvokeAction,
     LoadManualAction,
+    ResumeAction,
+    SuspendAction,
     UnloadManualAction,
 )
 from sora.activity import ActivityState
-from sora.perception import Percept, PerceptKind
-from sora.types import OPERATION_NAME, TOOL_ID, CompletedOperation, OperationInvocation, Step
+from sora.perception import Percept
+from sora.types import (
+    OPERATION_NAME,
+    TOOL_ID,
+    CompletedOperation,
+    OperationInvocation,
+    SignalWait,
+    Step,
+)
+
+# Bound on retained signals: they're consumption-evicted (a matched signal leaves when its activity
+# resumes), but an *orphan* — one that arrives before its waiter, or that nothing ever waits on —
+# can't be dropped eagerly without losing the early-arrival window (a completion signal that beats
+# its op's ack must survive to the cycle that suspends). Cap the append log so orphans can't grow it
+# without bound; the newest win. Deliberately simple, revisited when a real multi-waiter scenario
+# needs age- or ownership-based eviction.
+_SIGNAL_RETENTION = 256
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -154,11 +171,13 @@ class DefaultObserveStrategy:
         wm = cycle.working
         self._snapshot_properties(wm)
         async for source, signal in cycle.signal_sink.drain():
-            wm.perceptions.append(Percept(source, PerceptKind.SIGNAL, signal, time.time()))
+            wm.signals.append(Percept(source, signal, time.time()))
             log.info("observe: signal %s from %s", signal.name, source)
+        just_resolved: list[tuple[Activity, OperationInvocation]] = []
         async for invocation_id, ack in cycle.result_sink.drain():
-            # Unambiguous 1:1 match: the invoke's own result resolves its activity automatically,
-            # never as a Percept, no strategy involved (see Activities in README).
+            # Unambiguous 1:1 match: the invoke's own result resolves its activity automatically to
+            # READY — manual-agnostic, no strategy involved. The *second* kind of waiting (block on
+            # a declared completion signal) is layered on top below, never fused into this resolve.
             for activity in wm.activities.values():
                 if activity.pending_operation and activity.pending_operation.id == invocation_id:
                     invocation = activity.pending_operation.invocation
@@ -169,6 +188,7 @@ class DefaultObserveStrategy:
                     )  # belief to ground on
                     activity.pending_operation = None
                     activity.state = ActivityState.READY
+                    just_resolved.append((activity, invocation))
                     if ack.ok:
                         log.info("observe: resolved %s -> ok", op)
                     else:
@@ -176,32 +196,87 @@ class DefaultObserveStrategy:
                         # the error the trace just says failed with no cause (e.g. a schema error).
                         log.warning("observe: resolved %s -> FAILED: %s", op, _truncate(ack.result))
                     break
+        await self._suspend_on_completion_signal(cycle, just_resolved)
+        await self._resume_on_signal(cycle)
+        # Trim last: a signal that just arrived this tick must survive to be matched by the two
+        # passes above before it's ever subject to eviction (bound orphan growth; newest win).
+        if len(wm.signals) > _SIGNAL_RETENTION:
+            del wm.signals[:-_SIGNAL_RETENTION]
         async for message in cycle.communication.receive():
             wm.messages.append(message)
             log.info("observe: message from %s: %r", message.sender, _goal_from_message(message))
         return TickResult()
 
+    async def _suspend_on_completion_signal(
+        self, cycle: DecisionCycle, just_resolved: list[tuple[Activity, OperationInvocation]]
+    ) -> None:
+        """For each activity whose op just resolved: if the op's manual declares a completion signal
+        that hasn't already arrived, suspend the activity until it does. Layered on the automatic
+        RUNNING->READY resolve above (a failed op still terminates in Reflect; only a successful,
+        signal-declaring op suspends). If the signal already arrived (it beat the ack), stay READY
+        without blocking — the two waits compose, they don't deadlock. The signal itself is never
+        consumed here: it's left in `wm.signals` for `_resume_on_signal` (or any other activity
+        blocked on the same wait, or a strategy reading `wm.signals` directly) to still see it."""
+        wm = cycle.working
+        suspend = cycle.actions.internal(SuspendAction.name)
+        for activity, invocation in just_resolved:
+            last = activity.last_operation
+            if last is None or not last.ok:  # a failure isn't a completion to wait past
+                continue
+            completion = self._completion_signal(wm, invocation)
+            if completion is None:
+                continue
+            wait = SignalWait(signal_name=completion, source=invocation.tool_id)
+            if self._match_signal(wm, wait) is not None:  # early signal: already satisfied
+                log.info("observe: completion signal %s already present", completion)
+                continue
+            await suspend.execute(cycle, activity_id=activity.id, wait=wait)
+
+    async def _resume_on_signal(self, cycle: DecisionCycle) -> None:
+        """For each BLOCKED activity, if an observed signal satisfies its wait, resume it. The
+        matched signal is left in `wm.signals` rather than evicted — it's a shared, append-only log
+        any other blocked activity (waiting on the identical name+source) or strategy reading it
+        directly may still need; only the fixed retention cap (see observe()) ever evicts it."""
+        wm = cycle.working
+        resume = cycle.actions.internal(ResumeAction.name)
+        for activity in wm.activities.values():
+            if activity.blocked_on is None:
+                continue
+            if self._match_signal(wm, activity.blocked_on) is not None:
+                await resume.execute(cycle, activity_id=activity.id)
+
+    @staticmethod
+    def _completion_signal(wm: WorkingMemory, invocation: OperationInvocation) -> str | None:
+        """The completion signal the invoked op declares in its manual, or None (unknown tool,
+        unknown op, or a synchronous op)."""
+        try:
+            tool = wm.registry.get(invocation.tool_id)
+        except KeyError:
+            return None  # tool left since the invoke — nothing to wait on
+        op = tool.manual.operation(invocation.operation_name)
+        return op.completion_signal if op is not None else None
+
+    @staticmethod
+    def _match_signal(wm: WorkingMemory, wait: SignalWait) -> Percept | None:
+        """The first stored signal satisfying `wait` (name equality, plus source when scoped), or
+        None. Mechanical — no LLM judgment — since the wait is a manual-declared signal name."""
+        for percept in wm.signals:
+            if percept.payload.name == wait.signal_name and (
+                wait.source is None or percept.source == wait.source
+            ):
+                return percept
+        return None
+
     @staticmethod
     def _snapshot_properties(wm: WorkingMemory) -> None:
         """Represent observable properties as a replace-by-(source, name) snapshot: one percept per
         property, last value wins. A property is persistent, re-observed state, so re-observing the
-        same (source, name) overwrites its percept in place rather than appending — otherwise
-        wm.perceptions would grow unbounded with stale duplicate values every cycle. Signals are the
-        opposite (transient, fire-and-forget) and keep append semantics, handled in observe()."""
-        index = {
-            (p.source, p.payload.name): i
-            for i, p in enumerate(wm.perceptions)
-            if p.kind is PerceptKind.PROPERTY
-        }
+        same (source, name) overwrites its entry in the keyed store rather than accumulating — the
+        store *is* the snapshot. Signals are the opposite (transient, fire-and-forget) and keep
+        append semantics in their own list, handled in observe()."""
         for tool in wm.focused_tools.values():
             for prop in tool.observe():
-                percept = Percept(tool.id, PerceptKind.PROPERTY, prop, time.time())
-                key = (tool.id, prop.name)
-                if key in index:
-                    wm.perceptions[index[key]] = percept  # replace in place, position preserved
-                else:
-                    index[key] = len(wm.perceptions)
-                    wm.perceptions.append(percept)
+                wm.properties[(tool.id, prop.name)] = Percept(tool.id, prop, time.time())
 
 
 class DefaultReflectStrategy:

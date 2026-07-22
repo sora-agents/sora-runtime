@@ -49,7 +49,7 @@ Plan(
 )
 ```
 
-Each step executes in a separate decision cycle. Concrete parameters (target date, attendees, email ID) are bound from the most recent percepts in working memory each cycle: the `list_emails` result feeds the `email_id` for `reply_to_email`, and the `get_calendar_events_from_to` result determines which Monday slot is free. `add_calendar_event` is a write operation, so the ARE MCP server immediately sends `resource_updated` for `CalendarApp/state` — S-ORA delivers this as a `Percept(kind="signal")` on the next `observe()`, which the `ReflectStrategy` uses to confirm the operation succeeded before advancing the plan.
+Each step executes in a separate decision cycle. Concrete parameters (target date, attendees, email ID) are bound from the most recent percepts in working memory each cycle: the `list_emails` result feeds the `email_id` for `reply_to_email`, and the `get_calendar_events_from_to` result determines which Monday slot is free. `add_calendar_event` is a write operation, so the ARE MCP server immediately sends `resource_updated` for `CalendarApp/state` — S-ORA delivers this as a signal `Percept` (appended to `wm.signals`) on the next `observe()`, which the `ReflectStrategy` uses to confirm the operation succeeded before advancing the plan.
 
 ## Connecting via the ARE MCP server
 
@@ -113,7 +113,7 @@ async def focus(self, sink: SignalSink) -> None:
     )
 ```
 
-On the next `observe()`, `DefaultObserveStrategy` drains the `signal_sink` and appends a `Percept(source="EmailClientApp", kind="signal", payload=Signal("state_updated", ...), ...)` to working memory. The reasoning strategy checks for that percept and decides to re-invoke `list_emails` to discover what changed.
+On the next `observe()`, `DefaultObserveStrategy` drains the `signal_sink` and appends a `Percept(source="EmailClientApp", payload=Signal("state_updated", ...), ...)` to `wm.signals`. The reasoning strategy checks for that percept and decides to re-invoke `list_emails` to discover what changed.
 
 For `USER_MESSAGE` entries from the ARE notification system — the initial task prompt the scenario delivers to the agent — the adapter routes these through S-ORA's `MessageTransport`, so they arrive in `working_memory.messages` just like any agent-to-agent message.
 
@@ -129,7 +129,7 @@ ARE scenarios can inject mid-scenario events — a follow-up email from Bob ("ac
 
 1. A scheduled ARE event injects a new email into the inbox.
 2. The MCP server sends `resource_updated` for `EmailClientApp/state`.
-3. `DefaultObserveStrategy` delivers it as `Percept(source="EmailClientApp", kind="signal", ...)`.
+3. `DefaultObserveStrategy` delivers it as a signal `Percept(source="EmailClientApp", ...)` in `wm.signals`.
 4. `ReflectStrategy` sees the signal and marks the current activity's plan stale.
 5. The next `reason()` call re-derives a plan from the updated working memory — new target date, same shape — and execution resumes from step 2 (`get_calendar_events_from_to` with the corrected date).
 
@@ -385,13 +385,13 @@ await FocusAction().execute(agent.registry, agent.cycle, tool_id="robotic-arm")
 Once focused, `room-agent`'s `_observe()` polls `video-stream.observe()` every cycle and reflects the result into working memory as a percept — this is what `focus()` without any operations is for:
 
 ```python
-Percept(source="video-stream", kind="property",
+Percept(source="video-stream",
         payload=ObservableProperty("scene",
             "Two piles: a blue block is on top of a red block; a green block is on top of a yellow block."),
         observed_at=1751629200.0)
 ```
 
-This lands in `room_agent.working.perceptions` — nobody asked for it, it's just there because `room-agent` is focused on the tool that produces it.
+This lands in `room_agent.working.properties` under the key `("video-stream", "scene")` — nobody asked for it, it's just there because `room-agent` is focused on the tool that produces it (a re-observed snapshot, so a later cycle overwrites it in place).
 
 ## Coordinating across agents
 
@@ -412,7 +412,7 @@ Message(sender="arm-agent",
         received_at=1751629201.0)
 ```
 
-`room-agent`'s reasoning strategy sees the message in `wm.messages`, reads the latest `scene` percept out of `wm.perceptions`, and answers:
+`room-agent`'s reasoning strategy sees the message in `wm.messages`, reads the latest `scene` percept out of `wm.properties`, and answers:
 
 ```python
 await SendAction().execute(agent.registry, agent.cycle, to="arm-agent",
@@ -446,15 +446,15 @@ activity.pending_operation = None
 activity.state = ActivityState.READY
 ```
 
-This is where the *second*, independent kind of waiting comes in: `robotic-arm`'s manual additionally says to wait for the `target_reached` signal before doing anything else — a condition about the arm's physical state, unrelated to whether `move_to`'s own ack has returned. Back in `reason()`, seeing `last_operation` set but knowing the manual requires this extra wait, the strategy's next decision is the internal `_suspend_` action, moving `pick-up-block` from `ready` to `blocked`. The two waits compose — implicit-and-automatic, then explicit-and-manual-driven — rather than being the same mechanism:
+This is where the *second*, independent kind of waiting comes in: `robotic-arm`'s manual declares that `move_to`'s completion is marked by the `target_reached` signal (`OperationSpecification.completion_signal`, from the operation's `completes_on:` interface block) — a condition about the arm's physical state, separate from whether `move_to`'s own ack has returned. This is handled *mechanically, in Observe, layered on top of the automatic resolve above* — not by a strategy and not in `reason()`. In the same `observe()` that resolved `move_to` to `ready`, a suspend pass notices the completed op declares a completion signal that hasn't arrived yet and calls the internal `_suspend_` action, moving `pick-up-block` from `ready` to `blocked` and recording `blocked_on=SignalWait("target_reached", source="robotic-arm")`. The two waits compose — implicit-and-automatic, then a separate mechanical block — rather than being the same mechanism. A few cycles later the signal arrives:
 
 ```python
-Percept(source="robotic-arm", kind="signal",
+Percept(source="robotic-arm",
         payload=Signal(name="target_reached", payload={}),
         observed_at=1751629210.0)
 ```
 
-Reflect/Situate notices this signal (a genuine judgment call — matching it against what the manual said to wait for — which is why *this* resume isn't automatic the way the operation-completion one was), and the activity becomes `ready` again. The plan advances to closing the gripper, which goes through the exact same implicit `running` → automatic-resolve cycle as `move_to` did — no percept, no suspend, since this tool's manual doesn't require waiting for anything beyond the operation's own result:
+Observe's resume pass matches it against `blocked_on` by name (no judgment — the wait is structurally declared) and calls `_resume_` to return `pick-up-block` to `ready` — the signal itself stays in `wm.signals` (only the fixed retention cap evicts it, not the match). The plan advances to closing the gripper, which goes through the exact same implicit `running` → automatic-resolve cycle as `move_to` did — no block this time, since `close_gripper` declares no completion signal (it's synchronous):
 
 ```python
 await InvokeAction().execute(agent.registry, agent.cycle, activity_id="pick-up-block",
@@ -467,12 +467,12 @@ activity.last_operation = OperationAck(ok=True, result={"gripper": 0})
 
 `PickUpBlockStrategy` shows the seam `ReasonStrategy` provides — a small, deterministic strategy is enough to demonstrate the pipeline without a real model call. It's only called when `result.step` is still `None`, and it hands back the accumulated `TickResult`, not a bare `Step`. This particular activity genuinely can't be fully planned upfront — the coordinates depend on room-agent's reply, which hasn't arrived yet the first few cycles — so it decides one step at a time from `activity.context`, rather than building a multi-step `Plan`:
 
+Note there is no `BLOCKED` case to handle: a blocked activity is never selected by Situate (it's not `ready`), so `reason()` is never called on one — the suspend/resume is entirely mechanical, in Observe (above), not the strategy's concern.
+
 ```python
 class PickUpBlockStrategy:
     async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
                       result: TickResult) -> TickResult:
-        if activity.state is ActivityState.BLOCKED:
-            return TickResult(activity=activity, step=Step(next_action="wait", params={}))
         if "target" not in activity.context:
             reply = next((m for m in wm.messages
                            if m.sender == "room-agent" and m.content.get("type") == "reply"), None)
@@ -491,7 +491,7 @@ class PickUpBlockStrategy:
         return TickResult(activity=activity, step=Step(next_action="wait", params={}))
 ```
 
-`locate_blue_block` (a stand-in for whatever turns "a blue block is on top of a red block" into coordinates) is out of scope here — the point is that `wm.messages` and `wm.perceptions` are both plain, readable inputs to `reason()`, kept separate but equally available. Note that marking the activity `TERMINATED` once the gripper is closed isn't this strategy's job anymore — that judgment now belongs to a `ReflectStrategy` (here, as simple as checking `activity.context.get("gripper") == 0`), not shown in full to keep this example focused on Reason and Act.
+`locate_blue_block` (a stand-in for whatever turns "a blue block is on top of a red block" into coordinates) is out of scope here — the point is that `wm.messages` and the perceptual stores (`wm.properties`, `wm.signals`) are all plain, readable inputs to `reason()`, kept separate but equally available. Note that marking the activity `TERMINATED` once the gripper is closed isn't this strategy's job anymore — that judgment now belongs to a `ReflectStrategy` (here, as simple as checking `activity.context.get("gripper") == 0`), not shown in full to keep this example focused on Reason and Act.
 
 ## Fusing Reason into Act
 

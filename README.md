@@ -32,7 +32,7 @@ An activity can be in one of four states:
 - ready: the agent can pick and pursue the activity;
 - terminated: the activity was completed or dropped.
 
-An activity is eligible for selection only when ready; running and blocked activities are skipped until something transitions them back. Invoking an operation always, implicitly, moves an activity to running until that operation's own result comes back — this is unconditional, independent of anything the tool's manual says. A manual can additionally require blocking on a specific signal before the next step, layered on top of (not instead of) that implicit wait — the two are orthogonal: a signal may have nothing to do with the operation just invoked, or depend on other conditions entirely. Because resolving a running activity is an unambiguous, one-to-one match between an invoked operation and its result, the runtime does this automatically, with no strategy code involved; resolving a blocked activity is not automatic, since it requires matching a signal against whatever the manual says to wait for — a genuine judgment call left to Situate/Reflect.
+An activity is eligible for selection only when ready; running and blocked activities are skipped until something transitions them back. Invoking an operation always, implicitly, moves an activity to running until that operation's own result comes back — this is unconditional, independent of anything the tool's manual says, and resolving it back to ready is an unambiguous one-to-one match the runtime does automatically, with no strategy code involved. A manual can additionally require blocking on a specific signal before the next step, layered on top of (not instead of) that implicit wait — the two are orthogonal: the operation resolves to ready first, and a *separate* step then blocks the activity until the signal arrives. That block is likewise mechanical: an operation declares its completion signal in its manual (`OperationSpecification.completion_signal`), so entering `blocked` (the `_suspend_` action) and leaving it once the signal is observed (the `_resume_` action — the matched signal itself is left in `wm.signals`, not evicted, so it can also satisfy another activity waiting on the same signal, or a strategy reading it directly; only a fixed retention cap ever removes it) are both name-equality matches the Observe phase performs deterministically — no model call, no judgment. (A completion driven by an observable property reaching a state, rather than a signal, is a foreseen second form — deferred.)
 
 ### Tool Model and Use
 
@@ -64,7 +64,7 @@ We break down the process of using a tool into five phases:
 - Learning: the agent retrieves the tool's manual and loads it into its context; thus, the agent learns how to use the tool by reading its manual
 - Focus: the agent decides whether to subscribe to the tool's observable properties and signals to perceive relevant state changes and domain events
 - Operation: the agent invokes operations that return an immediate acknowledgment (but not necessarily the final result or outcome)
-- Suspension and Resumption: the agent may decide to suspend the operation of a tool if the manual specifies waiting for a signal or observable property update before resuming
+- Suspension and Resumption: if a tool's manual declares that a long-running operation's completion is marked by a specific signal (or, as a deferred second form, an observable property update), the runtime suspends the activity after invoking that operation and resumes it once the signal is observed — a mechanical match, not a per-operation decision
 
 ### Tool Manuals
 
@@ -77,7 +77,7 @@ Tools can be described by manuals. Any manual format can be used. S-ORA currentl
 5. Operations: definitions of commands to interact with the tool, including the commands' intended purposes, preconditions, and effects;
 6. Usage Protocols & Safety: operating instructions, including safety constraints (if any) or conditions under which an activity must be suspended (e.g., to wait for specific signals).
 
-In the Markdown rendering, Observable Properties, Signals, and Operations are `-` bullet lists. An operation bullet may additionally carry optional labeled sub-bullets — `Preconditions:`, `Effects:`, and `Behavior:` (whether the operation completes synchronously or is long-running, and which signal, if any, indicates completion) — expressing the operation semantics part 5 calls for. For now these are folded into the operation's single `description` (see `OperationSpecification` in the API Sketch): fully available to a reasoning strategy as text, but deliberately not lifted into discrete model fields until a strategy actually consumes them — the labels are the seams where that structure would later attach.
+In the Markdown rendering, Observable Properties, Signals, and Operations are `-` bullet lists. An operation bullet may additionally carry optional labeled sub-bullets — `Preconditions:`, `Effects:`, and `Behavior:` (whether the operation completes synchronously or is long-running, and which signal, if any, indicates completion) — expressing the operation semantics part 5 calls for. These are folded into the operation's single `description`: fully available to a reasoning strategy as text, but not lifted into discrete model fields until a strategy actually consumes them — the labels are the seams where that structure would later attach. The one such field a consumer now needs, the completion signal, is the exception: an author may declare it explicitly as `completes_on:` in the optional operations interface block (see The clean Markdown format / ADR-0018), which the parser lifts into `OperationSpecification.completion_signal` for the blocked-state machinery to match against — the mechanical wait the Activities section describes.
 
 Property, signal, and operation entries carry their data shapes as JSON Schema in the spec types' `schema`/`parameters` fields (see the API Sketch). A manual describes a tool *type* and stays protocol-agnostic: JSON Schema is data shape, not a protocol binding, so it is filled either by an adapter from a native description (an MCP tool schema, a WoT TD affordance schema) or, for a hand-authored manual, lifted from the light `(type, range)` hints above — with an optional inline JSON Schema where full fidelity is needed. The protocol binding — how to actually reach one instance — lives on the live `Tool`, never in the manual. See [ADR-0015](docs/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md).
 
@@ -131,7 +131,7 @@ The decision cycle follows 5 steps:
 - Reflect: for each activity, decides whether it has completed successfully or failed — and if so, executes an internal action to summarize and store the experience in episodic memory; "optional" means this decision itself is cheap by default and made fresh every cycle, not that the cycle is externally told when to check; the judgment is synchronous — it must land before Situate selects, so a just-completed activity is never re-selected the same cycle — while summarizing and storing run asynchronously and never block the cycle; several activities may terminate in the same cycle
 - Situate: the agent selects an activity and adjusts its working memory for that activity — for example, by loading required manuals, unloading obsolete ones, and filtering the perceptual input; if an unhandled message in working memory doesn't correspond to any existing activity, Situate creates one via the internal _create_activity_ action before selecting; which ready activity to select — the agent's scheduler — is its own pluggable sub-strategy, defaulting to fair round-robin rotation over the ready set (anti-starvation, still no model call) so richer policies (priority, aging, deadlines, an LLM-based scheduler) can replace just the pick without re-authoring the rest of Situate
 - Reason: the agent retrieves or infers a plan for the current activity — a multi-step, reusable artifact, not regenerated every cycle — and selects the next step to advance it; if the activity already has a valid plan, this is as cheap as reading its next step, no replanning involved; the Situate phase may suggest prerequisite external actions for situated reasoning, such as to retrieve tool manuals from an external repository, focus on or unfocus from tools; these prerequisite actions should take priority unless a more urgent action is needed — for example, to respond to a critical signal; if no prerequisite or urgent actions are required, the agent selects the next external action that advances the plan, which is either to send a message to another agent or invoke a tool operation
-- Act: binds the step to a concrete invocation and executes the external action; for external actions that invoke tool operations, if the tool's manual specifies waiting for a signal or an observable property change before completion, the agent invokes the suspend internal action to suspend the current activity; the activity can resume once the expected external event is received
+- Act: binds the step to a concrete invocation and executes the external action — mechanically, with no manual interpretation of its own. The suspend/resume that layers a signal-wait on top of a long-running operation is *not* done here: once the operation resolves, the Observe phase mechanically suspends the activity if the operation's manual declares a completion signal, and resumes it once that signal is observed (see Activities)
 
 The five phases are a ceiling, not a quota: every cycle runs the pipeline, but a given cycle may conclude with one external action, with internal work only (e.g., storing experiences), or with nothing to do — at most one external action per cycle, never a mandatory one.
 
@@ -245,8 +245,9 @@ tools' manuals into working memory (`_load_`), unloads any no longer backed by a
 (`_unload_`), and filters *observable-property* percepts down to the joined workspaces' tools
 (`_filter_`). `_filter_` prunes only properties — a re-observed snapshot, safe to drop and reproduced
 next cycle. Signals are **fire-and-forget** and are never dropped by `_filter_`: a signal may still
-matter to another (or a `blocked`) activity, so its retention/eviction is consumption-driven and
-owned by the blocked-state machinery, not a per-cycle prune. The default does not auto-*focus* —
+matter to another (or a `blocked`) activity, so its retention/eviction is owned by the blocked-state
+machinery's fixed retention cap, not a per-cycle prune — satisfying a wait never evicts a signal
+early. The default does not auto-*focus* —
 focusing is an external action (one per cycle, dispatched at Act), so an agent that needs to perceive
 a tool's properties/signals emits `_focus_` as a plan step.
 
@@ -319,6 +320,13 @@ when the variable isn't already set), so it never silently overrides a key you e
     class Signal:
         name: str
         payload: dict
+
+    @dataclass(frozen=True)
+    class SignalWait:         # what a `blocked` activity waits for — see Activity.blocked_on
+        signal_name: str      # matched mechanically in Observe (name equality, plus source when scoped)
+        source: str | None = None  # tool id the signal must come from; None matches any source
+        # A future variant will wait on an observable property reaching a state (README's "signal *or*
+        # property update") — deferred; hence Activity.blocked_on is named generally, not blocked_on_signal.
 
     @dataclass(frozen=True)
     class ActionAck:          # returned by ExternalAction.execute() — dispatch, not outcome (see EXAMPLES.md)
@@ -445,16 +453,13 @@ when the variable isn't already set), so it never silently overrides a key you e
             SemanticMemory first. Skips discovery entirely."""
 
     # sora/perception.py
-    class PerceptKind(StrEnum):   # closed set — one source of truth; each member == its str value
-        PROPERTY = "property"
-        SIGNAL = "signal"
-
     @dataclass(frozen=True)
     class Percept:
         source: str            # tool id
-        kind: PerceptKind       # genuine environment stimuli only; an invoked operation's own result
-        payload: Any             # is not a Percept (see Activity.pending_operation/last_operation) and
-        observed_at: float        # neither are agent messages (see WorkingMemory.messages)
+        payload: Any            # an ObservableProperty (in WorkingMemory.properties) or a Signal (in
+        observed_at: float      #   .signals) — the store discriminates, so there is no `kind` field.
+        # genuine environment stimuli only: an invoked operation's own result is not a Percept (see
+        # Activity.pending_operation/last_operation), and neither are agent messages (see .messages).
 
     @dataclass(frozen=True)
     class Message:
@@ -487,6 +492,9 @@ when the variable isn't already set), so it never silently overrides a key you e
         description: str     # folds in any Preconditions/Effects/Behavior sub-bullets as prose (see
                              #   Tool Manuals); discrete fields deferred until a strategy consumes them
         parameters: dict     # JSON-Schema-shaped
+        completion_signal: str | None = None  # the signal marking a long-running op's real completion
+                             #   (its ack means only "accepted") — author-owned (a native description
+                             #   can't express it), so merge_manuals keeps it; drives the blocked wait
 
     @dataclass(frozen=True)
     class ObservablePropertySpecification:
@@ -514,7 +522,8 @@ when the variable isn't already set), so it never silently overrides a key you e
 
     class ManualParser(Protocol):     # Markdown by default, XML pluggable
         def parse(self, raw: str) -> Manual: ...   # Manual envelope; also lifts an optional per-section
-                                                   #   ```yaml interface block (names + required) if present
+                                                   #   ```yaml interface block (names + required; plus an
+                                                   #   operation's completes_on completion signal) if present
 
     class ManualParseError(ValueError): ...   # e.g. a manual with no derivable id
     class MarkdownManualParser:               # the default ManualParser (clean Markdown format)
@@ -564,6 +573,8 @@ when the variable isn't already set), so it never silently overrides a key you e
         step_index: int = 0
         pending_operation: PendingOperation | None = None  # set while RUNNING; runtime clears it on resolve
         last_operation: OperationAck | None = None          # most recently resolved result, for Reason to read
+        blocked_on: SignalWait | None = None                # set while BLOCKED; the signal awaited before READY
+        #                                                     (set by _suspend_, cleared by _resume_) — see below
         history: list[CompletedOperation] = []              # append-only trace of resolved ops — a later step
         #                                                     grounds param references against it (see Reason
         #                                                     grounding); last_operation keeps only the newest
@@ -634,9 +645,9 @@ when the variable isn't already set), so it never silently overrides a key you e
             tool = cycle.working.focused_tools.pop(tool_id, None)
             if tool is not None:
                 await tool.unfocus()
-            # drop the tool's now-stale property snapshot (signals stay — fire-and-forget)
-            cycle.working.perceptions[:] = [p for p in cycle.working.perceptions
-                                            if not (p.kind == "property" and p.source == tool_id)]
+            # drop the tool's now-stale property snapshot (signals stay — their own store, untouched)
+            for key in [k for k in cycle.working.properties if k[0] == tool_id]:
+                del cycle.working.properties[key]
             return ActionAck(ok=True)
 
     class JoinAction:                  # predefined external action: _join_ — implies discover/connect
@@ -707,12 +718,26 @@ when the variable isn't already set), so it never silently overrides a key you e
     class FilterPerceptionsAction:     # predefined internal action: _filter_
         name = "filter"
         async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
-            tool_ids = kwargs["tool_ids"]        # prune observable-property percepts to relevant tools;
-            cycle.working.perceptions[:] = [     # signals are fire-and-forget -> always retained (their
-                p for p in cycle.working.perceptions   # eviction is consumption-driven, owned by the
-                if p.kind is PerceptKind.SIGNAL or p.source in tool_ids]  # blocked-state machinery)
+            tool_ids = kwargs["tool_ids"]         # prune observable-property percepts to relevant tools;
+            cycle.working.drop_properties(lambda source: source in tool_ids)  # signals: their own
+            # store, never touched here — owned by the blocked-state machinery's retention cap instead.
 
-    def default_action_registry() -> ActionRegistry:   # the six external + four internal, assembled once
+    class SuspendAction:               # predefined internal action: _suspend_
+        name = "suspend"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            activity = cycle.working.activities[kwargs["activity_id"]]  # READY -> BLOCKED, recording the
+            activity.state = ActivityState.BLOCKED                      # signal it waits for. The decision
+            activity.blocked_on = kwargs["wait"]  # (a SignalWait)      # to suspend is Observe's (a long-
+            #  running op declared a completion signal not yet observed); this action is just the flip.
+
+    class ResumeAction:                # predefined internal action: _resume_
+        name = "resume"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            activity = cycle.working.activities[kwargs["activity_id"]]  # BLOCKED -> READY once the awaited
+            activity.state = ActivityState.READY                       # signal was observed (the caller
+            activity.blocked_on = None       # matched it — the signal itself stays in working memory)
+
+    def default_action_registry() -> ActionRegistry:   # the six external + six internal, assembled once
         ...                                            # what bootstrap and test harnesses register through
 
     # sora/llm.py — the one seam onto a language model; wire-format-neutral on purpose
@@ -752,7 +777,11 @@ when the variable isn't already set), so it never silently overrides a key you e
                                        # WorkspaceRecord/ToolRecord knowledge stays in SemanticMemory
                                        # (what am I connected to now vs. what have I ever discovered)
         activities: dict[str, Activity]
-        perceptions: list[Percept]    # stimuli from the environment: properties and signals only
+        # Environment stimuli, stored by their opposite lifecycles: properties are a replace-by-
+        # (source, name) snapshot (one entry, last value wins); signals are an append log — a matched
+        # signal is never evicted just for satisfying a wait, only a fixed retention cap bounds it.
+        properties: dict[tuple[str, str], Percept]
+        signals: list[Percept]
         messages: list[Message]        # inbound agent-to-agent communication — kept distinct
         focused_tools: dict[str, Tool]
         loaded_manuals: dict[str, Manual]  # manuals pulled from SemanticMemory by _load_ (removed by
@@ -841,8 +870,8 @@ when the variable isn't already set), so it never silently overrides a key you e
 
     class ObserveStrategy(Protocol):
         async def observe(self, cycle: DecisionCycle) -> TickResult:
-            """Mutates cycle.working (perceptions, messages) as a side effect — same as the default
-            below. Default: mechanical, no model call, returns an empty TickResult(). An LLM-backed
+            """Mutates cycle.working (properties, signals, messages) as a side effect — same as the
+            default below. Default: mechanical, no model call, returns an empty TickResult(). An LLM-backed
             Observe is for interpreting raw perception itself (e.g., describing a camera snapshot),
             not for deciding the cycle — decision-chain fusion starts at Situate, not here."""
 
@@ -922,29 +951,34 @@ when the variable isn't already set), so it never silently overrides a key you e
         """The runtime's built-in default — purely mechanical, no LLM. This is the exact logic
         previously inlined in DecisionCycle._observe()."""
         async def observe(self, cycle: DecisionCycle) -> TickResult:
-            # Properties are persistent, re-observed state: one percept per (source, name),
-            # last value wins — a replaced snapshot, not a growing append log.
-            index = {(p.source, p.payload.name): i
-                     for i, p in enumerate(cycle.working.perceptions) if p.kind == "property"}
+            # Properties are persistent, re-observed state: one entry per (source, name), last value
+            # wins — the keyed store *is* the snapshot (no side index, no growing append log).
             for tool in cycle.working.focused_tools.values():
                 for prop in tool.observe():
-                    percept = Percept(tool.id, "property", prop, now())
-                    key = (tool.id, prop.name)
-                    if key in index:
-                        cycle.working.perceptions[index[key]] = percept   # replace in place
-                    else:
-                        index[key] = len(cycle.working.perceptions)
-                        cycle.working.perceptions.append(percept)
+                    cycle.working.properties[(tool.id, prop.name)] = Percept(tool.id, prop, now())
             async for source, signal in cycle.signal_sink.drain():
-                cycle.working.perceptions.append(Percept(source, "signal", signal, now()))  # append
+                cycle.working.signals.append(Percept(source, signal, now()))          # append log
+            just_resolved = []
             async for op_id, ack in cycle.result_sink.drain():
-                # unambiguous 1:1 match — resolved automatically, never a Percept, no strategy involved
+                # unambiguous 1:1 match — resolved automatically to READY (manual-agnostic), never a
+                # Percept, no strategy involved. The *blocked* wait is layered on top below, not fused.
                 activity = next((a for a in cycle.working.activities.values()
                                   if a.pending_operation and a.pending_operation.id == op_id), None)
                 if activity is not None:
+                    invocation = activity.pending_operation.invocation
                     activity.last_operation = ack
                     activity.pending_operation = None
                     activity.state = ActivityState.READY
+                    just_resolved.append((activity, invocation))
+            # Suspend pass: a resolved, successful op whose manual declares a completion_signal blocks
+            # until that signal is observed — unless it already arrived (early signal -> stay READY,
+            # don't block). Resume pass: a BLOCKED activity whose blocked_on matches an observed signal
+            # returns to READY; the matched signal is left in place, not evicted. Both mechanical (name
+            # equality), via the _suspend_ / _resume_ internal actions — no judgment needed.
+            self._suspend_on_completion_signal(cycle, just_resolved)
+            self._resume_on_signal(cycle)
+            if len(cycle.working.signals) > _SIGNAL_RETENTION:     # trim last: today's signal must
+                del cycle.working.signals[:-_SIGNAL_RETENTION]     # survive to be matched above first
             async for message in cycle.communication.receive():
                 cycle.working.messages.append(message)
             return TickResult()

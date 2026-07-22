@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -33,6 +33,13 @@ class OperationSpecification:  # was Operation — renamed for symmetry with the
     name: str
     description: str
     parameters: dict[str, Any]  # JSON-Schema-shaped
+    # The domain signal that marks this (long-running) operation's real completion — its own invoke
+    # ack means only "accepted", so the activity must block until this signal arrives before the
+    # next step (a safety interlock; e.g. robotic-arm move_to -> target_reached). Author-owned
+    # semantics a native description (MCP description or WoT Thing Descrition) might not be able to
+    # express, so merge_manuals keeps the authored value even though the adapter otherwise owns
+    # operations. None = synchronous op, no extra wait.
+    completion_signal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,10 @@ class Manual:
         body = _split_sections(self.raw_text).get(name)
         return None if body is None else body.strip()
 
+    def operation(self, name: str) -> OperationSpecification | None:
+        """The named operation's spec, or None if this manual doesn't describe it."""
+        return next((op for op in self.operations if op.name == name), None)
+
 
 class ManualMergeError(ValueError):
     """Raised when the two provenance channels for one Manual.id can't be reconciled — a mismatched
@@ -106,15 +117,30 @@ def merge_manuals(adapter: Manual, authored: Manual) -> Manual:
         adapter.id,
     )
     _validate_interface(adapter.signals, authored.signals, "signal", adapter.id)
+    # completion_signal is the one operation field the *author* owns (a native description might not
+    # express it — see OperationSpecification), so overlay it onto the adapter's specs; names were
+    # cross-validated above, so a match is safe. All else about operations stays adapter-owned.
+    authored_completion = {
+        op.name: op.completion_signal
+        for op in authored.operations
+        if op.completion_signal is not None
+    }
+    operations = [
+        replace(op, completion_signal=authored_completion[op.name])
+        if op.name in authored_completion
+        else op
+        for op in adapter.operations
+    ]
     return Manual(
         id=adapter.id,
         metadata={**adapter.metadata, **authored.metadata},
         description=authored.description or adapter.description,
         # Structured specs are the adapter channel's — full, native schema. The authored side's
-        # partial specs were only for validation above and are discarded here.
+        # partial specs were only for validation above and are discarded here (bar completion_signal
+        # overlaid onto `operations` just above).
         observable_properties=adapter.observable_properties,
         signals=adapter.signals,
-        operations=adapter.operations,
+        operations=operations,
         raw_text=adapter.raw_text if authored.raw_text is None else authored.raw_text,
     )
 
@@ -260,16 +286,25 @@ def _extract_fenced_block(section_body: str | None) -> str | None:
     return None
 
 
-def _interface_entries(section_body: str | None) -> list[tuple[str, list[str]]]:
-    """Parse a section's optional interface block into (name, required-keys) pairs; [] if no block.
-    The block is a list of ``{name: <str>, required: [<str>, ...]}`` (required optional)."""
+def _interface_entries(section_body: str | None) -> list[dict[str, Any]]:
+    """Parse a section's optional interface block into normalized entry dicts; [] if no block. Each
+    block item is ``{name: <str>, required: [<str>, ...], completes_on: <str>}`` (required and
+    completes_on optional; completes_on is only meaningful for operations). Normalized here so every
+    entry has all three keys and callers never re-validate."""
     block = _extract_fenced_block(section_body)
     if block is None:
         return []
     try:
         entries = yaml.safe_load(block)
-        return [(item["name"], list(item.get("required", []) or [])) for item in entries]
-    except (yaml.YAMLError, TypeError, KeyError) as exc:
+        return [
+            {
+                "name": item["name"],
+                "required": list(item.get("required", []) or []),
+                "completes_on": item.get("completes_on"),
+            }
+            for item in entries
+        ]
+    except (yaml.YAMLError, AttributeError, TypeError, KeyError) as exc:
         raise ManualParseError(f"malformed interface block: {exc!r}\n---\n{block}") from exc
 
 
@@ -290,16 +325,25 @@ class MarkdownManualParser:  # satisfies the ManualParser Protocol (Markdown is 
             metadata=metadata,
             description=sections.get(ManualSection.DESCRIPTION, "").strip(),
             observable_properties=[
-                ObservablePropertySpecification(name=n, description="", schema=_required_schema(r))
-                for n, r in _interface_entries(sections.get(ManualSection.OBSERVABLE_PROPERTIES))
+                ObservablePropertySpecification(
+                    name=e["name"], description="", schema=_required_schema(e["required"])
+                )
+                for e in _interface_entries(sections.get(ManualSection.OBSERVABLE_PROPERTIES))
             ],
             signals=[
-                SignalSpecification(name=n, description="", schema=_required_schema(r))
-                for n, r in _interface_entries(sections.get(ManualSection.SIGNALS))
+                SignalSpecification(
+                    name=e["name"], description="", schema=_required_schema(e["required"])
+                )
+                for e in _interface_entries(sections.get(ManualSection.SIGNALS))
             ],
             operations=[
-                OperationSpecification(name=n, description="", parameters=_required_schema(r))
-                for n, r in _interface_entries(sections.get(ManualSection.OPERATIONS))
+                OperationSpecification(
+                    name=e["name"],
+                    description="",
+                    parameters=_required_schema(e["required"]),
+                    completion_signal=e["completes_on"],
+                )
+                for e in _interface_entries(sections.get(ManualSection.OPERATIONS))
             ],
             raw_text=raw,
         )

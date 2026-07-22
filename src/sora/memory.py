@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -119,14 +120,27 @@ class WorkingMemory:  # transient, in-process, fast
     # concrete instance behind this is the shared EnvironmentRegistry (mutable on DecisionCycle).
     registry: EnvironmentView
     activities: dict[str, Activity] = field(default_factory=dict)
-    # stimuli from the environment: properties and signals only
-    perceptions: list[Percept] = field(default_factory=list)
+    # Environment stimuli, stored by their opposite lifecycles (see ADR-0012's split rationale).
+    # properties: persistent, re-observed state — a replace-by-(source, name) snapshot, one entry
+    # per property, last value wins (keyed so re-observing overwrites in place). signals: transient,
+    # fire-and-forget events — an append log. The same signal name can appear more than once, each a
+    # distinct occurence (not a repeat of the same one). A signal is never removed just because it
+    # satisfied some wait (it stays visible to any other blocked activity or strategy reading it
+    # directly) — the only eviction is the retention cap bounding orphan growth.
+    properties: dict[tuple[str, str], Percept] = field(default_factory=dict)
+    signals: list[Percept] = field(default_factory=list)
     # inbound agent-to-agent communication — kept distinct
     messages: list[Message] = field(default_factory=list)
     focused_tools: dict[str, Tool] = field(default_factory=dict)
     # manuals pulled from SemanticMemory by _load_ (removed by _unload_) — distinct from
     # focused_tools: focusing a tool is an external action, loading its manual is internal.
     loaded_manuals: dict[str, Manual] = field(default_factory=dict)
+
+    def drop_properties(self, keep: Callable[[str], bool]) -> None:
+        """Prune `properties` in place to entries whose tool id satisfies `keep` — the shared
+        mechanism behind `_unfocus_` (drop one tool) and `_filter_` (keep only the relevant set)."""
+        for key in [k for k in self.properties if not keep(k[0])]:
+            del self.properties[key]
 
 
 # Discriminators for the three record kinds sharing one backend. They serve double duty: as a
@@ -446,7 +460,7 @@ def _render_operation_schema(manual: Manual | None, operation_name: str) -> str:
     """The single operation's name/description + parameter schema (reuses ``_render_params``)."""
     if manual is None:
         return f"operation `{operation_name}` (no schema available)"
-    op = next((o for o in manual.operations if o.name == operation_name), None)
+    op = manual.operation(operation_name)
     if op is None:
         return f"operation `{operation_name}` (not described in the manual)"
     lines = [f"operation `{op.name}`" + (f": {op.description}" if op.description else "")]
