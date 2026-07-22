@@ -55,7 +55,9 @@ class AgentConfig:
     mid-build. ``strategies``/``memory`` are dotted-path / URI maps resolved during ``build_agent``;
     ``workspaces`` is the raw list (each entry carries an ``origin`` plus adapter-specific keys like
     ``command``/``args``); ``llm`` is optional (absent -> no model, store/retrieve-only procedural
-    memory)."""
+    memory); ``procedural`` optionally names dotted-path ``plan_prompt``/``ground_prompt`` overrides
+    for ``ProceduralMemory`` (absent -> its own built-in ``default_plan_prompt``/
+    ``default_ground_prompt``)."""
 
     name: str
     strategies: dict[str, str]
@@ -63,6 +65,7 @@ class AgentConfig:
     workspaces: list[dict[str, Any]]
     transport: dict[str, Any] | None = None
     llm: dict[str, Any] | None = None
+    procedural: dict[str, str] | None = None
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -117,6 +120,7 @@ def load_yaml(config_path: str | Path) -> AgentConfig:
             "agent.yaml: strategies.reason is required — Reason is the one phase with no "
             "mechanical default (planning needs a model). Name your ReasonStrategy there."
         )
+    procedural = agent.get("procedural")
     return AgentConfig(
         name=agent["name"],
         strategies=strategies,
@@ -124,6 +128,7 @@ def load_yaml(config_path: str | Path) -> AgentConfig:
         workspaces=list(agent.get("workspaces", [])),
         transport=agent.get("transport"),
         llm=agent.get("llm"),
+        procedural=dict(procedural) if procedural else None,
     )
 
 
@@ -197,6 +202,21 @@ def llm_for(config: AgentConfig) -> LLMClient | None:
     return client_cls(**settings)  # type: ignore[no-any-return]
 
 
+def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]:
+    """Resolve the optional ``procedural.plan_prompt``/``procedural.ground_prompt`` dotted paths
+    into ``ProceduralMemory`` constructor kwargs — a custom callable fully replaces the built-in
+    default (``default_plan_prompt``/``default_ground_prompt``), it doesn't patch pieces of it.
+    Absent -> an empty dict, so ``ProceduralMemory``'s own defaults apply unchanged."""
+    if not config.procedural:
+        return {}
+    kwargs: dict[str, Any] = {}
+    if "plan_prompt" in config.procedural:
+        kwargs["prompt"] = import_object(config.procedural["plan_prompt"])
+    if "ground_prompt" in config.procedural:
+        kwargs["ground_prompt"] = import_object(config.procedural["ground_prompt"])
+    return kwargs
+
+
 def transport_for(config: AgentConfig) -> MessageTransport:
     """The single-agent default is an in-process inbox. An agent-to-agent transport (A2A/HTTP,
     driven by ``transport.peers``) is the multi-agent case and is deferred, so a ``peers`` config
@@ -222,7 +242,11 @@ def build_agent(config_path: str) -> Agent:
     registry = EnvironmentRegistry(adapters=adapters)  # the single shared instance...
     working = WorkingMemory(registry=registry)  # ...held here read-only as an EnvironmentView
     semantic = SemanticMemory(backend_for(config.memory["semantic"]))
-    procedural = ProceduralMemory(backend_for(config.memory["procedural"]), llm=llm_for(config))
+    procedural = ProceduralMemory(
+        backend_for(config.memory["procedural"]),
+        llm=llm_for(config),
+        **procedural_prompts_for(config),
+    )
     episodic = EpisodicMemory(backend_for(config.memory["episodic"]))
     communication = transport_for(config)
 

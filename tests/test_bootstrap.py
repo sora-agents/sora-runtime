@@ -26,6 +26,7 @@ from sora.bootstrap import (
     llm_for,
     load_dotenv,
     load_yaml,
+    procedural_prompts_for,
     transport_for,
 )
 from sora.environment import WorkspaceOrigin
@@ -139,6 +140,43 @@ def test_load_yaml_parses_agent_block(tmp_path: Path) -> None:
     assert config.llm == {"model": "claude-opus-4-8"}
 
 
+def test_load_yaml_parses_procedural_block(tmp_path: Path) -> None:
+    config = load_yaml(
+        _write_yaml(
+            tmp_path,
+            "agent:\n"
+            "  name: demo\n"
+            "  strategies:\n"
+            "    reason: sora.strategies.DefaultReasonStrategy\n"
+            "  memory:\n"
+            "    semantic: file://./s\n"
+            "  workspaces: []\n"
+            "  procedural:\n"
+            "    plan_prompt: test_bootstrap._fake_plan_prompt\n"
+            "    ground_prompt: test_bootstrap._fake_ground_prompt\n",
+        )
+    )
+    assert config.procedural == {
+        "plan_prompt": "test_bootstrap._fake_plan_prompt",
+        "ground_prompt": "test_bootstrap._fake_ground_prompt",
+    }
+
+
+def test_load_yaml_absent_procedural_block_is_none(tmp_path: Path) -> None:
+    config = load_yaml(
+        _write_yaml(
+            tmp_path,
+            "agent:\n"
+            "  name: demo\n"
+            "  strategies:\n"
+            "    reason: sora.strategies.DefaultReasonStrategy\n"
+            "  memory: {}\n"
+            "  workspaces: []\n",
+        )
+    )
+    assert config.procedural is None
+
+
 def test_load_yaml_requires_reason_strategy(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="strategies.reason is required"):
         load_yaml(_write_yaml(tmp_path, "agent:\n  name: demo\n  strategies: {}\n"))
@@ -219,7 +257,10 @@ def test_adapter_for_without_manuals_key_has_no_manual_source() -> None:
 
 
 def _config(
-    *, llm: dict[str, object] | None = None, transport: dict[str, object] | None = None
+    *,
+    llm: dict[str, object] | None = None,
+    transport: dict[str, object] | None = None,
+    procedural: dict[str, str] | None = None,
 ) -> AgentConfig:
     return AgentConfig(
         name="demo",
@@ -228,6 +269,7 @@ def _config(
         workspaces=[],
         transport=transport,
         llm=llm,
+        procedural=procedural,
     )
 
 
@@ -249,3 +291,41 @@ def test_transport_for_defaults_to_in_process() -> None:
 def test_transport_for_rejects_peers() -> None:
     with pytest.raises(NotImplementedError, match="agent-to-agent"):
         transport_for(_config(transport={"peers": {"other": "http://x"}}))
+
+
+# --------------------------------------------------------------------------------------------------
+# procedural_prompts_for — optional PlanPrompt/GroundPrompt overrides
+# --------------------------------------------------------------------------------------------------
+
+
+def _fake_plan_prompt(activity: object, tools: object) -> tuple[str, str]:
+    return "fake plan system", "fake plan user"
+
+
+def _fake_ground_prompt(
+    activity: object, operation_name: str, manual: object, partial_params: object
+) -> tuple[str, str]:
+    return "fake ground system", "fake ground user"
+
+
+def test_procedural_prompts_for_absent_block_is_empty() -> None:
+    assert procedural_prompts_for(_config(procedural=None)) == {}
+
+
+def test_procedural_prompts_for_resolves_plan_prompt_only() -> None:
+    kwargs = procedural_prompts_for(
+        _config(procedural={"plan_prompt": "test_bootstrap._fake_plan_prompt"})
+    )
+    assert kwargs == {"prompt": _fake_plan_prompt}
+
+
+def test_procedural_prompts_for_resolves_both_prompts() -> None:
+    kwargs = procedural_prompts_for(
+        _config(
+            procedural={
+                "plan_prompt": "test_bootstrap._fake_plan_prompt",
+                "ground_prompt": "test_bootstrap._fake_ground_prompt",
+            }
+        )
+    )
+    assert kwargs == {"prompt": _fake_plan_prompt, "ground_prompt": _fake_ground_prompt}

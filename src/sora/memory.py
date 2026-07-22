@@ -247,19 +247,28 @@ PLAN_SYSTEM_PROMPT = (
     '  {"action": "invoke", "tool_id": "<id>", "operation_name": "<op>", "params": { ... }}\n'
     '  {"action": "focus", "tool_id": "<id>"}\n'
     '  {"action": "unfocus", "tool_id": "<id>"}\n'
-    # `send` disabled until we have proper communication support:
-    #    '  {"action": "send", "to": "<recipient>", "content": { ... }}\n'
+    '  {"action": "send", "to": "<recipient>", "content": { ... }}\n'
     'A step with no "action" is treated as "invoke". Use only tool ids and operation names that '
     "appear in the provided tool list. Invoking an operation does not require focusing the tool "
     "first — focus a tool only to perceive its observable properties and signals, and unfocus once "
     "you no longer need them. Respect any usage protocols & safety constraints listed for a tool "
-    "when choosing and ordering steps.\n"
+    "when choosing and ordering steps. If the goal came from the user, end the plan with a `send` "
+    'step addressed to "user" that reports the outcome — a plan that only invokes tools and never '
+    'reports back leaves the user without an answer. Put that report in content as {"text": "<a '
+    "short natural-language sentence>\"}, not a bare data value, since that's what gets displayed "
+    "to the user.\n"
     "When a parameter's value depends on the RESULT of an earlier step (e.g. an id or address you "
     "only learn by first listing/searching), you do NOT know it yet — never invent a literal. "
     "Instead reference the earlier result:\n"
     '  {"$from": "<operation_name>", "path": "<dotted path into that result>"} '
     '(e.g. {"$from": "search_emails", "path": "emails.0.id"}), or\n'
     '  {"$decide": "<what value is needed>"} when picking the value needs judgement.\n'
+    "A reference must be the WHOLE value of its key, never embedded inside a larger string — "
+    '{"text": "It is {"$from": ...}."} is invalid and will be sent to the user unresolved, '
+    "literal braces and all. To report a not-yet-known result in prose, make the field itself a "
+    '$decide reference describing the sentence to produce, e.g. {"text": {"$decide": "one '
+    'sentence reporting the get_time result"}} — it is phrased from the real result at run time, '
+    "not at plan time.\n"
     "Prefer a narrowing step first (e.g. search for the specific item) so a $from reference points "
     "at an unambiguous result."
 )

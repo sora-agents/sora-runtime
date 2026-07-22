@@ -234,6 +234,9 @@ so runs are reproducible. `uv run` executes inside that environment without manu
         semantic: file://./.sora/memory/semantic
         procedural: file://./.sora/memory/procedural
         episodic: file://./.sora/memory/episodic
+      procedural:                     # optional: override ProceduralMemory's built-in prompts
+        plan_prompt: my_agent.prompts.plan       # default: sora.memory.default_plan_prompt
+        ground_prompt: my_agent.prompts.ground   # default: sora.memory.default_ground_prompt
       transport: http://localhost:8765
       workspaces:
         - origin: {adapter: mcp, address: "mcp://localhost:6000"}   # clock tool, imported via the MCP adapter
@@ -250,6 +253,35 @@ machinery's fixed retention cap, not a per-cycle prune — satisfying a wait nev
 early. The default does not auto-*focus* —
 focusing is an external action (one per cycle, dispatched at Act), so an agent that needs to perceive
 a tool's properties/signals emits `_focus_` as a plan step.
+
+#### Customizing the planning/grounding prompts
+
+`agent.yaml`'s `procedural:` block (above) points at your own `PlanPrompt`/`GroundPrompt`
+callables — each fully *replaces* the corresponding built-in (`default_plan_prompt` /
+`default_ground_prompt`), it doesn't patch pieces of it; write one to change wording, tone, or the
+cost/quality tradeoff of planning and grounding. For example, the built-in prompt's default
+guidance for a `send` step reporting a not-yet-known result is a `$decide` reference — a natural
+sentence, but it costs one extra `ProceduralMemory.ground()` model call at run time (see
+`PlanPrompt` in the API Sketch). A stricter prompt can trade that phrasing for a free, mechanical
+`$from` copy:
+
+    # my_agent/prompts.py
+    from sora.memory import PLAN_SYSTEM_PROMPT, render_tools
+
+    def cheap_plan_prompt(activity, tools):
+        system = PLAN_SYSTEM_PROMPT + (
+            "\nPrefer a bare $from copy over $decide phrasing for send content, even if it reads "
+            "less like a sentence — minimizing model calls matters more than prose here."
+        )
+        user = f"Goal: {activity.goal}\n\nAvailable tools:\n{render_tools(tools)}"
+        return system, user
+
+    # my_agent/agent.yaml
+      procedural:
+        plan_prompt: my_agent.prompts.cheap_plan_prompt
+
+`ground_prompt` follows the same shape (`GroundPrompt` in the API Sketch), for customizing the
+grounding escalation itself rather than what the plan asks it to do.
 
 #### Driving an agent programmatically
 
@@ -1118,19 +1150,26 @@ when the variable isn't already set), so it never silently overrides a key you e
     class AgentConfig:
         """The parsed agent.yaml `agent:` block. strategies/memory are dotted-path / URI maps
         resolved during build_agent; workspaces is the raw list (each entry: an `origin` plus
-        adapter-specific keys like command/args); llm is optional (absent -> no model)."""
+        adapter-specific keys like command/args); llm is optional (absent -> no model); procedural
+        optionally names dotted-path plan_prompt/ground_prompt overrides for ProceduralMemory
+        (absent -> its own built-in default_plan_prompt/default_ground_prompt)."""
         name: str
         strategies: dict[str, str]
         memory: dict[str, str]
         workspaces: list[dict]
         transport: dict | None = None
         llm: dict | None = None
+        procedural: dict[str, str] | None = None
 
     def import_object(path: str) -> Any: ...        # resolve a dotted (pkg.mod.Attr) / module:attr path
     def load_yaml(config_path: str) -> AgentConfig: ...  # parse agent.yaml; require strategies.reason
     def backend_for(spec: str) -> MemoryBackend: ...     # file://<path> (or bare path) -> FileMemoryBackend
     def adapter_for(entry: dict) -> tuple[WorkspaceOrigin, WorkspaceAdapter]: ...  # dispatch on origin.adapter
     def llm_for(config: AgentConfig) -> LLMClient | None: ...  # the llm: block -> a client, else None
+    def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]: ...
+        #   resolves procedural.plan_prompt/ground_prompt dotted paths into ProceduralMemory kwargs
+        #   ({} if the block is absent); a custom callable fully replaces the built-in default, it
+        #   doesn't patch pieces of it.
     def transport_for(config: AgentConfig) -> MessageTransport: ...  # InProcessTransport (peers -> raise)
 
     def build_agent(config_path: str) -> Agent:
@@ -1144,7 +1183,8 @@ when the variable isn't already set), so it never silently overrides a key you e
         registry = EnvironmentRegistry(adapters=adapters)   # the single shared instance...
         working = WorkingMemory(registry=registry)          # ...held here read-only as EnvironmentView
         semantic = SemanticMemory(backend_for(config.memory["semantic"]))
-        procedural = ProceduralMemory(backend_for(config.memory["procedural"]), llm=llm_for(config))
+        procedural = ProceduralMemory(backend_for(config.memory["procedural"]), llm=llm_for(config),
+                                       **procedural_prompts_for(config))
         episodic = EpisodicMemory(backend_for(config.memory["episodic"]))
         communication = transport_for(config)
         strategies = Strategies(

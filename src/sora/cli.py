@@ -247,7 +247,7 @@ def _init(args: argparse.Namespace) -> None:
             print(f"  {path.relative_to(project_dir)}")
     print()
     print(f"  cd {project_dir}")
-    print("  uv sync --extra llm")
+    print("  uv sync")
     print("  export ANTHROPIC_API_KEY=sk-ant-...")
     print("  uv run sora run")
 

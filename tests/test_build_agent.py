@@ -97,3 +97,26 @@ def test_build_agent_without_llm_leaves_procedural_model_less(tmp_path: Path) ->
 def test_build_agent_uses_in_process_transport_by_default(tmp_path: Path) -> None:
     agent = build_agent(str(_write_config(tmp_path, with_llm=False)))
     assert isinstance(agent.communication, InProcessTransport)
+
+
+def _fake_plan_prompt(activity: object, tools: object) -> tuple[str, str]:
+    return "fake plan system", "fake plan user"
+
+
+def test_build_agent_wires_custom_plan_prompt_into_procedural_memory(tmp_path: Path) -> None:
+    path = _write_config(tmp_path, with_llm=False)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "  procedural:\n"
+        + "    plan_prompt: test_build_agent._fake_plan_prompt\n",
+        encoding="utf-8",
+    )
+    agent = build_agent(str(path))
+    assert agent.procedural._prompt is _fake_plan_prompt
+
+
+def test_build_agent_without_procedural_block_uses_default_prompt(tmp_path: Path) -> None:
+    from sora.memory import default_plan_prompt
+
+    agent = build_agent(str(_write_config(tmp_path, with_llm=False)))
+    assert agent.procedural._prompt is default_plan_prompt

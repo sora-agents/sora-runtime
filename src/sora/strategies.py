@@ -15,6 +15,7 @@ from sora.action import (
     InvokeAction,
     LoadManualAction,
     ResumeAction,
+    SendAction,
     SuspendAction,
     UnloadManualAction,
 )
@@ -564,28 +565,48 @@ class DefaultReasonStrategy:
     async def _ground(
         self, step: Step, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle
     ) -> Step:
-        """Ground a step's operation params against this run's execution history for *this cycle*,
-        leaving the stored plan's references intact so procedural reuse keeps a reusable skeleton.
-        Deciding a param value is a *reasoning* act, so it lives here, not in Act (which stays
-        mechanistic). Hybrid: resolve references deterministically; escalate to one model call
-        (``procedural.ground``) only for what can't be resolved mechanically. A step with
-        no references is a pure no-op — the cheap path makes no model call."""
-        if step.next_action != InvokeAction.name:
-            return step  # only invoke steps carry an operation param bag to ground
-        routing = {k: v for k, v in step.params.items() if k in (TOOL_ID, OPERATION_NAME)}
-        op_params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
-        resolved, unresolved = resolve_references(op_params, activity.history)
-        if unresolved:
-            log.info(
-                "reason: grounding %s params %s via the model", routing[OPERATION_NAME], unresolved
-            )
+        """Ground a step's reference-bearing params against this run's execution history for *this
+        cycle*, leaving the stored plan's references intact so procedural reuse keeps a reusable
+        skeleton. Deciding a param value is a *reasoning* act, so it lives here, not in Act (which
+        stays mechanistic). Hybrid: resolve references deterministically; escalate to one model call
+        (``procedural.ground``) only for what can't be resolved mechanically. A step with no
+        references is a pure no-op — the cheap path makes no model call. Only ``invoke`` (an
+        operation's params) and ``send`` (its ``content``) carry a groundable bag today — e.g. a
+        ``send`` reporting an earlier operation's result back to the user; ``focus``/``unfocus``
+        carry only a bare ``tool_id``, nothing to ground."""
+        if step.next_action == InvokeAction.name:
+            routing = {k: v for k, v in step.params.items() if k in (TOOL_ID, OPERATION_NAME)}
+            op_params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
             manual = _manual_for(wm, routing.get(TOOL_ID))
-            resolved = await cycle.procedural.ground(
-                activity, routing[OPERATION_NAME], manual, resolved
+            resolved = await self._resolve(
+                activity, cycle, op_params, routing[OPERATION_NAME], manual
             )
-        if resolved == op_params:
-            return step  # no references -> unchanged, reuse the original Step
-        return replace(step, params={**routing, **resolved})
+            if resolved == op_params:
+                return step  # no references -> unchanged, reuse the original Step
+            return replace(step, params={**routing, **resolved})
+        if step.next_action == SendAction.name:
+            content = step.params.get("content")
+            if not isinstance(content, dict):
+                return step  # nothing groundable
+            resolved = await self._resolve(activity, cycle, content, SendAction.name, manual=None)
+            if resolved == content:
+                return step
+            return replace(step, params={**step.params, "content": resolved})
+        return step
+
+    @staticmethod
+    async def _resolve(
+        activity: Activity,
+        cycle: DecisionCycle,
+        params: dict[str, Any],
+        operation_name: str,
+        manual: Manual | None,
+    ) -> dict[str, Any]:
+        resolved, unresolved = resolve_references(params, activity.history)
+        if unresolved:
+            log.info("reason: grounding %s params %s via the model", operation_name, unresolved)
+            resolved = await cycle.procedural.ground(activity, operation_name, manual, resolved)
+        return resolved
 
 
 class DefaultActStrategy:

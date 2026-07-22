@@ -211,6 +211,79 @@ async def test_reason_escalates_unresolvable_reference_to_model(tmp_path: Path) 
     assert spy.ground_calls[0][0] == "reply_to_email"
 
 
+async def test_reason_grounds_send_content_mechanically_without_model(tmp_path: Path) -> None:
+    tool = FakeTool("clock", invoke_results={"get_time": "12:00"})
+    spy = ScriptedProcedural()  # ground() would raise if reached
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    ref = {"$from": "get_time", "path": ""}
+    plan_step = Step(next_action="send", params={"to": "user", "content": {"time": ref}})
+    activity = Activity(
+        id="a",
+        goal="what time is it?",
+        context={},
+        plan=Plan(id="p", goal="what time is it?", steps=[plan_step]),
+        step_index=0,
+        history=[_history("get_time", "12:00")],
+    )
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is not None
+    assert result.step.params["content"] == {"time": "12:00"}  # resolved from history
+    assert result.step.params["to"] == "user"
+    assert spy.ground_calls == []  # mechanistic -> no model call
+    # The *stored* plan keeps the reference (a reusable skeleton); only the per-cycle step grounds.
+    assert activity.plan is not None
+    assert activity.plan.steps[0].params["content"] == {"time": ref}
+
+
+async def test_reason_escalates_unresolvable_send_content_to_model(tmp_path: Path) -> None:
+    tool = FakeTool("clock", invoke_results={"get_time": "12:00"})
+    spy = ScriptedProcedural(ground_result={"time": "12:00"})
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    plan_step = Step(
+        next_action="send",
+        params={"to": "user", "content": {"time": {"$decide": "the observed time"}}},
+    )
+    activity = Activity(
+        id="a",
+        goal="what time is it?",
+        context={},
+        plan=Plan(id="p", goal="what time is it?", steps=[plan_step]),
+        step_index=0,
+        history=[_history("get_time", "12:00")],
+    )
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is not None
+    assert result.step.params["content"] == {"time": "12:00"}  # from the model escalation
+    assert len(spy.ground_calls) == 1
+    assert spy.ground_calls[0][0] == "send"
+
+
+async def test_reason_send_without_dict_content_is_untouched(tmp_path: Path) -> None:
+    tool = FakeTool("clock", invoke_results={"get_time": "12:00"})
+    spy = ScriptedProcedural()  # would raise if ground() were called
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    plan_step = Step(next_action="send", params={"to": "user", "content": "plain text"})
+    activity = Activity(
+        id="a",
+        goal="hi",
+        context={},
+        plan=Plan(id="p", goal="hi", steps=[plan_step]),
+        step_index=0,
+    )
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is plan_step  # non-dict content -> nothing to ground, untouched
+    assert spy.ground_calls == []
+
+
 async def test_reason_reference_free_step_is_cheap_no_ground(tmp_path: Path) -> None:
     tool = FakeTool("email", invoke_results={"list_emails": {"emails": []}})
     spy = ScriptedProcedural()  # would raise if ground() were called
