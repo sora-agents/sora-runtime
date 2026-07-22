@@ -32,11 +32,12 @@ from sora.manual import Manual
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptSnapshot,
     ProceduralMemory,
     SemanticMemory,
     WorkingMemory,
 )
-from sora.perception import Message
+from sora.perception import Message, Percept
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
@@ -46,7 +47,7 @@ from sora.strategies import (
     Strategies,
     TickResult,
 )
-from sora.types import Plan
+from sora.types import ObservableProperty, Plan, Signal
 
 # --------------------------------------------------------------------------------------------------
 # Harness
@@ -82,14 +83,19 @@ class SpyProcedural(ProceduralMemory):
         self._retrieve_plan = retrieve
         self._infer_plan = infer
         self.retrieve_calls: list[Activity] = []
-        self.infer_calls: list[tuple[Activity, dict[str, Manual]]] = []
+        self.infer_calls: list[tuple[Activity, dict[str, Manual], PerceptSnapshot]] = []
 
     async def retrieve(self, activity: Activity) -> Plan | None:
         self.retrieve_calls.append(activity)
         return self._retrieve_plan
 
-    async def infer(self, activity: Activity, tools: dict[str, Manual]) -> Plan:
-        self.infer_calls.append((activity, tools))
+    async def infer(
+        self,
+        activity: Activity,
+        tools: dict[str, Manual],
+        observed: PerceptSnapshot | None = None,
+    ) -> Plan:
+        self.infer_calls.append((activity, tools, observed or PerceptSnapshot()))
         if self._infer_plan is None:
             raise AssertionError("infer() was called but no infer plan was configured")
         return self._infer_plan
@@ -209,10 +215,33 @@ async def test_reason_infers_plan_on_cache_miss_with_joined_tool_catalog(tmp_pat
     assert result.step == inferred.steps[0]
     assert len(spy.retrieve_calls) == 1
     assert len(spy.infer_calls) == 1
-    called_activity, called_tools = spy.infer_calls[0]
+    called_activity, called_tools, called_observed = spy.infer_calls[0]
     assert called_activity is activity
     # The planning catalog is the currently-joined tools, keyed by tool id -> its manual.
     assert called_tools == {tool.id: tool.manual}
+    # No percepts observed yet in this test -> infer() still gets the (empty) current snapshot.
+    assert called_observed == PerceptSnapshot()
+
+
+async def test_reason_infer_receives_current_properties_and_signals(tmp_path: Path) -> None:
+    # Reason shouldn't hand the planner only past action results — the agent's currently-known
+    # world state (WorkingMemory.properties/.signals) must reach infer() too.
+    tool = FakeTool("EmailClientApp", invoke_results={"list_emails": {"emails": []}})
+    registry, origin = _registry_with(tool)
+    await registry.join(origin)
+    inferred = Plan(id="p", goal="g", steps=[invoke_step("EmailClientApp", "list_emails")])
+    spy = SpyProcedural(retrieve=None, infer=inferred)
+    cycle, working = _cycle(registry, tmp_path, procedural=spy)
+    activity = Activity(id="a", goal="g", context={})
+    prop_percept = Percept("EmailClientApp", ObservableProperty("unread_count", 3), 0.0)
+    signal_percept = Percept("EmailClientApp", Signal("new_email", {"id": 1}), 0.0)
+    working.properties[("EmailClientApp", "unread_count")] = prop_percept
+    working.signals.append(signal_percept)
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    _activity, _tools, called_observed = spy.infer_calls[0]
+    assert called_observed == PerceptSnapshot([prop_percept], [signal_percept])
 
 
 # --------------------------------------------------------------------------------------------------

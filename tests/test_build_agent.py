@@ -99,7 +99,7 @@ def test_build_agent_uses_in_process_transport_by_default(tmp_path: Path) -> Non
     assert isinstance(agent.communication, InProcessTransport)
 
 
-def _fake_plan_prompt(activity: object, tools: object) -> tuple[str, str]:
+def _fake_plan_prompt(activity: object, tools: object, observed: object) -> tuple[str, str]:
     return "fake plan system", "fake plan user"
 
 

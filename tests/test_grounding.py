@@ -26,11 +26,12 @@ from sora.manual import Manual
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptSnapshot,
     ProceduralMemory,
     SemanticMemory,
     WorkingMemory,
 )
-from sora.perception import Message
+from sora.perception import Message, Percept
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
@@ -42,7 +43,15 @@ from sora.strategies import (
     resolve_references,
 )
 from sora.transport import MessageTransport
-from sora.types import CompletedOperation, OperationAck, OperationInvocation, Plan, Step
+from sora.types import (
+    CompletedOperation,
+    ObservableProperty,
+    OperationAck,
+    OperationInvocation,
+    Plan,
+    Signal,
+    Step,
+)
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
 
@@ -105,6 +114,7 @@ class ScriptedProcedural(ProceduralMemory):
         super().__init__(FileMemoryBackend("unused"))
         self._ground_result = ground_result
         self.ground_calls: list[tuple[str, dict[str, object]]] = []
+        self.ground_percepts: list[PerceptSnapshot] = []
 
     async def ground(
         self,
@@ -112,8 +122,10 @@ class ScriptedProcedural(ProceduralMemory):
         operation_name: str,
         manual: Manual | None,
         partial_params: dict[str, object],
+        observed: PerceptSnapshot | None = None,
     ) -> dict[str, object]:
         self.ground_calls.append((operation_name, dict(partial_params)))
+        self.ground_percepts.append(observed or PerceptSnapshot())
         if self._ground_result is None:
             raise AssertionError("ground() called but no ground_result configured")
         return self._ground_result
@@ -282,6 +294,37 @@ async def test_reason_send_without_dict_content_is_untouched(tmp_path: Path) -> 
 
     assert result.step is plan_step  # non-dict content -> nothing to ground, untouched
     assert spy.ground_calls == []
+
+
+async def test_reason_ground_escalation_receives_current_properties_and_signals(
+    tmp_path: Path,
+) -> None:
+    # The escalation shouldn't decide blind either — currently observed world state reaches
+    # ground() alongside the operation schema/partial params/history.
+    tool = FakeTool("email", invoke_results={"reply_to_email": {"sent": True}})
+    spy = ScriptedProcedural(ground_result={"email_id": 99, "body": "hi"})
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    prop_percept = Percept("email", ObservableProperty("unread_count", 3), 0.0)
+    signal_percept = Percept("email", Signal("new_email", {"id": 99}), 0.0)
+    working.properties[("email", "unread_count")] = prop_percept
+    working.signals.append(signal_percept)
+    plan_step = invoke_step(
+        "email", "reply_to_email", email_id={"$decide": "Alice's email"}, body="hi"
+    )
+    activity = Activity(
+        id="a",
+        goal="reply",
+        context={},
+        plan=Plan(id="p", goal="reply", steps=[plan_step]),
+        step_index=0,
+        history=[_history("search_emails", {"emails": [{"id": 99}]})],
+    )
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert len(spy.ground_percepts) == 1
+    assert spy.ground_percepts[0] == PerceptSnapshot([prop_percept], [signal_percept])
 
 
 async def test_reason_reference_free_step_is_cheap_no_ground(tmp_path: Path) -> None:

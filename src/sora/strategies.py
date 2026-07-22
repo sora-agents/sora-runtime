@@ -20,6 +20,7 @@ from sora.action import (
     UnloadManualAction,
 )
 from sora.activity import ActivityState
+from sora.memory import PerceptSnapshot
 from sora.perception import Percept
 from sora.types import (
     OPERATION_NAME,
@@ -529,8 +530,11 @@ class DefaultReasonStrategy:
       and advance ``step_index``: no model call, no procedural lookup;
     * an activity with no plan gets one by *reuse* first (``procedural.retrieve`` — a plan some past
       activity with this goal actually followed) and only *infers* a fresh one on a miss, passing
-      the currently-joined tools (id -> Manual) as the planning catalog (the strategy holds the live
-      registry; a memory module never reaches into the environment itself);
+      the currently-joined tools (id -> Manual) as the planning catalog and a ``PerceptSnapshot``
+      of ``wm.properties``/``wm.signals`` as the agent's known world state (the strategy holds
+      `wm`; a memory module never reaches into the environment or working memory itself — it only
+      sees what's extracted and handed to it). The same snapshot is reused by the grounding
+      escalation below it, rather than each rebuilding its own;
     * an exhausted plan yields no step — the cycle returns, and Reflect terminates the activity the
       next cycle on the same "plan present and fully consumed" rule (so this branch is normally only
       reached by a just-inferred empty plan).
@@ -542,12 +546,14 @@ class DefaultReasonStrategy:
     async def reason(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
+        observed: PerceptSnapshot | None = None
         if activity.plan is None:
             plan = await cycle.procedural.retrieve(activity)  # reuse across runs (cheap)
             if plan is None:
                 catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
                 log.info("reason: inferring a plan for %r (%d tools)", activity.goal, len(catalog))
-                plan = await cycle.procedural.infer(activity, catalog)  # the model call
+                observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+                plan = await cycle.procedural.infer(activity, catalog, observed)  # the model call
                 log.info("reason: inferred plan with %d steps", len(plan.steps))
             else:
                 log.info(
@@ -559,27 +565,34 @@ class DefaultReasonStrategy:
             return result  # exhausted -> no step this cycle
         step = activity.plan.steps[activity.step_index]
         activity.step_index += 1
-        grounded = await self._ground(step, activity, wm, cycle)
+        grounded = await self._ground(step, activity, wm, cycle, observed)
         return replace(result, activity=activity, step=grounded)
 
     async def _ground(
-        self, step: Step, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle
+        self,
+        step: Step,
+        activity: Activity,
+        wm: WorkingMemory,
+        cycle: DecisionCycle,
+        observed: PerceptSnapshot | None = None,
     ) -> Step:
         """Ground a step's reference-bearing params against this run's execution history for *this
-        cycle*, leaving the stored plan's references intact so procedural reuse keeps a reusable
-        skeleton. Deciding a param value is a *reasoning* act, so it lives here, not in Act (which
-        stays mechanistic). Hybrid: resolve references deterministically; escalate to one model call
-        (``procedural.ground``) only for what can't be resolved mechanically. A step with no
-        references is a pure no-op — the cheap path makes no model call. Only ``invoke`` (an
-        operation's params) and ``send`` (its ``content``) carry a groundable bag today — e.g. a
-        ``send`` reporting an earlier operation's result back to the user; ``focus``/``unfocus``
-        carry only a bare ``tool_id``, nothing to ground."""
+        cycle* plus the agent's currently observed properties/signals, leaving the stored plan's
+        references intact so procedural reuse keeps a reusable skeleton. Deciding a param value is
+        a *reasoning* act, so it lives here, not in Act (which stays mechanistic). Hybrid: resolve
+        references deterministically; escalate to one model call (``procedural.ground``) only for
+        what can't be resolved mechanically. A step with no references is a pure no-op — the cheap
+        path makes no model call. Only ``invoke`` (an operation's params) and ``send`` (its
+        ``content``) carry a groundable bag today — e.g. a ``send`` reporting an earlier operation's
+        result back to the user; ``focus``/``unfocus`` carry only a bare ``tool_id``, nothing to
+        ground. ``observed`` lets a caller that already built the current-tick snapshot (``reason``,
+        when it just inferred a plan) pass it through instead of ``_resolve`` rebuilding its own."""
         if step.next_action == InvokeAction.name:
             routing = {k: v for k, v in step.params.items() if k in (TOOL_ID, OPERATION_NAME)}
             op_params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
             manual = _manual_for(wm, routing.get(TOOL_ID))
             resolved = await self._resolve(
-                activity, cycle, op_params, routing[OPERATION_NAME], manual
+                activity, wm, cycle, op_params, routing[OPERATION_NAME], manual, observed
             )
             if resolved == op_params:
                 return step  # no references -> unchanged, reuse the original Step
@@ -588,7 +601,9 @@ class DefaultReasonStrategy:
             content = step.params.get("content")
             if not isinstance(content, dict):
                 return step  # nothing groundable
-            resolved = await self._resolve(activity, cycle, content, SendAction.name, manual=None)
+            resolved = await self._resolve(
+                activity, wm, cycle, content, SendAction.name, None, observed
+            )
             if resolved == content:
                 return step
             return replace(step, params={**step.params, "content": resolved})
@@ -597,15 +612,20 @@ class DefaultReasonStrategy:
     @staticmethod
     async def _resolve(
         activity: Activity,
+        wm: WorkingMemory,
         cycle: DecisionCycle,
         params: dict[str, Any],
         operation_name: str,
         manual: Manual | None,
+        observed: PerceptSnapshot | None,
     ) -> dict[str, Any]:
         resolved, unresolved = resolve_references(params, activity.history)
         if unresolved:
             log.info("reason: grounding %s params %s via the model", operation_name, unresolved)
-            resolved = await cycle.procedural.ground(activity, operation_name, manual, resolved)
+            observed = observed or PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+            resolved = await cycle.procedural.ground(
+                activity, operation_name, manual, resolved, observed
+            )
         return resolved
 
 

@@ -268,7 +268,7 @@ sentence, but it costs one extra `ProceduralMemory.ground()` model call at run t
     # my_agent/prompts.py
     from sora.memory import PLAN_SYSTEM_PROMPT, render_tools
 
-    def cheap_plan_prompt(activity, tools):
+    def cheap_plan_prompt(activity, tools, observed):
         system = PLAN_SYSTEM_PROMPT + (
             "\nPrefer a bare $from copy over $decide phrasing for send content, even if it reads "
             "less like a sentence — minimizing model calls matters more than prose here."
@@ -831,19 +831,30 @@ when the variable isn't already set), so it never silently overrides a key you e
         async def store_tool_record(self, record: ToolRecord) -> None: ...
         async def list_tool_records(self) -> list[ToolRecord]: ...   # reconstitute known instances at startup
 
-    class PlanPrompt(Protocol):   # builds infer()'s (system, user) prompt from (activity, tools)
-        def __call__(self, activity: Activity, tools: dict[str, Manual]) -> tuple[str, str]: ...
-        #   default_plan_prompt is the built-in one; PLAN_SYSTEM_PROMPT / render_tools are reusable
-        #   pieces a custom PlanPrompt can lean on. The response contract ({"steps":[...]}) stays
-        #   fixed — customize the *prompt*, not the parse. PLAN_SYSTEM_PROMPT also tells the model to
-        #   emit a *reference* — {"$from": "<op>", "path": "<dotted path>"} or {"$decide": "..."} —
-        #   for a param whose value depends on an earlier step's result, never a made-up literal.
+    @dataclass(frozen=True)
+    class PerceptSnapshot:   # the agent's currently-observed world state, bundled for a planning/
+        #                      grounding prompt. An empty snapshot (PerceptSnapshot()) means nothing
+        #                      observed yet.
+        properties: list[Percept] = field(default_factory=list)
+        signals: list[Percept] = field(default_factory=list)
+
+    class PlanPrompt(Protocol):   # builds infer()'s (system, user) prompt from (activity, tools, observed)
+        def __call__(self, activity: Activity, tools: dict[str, Manual],
+                     observed: PerceptSnapshot) -> tuple[str, str]: ...
+        #   default_plan_prompt is the built-in one; PLAN_SYSTEM_PROMPT / render_tools /
+        #   render_properties / render_signals are reusable pieces a custom PlanPrompt can lean on.
+        #   The response contract ({"steps":[...]}) stays fixed — customize the *prompt*, not the
+        #   parse. PLAN_SYSTEM_PROMPT also tells the model to emit a *reference* —
+        #   {"$from": "<op>", "path": "<dotted path>"} or {"$decide": "..."} — for a param whose
+        #   value depends on an earlier step's result, never a made-up literal, and to reuse an
+        #   already-observed property/signal value directly instead of re-discovering it.
 
     class GroundPrompt(Protocol):   # builds ground()'s (system, user) prompt — grounding's counterpart
         def __call__(self, activity: Activity, operation_name: str, manual: Manual | None,
-                     partial_params: dict) -> tuple[str, str]: ...
-        #   default_ground_prompt is the built-in one; GROUND_SYSTEM_PROMPT / render_history are the
-        #   reusable pieces. Response contract is fixed ({"params": {...}}).
+                     partial_params: dict, observed: PerceptSnapshot) -> tuple[str, str]: ...
+        #   default_ground_prompt is the built-in one; GROUND_SYSTEM_PROMPT / render_history /
+        #   render_properties / render_signals are the reusable pieces. Response contract is fixed
+        #   ({"params": {...}}).
 
     class ProceduralMemory:
         def __init__(self, backend: MemoryBackend, llm: LLMClient | None = None,
@@ -856,18 +867,22 @@ when the variable isn't already set), so it never silently overrides a key you e
             similarity, backend-dependent. Returns the backend's top-ranked match (query() orders
             most-relevant-first — see MemoryBackend), so this stays one line regardless of backend.
             The cheap path: skips infer() entirely when it hits."""
-        async def infer(self, activity: Activity, tools: dict[str, Manual]) -> Plan:
+        async def infer(self, activity: Activity, tools: dict[str, Manual],
+                        observed: PerceptSnapshot | None = None) -> Plan:
             """Produces a new multi-step Plan when no cached one fits — the model path: one LLMClient
             call producing a whole sequence of Steps at once. This is procedural memory querying its
             'implicit knowledge encoded in LLM weights'. `tools` (id -> its Manual) is the planning
             catalog, passed in by the caller that holds the live registry (a memory module never
-            reaches into the environment). Converts the model's JSON answer into Plan/Step (the
-            anti-corruption boundary); malformed output raises ValueError. No llm -> raises."""
+            reaches into the environment); `observed` is the caller's current properties/signals
+            snapshot (omittable — defaults to none observed), so planning isn't blind to already-
+            known world state. Converts the model's JSON answer into Plan/Step (the anti-corruption
+            boundary); malformed output raises ValueError. No llm -> raises."""
         async def ground(self, activity: Activity, operation_name: str, manual: Manual | None,
-                         partial_params: dict) -> dict:
+                         partial_params: dict, observed: PerceptSnapshot | None = None) -> dict:
             """The Reason-phase grounding *escalation*: decide an operation's concrete params from the
             execution context when a reference can't be resolved mechanically. One LLMClient call over
-            the operation schema + partial params + the activity's history; parses {"params": {...}}
+            the operation schema + partial params + the currently observed properties/signals
+            (`observed`, omittable) + the activity's history; parses {"params": {...}}
             (anti-corruption); no llm -> raises. Packaged here (like infer) because procedural memory
             owns the model handle; grounding a step is really an Act-adjacent reasoning act — see
             ADR-0017. (The mechanical reference resolver lives in Reason, not here.)"""

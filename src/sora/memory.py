@@ -270,7 +270,11 @@ PLAN_SYSTEM_PROMPT = (
     'sentence reporting the get_time result"}} — it is phrased from the real result at run time, '
     "not at plan time.\n"
     "Prefer a narrowing step first (e.g. search for the specific item) so a $from reference points "
-    "at an unambiguous result."
+    "at an unambiguous result.\n"
+    "You are also given the agent's currently observed properties (persistent state, e.g. a "
+    "thermostat reading) and recently observed signals (transient events, e.g. a notification) as "
+    "already-known facts about the current world — use a value already visible there directly "
+    "instead of planning a step to (re)discover it."
 )
 
 
@@ -375,23 +379,96 @@ def _prose(section: str | None) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class PerceptSnapshot:
+    """The agent's currently-observed world state, bundled for a planning/grounding prompt —
+    ``WorkingMemory.properties``/``.signals`` handed down as one value instead of two parallel
+    ``list[Percept]`` parameters, so a ``PlanPrompt``/``GroundPrompt`` call can't have properties
+    and signals transposed (both are otherwise the exact same static type). ``properties`` holds
+    ``ObservableProperty``-payload percepts (replace-by-key, at most one per ``(source, name)``);
+    ``signals`` holds ``Signal``-payload percepts (an append log — duplicates are distinct
+    occurrences, never deduplicated). An empty snapshot (``PerceptSnapshot()``) means nothing
+    observed yet, not an omitted section."""
+
+    properties: list[Percept] = field(default_factory=list)
+    signals: list[Percept] = field(default_factory=list)
+
+
+def _render_json(value: Any) -> str:
+    """JSON-render a percept value/payload for a prompt. Falls back to the ``str()`` of anything
+    ``json.dumps`` can't serialize (e.g. a ``datetime`` a custom adapter pushed) rather than raising
+    and crashing the whole ``infer``/``ground`` call — a degraded rendering beats no plan at all."""
+    try:
+        return json.dumps(value)
+    except TypeError:
+        return json.dumps(str(value))
+
+
+def render_properties(properties: list[Percept]) -> str:
+    """Render the agent's currently observed property snapshot (``WorkingMemory.properties``) for a
+    planning/grounding prompt — the runtime's currently-known world state, not just the results of
+    past actions (``activity.history``). Every percept here carries an ``ObservableProperty``
+    payload (``name``/``value``), replaced-by-key so at most one line per ``(source, name)``. Values
+    are JSON-rendered (not ``repr``) so a model told to reuse one verbatim in its own JSON answer
+    copies a valid literal (``false``/``null``, not ``False``/``None``), and length-capped like
+    ``render_history``. Public so a custom ``PlanPrompt``/``GroundPrompt`` can reuse it."""
+    if not properties:
+        return "(none observed yet)"
+    return "\n".join(
+        f"- {p.source}.{p.payload.name} = {_truncate(_render_json(p.payload.value))}"
+        for p in properties
+    )
+
+
+def render_signals(signals: list[Percept]) -> str:
+    """Render recently observed signals (``WorkingMemory.signals``) for a planning/grounding
+    prompt. Every percept here carries a ``Signal`` payload (``name``/``payload`` dict). An
+    append log — the same name from the same source may appear more than once, each a distinct
+    occurrence, never deduplicated. Length-capped like ``render_history``. Public so a custom
+    ``PlanPrompt``/``GroundPrompt`` can reuse it."""
+    if not signals:
+        return "(none observed yet)"
+    return "\n".join(
+        f"- {p.source}.{p.payload.name}: {_truncate(_render_json(p.payload.payload))}"
+        for p in signals
+    )
+
+
 class PlanPrompt(Protocol):
-    """Builds the ``(system, user_prompt)`` pair ``infer()`` sends to the LLM, from the activity and
-    the available tools. Injected into ``ProceduralMemory`` so planning *content* is customizable —
-    a domain system prompt, few-shot examples, a different catalog rendering — without subclassing
-    or moving planning into a ``ReasonStrategy``. A plain function satisfies it; a class with
-    ``__call__`` works too (a stateful builder). Whatever it produces, the model's response must
-    still parse as the ``{"steps": [...]}`` contract — that half is fixed (``_parse_plan_steps``).
+    """Builds the ``(system, user_prompt)`` pair ``infer()`` sends to the LLM, from the activity,
+    the available tools, and the agent's currently observed world state. Injected into
+    ``ProceduralMemory`` so planning *content* is customizable — a domain system prompt, few-shot
+    examples, a different catalog rendering — without subclassing or moving planning into a
+    ``ReasonStrategy``. A plain function satisfies it; a class with ``__call__`` works too (a
+    stateful builder). Whatever it produces, the model's response must still parse as the
+    ``{"steps": [...]}`` contract — that half is fixed (``_parse_plan_steps``).
     """
 
-    def __call__(self, activity: Activity, tools: dict[str, Manual]) -> tuple[str, str]: ...
+    def __call__(
+        self,
+        activity: Activity,
+        tools: dict[str, Manual],
+        observed: PerceptSnapshot,
+    ) -> tuple[str, str]: ...
 
 
-def default_plan_prompt(activity: Activity, tools: dict[str, Manual]) -> tuple[str, str]:
+def default_plan_prompt(
+    activity: Activity,
+    tools: dict[str, Manual],
+    observed: PerceptSnapshot | None = None,
+) -> tuple[str, str]:
     """The built-in ``PlanPrompt``: the fixed ``PLAN_SYSTEM_PROMPT`` (the JSON step vocabulary) plus
-    a user prompt rendering the goal and the tool catalog. Reuse ``PLAN_SYSTEM_PROMPT`` /
-    ``render_tools`` when writing a custom one."""
-    user = f"Goal: {activity.goal}\n\nAvailable tools and their operations:\n{render_tools(tools)}"
+    a user prompt rendering the goal, the tool catalog, and the agent's currently observed world
+    state (``observed`` is omittable — an unrelated caller isn't forced to supply one). Reuse
+    ``PLAN_SYSTEM_PROMPT`` / ``render_tools`` / ``render_properties`` / ``render_signals`` when
+    writing a custom one."""
+    observed = observed or PerceptSnapshot()
+    user = (
+        f"Goal: {activity.goal}\n\n"
+        f"Available tools and their operations:\n{render_tools(tools)}\n\n"
+        f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
+        f"Recently observed signals:\n{render_signals(observed.signals)}"
+    )
     return PLAN_SYSTEM_PROMPT, user
 
 
@@ -430,9 +507,11 @@ def _strip_code_fences(text: str) -> str:
 GROUND_SYSTEM_PROMPT = (
     "You are grounding the parameters of a SINGLE tool operation about to be invoked. You are "
     "given the goal, the operation and its parameter schema, a partial set of parameters (some "
-    "values may still be references to earlier results), and the results of the operations already "
-    "executed. Produce the final, concrete parameters: fill every value that depends on a prior "
-    "result from the ACTUAL data in those results, and keep already-concrete values as given.\n"
+    "values may still be references to earlier results), the agent's currently observed properties "
+    "and recently observed signals, and the results of the operations already executed. Produce "
+    "the final, concrete parameters: fill every value that depends on a prior result or an already-"
+    "observed property/signal from the ACTUAL data given, and keep already-concrete values as "
+    "given.\n"
     'Respond with ONLY a JSON object of the form {"params": { ... }} and nothing else — no prose, '
     "no markdown fences. Use only parameter names from the schema."
 )
@@ -449,6 +528,7 @@ class GroundPrompt(Protocol):
         operation_name: str,
         manual: Manual | None,
         partial_params: dict[str, Any],
+        observed: PerceptSnapshot,
     ) -> tuple[str, str]: ...
 
 
@@ -482,14 +562,20 @@ def default_ground_prompt(
     operation_name: str,
     manual: Manual | None,
     partial_params: dict[str, Any],
+    observed: PerceptSnapshot | None = None,
 ) -> tuple[str, str]:
     """The built-in ``GroundPrompt``: goal + the operation schema + the partial params + the
-    execution history. Reuse ``GROUND_SYSTEM_PROMPT`` / ``render_history`` in a custom one."""
+    agent's currently observed world state + the execution history (``observed`` is omittable —
+    an unrelated caller isn't forced to supply one). Reuse ``GROUND_SYSTEM_PROMPT`` /
+    ``render_history`` / ``render_properties`` / ``render_signals`` in a custom one."""
+    observed = observed or PerceptSnapshot()
     user = (
         f"Goal: {activity.goal}\n\n"
         f"Operation to invoke:\n{_render_operation_schema(manual, operation_name)}\n\n"
         f"Partial parameters (resolve any references, keep concrete values):\n"
         f"{json.dumps(partial_params, indent=2)}\n\n"
+        f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
+        f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
         f"Results of operations already executed:\n{render_history(activity.history)}"
     )
     return GROUND_SYSTEM_PROMPT, user
@@ -546,22 +632,29 @@ class ProceduralMemory:
         # canonical plan for this goal regardless of backend.
         return self._from_dict(rows[0])
 
-    async def infer(self, activity: Activity, tools: dict[str, Manual]) -> Plan:
+    async def infer(
+        self,
+        activity: Activity,
+        tools: dict[str, Manual],
+        observed: PerceptSnapshot | None = None,
+    ) -> Plan:
         """Produce a new multi-step Plan when no cached one fits — the expensive path, one model
         call producing a whole sequence of Steps at once. This is querying procedural memory for
-        "implicit knowledge encoded in LLM weights": it builds a prompt from the goal plus the
+        "implicit knowledge encoded in LLM weights": it builds a prompt from the goal, the
         available ``tools`` (keyed by tool id -> its Manual, supplied by the caller that holds the
-        live registry — a memory module never reaches into the environment) via the injected
+        live registry — a memory module never reaches into the environment), and the caller's
+        current ``observed`` world-state snapshot (so planning isn't blind to already-observed
+        properties/signals — omittable, defaulting to none observed) via the injected
         ``PlanPrompt``, calls the pluggable ``LLMClient``, then converts the model's JSON answer to
-        the runtime's own ``Plan``/``Step`` vocabulary. That text -> domain conversion is the
-        anti-corruption boundary; malformed output raises ``ValueError`` rather than a half-built
-        plan. Without an LLM the module is store/retrieve only and this raises."""
+        the runtime's own ``Plan``/``Step`` vocabulary. That conversion is the anti-corruption
+        boundary; malformed output raises ``ValueError`` rather than a half-built plan. Without an
+        LLM the module is store/retrieve only and this raises."""
         if self._llm is None:
             raise RuntimeError(
                 "ProceduralMemory has no LLM configured; cannot infer a plan (store/retrieve "
                 "still work). Pass an LLMClient to enable inference."
             )
-        system, user = self._prompt(activity, tools)  # the injected PlanPrompt
+        system, user = self._prompt(activity, tools, observed or PerceptSnapshot())
         text = await self._llm.complete(system=system, prompt=user)
         return Plan(id=uuid.uuid4().hex, goal=activity.goal, steps=_parse_plan_steps(text))
 
@@ -571,21 +664,25 @@ class ProceduralMemory:
         operation_name: str,
         manual: Manual | None,
         partial_params: dict[str, Any],
+        observed: PerceptSnapshot | None = None,
     ) -> dict[str, Any]:
         """Decide an operation's concrete parameters from the execution context — the escalation
         the Reason phase calls when a param reference can't be resolved *mechanically* (an ambiguous
         pick, or an unknown/mis-guessed result shape). One model call: a prompt from the goal,
-        the operation schema, the partial params, and the activity's history (via the injected
-        ``GroundPrompt``), then converts the model's JSON answer to a concrete params dict — the
-        anti-corruption boundary (malformed -> ``ValueError``). Reuses the same ``LLMClient`` seam
-        as ``infer``; no LLM -> raises. (Grounding a step is an Act-adjacent reasoning act; it
+        the operation schema, the partial params, the caller's current ``observed`` world-state
+        snapshot (omittable, defaulting to none observed), and the activity's history (via the
+        injected ``GroundPrompt``), then converts the model's JSON answer to a concrete params dict
+        — the anti-corruption boundary (malformed -> ``ValueError``). Reuses the same ``LLMClient``
+        seam as ``infer``; no LLM -> raises. (Grounding a step is an Act-adjacent reasoning act; it
         lives here only because procedural memory currently owns the model handle — the eventual
         home is a client injected per strategy. See ADR-0017.)"""
         if self._llm is None:
             raise RuntimeError(
                 "ProceduralMemory has no LLM configured; cannot ground parameters. Pass a client."
             )
-        system, user = self._ground_prompt(activity, operation_name, manual, partial_params)
+        system, user = self._ground_prompt(
+            activity, operation_name, manual, partial_params, observed or PerceptSnapshot()
+        )
         text = await self._llm.complete(system=system, prompt=user)
         return _parse_params(text)
 

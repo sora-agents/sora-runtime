@@ -30,15 +30,36 @@ from sora.memory import (
     GROUND_SYSTEM_PROMPT,
     PLAN_SYSTEM_PROMPT,
     FileMemoryBackend,
+    PerceptSnapshot,
     ProceduralMemory,
+    default_ground_prompt,
     default_plan_prompt,
+    render_properties,
+    render_signals,
     render_tools,
 )
-from sora.types import CompletedOperation, OperationAck, OperationInvocation, Plan, Step
+from sora.perception import Percept
+from sora.types import (
+    CompletedOperation,
+    ObservableProperty,
+    OperationAck,
+    OperationInvocation,
+    Plan,
+    Signal,
+    Step,
+)
 
 
 def _activity(goal: str) -> Activity:
     return Activity(id=f"act-{goal}", goal=goal, context={})
+
+
+def _property_percept(source: str, name: str, value: object) -> Percept:
+    return Percept(source, ObservableProperty(name, value), 0.0)
+
+
+def _signal_percept(source: str, name: str, payload: dict[str, object]) -> Percept:
+    return Percept(source, Signal(name, payload), 0.0)
 
 
 def _plan(plan_id: str, goal: str, steps: list[Step] | None = None) -> Plan:
@@ -220,6 +241,32 @@ async def test_infer_prompt_carries_goal_and_tool_operations(tmp_path: Path) -> 
     assert "list_emails" in prompt and "send_email" in prompt  # its operations
 
 
+async def test_infer_prompt_carries_observed_properties_and_signals(tmp_path: Path) -> None:
+    # infer() shouldn't reason blind — the agent's currently-known world state (not just past
+    # action results) is available to the planner too.
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+    properties = [_property_percept("thermostat", "temperature", 72)]
+    signals = [_signal_percept("clock", "tick", {"n": 1})]
+
+    await mem.infer(_activity("g"), {}, PerceptSnapshot(properties, signals))
+
+    _system, prompt = llm.calls[0]
+    assert "thermostat.temperature = 72" in prompt
+    assert "clock.tick" in prompt and '"n": 1' in prompt
+
+
+async def test_infer_with_no_percepts_reports_none_observed(tmp_path: Path) -> None:
+    # No properties/signals passed -> the default empty rendering, not an omitted section.
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+
+    await mem.infer(_activity("g"), {})
+
+    _system, prompt = llm.calls[0]
+    assert prompt.count("(none observed yet)") == 2  # properties section + signals section
+
+
 async def test_infer_tolerates_code_fences(tmp_path: Path) -> None:
     fenced = "```json\n" + plan_json({"action": "wait"}) + "\n```"
     mem = _llm_memory(tmp_path, FakeLLMClient(fenced))
@@ -261,16 +308,26 @@ async def test_infer_result_is_storable_and_reusable(tmp_path: Path) -> None:
 
 async def test_infer_uses_injected_prompt(tmp_path: Path) -> None:
     # A custom PlanPrompt fully controls what the LLM is asked (system + user), without subclassing
-    # ProceduralMemory or re-implementing planning in a ReasonStrategy.
-    def custom_prompt(activity: Activity, tools: dict[str, Manual]) -> tuple[str, str]:
-        return "SYS: plan tersely", f"CUSTOM goal={activity.goal} tools={sorted(tools)}"
+    # ProceduralMemory or re-implementing planning in a ReasonStrategy. The Protocol hands every
+    # PlanPrompt the current observed world state too, not just the defaults.
+    def custom_prompt(
+        activity: Activity,
+        tools: dict[str, Manual],
+        observed: PerceptSnapshot,
+    ) -> tuple[str, str]:
+        return "SYS: plan tersely", (
+            f"CUSTOM goal={activity.goal} tools={sorted(tools)} "
+            f"properties={len(observed.properties)} signals={len(observed.signals)}"
+        )
 
     llm = FakeLLMClient(plan_json({"action": "wait"}))
     mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm, prompt=custom_prompt)
 
     await mem.infer(_activity("g"), {"clock": fake_manual("clock", ["get_time"])})
 
-    assert llm.calls == [("SYS: plan tersely", "CUSTOM goal=g tools=['clock']")]
+    assert llm.calls == [
+        ("SYS: plan tersely", "CUSTOM goal=g tools=['clock'] properties=0 signals=0")
+    ]
 
 
 async def test_infer_default_prompt_is_used_when_none_injected(tmp_path: Path) -> None:
@@ -289,11 +346,24 @@ async def test_infer_default_prompt_is_used_when_none_injected(tmp_path: Path) -
 
 def test_default_plan_prompt_exposes_reusable_pieces() -> None:
     # The default builder and its parts are public, so a custom PlanPrompt can reuse them.
+    # observed is omittable — an unrelated caller isn't forced to supply one.
     tools = {"EmailClientApp": fake_manual("EmailClientApp", ["list_emails"])}
     system, user = default_plan_prompt(_activity("triage"), tools)
     assert system == PLAN_SYSTEM_PROMPT
     assert "triage" in user
     assert render_tools(tools) in user  # the tool rendering is a reusable public helper
+
+
+def test_default_plan_prompt_includes_percept_rendering() -> None:
+    tools = {"EmailClientApp": fake_manual("EmailClientApp", ["list_emails"])}
+    properties = [_property_percept("EmailClientApp", "unread_count", 3)]
+    signals = [_signal_percept("EmailClientApp", "new_email", {"id": 1})]
+    system, user = default_plan_prompt(
+        _activity("triage"), tools, PerceptSnapshot(properties, signals)
+    )
+    assert system == PLAN_SYSTEM_PROMPT
+    assert render_properties(properties) in user
+    assert render_signals(signals) in user
 
 
 # --------------------------------------------------------------------------------------------------
@@ -419,6 +489,74 @@ def test_plan_prompt_instructs_references_for_runtime_dependent_params() -> None
 
 
 # --------------------------------------------------------------------------------------------------
+# render_properties / render_signals: rendering the agent's currently-known world state (not just
+# past action results) for a planning/grounding prompt — see WorkingMemory's replace-by-key
+# properties snapshot vs. append-log signals split (ADR-0012/ADR-0019).
+# --------------------------------------------------------------------------------------------------
+
+
+def test_render_properties_formats_source_name_value() -> None:
+    rendered = render_properties([_property_percept("thermostat", "temperature", 72)])
+    assert rendered == "- thermostat.temperature = 72"
+
+
+def test_render_properties_empty_reports_none_observed() -> None:
+    assert render_properties([]) == "(none observed yet)"
+
+
+def test_render_properties_renders_json_literals_not_python_repr() -> None:
+    # A model is told to reuse an already-observed value verbatim in its own strict-JSON answer —
+    # rendering with repr() would show it Python's False/None/True, not JSON's false/null/true.
+    rendered = render_properties([_property_percept("door", "locked", False)])
+    assert rendered == "- door.locked = false"
+    rendered = render_properties([_property_percept("door", "code", None)])
+    assert rendered == "- door.code = null"
+
+
+def test_render_properties_truncates_long_values() -> None:
+    # Unbounded like render_history would be — a large property value must not grow every
+    # planning/grounding prompt without bound.
+    rendered = render_properties([_property_percept("sensor", "buffer", "x" * 1000)])
+    assert len(rendered) < 500
+    assert rendered.endswith("…")
+
+
+def test_render_signals_formats_source_name_payload() -> None:
+    rendered = render_signals([_signal_percept("clock", "tick", {"n": 1})])
+    assert "clock.tick" in rendered and '"n": 1' in rendered
+
+
+def test_render_signals_empty_reports_none_observed() -> None:
+    assert render_signals([]) == "(none observed yet)"
+
+
+def test_render_signals_keeps_duplicate_occurrences() -> None:
+    # Signals are an append log — the same name from the same source twice is two distinct
+    # occurrences, not a repeat to collapse.
+    percepts = [
+        _signal_percept("EmailClientApp", "new_email", {"id": 1}),
+        _signal_percept("EmailClientApp", "new_email", {"id": 2}),
+    ]
+    rendered = render_signals(percepts)
+    assert rendered.count("EmailClientApp.new_email") == 2
+    assert '"id": 1' in rendered and '"id": 2' in rendered
+
+
+def test_render_signals_falls_back_to_str_for_non_json_serializable_payload() -> None:
+    # A signal payload isn't guaranteed JSON-safe (e.g. an adapter pushing a datetime) — that must
+    # degrade to a str() rendering, not crash the whole infer()/ground() call.
+    percept = _signal_percept("sensor", "reading", {"at": object()})
+    rendered = render_signals([percept])
+    assert "sensor.reading" in rendered  # renders instead of raising TypeError
+
+
+def test_render_signals_truncates_long_payloads() -> None:
+    rendered = render_signals([_signal_percept("clock", "tick", {"data": "x" * 1000})])
+    assert len(rendered) < 500
+    assert rendered.endswith("…")
+
+
+# --------------------------------------------------------------------------------------------------
 # ground(): the escalation model call — decide an operation's params from execution history
 # --------------------------------------------------------------------------------------------------
 
@@ -486,6 +624,42 @@ async def test_ground_prompt_carries_operation_schema_and_history(tmp_path: Path
     assert system == GROUND_SYSTEM_PROMPT
     assert "email_id" in user and "id to reply to" in user  # the operation schema
     assert "search_emails" in user and "42" in user  # the prior result (history)
+
+
+async def test_ground_prompt_carries_observed_properties_and_signals(tmp_path: Path) -> None:
+    # Grounding shouldn't reason blind either — the current world state can settle a param a prior
+    # operation result alone can't (e.g. a value already visible as an observed property).
+    llm = FakeLLMClient(_params_json(email_id=42))
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm)
+    activity = _activity_with_history("reply", "search_emails", {"emails": [{"id": 42}]})
+    properties = [_property_percept("EmailClientApp", "unread_count", 3)]
+    signals = [_signal_percept("EmailClientApp", "new_email", {"id": 42})]
+
+    await mem.ground(
+        activity,
+        "reply_to_email",
+        None,
+        {"email_id": {"$decide": "x"}},
+        PerceptSnapshot(properties, signals),
+    )
+
+    _system, prompt = llm.calls[0]
+    assert "EmailClientApp.unread_count = 3" in prompt
+    assert "EmailClientApp.new_email" in prompt
+
+
+def test_default_ground_prompt_includes_percept_rendering() -> None:
+    activity = _activity_with_history("reply", "search_emails", {"emails": [{"id": 42}]})
+    properties = [_property_percept("EmailClientApp", "unread_count", 3)]
+    signals = [_signal_percept("EmailClientApp", "new_email", {"id": 42})]
+
+    system, user = default_ground_prompt(
+        activity, "reply_to_email", None, {}, PerceptSnapshot(properties, signals)
+    )
+
+    assert system == GROUND_SYSTEM_PROMPT
+    assert render_properties(properties) in user
+    assert render_signals(signals) in user
 
 
 async def test_ground_rejects_non_json(tmp_path: Path) -> None:

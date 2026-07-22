@@ -19,10 +19,12 @@ telling you to write a strategy instead.
 
 - **`LLMClient.complete(system, prompt) -> str`** (`sora/llm.py`) — the raw model round-trip. Dumb,
   stateless, text-in/text-out. No tools, no multi-turn, no structured output.
-- **`ProceduralMemory.infer(activity, tools) -> Plan`** (`sora/memory.py`) — *one* `complete()`
-  call → a static `Plan`. A pure function of `(goal, tool catalog)`; it gets **no `wm`, no `cycle`,
-  no memory access** (a memory module must not reach into the environment). In CoALA terms it is a
-  *query* against procedural memory's implicit knowledge, not a planning process.
+- **`ProceduralMemory.infer(activity, tools, observed) -> Plan`** (`sora/memory.py`) — *one*
+  `complete()` call → a static `Plan`. A pure function of `(goal, tool catalog, currently-observed
+  properties/signals)`; it gets **no `wm`, no `cycle`, no memory access** — `observed` is a narrow
+  `PerceptSnapshot` value the caller extracts and hands in, not a reference into `WorkingMemory` (a
+  memory module must not reach into the environment or working memory itself). In CoALA terms it is
+  a *query* against procedural memory's implicit knowledge, not a planning process.
 - **`ReasonStrategy.reason(activity, wm, cycle, result)`** (`sora/strategies.py`) — the reasoning
   **policy**, and the actual pluggable extension point. It has the whole context, and via
   `TickResult` threading it can fill `result.step` *and* `result.invocation` directly — i.e. **it
@@ -39,7 +41,7 @@ the only one.
 |---|---|---|
 | **Replanning** (invalidate & re-plan on a signal/observation) | Yes | A `ReasonStrategy` reads `wm.perceptions` / `activity.last_operation`, clears `activity.plan` when stale, and re-calls `infer()`. The Protocol already says "deciding when a plan is invalidated is up to the implementation." This is the mid-scenario follow-up-email path in EXAMPLES.md. |
 | **ReAct / reactive** (thought→action→observe, no static plan) | Bypasses it | A strategy that each cycle builds a prompt from `wm` (goal + recent percepts + `last_operation` as the last observation), calls the LLM, and returns a single `result.step`. **No `Plan`, no `infer()`.** The observation arrives next cycle via Observe (the invoke resolves onto `last_operation`), so the ReAct loop is spread across decision cycles — the idiomatic S-ORA shape. Scratchpad lives in `activity.context` (strategy-owned data). |
-| **Context-rich planning** (consult episodic memory / beliefs / observed state) | Not in `infer()` | `infer()` only sees `(activity, tools)` by design. The strategy gathers the extra context and either (a) passes it into a *widened* `infer(activity, tools, episodes=…, beliefs=…)` — a backward-compatible signature growth that keeps `infer` a pure function of its inputs — or (b) does the LLM call itself. Do **not** push `wm`/environment access *into* the memory module. |
+| **Context-rich planning** (consult episodic memory / beliefs / observed state) | Partially — currently-observed properties/signals already flow in via `observed: PerceptSnapshot`; episodic/belief context does not yet | `infer()` sees `(activity, tools, observed)`, where `observed` already carries `wm.properties`/`wm.signals` (see [ADR-0019](adrs/0019-blocked-state-machinery-and-percept-storage.md) and the `DefaultReasonStrategy.reason()` call site). For context beyond that (episodic memory, beliefs), the strategy gathers it and either (a) passes it into a *further-widened* `infer(activity, tools, observed, episodes=…, beliefs=…)` — a backward-compatible signature growth that keeps `infer` a pure function of its inputs — or (b) does the LLM call itself. Do **not** push `wm`/environment access *into* the memory module. |
 | **ToT / self-critique / multi-sample** (many LLM calls before committing) | Bypasses it | `infer()` is single-call. A strategy can make *several* `complete()` calls within one cycle (the "at most one **external action** per cycle" limit is about actions, not model calls) then commit to one step. `infer()` does not support the burst; the strategy does. |
 | **Native tool-calling during reasoning** (model calls tools mid-plan) | Neither seam supports it | Needs a richer client than `complete()` — a `chat(messages, tools) -> response-with-tool-calls` shape — plus multi-turn state (thinking-block / tool-call preservation). That is the deferred two-axis / normalized-response-with-`provider_data` work (see the Phase 4 backlog in [ROADMAP.md](../ROADMAP.md)). |
 
@@ -53,10 +55,12 @@ Three real limits, stated honestly:
    alongside it — exactly the Phase 4 two-axis backlog item. Complex reasoning is precisely the
    trigger that promotes that from "deferred" to "needed."
 
-2. **`infer()`'s narrow `(activity, tools)` signature caps context-aware planning.** Good for
-   purity, but a strategy wanting episodic/belief-conditioned planning must pass that context in
-   (signature growth) or move the LLM call into itself. The narrowness is a feature — it keeps the
-   primitive stable and side-effect-free — but it means `infer()` is not where you add smarts.
+2. **`infer()`'s narrow `(activity, tools, observed)` signature still caps context-aware
+   planning.** Currently-observed properties/signals already flow in via `observed`, but episodic
+   memory and beliefs don't. Good for purity, but a strategy wanting episodic/belief-conditioned
+   planning must pass that context in (further signature growth) or move the LLM call into itself.
+   The narrowness is a feature — it keeps the primitive stable and side-effect-free — but it means
+   `infer()` is not where you add smarts.
 
 3. **There is no `ProceduralMemory` Protocol.** `DecisionCycle.procedural` is the concrete class, so
    swapping in a *different* procedural-reasoning engine (a PDDL solver, a hosted planner service,
