@@ -1,0 +1,39 @@
+# In-process ARE showcase — run a dynamic ARE scenario end to end.
+#
+#     uv sync --all-extras --group are         # installs the ARE package + the llm extra
+#     export ANTHROPIC_API_KEY=sk-ant-...       # or a .gitignored .env
+#     uv run python -m examples.are_scenario.run                        # default scenario
+#     uv run python -m examples.are_scenario.run --scenario <ref>       # any ARE scenario
+#
+# This config is deliberately **generic**: it selects the in-process ARE workspace (`are-sim`) and the
+# ARE transport (user messages routed through the scenario's AgentUserInterface), but names **no
+# scenario** — a scenario is a per-run input, like a task, so it's a CLI argument the runner turns into
+# the running simulation (see run.py). The same config runs any ARE scenario.
+agent:
+  name: are-scenario
+  strategies:
+    # Dynamic-scenario strategies: model-backed planning (the runtime default) plus handling a mid-run
+    # state change through the agent's own cycle — Reason re-infers an in-flight plan on a fresh
+    # signal; Situate spawns a corrective activity if the change lands after the goal already completed.
+    # Nothing here is scenario-specific. The static MCP showcase, which never emits signals, keeps the
+    # simpler ScheduleFromEmailStrategy.
+    reason: examples.are_scenario.strategies.ReconcilingReasonStrategy
+    situate: examples.are_scenario.strategies.CorrectiveSituateStrategy
+  memory:
+    semantic: file://./.sora/are_scenario/semantic
+    procedural: file://./.sora/are_scenario/procedural
+    episodic: file://./.sora/are_scenario/episodic
+  procedural:
+    # In adition to the default prompt, tells the planner it may have already acted and must reconcile
+    # against current state (undo/modify) instead of assuming a blank slate. Separate from the
+    # memory.procedural URI above (that's the plan *store*; this overrides the plan *prompt*).
+    plan_prompt: examples.are_scenario.strategies.reconciling_plan_prompt
+  llm:
+    model: claude-opus-4-8
+  transport:
+    # The ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies
+    # via send_message_to_user. Shares the running simulation with the are-sim workspace below.
+    kind: are
+  workspaces:
+    - origin: { adapter: are-sim, address: "insim:are" }
+      workspace_id: are
