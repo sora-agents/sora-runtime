@@ -37,4 +37,4 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 
 ## Planned
 
-None currently pending — 16 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
+None currently pending — 19 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).

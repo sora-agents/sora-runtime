@@ -18,6 +18,8 @@ A S-ORA agent fits naturally into ARE because both share the same structural vie
 | `Message` | ARE `USER_MESSAGE` from the notification system (the scenario's initial task and follow-ups) |
 | `Activity` | ARE scenario task (one or more activities, depending on task complexity) |
 
+**Two adapter paths.** The table above and the walkthrough that follows describe the **MCP path** — S-ORA's `AreMcpWorkspaceAdapter` over ARE's MCP server. That server exposes a *static snapshot* of a scenario's initial app state and does not run the simulation engine, so it fits the single-shot plan→ground→act loop (the seeded `examples/gaia2/email_calendar` showcase). To run a scenario's **event timeline** — mid-run email injections, follow-ups, task delivery — S-ORA also ships an **in-process path** that runs the ARE `Environment` directly; see [Running dynamic scenarios in-process](#running-dynamic-scenarios-in-process) below and the [ARE dynamic scenarios design note](docs/are-dynamic-scenarios.md).
+
 ## Scenario: scheduling a meeting from email
 
 A Gaia2-style task, `scenario_email_calendar`: the scenario injects an email from Alice ("Can you set up a 30-minute team sync with Bob and Carol next Monday?"), then validates that the agent creates the correct calendar event and replies. (`scenario_email_calendar` is an *illustrative* id — no such scenario ships in ARE 1.2.0; the real seeded scenario must be pinned against the installed ARE version. See the launch note below.)
@@ -115,25 +117,35 @@ async def focus(self, sink: SignalSink) -> None:
 
 On the next `observe()`, `DefaultObserveStrategy` drains the `signal_sink` and appends a `Percept(source="EmailClientApp", payload=Signal("state_updated", ...), ...)` to `wm.signals`. The reasoning strategy checks for that percept and decides to re-invoke `list_emails` to discover what changed.
 
-For `USER_MESSAGE` entries from the ARE notification system — the initial task prompt the scenario delivers to the agent — the adapter routes these through S-ORA's `MessageTransport`, so they arrive in `working_memory.messages` just like any agent-to-agent message.
+For `USER_MESSAGE` entries from the ARE notification system — the task prompt the scenario delivers to the agent, plus follow-ups — the target is S-ORA's `MessageTransport`, so they arrive in `working_memory.messages` just like any agent-to-agent message. Over the **MCP path** this has no push surface (the `AgentUserInterface` is a tool, not a resource the server notifies on), so the seeded showcase submits the task directly; it is genuinely wired in the **in-process path** below, where `AreTransport` drains the scenario's `AgentUserInterface` for the agent.
 
 ## Plan reuse across scenarios
 
-The most concrete payoff of S-ORA's procedural memory is across ARE benchmark runs. After the first `schedule-from-email` activity completes successfully, `ReflectStrategy` calls `cycle.procedural.store(activity.plan)` — persisting the four-step shape ("read email → check calendar → create event → reply") keyed by the goal.
+Procedural memory is *designed* to pay off across ARE benchmark runs: a `schedule-from-email` plan — the four-step shape ("read email → check calendar → create event → reply") — could be stored once and reused whenever the same goal pattern recurs, turning hundreds of similar scheduling scenarios into one LLM call per step rather than one to derive the plan plus one per step.
 
-The next scenario with the same goal pattern hits `cycle.procedural.retrieve(activity)` on its first `reason()` call, skips plan derivation entirely, and goes straight to step execution. In a Gaia2 run with hundreds of similar scheduling scenarios, this means one LLM call per step rather than one to derive the plan plus one per step — the exact throughput trade-off the runtime is designed to let you dial.
+That auto-caching is **currently disabled**, though: `ReflectStrategy` no longer calls `cycle.procedural.store(activity.plan)`, because replaying a completed plan verbatim is unsound — a plan corrected mid-run, or coupled to one run's observed ids, is not a reusable template. So every activity infers a fresh plan. The `store`/`retrieve` operations remain; the payoff returns once a consolidation step distils a reusable *common-case* procedure from accumulated episodes and stores that deliberately, rather than caching whatever plan happened to complete last.
 
 ## ARE's dynamic events as reactive interrupts
 
 ARE scenarios can inject mid-scenario events — a follow-up email from Bob ("actually, can we push it to Tuesday?") arriving while the agent is mid-plan. In ARE's default ReAct agent this restarts the turn from scratch. In S-ORA:
 
 1. A scheduled ARE event injects a new email into the inbox.
-2. The MCP server sends `resource_updated` for `EmailClientApp/state`.
+2. The runtime surfaces that state change as a `state_changed` signal — in the **in-process path** the focused tool's poll-on-observe diff catches it (the MCP path can only push `resource_updated` for the agent's *own* writes, not a background timeline injection — which is why the dynamic story runs in-process; see below).
 3. `DefaultObserveStrategy` delivers it as a signal `Percept(source="EmailClientApp", ...)` in `wm.signals`.
 4. `ReflectStrategy` sees the signal and marks the current activity's plan stale.
 5. The next `reason()` call re-derives a plan from the updated working memory — new target date, same shape — and execution resumes from step 2 (`get_calendar_events_from_to` with the corrected date).
 
 No tool call already in flight is lost: the `_suspend_` / `_resume_` mechanism from the robotic-arm example (below) applies here too, if a long-running ARE operation (e.g., waiting for a user to reply) needs to block the activity until the expected event arrives.
+
+## Running dynamic scenarios in-process
+
+The MCP path above serves a *static* snapshot: ARE's MCP server never runs `Environment.run`, and it can only push `resource_updated` from inside a write-tool request — so a timeline-injected email (or an `AgentUserInterface` `USER_MESSAGE`) is never pushed to the client off-request. To make the *dynamic* story real, S-ORA ships an **in-process** path (`sora/adapters/are_sim.py`, [ARE dynamic scenarios design note](docs/are-dynamic-scenarios.md)) that talks to the live ARE app objects directly and runs the `Environment` event loop on a background thread:
+
+- **`AreSimulation`** owns the `Environment`/scenario lifecycle (started when the workspace is joined, stopped when it's left) and scores the run via `scenario.validate(env)`.
+- **`AreInProcessWorkspaceAdapter`** imports each app as a tool (its ops from `app.get_tools()`, minus the `AgentUserInterface`); app-state changes surface as a `state_changed` `Signal` by **poll-on-observe** — the focused tool re-reads `get_state()` each `observe()` and diffs, the in-process analogue of the MCP resource push but driven by the cycle's own cadence, so a background timeline change is caught even though nothing pushed it.
+- **`AreTransport`** (a `MessageTransport`) drains the scenario's `AgentUserInterface` unread USER messages in `receive()` and replies via `send_message_to_user()` in `send()` — this is where `USER_MESSAGE` routing is actually wired.
+
+The scenario is a **per-run input**, not config: `agent.yaml` names the `are-sim` workspace and the `are` transport generically (no scenario key), and the runner passes the scenario — a dotted `Scenario` subclass or a Gaia2 `.json` — on the command line, which `build_agent(config, simulation=...)` injects (the workspace owns the Environment lifecycle, so `Agent.run()` starts it on the startup join and stops it on teardown). See `examples/are_scenario/` (`run.py --scenario <ref>`), which reproduces the mid-run Monday→Tuesday follow-up email and the signal-driven replan against a live ARE `Environment`, then scores the run. (Bringing this dynamic story back onto the MCP wire — a launcher that runs the Environment plus poll-on-observe — is a backlog/exploratory item; see [ROADMAP.md](ROADMAP.md).)
 
 ---
 
@@ -508,7 +520,7 @@ Once `activity.context["target"]` holds real coordinates, there's nothing left f
 
 ## Reusing a plan across activities
 
-Once `pick-up-block` (the first stack) completes, `ReflectStrategy` stores its `Plan` — the sequence of *action types* ("send", "invoke move_to", "invoke close_gripper"), independent of the specific coordinates — via `cycle.procedural.store(activity.plan)`, keyed by a goal like `"pick up the top block of a stack"`.
+This illustrates the reuse *capability* (the default `ReflectStrategy` no longer auto-stores completed plans — see [Plan reuse across scenarios](#plan-reuse-across-scenarios) — so realizing it needs a deliberate store: a custom Reflect, or the future episode-consolidation step). Given such a store, once `pick-up-block` (the first stack) completes its `Plan` — the sequence of *action types* ("send", "invoke move_to", "invoke close_gripper"), independent of the specific coordinates — is kept via `cycle.procedural.store(activity.plan)`, keyed by a goal like `"pick up the top block of a stack"`.
 
 When a second activity starts — `pick-up-second-block`, same goal, different stack — its first `reason()` call has no `activity.plan` yet, so it calls `cycle.procedural.retrieve(activity)` before falling back to deriving one from scratch:
 

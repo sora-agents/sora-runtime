@@ -339,6 +339,36 @@ loads a local `.env` automatically when present, so you don't need to `export` i
 is gitignored, and **real environment variables still take precedence** (a `.env` value is used only
 when the variable isn't already set), so it never silently overrides a key you exported deliberately.
 
+### Running the ARE examples
+
+Two runnable showcases drive S-ORA against Meta's [Agents Research Environments](https://github.com/facebookresearch/meta-agents-research-environments) (ARE). Both need a live model and the ARE package, so they live outside the pytest suite and share the same one-time setup — install the `are` dependency group and provide a key:
+
+    $ uv sync --all-extras --group are
+    $ export ANTHROPIC_API_KEY=sk-ant-...     # or a .gitignored .env, as above
+
+**MCP path — static snapshot** (`examples/gaia2/email_calendar/`). S-ORA's `AreMcpWorkspaceAdapter` connects over ARE's MCP server, which serves a scenario's *initial* app state; this fits the single-shot plan→ground→act loop:
+
+    $ uv run python -m examples.gaia2.email_calendar.run
+    # or the same scenario through the CLI:
+    $ uv run sora run examples/gaia2/email_calendar/agent.yaml \
+        --task-file examples/gaia2/email_calendar/task.txt --verbose
+
+**In-process path — dynamic timeline** (`examples/are_scenario/`). To exercise a scenario's *event timeline* — mid-run email injections, follow-ups, task delivery — S-ORA runs the ARE `Environment` directly. The scenario is a **per-run input on the command line**, not config: a dotted `Scenario` subclass or a Gaia2 `.json` file, injected via `build_agent(config, simulation=...)`:
+
+    $ uv run python -m examples.are_scenario.run                          # the bundled default scenario
+    $ uv run python -m examples.are_scenario.run --scenario path/to.json  # a Gaia2 JSON scenario
+    $ uv run python -m examples.are_scenario.run --scenario pkg.mod.MyScenario
+
+**Scenarios you can run.** The in-process path is scenario-agnostic — `--scenario` accepts any of three forms:
+
+- **`examples.are_scenario.scenario.EmailScheduleScenario`** — the bundled default (used when `--scenario` is omitted). A *dynamic* scenario: Alice emails to schedule a Monday team sync, then a follow-up email mid-run moves it to Tuesday, surfacing as a `state_changed` signal that drives a replan.
+- **A Gaia2 `.json` benchmark scenario** — any scenario file from Meta's Gaia2 benchmark (distributed with [ARE](https://github.com/facebookresearch/meta-agents-research-environments)), loaded through ARE's benchmark scenario loader. These are not vendored in this repo; point at your own copy.
+- **A dotted `Scenario` subclass you author** — subclass ARE's `Scenario` (see `examples/are_scenario/scenario.py` for the template) and pass its dotted path.
+
+Separately, the **MCP path** runs one seeded static scenario, `examples/gaia2/email_calendar` (a 30-minute team sync from an inbox email); it is fixed by that example's `agent.yaml`/`task.txt` rather than selected with `--scenario`.
+
+Each runner drives the decision cycle until the activity terminates, prints the trajectory, and (for the in-process path) scores the run via `scenario.validate(env)`. Both print the runtime's own INFO trace (join / plan / invoke / resolve / terminate) by default; raise or lower it with `LOGLEVEL` (e.g. `LOGLEVEL=WARNING`). For how the two adapter paths differ and why the dynamic path exists, see [EXAMPLES.md](EXAMPLES.md#running-dynamic-scenarios-in-process) and the [ARE dynamic scenarios design note](docs/are-dynamic-scenarios.md).
+
 ## API Sketch
 
 ```python
@@ -1063,6 +1093,9 @@ when the variable isn't already set), so it never silently overrides a key you e
         send() records outbound content. A peer-to-peer transport (A2A/HTTP, transport.peers) is the 
         multi-agent case."""
         def submit(self, message: Message) -> None: ...
+    # AreTransport (sora/adapters/are_sim.py) is a second MessageTransport: over a running ARE
+    # scenario's AgentUserInterface — receive() drains unread USER messages, send() -> send_message_to_user.
+    # Selected by transport.kind: are; shares the AreSimulation with the are-sim workspace. See EXAMPLES.md.
 
     # sora/cycle.py
     class DecisionCycle:
@@ -1179,29 +1212,37 @@ when the variable isn't already set), so it never silently overrides a key you e
     def import_object(path: str) -> Any: ...        # resolve a dotted (pkg.mod.Attr) / module:attr path
     def load_yaml(config_path: str) -> AgentConfig: ...  # parse agent.yaml; require strategies.reason
     def backend_for(spec: str) -> MemoryBackend: ...     # file://<path> (or bare path) -> FileMemoryBackend
-    def adapter_for(entry: dict) -> tuple[WorkspaceOrigin, WorkspaceAdapter]: ...  # dispatch on origin.adapter
+    def adapter_for(entry: dict, simulation: Any = None) -> tuple[WorkspaceOrigin, WorkspaceAdapter]: ...
+        #   dispatch on origin.adapter; the are-sim (in-process ARE) kind receives the injected simulation
     def llm_for(config: AgentConfig) -> LLMClient | None: ...  # the llm: block -> a client, else None
     def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]: ...
         #   resolves procedural.plan_prompt/ground_prompt dotted paths into ProceduralMemory kwargs
         #   ({} if the block is absent); a custom callable fully replaces the built-in default, it
         #   doesn't patch pieces of it.
-    def transport_for(config: AgentConfig) -> MessageTransport: ...  # InProcessTransport (peers -> raise)
+    def transport_for(config: AgentConfig, simulation: Any = None) -> MessageTransport: ...
+        #   InProcessTransport by default (peers -> raise); transport.kind: are -> AreTransport, which
+        #   shares `simulation` with the are-sim workspace (user messages via the scenario's AUI)
 
-    def build_agent(config_path: str) -> Agent:
+    def build_agent(config_path: str, *, simulation: Any = None) -> Agent:
         """What `sora run` calls before handing off to TerminalSession. This is the one place all the
         wiring (which memory backend, which transport, which adapters, DecisionCycle <-> Agent sharing
         the same instances) actually happens — a developer implementing an agent never writes this.
-        Stays synchronous: the async startup join runs in Agent.run()."""
+        Stays synchronous: the async startup join runs in Agent.run().
+
+        `simulation` is an opaque, runtime-provided shared object for adapters/transports that need one
+        (currently only the ARE in-process integration's AreSimulation, shared by an are-sim workspace
+        and the are transport). It keeps config generic — the per-run scenario is a CLI argument the
+        runner turns into this object, not a key in agent.yaml. None for every other agent."""
         load_dotenv()   # convenience for development
         config = load_yaml(config_path)
-        adapters = dict(adapter_for(entry) for entry in config.workspaces)
+        adapters = dict(adapter_for(entry, simulation) for entry in config.workspaces)
         registry = EnvironmentRegistry(adapters=adapters)   # the single shared instance...
         working = WorkingMemory(registry=registry)          # ...held here read-only as EnvironmentView
         semantic = SemanticMemory(backend_for(config.memory["semantic"]))
         procedural = ProceduralMemory(backend_for(config.memory["procedural"]), llm=llm_for(config),
                                        **procedural_prompts_for(config))
         episodic = EpisodicMemory(backend_for(config.memory["episodic"]))
-        communication = transport_for(config)
+        communication = transport_for(config, simulation)
         strategies = Strategies(
             observe=import_object(config.strategies.get("observe", "sora.strategies.DefaultObserveStrategy"))(),
             reflect=import_object(config.strategies.get("reflect", "sora.strategies.DefaultReflectStrategy"))(),

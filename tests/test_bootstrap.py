@@ -294,6 +294,59 @@ def test_transport_for_rejects_peers() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# ARE in-process injection seam — the opaque `simulation` shared by an are-sim workspace + are
+# transport. Config stays generic (no scenario key); the scenario is a runtime (CLI) input. These
+# assert the *wiring* only (a stub stands in for AreSimulation), so no ARE dependency is needed.
+# --------------------------------------------------------------------------------------------------
+
+
+def _are_entry() -> dict[str, object]:
+    return {"origin": {"adapter": "are-sim", "address": "insim:are"}, "workspace_id": "are"}
+
+
+def test_adapter_for_are_sim_injects_the_shared_simulation() -> None:
+    from sora.adapters.are_sim import AreInProcessWorkspaceAdapter
+
+    sim = object()
+    _origin_, adapter = adapter_for(_are_entry(), sim)
+    assert isinstance(adapter, AreInProcessWorkspaceAdapter)
+    assert adapter._sim is sim
+
+
+def test_adapter_for_are_sim_without_simulation_raises() -> None:
+    with pytest.raises(ValueError, match="simulation"):
+        adapter_for(_are_entry())
+
+
+def test_transport_for_are_kind_injects_the_same_simulation() -> None:
+    from sora.adapters.are_sim import AreTransport
+
+    sim = object()
+    transport = transport_for(_config(transport={"kind": "are"}), sim)
+    assert isinstance(transport, AreTransport)
+    assert transport._sim is sim
+
+
+def test_transport_for_are_kind_without_simulation_raises() -> None:
+    with pytest.raises(ValueError, match="simulation"):
+        transport_for(_config(transport={"kind": "are"}))
+
+
+def test_shipped_adapter_names_match_bootstrap_dispatch_kinds() -> None:
+    # Each shipped adapter declares its kind as `.name`; bootstrap dispatches on the same literal
+    # but can't read `.name` (lazy imports), so the two are synced only by convention. This guard
+    # makes a rename on either side fail loudly instead of silently missing dispatch.
+    from sora.adapters.are_mcp import AreMcpWorkspaceAdapter
+    from sora.adapters.are_sim import AreInProcessWorkspaceAdapter
+    from sora.adapters.mcp import McpWorkspaceAdapter
+    from sora.bootstrap import _ADAPTER_ARE_MCP, _ADAPTER_ARE_SIM, _ADAPTER_MCP
+
+    assert McpWorkspaceAdapter.name == _ADAPTER_MCP
+    assert AreMcpWorkspaceAdapter.name == _ADAPTER_ARE_MCP
+    assert AreInProcessWorkspaceAdapter.name == _ADAPTER_ARE_SIM
+
+
+# --------------------------------------------------------------------------------------------------
 # procedural_prompts_for — optional PlanPrompt/GroundPrompt overrides
 # --------------------------------------------------------------------------------------------------
 

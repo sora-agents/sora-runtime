@@ -48,6 +48,18 @@ _DEFAULT_STRATEGIES = {
 }
 _DEFAULT_LLM_CLIENT = "sora.adapters.anthropic_llm.AnthropicLLMClient"
 
+# Built-in workspace-adapter / transport "kinds" — the config↔code contract. Each is the string a
+# shipped adapter also declares as its own ``.name`` (a duck-typed invariant guarded by a test:
+# ``test_shipped_adapter_names_match_bootstrap_dispatch_kinds``). Bootstrap can't dispatch off
+# ``Adapter.name`` directly because adapter imports are lazy — importing bootstrap must not require
+# an optional SDK extra — so the literal is repeated here, named (not inline) so a typo is a
+# NameError, not a silent dispatch miss, and a rename is one edit. Custom adapters stay open via
+# ``factory:``; this is only the *built-in* set, deliberately not a closed enum (ADR-0008).
+_ADAPTER_MCP = "mcp"
+_ADAPTER_ARE_MCP = "are-mcp"
+_ADAPTER_ARE_SIM = "are-sim"
+_TRANSPORT_ARE = "are"
+
 
 @dataclass(frozen=True)
 class AgentConfig:
@@ -142,7 +154,23 @@ def backend_for(spec: str) -> MemoryBackend:
     return FileMemoryBackend(path)
 
 
-def adapter_for(entry: dict[str, Any]) -> tuple[WorkspaceOrigin, WorkspaceAdapter]:
+def _require_simulation(simulation: Any | None, *, subject: str) -> Any:
+    """Guard that the opaque ``simulation`` object ``build_agent`` accepts at runtime is present,
+    for a workspace/transport kind that needs one. This is the *generic* injection seam — any
+    adapter/transport that requires a live per-run object goes through it (ARE's ``AreSimulation``
+    is the only one today); the ARE-specific part stays in the caller's ``subject``. Returns it
+    (narrowing away ``None``) so callers pass the result on."""
+    if simulation is None:
+        raise ValueError(
+            f"{subject} needs the runtime `simulation` object: pass simulation=... to build_agent "
+            "(a per-run input the runner supplies — e.g. the ARE runner builds it from --scenario)"
+        )
+    return simulation
+
+
+def adapter_for(
+    entry: dict[str, Any], simulation: Any | None = None
+) -> tuple[WorkspaceOrigin, WorkspaceAdapter]:
     """Build one workspace's ``(origin, adapter)`` from its agent.yaml entry. Dispatch is on
     ``origin.adapter``. Adapter SDKs are optional extras, so their imports are lazy (importing
     bootstrap must not require the ``mcp`` extra).
@@ -153,13 +181,30 @@ def adapter_for(entry: dict[str, Any]) -> tuple[WorkspaceOrigin, WorkspaceAdapte
     ``transport: streamable-http``) and nothing is deployed. An optional ``manuals:`` directory path
     is wired into a ``DirectoryManualSource``, given to the adapter so it can pair hand-authored
     manuals with the ones it synthesizes for the same id (ADR-0018); absent -> no pairing, unchanged
-    adapter-only manuals. The ``fake`` kind — plus any custom adapter — is an escape hatch: name a
-    factory ``(origin) -> WorkspaceAdapter`` via ``factory:`` resolved through ``import_object``
-    (the test/showcase seam)."""
+    adapter-only manuals.
+
+    ``are-sim`` is the in-process ARE integration: it needs a running scenario, so ``simulation``
+    (an ``AreSimulation``) is *injected* at runtime; config stays generic (no scenario key); the
+    scenario is a CLI argument the runner turns into the simulation (see examples/are_scenario/run).
+
+    The ``fake`` kind — plus any custom adapter — is an escape hatch: name a factory
+    ``(origin) -> WorkspaceAdapter`` via ``factory:`` resolved through ``import_object`` (the
+    test/showcase seam)."""
     origin = WorkspaceOrigin(**entry["origin"])
     kind = origin.adapter
-    if kind in ("mcp", "are-mcp"):
-        if kind == "mcp":
+    if kind == _ADAPTER_ARE_SIM:
+        sim = _require_simulation(simulation, subject="an 'are-sim' workspace")
+        from sora.adapters.are_sim import AreInProcessWorkspaceAdapter
+
+        manual_source = DirectoryManualSource(entry["manuals"]) if "manuals" in entry else None
+        return origin, AreInProcessWorkspaceAdapter(
+            workspace_id=entry["workspace_id"],
+            origin=origin,
+            simulation=sim,
+            manual_source=manual_source,
+        )
+    if kind in (_ADAPTER_MCP, _ADAPTER_ARE_MCP):
+        if kind == _ADAPTER_MCP:
             from sora.adapters.mcp import McpWorkspaceAdapter as _Adapter
         else:
             from sora.adapters.are_mcp import AreMcpWorkspaceAdapter as _Adapter
@@ -217,10 +262,17 @@ def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]:
     return kwargs
 
 
-def transport_for(config: AgentConfig) -> MessageTransport:
-    """The single-agent default is an in-process inbox. An agent-to-agent transport (A2A/HTTP,
-    driven by ``transport.peers``) is the multi-agent case and is deferred, so a ``peers`` config
-    raises rather than silently running peerless."""
+def transport_for(config: AgentConfig, simulation: Any | None = None) -> MessageTransport:
+    """The single-agent default is an in-process inbox. ``transport: { kind: are }`` selects the ARE
+    in-process transport (user messages via the running scenario's ``AgentUserInterface``)
+    — it shares the injected ``simulation`` with the ``are-sim`` workspace. An agent-to-agent
+    transport (A2A/HTTP, driven by ``transport.peers``) is the multi-agent case, deferred, so a
+    ``peers`` config raises rather than silently running peerless."""
+    if config.transport and config.transport.get("kind") == _TRANSPORT_ARE:
+        sim = _require_simulation(simulation, subject="transport 'are'")
+        from sora.adapters.are_sim import AreTransport
+
+        return AreTransport(sim)
     if config.transport and config.transport.get("peers"):
         raise NotImplementedError(
             "agent-to-agent transport (transport.peers) is not implemented yet; single-agent runs "
@@ -229,16 +281,22 @@ def transport_for(config: AgentConfig) -> MessageTransport:
     return InProcessTransport()
 
 
-def build_agent(config_path: str) -> Agent:
+def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
     """What ``sora run`` calls before handing off to TerminalSession. The one place all the wiring
     happens — a developer implementing an agent never writes this. Constructs the single shared
     EnvironmentRegistry / WorkingMemory / memory modules / transport and hands the *same* instances
     to both DecisionCycle and Agent (ADR-0013). Stays synchronous: e.g. the async startup join runs
-    in ``Agent.run()``."""
+    in ``Agent.run()``.
+
+    ``simulation`` is an opaque, runtime-provided object for adapters/transports that need one
+    (currently only the ARE in-process integration's ``AreSimulation``, shared by an ``are-sim``
+    workspace and the ``are`` transport). It keeps config generic — the per-run scenario is a CLI
+    argument the runner turns into this object, not a key in agent.yaml. ``None`` for every other
+    agent; passing it when config asks for ``are-sim``/``are`` is required (else a clear error)."""
     load_dotenv()  # convenience: pick up ANTHROPIC_API_KEY etc. from a local .env if present
     config = load_yaml(config_path)
 
-    adapters = dict(adapter_for(entry) for entry in config.workspaces)
+    adapters = dict(adapter_for(entry, simulation) for entry in config.workspaces)
     registry = EnvironmentRegistry(adapters=adapters)  # the single shared instance...
     working = WorkingMemory(registry=registry)  # ...held here read-only as an EnvironmentView
     semantic = SemanticMemory(backend_for(config.memory["semantic"]))
@@ -248,7 +306,7 @@ def build_agent(config_path: str) -> Agent:
         **procedural_prompts_for(config),
     )
     episodic = EpisodicMemory(backend_for(config.memory["episodic"]))
-    communication = transport_for(config)
+    communication = transport_for(config, simulation)
 
     strategies = Strategies(
         observe=import_object(config.strategies.get("observe", _DEFAULT_STRATEGIES["observe"]))(),
