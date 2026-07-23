@@ -25,6 +25,7 @@ from pathlib import Path
 from sora.activity import ActivityState
 from sora.adapters.are_sim import AreSimulation, load_scenario
 from sora.bootstrap import build_agent
+from sora.llm import LLMMeter
 
 log = logging.getLogger(__name__)
 
@@ -45,11 +46,17 @@ async def main(scenario_ref: str) -> None:
     for noisy in ("httpx", "anthropic", "mcp"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    # Count/time the model round-trips (the per-call `~ llm (…s)` cue prints via basicConfig above);
+    # combined with a wall-clock start, this scores the scenario run in the footer below.
+    meter = LLMMeter()
+    logging.getLogger("sora").addHandler(meter)
+
     print(f"loading scenario {scenario_ref!r} ...", flush=True)
     simulation = AreSimulation(load_scenario(scenario_ref))
     agent = build_agent(str(CONFIG), simulation=simulation)
 
     print("joining workspace + running the ARE event loop ...", flush=True)
+    wall_start = time.monotonic()
     runner = asyncio.create_task(agent.run())
     try:
         deadline = time.monotonic() + _MAX_WAIT_S
@@ -110,6 +117,8 @@ async def main(scenario_ref: str) -> None:
         )
     except Exception as exc:  # a scenario whose validators need oracle events can raise instead
         print(f"ARE validation: n/a ({exc})")
+
+    print(f"\n-- {meter.summary(time.monotonic() - wall_start)} --")
 
 
 if __name__ == "__main__":

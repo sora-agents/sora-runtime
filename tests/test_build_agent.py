@@ -84,9 +84,12 @@ def test_build_agent_resolves_default_and_required_strategies(tmp_path: Path) ->
 
 def test_build_agent_wires_llm_into_procedural_memory(tmp_path: Path) -> None:
     from fakes import FakeLLMClient
+    from sora.llm import MeteredLLMClient
 
     agent = build_agent(str(_write_config(tmp_path, with_llm=True)))
-    assert isinstance(agent.procedural._llm, FakeLLMClient)  # the E2 model seam
+    # The model seam, wrapped for per-call timing/logging; the fake client is underneath.
+    assert isinstance(agent.procedural._llm, MeteredLLMClient)
+    assert isinstance(agent.procedural._llm._inner, FakeLLMClient)
 
 
 def test_build_agent_without_llm_leaves_procedural_model_less(tmp_path: Path) -> None:

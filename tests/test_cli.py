@@ -248,6 +248,18 @@ def test_presenter_non_verbose_only_surfaces_invoke_cues(
     assert out == "[invoking Clock.get_time...]\n"
 
 
+def test_presenter_verbose_surfaces_the_llm_cue(capsys: pytest.CaptureFixture[str]) -> None:
+    presenter = _Presenter(verbose=True, console=_Console())
+    presenter.emit(_record("sora.llm", logging.INFO, "~ llm (%.2fs)", 1.24))
+    assert capsys.readouterr().out == "~ llm (1.24s)\n"
+
+
+def test_presenter_terse_hides_the_llm_cue(capsys: pytest.CaptureFixture[str]) -> None:
+    presenter = _Presenter(verbose=False, console=_Console())
+    presenter.emit(_record("sora.llm", logging.INFO, "~ llm (%.2fs)", 1.24))
+    assert capsys.readouterr().out == ""  # counted in the summary, but not shown live in terse mode
+
+
 # ---------------------------------------------------------------------------
 # TerminalSession.run — stdin/output plumbing, against a real (fakes-backed) Agent
 # ---------------------------------------------------------------------------
@@ -515,12 +527,14 @@ class _FakeSession:
         agent: object,
         verbose: bool = False,
         *,
+        color: bool | None = None,
         poll_interval: float = 0.02,
         initial_task: str | None = None,
     ) -> None:
         _FakeSession.last_calls = {
             "agent": agent,
             "verbose": verbose,
+            "color": color,
             "initial_task": initial_task,
         }
 
@@ -543,7 +557,21 @@ def test_main_run_defaults_to_agent_yaml_and_non_verbose(monkeypatch: pytest.Mon
 
     assert calls["config"] == "agent.yaml"
     assert _FakeSession.last_calls["verbose"] is False
+    assert _FakeSession.last_calls["color"] is None  # auto: TerminalSession resolves TTY/NO_COLOR
     assert _FakeSession.last_calls["initial_task"] is None
+
+
+def test_main_run_color_flags_pass_tri_state_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path: object())
+    monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
+
+    monkeypatch.setattr(sys, "argv", ["sora", "run", "--no-color"])
+    main()
+    assert _FakeSession.last_calls["color"] is False
+
+    monkeypatch.setattr(sys, "argv", ["sora", "run", "--color"])
+    main()
+    assert _FakeSession.last_calls["color"] is True
 
 
 def test_main_run_accepts_config_path_and_verbose_flag(monkeypatch: pytest.MonkeyPatch) -> None:

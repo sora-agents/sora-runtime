@@ -279,9 +279,12 @@ def test_llm_for_absent_block_is_none() -> None:
 
 def test_llm_for_builds_named_client_with_kwargs() -> None:
     from fakes import FakeLLMClient
+    from sora.llm import MeteredLLMClient
 
     client = llm_for(_config(llm={"client": "fakes.FakeLLMClient", "response": "hi"}))
-    assert isinstance(client, FakeLLMClient)
+    # Every built client is wrapped for per-call timing/logging; the named client is underneath.
+    assert isinstance(client, MeteredLLMClient)
+    assert isinstance(client._inner, FakeLLMClient)
 
 
 def test_transport_for_defaults_to_in_process() -> None:

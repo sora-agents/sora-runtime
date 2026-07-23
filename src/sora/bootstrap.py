@@ -244,7 +244,12 @@ def llm_for(config: AgentConfig) -> LLMClient | None:
     settings = dict(config.llm)
     client_path = settings.pop("client", _DEFAULT_LLM_CLIENT)
     client_cls = import_object(client_path)
-    return client_cls(**settings)  # type: ignore[no-any-return]
+    client = client_cls(**settings)
+    # Wrap every built client so each round-trip is timed and logged (`sora.llm`) — instrumentation
+    # a run surface reads back via `LLMMeter`, without the concrete client growing that concern.
+    from sora.llm import MeteredLLMClient
+
+    return MeteredLLMClient(client)
 
 
 def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]:

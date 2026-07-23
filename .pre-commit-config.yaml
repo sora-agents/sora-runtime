@@ -10,15 +10,21 @@ repos:
       - id: check-added-large-files
       - id: check-merge-conflict
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.4
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-
   - repo: local
     hooks:
+      # ruff runs in the project venv via uv (not ruff-pre-commit's isolated install) so the hook
+      # and CI's `uv run ruff` share the one pinned ruff — no lint/format version skew (the same
+      # one-source-of-truth reason mypy is wired this way below).
+      - id: ruff
+        name: ruff (project venv via uv — matches CI)
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff-format (project venv via uv — matches CI)
+        entry: uv run ruff format
+        language: system
+        types: [python]
       # mypy runs in the project venv via uv (not mirrors-mypy's isolated env) so it resolves the
       # project's own deps — mcp, pytest, optional extras — exactly as CI's `uv run mypy` does.
       # An isolated env would need every dependency re-declared under additional_dependencies,

@@ -813,6 +813,18 @@ Each runner drives the decision cycle until the activity terminates, prints the 
         not here."""
         async def complete(self, *, system: str, prompt: str) -> str: ...
 
+    class MeteredLLMClient:            # transparent decorator bootstrap wraps every client in
+        """Times each round-trip and logs a `sora.llm` cue carrying the elapsed seconds. Not a
+        breach of the non-ownership contract — that forbids the *client itself* growing timing;
+        this instruments one from the outside, so the concrete client stays a bare round-trip."""
+        def __init__(self, inner: LLMClient) -> None: ...
+        async def complete(self, *, system: str, prompt: str) -> str: ...
+
+    class LLMMeter(logging.Handler):   # tallies the `sora.llm` cues: call count + in-model seconds
+        """A run surface (TerminalSession, an example runner) attaches it to the `sora` logger and
+        calls summary() at the end — no reference to the client (which bootstrap hands off) needed."""
+        def summary(self, wall_seconds: float | None = None) -> str: ...
+
     # sora/memory.py
     class MemoryBackend(Protocol):    # pluggable: file, DB, vector store
         async def get(self, key: str) -> Any: ...

@@ -31,6 +31,7 @@ from pathlib import Path
 
 from sora.activity import ActivityState
 from sora.bootstrap import build_agent
+from sora.llm import LLMMeter
 from sora.perception import Message
 from sora.transport import InProcessTransport
 
@@ -48,6 +49,12 @@ async def main() -> None:
     logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO"), format="%(message)s")
     for noisy in ("httpx", "anthropic", "mcp"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Count/time the model round-trips (per-call `~ llm (…s)` cue prints via basicConfig above) and
+    # start the wall clock, for the scenario-run footer below.
+    meter = LLMMeter()
+    logging.getLogger("sora").addHandler(meter)
+
     print(f"building agent from {CONFIG.name} ...", flush=True)
     agent = build_agent(str(CONFIG))
     transport = agent.communication
@@ -55,6 +62,7 @@ async def main() -> None:
     transport.submit(Message(sender="user", content={"text": TASK}, received_at=time.time()))
 
     print("joining workspaces + running (ARE startup takes a few seconds) ...", flush=True)
+    wall_start = time.monotonic()
     runner = asyncio.create_task(agent.run())
     try:
         deadline = time.monotonic() + _MAX_WAIT_S
@@ -87,6 +95,8 @@ async def main() -> None:
             for i, step in enumerate(activity.plan.steps):
                 marker = ">" if i == activity.step_index else " "
                 print(f"  {marker} {step.next_action} {step.params}")
+
+    print(f"\n-- {meter.summary(time.monotonic() - wall_start)} --")
 
 
 if __name__ == "__main__":

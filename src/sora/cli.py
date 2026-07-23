@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import re
 import sys
 import time
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING
 from sora import scaffold
 from sora.activity import ActivityState
 from sora.bootstrap import build_agent
+from sora.llm import LLMMeter
 from sora.perception import Message
 from sora.transport import InProcessTransport
 
@@ -26,6 +28,32 @@ log = logging.getLogger("sora.cli")
 _PHASES = ("observe", "situate", "reason", "reflect", "act")
 _CYCLE_BEGIN = re.compile(r"^\[cycle (\d+)\] begin$")
 _EXIT_COMMANDS = ("exit", "quit")
+
+# ANSI styling. Raw escapes, no dependency: the core stays dependency-light and the CLI already
+# speaks straight to the terminal. Every styled write goes through `_paint`, a no-op when color is
+# off — so with color disabled (tests, pipes, NO_COLOR) output is byte-for-byte the pre-color text.
+_RESET = "\x1b[0m"
+_BOLD = "\x1b[1m"
+_DIM = "\x1b[2m"
+_CYAN = "\x1b[36m"
+_MAGENTA = "\x1b[35m"
+
+
+def _paint(text: str, code: str, *, enabled: bool) -> str:
+    return f"{code}{text}{_RESET}" if enabled else text
+
+
+def _color_enabled(setting: bool | None) -> bool:
+    """Resolve the --color / --no-color / auto tri-state. Auto (``None``) colors only a real TTY
+    with ``NO_COLOR`` unset — the de-facto convention — so redirected/piped output and CI stay
+    plain, and captured test output has no escapes to assert around."""
+    if setting is not None:
+        return setting
+    try:
+        return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    except (AttributeError, ValueError):  # stdout may be a capture object without a real fileno
+        return False
+
 
 # No trailing "> " prompt: in a plain line-buffered terminal it has no way to survive
 # asynchronous output landing mid-line (it's not a real prompt-toolkit-style redraw), so it just
@@ -40,6 +68,21 @@ _BANNER = (
 )
 
 
+def _restore_blocking_stdout() -> None:
+    """Force stdout back to blocking mode before a write. A stdio subprocess sharing our terminal
+    (the MCP server) and asyncio's own ``connect_read_pipe`` on stdin both call
+    ``os.set_blocking(fd, False)``; on a tty, fds 0/1/2 share one open file description, so that
+    also makes stdout non-blocking. A write larger than the tty buffer then raises
+    ``BlockingIOError`` (EAGAIN) instead of blocking — which struck the final, oversized trajectory
+    dump. Restoring blocking mode is safe for the async stdin reader: ``add_reader``-gated reads
+    only fire when data is already available, so they never block on a blocking fd. Best-effort:
+    stdout may be captured/redirected with no real fd (tests)."""
+    try:
+        os.set_blocking(sys.stdout.fileno(), True)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 class _Console:
     """Tracks whether the terminal cursor sits at the start of a line, so lines printed through
     here (log trace lines, the agent's replies) are always separated by exactly one newline —
@@ -49,6 +92,7 @@ class _Console:
         self._at_line_start = True
 
     def line(self, text: str) -> None:
+        _restore_blocking_stdout()
         if not self._at_line_start:
             print()
         print(text)
@@ -62,13 +106,25 @@ class _Presenter(logging.Handler):
     ``cycle.py``'s existing ``"[cycle %d] begin"`` debug record: ``DecisionCycle`` deliberately
     exposes no current-phase/current-activity state for a presenter to read directly."""
 
-    def __init__(self, *, verbose: bool, console: _Console) -> None:
+    def __init__(self, *, verbose: bool, console: _Console, color: bool = False) -> None:
         super().__init__(level=logging.DEBUG if verbose else logging.INFO)
         self._verbose = verbose
         self._console = console
+        self._color = color
         self._cycle = 0
 
     def emit(self, record: logging.LogRecord) -> None:
+        # The presenter formats the *runtime's* trace; ignore the CLI layer's own diagnostics
+        # (e.g. the expected shutdown-cancel CancelledError), which are children of `sora` too but
+        # aren't part of the decision-cycle trace the user is watching.
+        if record.name.startswith(log.name):
+            return
+        # `MeteredLLMClient`'s per-call cue: a live "the model is thinking" signal, shown only under
+        # --verbose (it's noise in the terse view, but the end-of-run summary still counts it).
+        if record.name == "sora.llm":
+            if self._verbose:
+                self._console.line(_paint(record.getMessage(), _MAGENTA, enabled=self._color))
+            return
         message = record.getMessage()
         begin = _CYCLE_BEGIN.match(message)
         if begin:
@@ -83,14 +139,15 @@ class _Presenter(logging.Handler):
         prefix, sep, rest = message.partition(": ")
         if sep and prefix.lower() in _PHASES:
             label = f"{prefix.capitalize():<9}-"
-            self._console.line(f"[cycle {self._cycle}] {label} {rest}")
+            line = f"[cycle {self._cycle}] {label} {rest}"
         else:
-            self._console.line(message)  # no recognized phase prefix — passed through as-is
+            line = message  # no recognized phase prefix — passed through as-is
+        self._console.line(_paint(line, _DIM, enabled=self._color))
 
     def _emit_terse(self, message: str) -> None:
         if message.startswith("act: invoke "):
             target = message.removeprefix("act: invoke ").split(" ", 1)[0]
-            self._console.line(f"[invoking {target}...]")
+            self._console.line(_paint(f"[invoking {target}...]", _CYAN, enabled=self._color))
 
 
 class TerminalSession:
@@ -103,6 +160,7 @@ class TerminalSession:
         agent: Agent,
         verbose: bool = False,
         *,
+        color: bool | None = None,
         poll_interval: float = 0.02,
         initial_task: str | None = None,
     ) -> None:
@@ -115,6 +173,7 @@ class TerminalSession:
         self._agent = agent
         self._transport = communication
         self._verbose = verbose
+        self._color = _color_enabled(color)
         # Neither of these is README-documented (the sketch's __init__ takes only agent/verbose)
         # — implementation details, same role as Agent's own tick_interval. initial_task lets
         # `sora run --task/--task-file` (and a test) seed the first Observe without needing a
@@ -124,11 +183,17 @@ class TerminalSession:
 
     async def run(self) -> None:
         console = _Console()
-        presenter = _Presenter(verbose=self._verbose, console=console)
+        presenter = _Presenter(verbose=self._verbose, console=console, color=self._color)
+        # Tallies the model round-trips `MeteredLLMClient` logs, for the end-of-run summary. A
+        # separate handler from the presenter (which only *displays*), so counting is independent
+        # of display: the terse view hides the per-call cue but still totals it in the summary.
+        meter = LLMMeter()
         sora_log = logging.getLogger("sora")
         previous_level = sora_log.level
         sora_log.setLevel(logging.DEBUG)
         sora_log.addHandler(presenter)
+        sora_log.addHandler(meter)
+        wall_start = time.monotonic()
 
         if self._initial_task:
             self._transport.submit(
@@ -142,14 +207,19 @@ class TerminalSession:
         reader = asyncio.create_task(self._read_stdin(stop_reading))
         printed_trajectories: set[str] = set()
         try:
-            console.line(_BANNER)
+            console.line(_paint(_BANNER, _BOLD, enabled=self._color))
             sent_seen = 0
             while not runner.done() and not stop_reading.is_set():
                 sent = self._transport.sent
                 while sent_seen < len(sent):
                     _, content = sent[sent_seen]
                     sent_seen += 1
-                    console.line(str(content.get("text", content)))
+                    # A blank line above + bold sets the agent's reply apart from the dim trace
+                    # around it — the one line the user is actually waiting for.
+                    console.line("")
+                    console.line(
+                        _paint(str(content.get("text", content)), _BOLD, enabled=self._color)
+                    )
                 self._print_new_trajectories(console, printed_trajectories)
                 await asyncio.sleep(self._poll_interval)
         finally:
@@ -173,14 +243,17 @@ class TerminalSession:
             except asyncio.CancelledError:
                 pass
             sora_log.removeHandler(presenter)
+            sora_log.removeHandler(meter)
             sora_log.setLevel(previous_level)
-            console.line("Goodbye.")
+            wall = time.monotonic() - wall_start
+            console.line(_paint(f"-- {meter.summary(wall)} --", _DIM, enabled=self._color))
+            console.line(_paint("Goodbye.", _DIM, enabled=self._color))
 
     def _print_new_trajectories(self, console: _Console, printed: set[str]) -> None:
         for activity in self._agent.working.activities.values():
             if activity.state is ActivityState.TERMINATED and activity.id not in printed:
                 printed.add(activity.id)
-                console.line(_trajectory(activity))
+                console.line(_paint(_trajectory(activity), _DIM, enabled=self._color))
 
     async def _read_stdin(self, stop_reading: asyncio.Event) -> None:
         # A plain `run_in_executor(None, sys.stdin.readline)` blocks a real OS thread with no way
@@ -231,7 +304,9 @@ def _run(args: argparse.Namespace) -> None:
         initial_task = Path(args.task_file).read_text(encoding="utf-8").strip()
 
     agent = build_agent(args.config)
-    session = TerminalSession(agent, verbose=args.verbose, initial_task=initial_task)
+    session = TerminalSession(
+        agent, verbose=args.verbose, color=args.color, initial_task=initial_task
+    )
     try:
         asyncio.run(session.run())
     except KeyboardInterrupt:
@@ -262,6 +337,17 @@ def main() -> None:
     run_parser.add_argument("config", nargs="?", default="agent.yaml", help="Path to agent.yaml")
     run_parser.add_argument(
         "--verbose", action="store_true", help="Print the per-phase decision-cycle trace"
+    )
+    color_group = run_parser.add_mutually_exclusive_group()
+    color_group.add_argument(
+        "--color",
+        dest="color",
+        action="store_true",
+        default=None,
+        help="Force ANSI color output (default: auto — on only for a TTY, off if NO_COLOR is set)",
+    )
+    color_group.add_argument(
+        "--no-color", dest="color", action="store_false", help="Disable ANSI color output"
     )
     task_group = run_parser.add_mutually_exclusive_group()
     task_group.add_argument(
