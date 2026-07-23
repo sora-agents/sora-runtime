@@ -273,8 +273,14 @@ PLAN_SYSTEM_PROMPT = (
     "at an unambiguous result.\n"
     "You are also given the agent's currently observed properties (persistent state, e.g. a "
     "thermostat reading) and recently observed signals (transient events, e.g. a notification) as "
-    "already-known facts about the current world — use a value already visible there directly "
-    "instead of planning a step to (re)discover it."
+    "already-known facts about the current world. Use them to decide WHAT to do — which branch to "
+    "take, whether a step is still needed — and to fill parameters whose value is stable and "
+    "meaningful (a temperature, a status, a name). But do NOT copy a volatile IDENTIFIER you "
+    "happen to see there — an email id, event id, message or thread id, an address — into a step "
+    "as a literal: such an id is specific to this run's data, so a plan that hardcodes it is not "
+    "reusable and breaks the next time the same goal runs against different data. For an id, still "
+    "emit a $from reference to the operation that yields it (adding the narrowing search/list step "
+    "if the plan lacks one), exactly as you would if it were not currently visible."
 )
 
 

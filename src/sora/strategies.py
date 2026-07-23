@@ -80,9 +80,10 @@ class ReflectStrategy(Protocol):
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
         """Decides whether this activity just completed or failed — deterministic or model-backed,
-        depending on the application — and if so, summarizes and stores to episodic memory. On
-        success, also stores activity.plan via cycle.procedural.store() so future activities with a
-        similar goal can reuse it; on failure, it isn't stored. The completion judgment is
+        depending on the application — and if so, summarizes and stores to episodic memory. (The
+        default does NOT auto-cache the completed plan to procedural memory — replaying a stored
+        plan verbatim is unsound; distilling reusable procedures from episodes is future work.) The
+        completion judgment is
         synchronous — it must land before Situate selects, so a just-completed activity is never
         re-selected the same cycle — while the summarize/store side effects are dispatched
         asynchronously and never block the cycle; several activities may terminate in the same
@@ -296,9 +297,10 @@ class DefaultReflectStrategy:
     so the activity terminates even mid-plan. **Completion** requires positive evidence that all
     planned work is done — a plan present and fully consumed (``step_index >= len(plan.steps)``) —
     so a plan-less activity is never auto-completed here (what a plan-following Reason, and any
-    application driving activities without a plan, relies on). Only completion stores the plan to
-    procedural memory; a failed plan isn't something future activities should retrieve as procedrual
-    knowledge."""
+    application driving activities without a plan, relies on). Both outcomes record an episode;
+    neither auto-caches the plan to procedural memory — replaying a stored plan verbatim is unsound,
+    so plan storage is disabled until reusable procedures are distilled from episodes (Reason still
+    consults ``procedural.retrieve``, which simply finds nothing until then)."""
 
     def __init__(self) -> None:
         # Hold strong refs to in-flight background stores so they aren't GC'd mid-write.
@@ -319,7 +321,7 @@ class DefaultReflectStrategy:
             self._dispatch(self._record_failure(cycle, activity))
         elif activity.plan is not None and activity.step_index >= len(activity.plan.steps):
             activity.state = ActivityState.TERMINATED
-            log.info("reflect: activity %s completed; storing episode + plan", activity.id)
+            log.info("reflect: activity %s completed; storing episode", activity.id)
             self._dispatch(self._record_success(cycle, activity))
         # Reflect never fills in the decision fields (activity/step/invocation) — it threads
         # `result` through untouched.
@@ -331,9 +333,11 @@ class DefaultReflectStrategy:
         task.add_done_callback(self._tasks.discard)
 
     async def _record_success(self, cycle: DecisionCycle, activity: Activity) -> None:
+        # Records the episode only. The completed plan is deliberately NOT stored to procedural
+        # memory: auto-caching a plan and replaying it verbatim is unsound (a corrected or
+        # observation-coupled plan is not reusable). Distilling reusable procedures from episodes is
+        # future work; cycle.procedural.store stays available for that deliberate step.
         await cycle.episodic.learn(activity, _summarize(activity, succeeded=True), succeeded=True)
-        if activity.plan is not None:
-            await cycle.procedural.store(activity.plan)
 
     async def _record_failure(self, cycle: DecisionCycle, activity: Activity) -> None:
         await cycle.episodic.learn(activity, _summarize(activity, succeeded=False), succeeded=False)
@@ -528,8 +532,10 @@ class DefaultReasonStrategy:
 
     * an activity that already has a plan with steps left is the cheap path — read the current step
       and advance ``step_index``: no model call, no procedural lookup;
-    * an activity with no plan gets one by *reuse* first (``procedural.retrieve`` — a plan some past
-      activity with this goal actually followed) and only *infers* a fresh one on a miss, passing
+    * an activity with no plan gets one by *reuse* first (``procedural.retrieve``) and only *infers*
+      a fresh one on a miss. Reuse is currently always a miss — the default Reflect no longer stores
+      completed plans (auto-caching a plan for verbatim replay is unsound), so every activity infers
+      until reusable procedures are distilled from episodes. Infer passes
       the currently-joined tools (id -> Manual) as the planning catalog and a ``PerceptSnapshot``
       of ``wm.properties``/``wm.signals`` as the agent's known world state (the strategy holds
       `wm`; a memory module never reaches into the environment or working memory itself — it only

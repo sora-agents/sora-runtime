@@ -184,14 +184,10 @@ async def test_reproduces_four_step_plan_and_stores_it(tmp_path: Path) -> None:
     assert email.invocations[1] == ("reply_to_email", {"email_id": 1})  # params bound through
 
     await _settle(reflect)
+    # The default Reflect no longer auto-caches completed plans (unsound to replay verbatim), so
+    # nothing is persisted for cross-run reuse.
     stored = await cycle.procedural.retrieve(Activity(id="probe", goal=_GOAL, context={}))
-    assert stored is not None  # the followed plan was stored for reuse across runs
-    assert [s.params["operation_name"] for s in stored.steps] == [
-        "list_emails",
-        "get_calendar_events_from_to",
-        "add_calendar_event",
-        "reply_to_email",
-    ]
+    assert stored is None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -199,10 +195,12 @@ async def test_reproduces_four_step_plan_and_stores_it(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-async def test_second_run_reuses_stored_plan_without_model_call(tmp_path: Path) -> None:
-    procedural_dir = tmp_path / "procedural"  # shared across both runs -> the plan persists
+async def test_second_run_reinfers_no_plan_reuse(tmp_path: Path) -> None:
+    # Plan auto-caching is disabled: a completed plan is never persisted to procedural memory, so a
+    # second run with the same goal and the same store must infer again rather than reuse.
+    procedural_dir = tmp_path / "procedural"  # shared across both runs; still, nothing persists
 
-    # Run 1: infer + store.
+    # Run 1: infer (records an episode, but does NOT store the plan).
     reflect1 = DefaultReflectStrategy()
     cycle1, working1, transport1, registry1 = _cycle(
         tmp_path / "run1",
@@ -217,13 +215,14 @@ async def test_second_run_reuses_stored_plan_without_model_call(tmp_path: Path) 
     assert a1.state is ActivityState.TERMINATED
     await _settle(reflect1)
 
-    # Run 2: same goal, same procedural store, a model that would RAISE if inference were attempted.
+    # Run 2: same goal, same store. With no cached plan, run 2 must call the model again — an empty
+    # LLM would raise, so a real response is required precisely because there is no reuse.
     reflect2 = DefaultReflectStrategy()
-    empty_llm = FakeLLMClient([])  # no configured response -> .complete() raises if ever called
+    llm2 = FakeLLMClient(_FOUR_STEP_PLAN)
     cycle2, working2, transport2, registry2 = _cycle(
         tmp_path / "run2",
         procedural_dir=procedural_dir,
-        llm=empty_llm,
+        llm=llm2,
         tools=_tools(),
         reflect=reflect2,
     )
@@ -231,8 +230,8 @@ async def test_second_run_reuses_stored_plan_without_model_call(tmp_path: Path) 
     _seed_goal(transport2)
     a2 = await _drive(cycle2, working2)
 
-    assert a2.state is ActivityState.TERMINATED  # completed purely from the reused plan
-    assert empty_llm.calls == []  # the cache hit skipped the model entirely
+    assert a2.state is ActivityState.TERMINATED
+    assert len(llm2.calls) == 1  # re-inferred from scratch; no plan was reused from run 1
     await _settle(reflect2)
 
 

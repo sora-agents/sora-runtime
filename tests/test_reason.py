@@ -302,10 +302,11 @@ async def test_tick_infers_advances_and_terminates_two_step_plan(tmp_path: Path)
     assert tool.invocations[1] == ("read_email", {"id": 1})  # params bound through
     assert len(llm.calls) == 1  # inferred once; every later cycle advanced the cached plan
 
-    await _settle(reflect)  # settle the async success store so no task dangles past the test
+    await _settle(reflect)  # settle the async episode write so no task dangles past the test
+    # The default Reflect no longer auto-caches completed plans (unsound to replay verbatim), so
+    # nothing is persisted for reuse — every activity infers fresh.
     stored = await procedural.retrieve(Activity(id="probe", goal="triage inbox", context={}))
-    assert stored is not None  # the followed plan was stored for reuse across runs
-    assert [s.params["operation_name"] for s in stored.steps] == ["list_emails", "read_email"]
+    assert stored is None
 
 
 async def test_tick_plan_focuses_then_invokes(tmp_path: Path) -> None:

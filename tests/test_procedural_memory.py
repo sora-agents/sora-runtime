@@ -488,6 +488,15 @@ def test_plan_prompt_instructs_references_for_runtime_dependent_params() -> None
     assert "$from" in PLAN_SYSTEM_PROMPT and "$decide" in PLAN_SYSTEM_PROMPT
 
 
+def test_plan_prompt_keeps_visible_identifiers_as_references() -> None:
+    # An observed identifier (an email/event id currently visible in properties) must still be
+    # referenced, not hardcoded — otherwise a goal-keyed cached plan bakes in one run's ids and
+    # fails against the next run's data. Guards the "use a visible value directly" guidance from
+    # swallowing volatile ids again.
+    lowered = PLAN_SYSTEM_PROMPT.lower()
+    assert "identifier" in lowered and "reusable" in lowered
+
+
 # --------------------------------------------------------------------------------------------------
 # render_properties / render_signals: rendering the agent's currently-known world state (not just
 # past action results) for a planning/grounding prompt — see WorkingMemory's replace-by-key

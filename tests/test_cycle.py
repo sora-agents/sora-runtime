@@ -368,9 +368,10 @@ def _planned_activity(
     state: ActivityState = ActivityState.READY,
     last_ok: bool | None = True,
 ) -> Activity:
-    """An activity carrying a plan whose ``goal`` matches its own (so ``procedural.retrieve`` and
-    ``episodic.consult``, both keyed on goal, can find what Reflect stores). ``step_index`` defaults
-    to *fully consumed* (plan complete); ``last_ok`` sets ``last_operation`` (``None`` = no op)."""
+    """An activity carrying a plan whose ``goal`` matches its own (so ``episodic.consult``, keyed on
+    goal, can find the episode Reflect records — plans are no longer auto-cached). ``step_index``
+    defaults to *fully consumed* (plan complete); ``last_ok`` sets ``last_operation`` (``None`` = no
+    op)."""
     goal = f"goal-{activity_id}"
     plan = Plan(
         id=f"plan-{activity_id}",
@@ -394,7 +395,7 @@ async def _drain(strategy: DefaultReflectStrategy) -> None:
     await asyncio.gather(*list(strategy._tasks))
 
 
-async def test_reflect_terminates_completed_activity_and_stores(tmp_path: Path) -> None:
+async def test_reflect_terminates_completed_activity_and_records_episode(tmp_path: Path) -> None:
     cycle, working = _cycle(tmp_path)
     activity = _planned_activity("a1")  # plan consumed, last op ok -> completed
     working.activities["a1"] = activity
@@ -404,7 +405,7 @@ async def test_reflect_terminates_completed_activity_and_stores(tmp_path: Path) 
 
     # The completion judgment is synchronous: state flips before the cycle continues to Situate.
     assert activity.state is ActivityState.TERMINATED
-    # The stores are *dispatched*, not awaited — a task exists but hasn't necessarily run yet.
+    # The episode write is *dispatched*, not awaited — a task exists but hasn't necessarily run yet.
     assert strategy._tasks
     # Reflect never fills in the decision fields.
     assert result == TickResult()
@@ -421,9 +422,9 @@ async def test_reflect_terminates_completed_activity_and_stores(tmp_path: Path) 
     assert episode["step_index"] == 1
     assert episode["step_count"] == 1
     assert episode["last_result"] == asdict(OperationAck(ok=True))
-    stored_plan = await cycle.procedural.retrieve(activity)
-    assert stored_plan is not None
-    assert stored_plan.id == "plan-a1"
+    # The completed plan is deliberately NOT auto-cached to procedural memory (unsound to replay
+    # verbatim); the episode above is the only durable record.
+    assert await cycle.procedural.retrieve(activity) is None
 
 
 async def test_reflect_terminates_failed_activity_without_storing_plan(tmp_path: Path) -> None:
@@ -561,7 +562,7 @@ async def test_tick_reflect_terminates_completed_activity_and_is_not_reselected(
     assert reason.called is False  # Situate did not re-select the just-terminated activity
     await _drain(reflect)
     assert len(await cycle.episodic.consult(activity)) == 1
-    assert await cycle.procedural.retrieve(activity) is not None
+    assert await cycle.procedural.retrieve(activity) is None  # plan auto-caching is disabled
 
 
 # --------------------------------------------------------------------------------------------------
