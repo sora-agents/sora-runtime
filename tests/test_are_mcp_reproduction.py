@@ -1,6 +1,6 @@
-"""Skip-gated end-to-end reproduction: the gaia2 showcase against real ARE apps + Claude.
+"""Skip-gated end-to-end reproduction: the ARE-over-MCP showcase against real ARE apps + Claude.
 
-Builds the agent from ``examples/gaia2/email_calendar/agent.yaml`` via ``build_agent`` — the same
+Builds the agent from ``examples/are/mcp/email_calendar/agent.yaml`` via ``build_agent`` — the same
 path the on-demand showcase (``run.py``) uses — then drives the full decision cycle: a seeded task
 message becomes an activity, the model-backed ``ScheduleFromEmailStrategy`` plans against the live
 ARE apps, and the invokes hit our *seeded* ARE MCP launcher (``are_server.py``) over stdio — so
@@ -10,12 +10,13 @@ ARE apps, and the invokes hit our *seeded* ARE MCP launcher (``are_server.py``) 
 **Opt-in and skip-gated** (marked ``integration``, excluded from the default ``pytest`` run — see
 pyproject ``addopts``): it needs the ``mcp``/``llm`` extras, the ARE package (``uv sync --all-extras
 --group are``), and a live ``ANTHROPIC_API_KEY``. CI stays deterministic — the scenario's *shape* is
-pinned deterministically in ``test_gaia2_reproduction.py`` over fakes.
+pinned deterministically in ``test_are_mcp_email_calendar.py`` over fakes.
 
-Must run from the repo root (like the showcase): the launcher is spawned as ``python -m
-examples.gaia2.email_calendar.are_server``, which needs the repo root on the path. This asserts the
-runnable-agent contract (the plan executes end-to-end against real ARE apps with real data), not a
-scenario validator score — the world here is a static seeded snapshot, not a running simulation.
+Must run from the repo root (like the showcase): the launcher is spawned as
+``python -m examples.are.mcp.email_calendar.are_server``, which needs the repo root on the path.
+This asserts the runnable-agent contract (the plan executes end-to-end against real ARE apps with
+real data), not a scenario validator score — the world here is a static seeded snapshot, not a
+running simulation.
 """
 
 from __future__ import annotations
@@ -33,7 +34,12 @@ from sora.perception import Message
 from sora.transport import InProcessTransport
 
 _CONFIG = (
-    Path(__file__).resolve().parent.parent / "examples" / "gaia2" / "email_calendar" / "agent.yaml"
+    Path(__file__).resolve().parent.parent
+    / "examples"
+    / "are"
+    / "mcp"
+    / "email_calendar"
+    / "agent.yaml"
 )
 _TASK = "Set up a 30-minute team sync with Bob and Carol next Monday, then reply to Alice."
 
@@ -52,7 +58,7 @@ def _config_with_tmp_memory(tmp_path: Path) -> Path:
 
 
 @pytest.mark.integration
-async def test_gaia2_agent_runs_against_real_are(tmp_path: Path) -> None:
+async def test_are_mcp_agent_runs_against_real_are(tmp_path: Path) -> None:
     pytest.importorskip("mcp")
     pytest.importorskip("are.simulation")
     pytest.importorskip("anthropic")

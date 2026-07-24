@@ -9,7 +9,8 @@ Getting this to work end-to-end took a fair amount of **prompt tuning** and a fe
 strategies. That effort is deliberate scaffolding around real, still-open runtime gaps — it is not
 meant to look production-clean. This note records what is example-specific, what is a genuine
 runtime limitation the example papers over, and which foundational extensions would replace the
-scaffolding. The mechanics of *how* it works live in [`../../docs/are-dynamic-scenarios.md`](../../docs/are-dynamic-scenarios.md);
+scaffolding. The mechanics of *how* it works live in
+[`../../../../docs/are-dynamic-scenarios.md`](../../../../docs/are-dynamic-scenarios.md);
 this note is the honest catalogue of seams.
 
 Note: plan auto-caching is disabled runtime-wide (the default Reflect no longer stores completed
@@ -19,7 +20,7 @@ plans), so each run infers fresh — there is no stale plan cache to clear betwe
 
 ## What is example-specific (not runtime)
 
-Everything here lives under `examples/are_scenario/` and would not ship in the runtime:
+Everything here lives under `examples/are/sim/email_calendar/` and would not ship in the runtime:
 
 - **`ReconcilingReasonStrategy`** — re-infers an in-flight plan when a *new inbound email* appears.
   The trigger keys on the set of **INBOX email ids** (`_inbound_email_ids`), which knows ARE's

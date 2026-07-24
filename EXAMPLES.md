@@ -18,7 +18,7 @@ A S-ORA agent fits naturally into ARE because both share the same structural vie
 | `Message` | ARE `USER_MESSAGE` from the notification system (the scenario's initial task and follow-ups) |
 | `Activity` | ARE scenario task (one or more activities, depending on task complexity) |
 
-**Two adapter paths.** The table above and the walkthrough that follows describe the **MCP path** — S-ORA's `AreMcpWorkspaceAdapter` over ARE's MCP server. That server exposes a *static snapshot* of a scenario's initial app state and does not run the simulation engine, so it fits the single-shot plan→ground→act loop (the seeded `examples/gaia2/email_calendar` showcase). To run a scenario's **event timeline** — mid-run email injections, follow-ups, task delivery — S-ORA also ships an **in-process path** that runs the ARE `Environment` directly; see [Running dynamic scenarios in-process](#running-dynamic-scenarios-in-process) below and the [ARE dynamic scenarios design note](docs/are-dynamic-scenarios.md).
+**Two adapter paths.** The table above and the walkthrough that follows describe the **MCP path** — S-ORA's `AreMcpWorkspaceAdapter` over ARE's MCP server. That server exposes a *static snapshot* of a scenario's initial app state and does not run the simulation engine, so it fits the single-shot plan→ground→act loop (the seeded `examples/are/mcp/email_calendar` showcase). To run a scenario's **event timeline** — mid-run email injections, follow-ups, task delivery — S-ORA also ships an **in-process path** that runs the ARE `Environment` directly; see [Running dynamic scenarios in-process](#running-dynamic-scenarios-in-process) below and the [ARE dynamic scenarios design note](docs/are-dynamic-scenarios.md).
 
 ## Scenario: scheduling a meeting from email
 
@@ -76,7 +76,7 @@ python -m are.simulation.apps.mcp.server.are_simulation_mcp_server \
 agent:
   name: gaia2-agent
   strategies:
-    reason: examples.gaia2.ScheduleFromEmailStrategy
+    reason: examples.are.mcp.email_calendar.ScheduleFromEmailStrategy
   memory:
     working: in_process
     semantic: file://./.sora/memory/semantic
@@ -98,7 +98,7 @@ ARE's own MCP server (`ARESimulationMCPServer`) decides to expose each app's int
 
 S-ORA's `AreMcpWorkspaceAdapter` curates this one resource per app into exactly one `ObservableProperty` (`state`) and one `Signal` (`state_changed`) via its `_observable_bindings` hook — the base `McpWorkspaceAdapter` synthesizes both as empty lists for a vanilla MCP tool (a raw MCP tool alone carries no observable state; see [ADR-0004](docs/adrs/0004-tool-usage-interface.md)), and curation is exactly the act of lifting ARE's resource convention into that shape. Because the URI is scoped to the app *type* and only meaningful within one MCP session, it's never treated as a global identifier: each workspace gets its own session and its own resource-routing table, and every `Signal` a tool pushes travels alongside its own globally-unique, origin-qualified tool id (`SignalSink.push(source, signal)` → `Percept.source`) rather than encoding identity in the `Signal` itself — so two workspaces each running an `EmailClientApp` never collide, even though both fire an identically-named `state_changed` signal.
 
-Because no schema exists anywhere along this path, any structure an agent needs about `state`'s actual content has to live in a hand-authored manual's prose, paired in via `ManualSource`/`merge_manuals` ([ADR-0018](docs/adrs/0018-manual-merge-policy-and-authored-interface.md)) — see `examples/gaia2/email_calendar/manuals/email-client.md` for a worked example describing the shape (folders, emails, and their fields) in full.
+Because no schema exists anywhere along this path, any structure an agent needs about `state`'s actual content has to live in a hand-authored manual's prose, paired in via `ManualSource`/`merge_manuals` ([ADR-0018](docs/adrs/0018-manual-merge-policy-and-authored-interface.md)) — see `examples/are/mcp/email_calendar/manuals/email-client.md` for a worked example describing the shape (folders, emails, and their fields) in full.
 
 ## Signals from ARE write operations
 
@@ -145,7 +145,7 @@ The MCP path above serves a *static* snapshot: ARE's MCP server never runs `Envi
 - **`AreInProcessWorkspaceAdapter`** imports each app as a tool (its ops from `app.get_tools()`, minus the `AgentUserInterface`); app-state changes surface as a `state_changed` `Signal` by **poll-on-observe** — the focused tool re-reads `get_state()` each `observe()` and diffs, the in-process analogue of the MCP resource push but driven by the cycle's own cadence, so a background timeline change is caught even though nothing pushed it.
 - **`AreTransport`** (a `MessageTransport`) drains the scenario's `AgentUserInterface` unread USER messages in `receive()` and replies via `send_message_to_user()` in `send()` — this is where `USER_MESSAGE` routing is actually wired.
 
-The scenario is a **per-run input**, not config: `agent.yaml` names the `are-sim` workspace and the `are` transport generically (no scenario key), and the runner passes the scenario — a dotted `Scenario` subclass or a Gaia2 `.json` — on the command line, which `build_agent(config, simulation=...)` injects (the workspace owns the Environment lifecycle, so `Agent.run()` starts it on the startup join and stops it on teardown). See `examples/are_scenario/` (`run.py --scenario <ref>`), which reproduces the mid-run Monday→Tuesday follow-up email and the signal-driven replan against a live ARE `Environment`, then scores the run. (Bringing this dynamic story back onto the MCP wire — a launcher that runs the Environment plus poll-on-observe — is a backlog/exploratory item; see [ROADMAP.md](ROADMAP.md).)
+The scenario is a **per-run input**, not config: `agent.yaml` names the `are-sim` workspace and the `are` transport generically (no scenario key), and the runner passes the scenario — a dotted `Scenario` subclass or a Gaia2 `.json` — on the command line (`sora run`'s `--scenario` flag), which `build_agent(config, simulation=...)` injects (the workspace owns the Environment lifecycle, so `Agent.run()` starts it on the startup join and stops it on teardown). See `examples/are/sim/email_calendar/` — `uv run sora run examples/are/sim/email_calendar/agent.yaml --scenario <ref>` (add `--report examples.are.sim.email_calendar.report.report --exit-when-idle <n>` for a headless, scored run) — which reproduces the mid-run Monday→Tuesday follow-up email and the signal-driven replan against a live ARE `Environment`. (Bringing this dynamic story back onto the MCP wire — a launcher that runs the Environment plus poll-on-observe — is a backlog/exploratory item; see [ROADMAP.md](ROADMAP.md).)
 
 ---
 

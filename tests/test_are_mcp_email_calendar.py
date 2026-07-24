@@ -12,8 +12,8 @@ invokes land on the fake ARE tools in order. Three behaviors EXAMPLES.md promise
 * *signal-driven replanning* — a mid-plan ``resource_updated`` signal invalidates the plan and the
   agent re-plans from the updated working memory.
 
-The real ARE server + real Claude version is the skip-gated ``test_are_scenario_reproduction.py``;
-the on-demand showcase is ``examples/gaia2/email_calendar/run.py``.
+The real ARE server + real Claude version is the skip-gated ``test_are_mcp_reproduction.py``;
+the on-demand showcase is ``examples/are/mcp/email_calendar/run.py``.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import json
 import time
 from pathlib import Path
 
-from examples.gaia2.email_calendar import ScheduleFromEmailStrategy
+from examples.are.mcp.email_calendar import ScheduleFromEmailStrategy
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
 from sora.action import default_action_registry
@@ -93,7 +93,7 @@ def _cycle(
     reflect: DefaultReflectStrategy,
 ) -> tuple[DecisionCycle, WorkingMemory, InProcessTransport, EnvironmentRegistry]:
     email, calendar = tools
-    workspace = FakeWorkspace("gaia2", _ORIGIN, [email, calendar])
+    workspace = FakeWorkspace("are-mcp-email-calendar", _ORIGIN, [email, calendar])
     registry = EnvironmentRegistry(adapters={_ORIGIN: FakeAdapter("fake", workspace)})
     working = WorkingMemory(registry=registry)
     transport = InProcessTransport()

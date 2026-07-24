@@ -10,14 +10,13 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from sora import scaffold
 from sora.activity import ActivityState
-from sora.bootstrap import build_agent
+from sora.bootstrap import build_agent, import_object
 from sora.llm import LLMMeter
 from sora.perception import Message
-from sora.transport import InProcessTransport
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -28,6 +27,29 @@ log = logging.getLogger("sora.cli")
 _PHASES = ("observe", "situate", "reason", "reflect", "act")
 _CYCLE_BEGIN = re.compile(r"^\[cycle (\d+)\] begin$")
 _EXIT_COMMANDS = ("exit", "quit")
+
+
+@runtime_checkable
+class _PresentableTransport(Protocol):
+    """The structural capability ``TerminalSession`` needs from a transport to stream its
+    replies: an outbound log, mirroring ``InProcessTransport.sent`` (a convention, not part of
+    the ``MessageTransport`` Protocol itself). Both shipped transports satisfy it —
+    ``InProcessTransport`` and the ARE in-process ``AreTransport`` — so a session isn't hardwired
+    to one transport kind. Submitting ad hoc input (``.submit()``) is a *narrower*, separate
+    capability (see ``_SubmittableTransport``) that not every presentable transport has."""
+
+    sent: list[tuple[str, dict[str, Any]]]
+
+
+@runtime_checkable
+class _SubmittableTransport(Protocol):
+    """The narrower capability of accepting ad hoc input (``--task``/``--task-file``, typed
+    stdin lines): a transport like the ARE ``AreTransport`` gets its messages from elsewhere (the
+    running scenario's own timeline) and doesn't implement this, so it's checked separately from
+    ``_PresentableTransport``."""
+
+    def submit(self, message: Message) -> None: ...
+
 
 # ANSI styling. Raw escapes, no dependency: the core stays dependency-light and the CLI already
 # speaks straight to the terminal. Every styled write goes through `_paint`, a no-op when color is
@@ -55,15 +77,43 @@ def _color_enabled(setting: bool | None) -> bool:
         return False
 
 
-# No trailing "> " prompt: in a plain line-buffered terminal it has no way to survive
-# asynchronous output landing mid-line (it's not a real prompt-toolkit-style redraw), so it just
-# reads as noise. This banner is printed once at startup instead, explaining how to interact.
+# This banner is printed once at startup, explaining how to interact. No trailing "> " prompt:
+# in a plain line-buffered terminal it has no way to survive asynchronous output landing mid-line
+# (it's not a real prompt-toolkit-style redraw), so it just reads as noise. Four variants, not one:
+# a transport that can't accept ad hoc input (e.g. AreTransport, driven by a scenario's own
+# timeline) shouldn't be told to "type a goal", and a session with --exit-when-idle shouldn't be
+# told its only way out is typing 'exit' when it will also stop on its own — either claim would be
+# actively wrong, not just incomplete, for a headless `--scenario ... --exit-when-idle` run.
 _BANNER = (
     "+----------------------------------------------+\n"
     "| S-ORA -- minimal terminal interface          |\n"
     "|                                              |\n"
     "| Type a goal in plain English to delegate it. |\n"
     "| Type 'exit' or 'quit' to quit.               |\n"
+    "+----------------------------------------------+"
+)
+_BANNER_IDLE_EXIT = (
+    "+----------------------------------------------+\n"
+    "| S-ORA -- minimal terminal interface          |\n"
+    "|                                              |\n"
+    "| Type a goal in plain English to delegate it. |\n"
+    "| Auto-exits once idle (or 'exit'/'quit').     |\n"
+    "+----------------------------------------------+"
+)
+_BANNER_NOT_SUBMITTABLE = (
+    "+----------------------------------------------+\n"
+    "| S-ORA -- minimal terminal interface          |\n"
+    "|                                              |\n"
+    "| Driven by the running scenario's timeline.   |\n"
+    "| Type 'exit' or 'quit' to stop watching.      |\n"
+    "+----------------------------------------------+"
+)
+_BANNER_NOT_SUBMITTABLE_IDLE_EXIT = (
+    "+----------------------------------------------+\n"
+    "| S-ORA -- minimal terminal interface          |\n"
+    "|                                              |\n"
+    "| Driven by the running scenario's timeline.   |\n"
+    "| Exits automatically once idle.               |\n"
     "+----------------------------------------------+"
 )
 
@@ -163,23 +213,41 @@ class TerminalSession:
         color: bool | None = None,
         poll_interval: float = 0.02,
         initial_task: str | None = None,
+        exit_when_idle: float | None = None,
     ) -> None:
         communication = agent.communication
-        if not isinstance(communication, InProcessTransport):
+        # `_PresentableTransport` is a data-only Protocol — `isinstance` only proves `.sent`
+        # exists, not that it's actually a list (e.g. a transport that sets `sent = None` would
+        # still pass), so check the value too rather than fail confusingly later in run()'s
+        # polling loop.
+        if not isinstance(communication, _PresentableTransport) or not isinstance(
+            communication.sent, list
+        ):
             raise TypeError(
-                "TerminalSession requires an InProcessTransport "
-                f"(got {type(communication).__name__}); peer transports are not supported yet"
+                "TerminalSession requires a transport exposing a `.sent` outbound log "
+                f"(got {type(communication).__name__}); InProcessTransport and the ARE "
+                "AreTransport both provide this — a custom transport needs the same duck-typed "
+                "attribute to stream replies"
             )
         self._agent = agent
         self._transport = communication
+        # submit() (ad hoc input: --task/--task-file, typed stdin lines) is a narrower capability
+        # — a transport like AreTransport gets its messages from elsewhere (the running scenario's
+        # own timeline), so there's nowhere to deliver an ad hoc message.
+        self._submittable = (
+            communication if isinstance(communication, _SubmittableTransport) else None
+        )
         self._verbose = verbose
         self._color = _color_enabled(color)
-        # Neither of these is README-documented (the sketch's __init__ takes only agent/verbose)
+        # None of these is README-documented (the sketch's __init__ takes only agent/verbose)
         # — implementation details, same role as Agent's own tick_interval. initial_task lets
         # `sora run --task/--task-file` (and a test) seed the first Observe without needing a
         # real stdin line, mirroring what examples/*/run.py does by hand via transport.submit().
+        # exit_when_idle lets a scripted/headless run (`sora run --scenario ... --exit-when-idle`)
+        # stop on its own once nothing is happening, instead of waiting on stdin EOF/exit.
         self._poll_interval = poll_interval
         self._initial_task = initial_task
+        self._exit_when_idle = exit_when_idle
 
     async def run(self) -> None:
         console = _Console()
@@ -196,18 +264,31 @@ class TerminalSession:
         wall_start = time.monotonic()
 
         if self._initial_task:
-            self._transport.submit(
-                Message(
-                    sender="user", content={"text": self._initial_task}, received_at=time.time()
+            if self._submittable is not None:
+                self._submittable.submit(
+                    Message(
+                        sender="user",
+                        content={"text": self._initial_task},
+                        received_at=time.time(),
+                    )
                 )
-            )
+            else:
+                console.line(
+                    _paint(
+                        "(this session's transport doesn't accept ad hoc input — the initial "
+                        "task was not submitted)",
+                        _DIM,
+                        enabled=self._color,
+                    )
+                )
 
         runner = asyncio.create_task(self._agent.run())
         stop_reading = asyncio.Event()
-        reader = asyncio.create_task(self._read_stdin(stop_reading))
+        reader = asyncio.create_task(self._read_stdin(stop_reading, console))
         printed_trajectories: set[str] = set()
+        idle_since: float | None = None
         try:
-            console.line(_paint(_BANNER, _BOLD, enabled=self._color))
+            console.line(_paint(self._banner(), _BOLD, enabled=self._color))
             sent_seen = 0
             while not runner.done() and not stop_reading.is_set():
                 sent = self._transport.sent
@@ -221,6 +302,17 @@ class TerminalSession:
                         _paint(str(content.get("text", content)), _BOLD, enabled=self._color)
                     )
                 self._print_new_trajectories(console, printed_trajectories)
+                if self._exit_when_idle is not None:
+                    activities = list(self._agent.working.activities.values())
+                    idle = bool(activities) and all(
+                        a.state is ActivityState.TERMINATED for a in activities
+                    )
+                    if not idle:
+                        idle_since = None
+                    else:
+                        idle_since = idle_since or time.monotonic()
+                        if time.monotonic() - idle_since >= self._exit_when_idle:
+                            break
                 await asyncio.sleep(self._poll_interval)
         finally:
             await self._agent.stop()
@@ -249,13 +341,22 @@ class TerminalSession:
             console.line(_paint(f"-- {meter.summary(wall)} --", _DIM, enabled=self._color))
             console.line(_paint("Goodbye.", _DIM, enabled=self._color))
 
+    def _banner(self) -> str:
+        if self._submittable is None:
+            return (
+                _BANNER_NOT_SUBMITTABLE_IDLE_EXIT
+                if self._exit_when_idle is not None
+                else _BANNER_NOT_SUBMITTABLE
+            )
+        return _BANNER_IDLE_EXIT if self._exit_when_idle is not None else _BANNER
+
     def _print_new_trajectories(self, console: _Console, printed: set[str]) -> None:
         for activity in self._agent.working.activities.values():
             if activity.state is ActivityState.TERMINATED and activity.id not in printed:
                 printed.add(activity.id)
                 console.line(_paint(_trajectory(activity), _DIM, enabled=self._color))
 
-    async def _read_stdin(self, stop_reading: asyncio.Event) -> None:
+    async def _read_stdin(self, stop_reading: asyncio.Event, console: _Console) -> None:
         # A plain `run_in_executor(None, sys.stdin.readline)` blocks a real OS thread with no way
         # to interrupt it once started — cancelling *our* task doesn't stop it, and both
         # asyncio.run()'s own shutdown and Python's ThreadPoolExecutor atexit hook then wait for
@@ -267,19 +368,39 @@ class TerminalSession:
         stream = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(stream)
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        warned_no_submit = False
         while True:
             raw = await stream.readline()
             if raw == b"":
-                stop_reading.set()
+                # A headless/scripted run (`--exit-when-idle`) is meant to end on its own idle
+                # timer, not on stdin EOF — stdin is commonly /dev/null or an already-closed pipe
+                # in that context, which would otherwise tear the session down before the scenario
+                # has made any progress. Only a real interactive session (no exit_when_idle) treats
+                # EOF as Ctrl-D-style "stop".
+                if self._exit_when_idle is None:
+                    stop_reading.set()
                 return
             line = raw.decode(errors="replace").strip()
             if line.lower() in _EXIT_COMMANDS:
                 stop_reading.set()
                 return
-            if line:
-                self._transport.submit(
-                    Message(sender="user", content={"text": line}, received_at=time.time())
-                )
+            if not line:
+                continue
+            if self._submittable is None:
+                if not warned_no_submit:
+                    warned_no_submit = True
+                    console.line(
+                        _paint(
+                            "(this session's transport doesn't accept ad hoc input — it's driven "
+                            "by the running scenario; type 'exit' or Ctrl-D to stop watching)",
+                            _DIM,
+                            enabled=self._color,
+                        )
+                    )
+                continue
+            self._submittable.submit(
+                Message(sender="user", content={"text": line}, received_at=time.time())
+            )
 
 
 def _trajectory(activity: Activity) -> str:
@@ -303,14 +424,43 @@ def _run(args: argparse.Namespace) -> None:
     if args.task_file:
         initial_task = Path(args.task_file).read_text(encoding="utf-8").strip()
 
-    agent = build_agent(args.config)
+    # `simulation` is bootstrap's one opaque per-run injection seam (see build_agent's docstring)
+    # — a scenario reference is a CLI argument, never agent.yaml config, so `--scenario` is the
+    # runner's job of turning it into the runtime object an `are-sim` workspace/`are` transport
+    # need. Lazy import: ARE is an optional dependency group, not needed unless `--scenario` is
+    # given.
+    simulation = None
+    if args.scenario:
+        # Resolving a dotted scenario path first-imports the real `are.simulation` package — a
+        # "batteries-included" research-environment package whose first import is genuinely
+        # multi-second, not milliseconds. That happens here, synchronously, before TerminalSession
+        # exists to print anything (the startup banner is its first line) — so without this cue the
+        # terminal just sits silent for the duration. flush=True: stdout may be line-buffered.
+        print(f"loading scenario {args.scenario!r} ...", flush=True)
+        from sora.adapters.are_sim import AreSimulation, load_scenario
+
+        simulation = AreSimulation(load_scenario(args.scenario))
+
+    agent = build_agent(args.config, simulation=simulation)
     session = TerminalSession(
-        agent, verbose=args.verbose, color=args.color, initial_task=initial_task
+        agent,
+        verbose=args.verbose,
+        color=args.color,
+        initial_task=initial_task,
+        exit_when_idle=args.exit_when_idle,
     )
+    interrupted = False
     try:
         asyncio.run(session.run())
     except KeyboardInterrupt:
-        pass
+        interrupted = True
+
+    # A generic hook for custom post-run metrics/checks (e.g. ARE's own scenario.validate()
+    # scoring) — resolved via the same dotted-path mechanism as strategies/adapters/prompts, so
+    # this file never learns what ARE or any other domain-specific check is. Skipped on Ctrl-C:
+    # the run was aborted, not completed, so a PASS/FAIL/outcome report would misrepresent it.
+    if args.report and not interrupted:
+        import_object(args.report)(agent, simulation)
 
 
 def _init(args: argparse.Namespace) -> None:
@@ -355,6 +505,33 @@ def main() -> None:
     )
     task_group.add_argument(
         "--task-file", help="Read the initial user message from this file at startup"
+    )
+    task_group.add_argument(
+        "--scenario",
+        help=(
+            "An ARE scenario reference (dotted Scenario subclass path or a Gaia2 .json file) — "
+            "injected as the runtime `simulation` object for an `are-sim` workspace/`are` "
+            "transport in agent.yaml. Mutually exclusive with --task/--task-file: the scenario "
+            "delivers its own task through the AgentUserInterface timeline."
+        ),
+    )
+    run_parser.add_argument(
+        "--report",
+        metavar="DOTTED.PATH",
+        help=(
+            "Call this `(agent, simulation) -> None` after the session ends — e.g. to print "
+            "custom scoring/checks (see examples/are/sim/email_calendar/report.py)"
+        ),
+    )
+    run_parser.add_argument(
+        "--exit-when-idle",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Auto-exit once every activity has stayed TERMINATED for this many seconds, instead "
+            "of waiting for stdin (useful for scripted/headless runs)"
+        ),
     )
 
     init_parser = subparsers.add_parser("init", help="Scaffold a minimal example agent")

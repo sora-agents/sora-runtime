@@ -220,6 +220,14 @@ Ctrl-D (EOF) does the same. `--task "..."` (or `--task-file path`) submits an in
 startup, before you'd type anything yourself — useful for scripting a run non-interactively, e.g.
 `sora run agent.yaml --task-file task.txt`, without needing to type it in by hand.
 
+Three more optional flags, mainly for driving an ARE scenario without a bespoke runner script (see
+[Running the ARE examples](#running-the-are-examples)): `--scenario <ref>` injects a runtime
+`AreSimulation` for an `are-sim` workspace/`are` transport (mutually exclusive with `--task`/
+`--task-file` — the scenario delivers its own task through the `AgentUserInterface`); `--report
+dotted.path` calls a `(agent, simulation) -> None` hook after the session ends, e.g. to print
+custom scoring/checks; `--exit-when-idle SECONDS` auto-exits once every activity has stayed
+`TERMINATED` for that long, instead of waiting on stdin — useful for a scripted/headless run.
+
 `uv sync` installs pinned dependencies into a project-local `.venv` per `uv.lock` — commit the lockfile
 so runs are reproducible. `uv run` executes inside that environment without manual activation.
 
@@ -287,7 +295,7 @@ grounding escalation itself rather than what the plan asks it to do.
 
 `sora run` is one way to run an `Agent` — the terminal CLI. Embedding S-ORA in your own program
 (a test harness, an evaluation runner, a service) instead means calling `build_agent()` and
-`Agent.run()`/`stop()` directly, without `TerminalSession` at all — `examples/gaia2/email_calendar/run.py`
+`Agent.run()`/`stop()` directly, without `TerminalSession` at all — `examples/are/mcp/email_calendar/run.py`
 is a runnable reference for that shape: build the agent, `transport.submit()` an initial `Message`
 (what `sora run --task` does for you at the CLI), drive `agent.run()` as a background task, poll for
 the condition you care about (an activity reaching `TERMINATED`, a timeout), then `await agent.stop()`
@@ -346,28 +354,33 @@ Two runnable showcases drive S-ORA against Meta's [Agents Research Environments]
     $ uv sync --all-extras --group are
     $ export ANTHROPIC_API_KEY=sk-ant-...     # or a .gitignored .env, as above
 
-**MCP path — static snapshot** (`examples/gaia2/email_calendar/`). S-ORA's `AreMcpWorkspaceAdapter` connects over ARE's MCP server, which serves a scenario's *initial* app state; this fits the single-shot plan→ground→act loop:
+**MCP path — static snapshot** (`examples/are/mcp/email_calendar/`). S-ORA's `AreMcpWorkspaceAdapter` connects over ARE's MCP server, which serves a scenario's *initial* app state; this fits the single-shot plan→ground→act loop:
 
-    $ uv run python -m examples.gaia2.email_calendar.run
+    $ uv run python -m examples.are.mcp.email_calendar.run
     # or the same scenario through the CLI:
-    $ uv run sora run examples/gaia2/email_calendar/agent.yaml \
-        --task-file examples/gaia2/email_calendar/task.txt --verbose
+    $ uv run sora run examples/are/mcp/email_calendar/agent.yaml \
+        --task-file examples/are/mcp/email_calendar/task.txt --verbose
 
-**In-process path — dynamic timeline** (`examples/are_scenario/`). To exercise a scenario's *event timeline* — mid-run email injections, follow-ups, task delivery — S-ORA runs the ARE `Environment` directly. The scenario is a **per-run input on the command line**, not config: a dotted `Scenario` subclass or a Gaia2 `.json` file, injected via `build_agent(config, simulation=...)`:
+**In-process path — dynamic timeline** (`examples/are/sim/email_calendar/`). To exercise a scenario's *event timeline* — mid-run email injections, follow-ups, task delivery — S-ORA runs the ARE `Environment` directly. The scenario is a **per-run input on the command line**, not config: a dotted `Scenario` subclass or a Gaia2 `.json` file, passed via `sora run`'s `--scenario` flag, which turns it into the `simulation` object `build_agent(config, simulation=...)` injects. This runs through the same `sora run`/`TerminalSession` trace as any other agent — `TerminalSession` only needs a transport with an outbound `.sent` log, not specifically `InProcessTransport`:
 
-    $ uv run python -m examples.are_scenario.run                          # the bundled default scenario
-    $ uv run python -m examples.are_scenario.run --scenario path/to.json  # a Gaia2 JSON scenario
-    $ uv run python -m examples.are_scenario.run --scenario pkg.mod.MyScenario
+    $ uv run sora run examples/are/sim/email_calendar/agent.yaml \
+        --scenario examples.are.sim.email_calendar.scenario.EmailScheduleScenario --verbose    # watch it interactively
 
-**Scenarios you can run.** The in-process path is scenario-agnostic — `--scenario` accepts any of three forms:
+    # headless + scored: auto-exit once quiescent, then print the agent's outcome + ARE's own
+    # scenario.validate() score via a plain (agent, simulation) -> None hook (examples/are/sim/email_calendar/report.py)
+    $ uv run sora run examples/are/sim/email_calendar/agent.yaml \
+        --scenario examples.are.sim.email_calendar.scenario.EmailScheduleScenario \
+        --report examples.are.sim.email_calendar.report.report --exit-when-idle 8
 
-- **`examples.are_scenario.scenario.EmailScheduleScenario`** — the bundled default (used when `--scenario` is omitted). A *dynamic* scenario: Alice emails to schedule a Monday team sync, then a follow-up email mid-run moves it to Tuesday, surfacing as a `state_changed` signal that drives a replan.
+**Scenarios you can run.** The in-process path is scenario-agnostic — `--scenario` is required (there is no default) and accepts any of three forms:
+
+- **`examples.are.sim.email_calendar.scenario.EmailScheduleScenario`** — the bundled illustrative scenario. A *dynamic* scenario: Alice emails to schedule a Monday team sync, then a follow-up email mid-run moves it to Tuesday, surfacing as a `state_changed` signal that drives a replan.
 - **A Gaia2 `.json` benchmark scenario** — any scenario file from Meta's Gaia2 benchmark (distributed with [ARE](https://github.com/facebookresearch/meta-agents-research-environments)), loaded through ARE's benchmark scenario loader. These are not vendored in this repo; point at your own copy.
-- **A dotted `Scenario` subclass you author** — subclass ARE's `Scenario` (see `examples/are_scenario/scenario.py` for the template) and pass its dotted path.
+- **A dotted `Scenario` subclass you author** — subclass ARE's `Scenario` (see `examples/are/sim/email_calendar/scenario.py` for the template) and pass its dotted path.
 
-Separately, the **MCP path** runs one seeded static scenario, `examples/gaia2/email_calendar` (a 30-minute team sync from an inbox email); it is fixed by that example's `agent.yaml`/`task.txt` rather than selected with `--scenario`.
+Separately, the **MCP path** runs one seeded static scenario, `examples/are/mcp/email_calendar` (a 30-minute team sync from an inbox email); it is fixed by that example's `agent.yaml`/`task.txt` rather than selected with `--scenario`.
 
-Each runner drives the decision cycle until the activity terminates, prints the trajectory, and (for the in-process path) scores the run via `scenario.validate(env)`. Both print the runtime's own INFO trace (join / plan / invoke / resolve / terminate) by default; raise or lower it with `LOGLEVEL` (e.g. `LOGLEVEL=WARNING`). For how the two adapter paths differ and why the dynamic path exists, see [EXAMPLES.md](EXAMPLES.md#running-dynamic-scenarios-in-process) and the [ARE dynamic scenarios design note](docs/are-dynamic-scenarios.md).
+The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the decision cycle until the activity terminates, prints the trajectory, and prints the runtime's own INFO trace via plain `logging.basicConfig`; raise or lower it with `LOGLEVEL` (e.g. `LOGLEVEL=WARNING`) — it exists primarily as the reference example for [driving an agent programmatically](#driving-an-agent-programmatically), without `TerminalSession`. The in-process dynamic path runs entirely through `sora run` (above), so its trace/trajectory/footer are the same colored `[cycle N] Phase - ...` output (or terse `[invoking ...]` cues) as any other `sora run` session, controlled by `--verbose`/`--color`/`--no-color`, not `LOGLEVEL`. For how the two adapter paths differ and why the dynamic path exists, see [EXAMPLES.md](EXAMPLES.md#running-dynamic-scenarios-in-process) and the [ARE dynamic scenarios design note](docs/are-dynamic-scenarios.md).
 
 ## API Sketch
 
@@ -640,7 +653,7 @@ Each runner drives the decision cycle until the activity terminates, prints the 
         history: list[CompletedOperation] = []              # append-only trace of resolved ops — a later step
         #                                                     grounds param references against it (see Reason
         #                                                     grounding); last_operation keeps only the newest
-        # context and is exclusively for strategy-author data — the runtime itself never writes into it,
+        # context is exclusively for strategy-author data — the runtime itself never writes into it,
         # which is what keeps pending_operation/last_operation as dedicated fields instead of context keys
         # with a naming convention (no shared namespace means no collision to avoid in the first place)
 
@@ -981,6 +994,13 @@ Each runner drives the decision cycle until the activity terminates, prints the 
             what makes these memory calls possible at all — previously missing from this Protocol
             despite the calls it was already documented as making."""
 
+        def failed(self, activity: Activity) -> bool:
+            """This strategy's own judgment of whether `activity` has failed — a judgment call, not
+            a fact recorded on Activity itself, since a different ReflectStrategy may define failure
+            differently than the default's "resolved operation, not ok" rule. Callers outside the
+            cycle (a reporting hook, a test) go through whichever strategy is actually configured
+            (e.g. `agent.cycle.strategies.reflect.failed(activity)`) rather than re-deriving the rule."""
+
     class SituateStrategy(Protocol):
         async def situate(self, activities: list[Activity], wm: WorkingMemory, cycle: DecisionCycle,
                            result: TickResult) -> TickResult:
@@ -1203,6 +1223,16 @@ Each runner drives the decision cycle until the activity terminates, prints the 
     # _Console (private, sora/cli.py): tracks whether the terminal cursor sits at the start of a
     # line, so lines printed through it are always cleanly newline-separated — not part of the
     # public API.
+
+    # _PresentableTransport (private, sora/cli.py): a runtime_checkable Protocol requiring a `.sent`
+    # outbound log — the structural capability TerminalSession needs to stream a transport's replies,
+    # satisfied by both InProcessTransport and the ARE in-process AreTransport. Not part of the
+    # public API.
+
+    # _SubmittableTransport (private, sora/cli.py): a runtime_checkable Protocol requiring a
+    # `submit(Message)` method — the narrower capability of accepting ad hoc input (--task/
+    # --task-file, typed stdin lines), which InProcessTransport has and AreTransport doesn't. Not
+    # part of the public API.
 
     # sora/scaffold.py — `sora init`'s file generator
     def write_project(project_dir: Path) -> None:

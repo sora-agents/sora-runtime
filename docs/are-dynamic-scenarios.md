@@ -88,7 +88,7 @@ Lazy ARE imports throughout (the optional `are` dependency-group):
 
 The bridge only *surfaces* the mid-run change (a follow-up email); making the agent act on it is the
 application's job, done entirely through the pluggable phase strategies (no runtime change). The
-showcase ships two, in `examples/are_scenario/strategies.py`, so the follow-up is handled regardless
+showcase ships two, in `examples/are/sim/email_calendar/strategies.py`, so the follow-up is handled regardless
 of when it lands relative to the original activity's life:
 
 * **`ReconcilingReasonStrategy`** — while the scheduling activity is still in flight, a **new inbound
@@ -131,7 +131,7 @@ undo/modify rather than duplicating" instruction is a commitment-aware
 BDI-style commitment machinery (single-minded/open-minded reconsideration as a first-class pluggable
 policy) — that, and hard-interrupt preemption so the reaction is immediate rather than next-tick
 (the `DecisionCycle.interrupt()` item in ROADMAP.md), are deferred. The strategies are pinned by
-deterministic fakes in `tests/test_are_dynamic_strategies.py`.
+deterministic fakes in `tests/test_are_sim_strategies.py`.
 
 ## What this buys
 
@@ -199,11 +199,17 @@ Four claims were checked directly against ARE's source (`environment.py`, `apps/
   *can't* close, by nature: a free-form `dict[str, Any]` maps to an untyped object with no key
   guidance (that's an authored manual's job, [ADR-0018](adrs/0018-manual-merge-policy-and-authored-interface.md)), and any remaining model deviation surfaces
   as a failed `OperationAck` that terminates the activity — a graceful failure, not a crash. Related
-  reporting fix in the showcase runner: ARE's base `Scenario.validate` only checks the environment
-  didn't enter a `FAILED` state and runs any oracle validators, so a scenario with no oracle events
-  (like the default one) reports `PASS` even when the agent failed the task; `examples/are_scenario/run.py`
-  now reports the agent's own outcome separately and labels the ARE check as vacuous without oracle
-  events.
+  reporting fix: ARE's base `Scenario.validate` only checks the environment didn't enter a `FAILED`
+  state and runs any oracle validators, so a scenario with no `validate()` override and no oracle
+  events reports `PASS` even when the agent failed the task; `examples/are/sim/email_calendar/report.py` (the
+  `sora run --report` hook) reports the agent's own outcome separately and labels the ARE check
+  vacuous whenever that's what the pointed-at scenario is. The bundled default,
+  `EmailScheduleScenario`, isn't one of those — it overrides `validate()` to check final calendar/
+  email state directly (did the meeting land on the corrected day, was Alice replied to), the same
+  pattern as the native-ARE port of this scenario; it also declares two `.oracle()` events, but only
+  as documentation of the ideal trajectory for ARE's own oracle-mode tooling — `validate()` doesn't
+  check whether they specifically fired, since the agent may reasonably reply to either of Alice's
+  two emails.
 
 ## Links
 

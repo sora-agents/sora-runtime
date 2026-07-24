@@ -1,7 +1,7 @@
 """Deterministic tests for the in-process ARE *dynamic*-scenario strategies — over fakes, no model.
 
 The dynamic scenario's follow-up (a mid-run Monday -> Tuesday change) reaches the agent as a **new
-inbound email**. Three behaviors distinguish these strategies from the static gaia2 one and are
+inbound email**. Three behaviors distinguish these strategies from the static MCP one and are
 pinned here:
 
 * ``ReconcilingReasonStrategy`` re-*infers* mid-plan when a new INBOX email appears — and crucially
@@ -10,7 +10,7 @@ pinned here:
   the original goal completed, and stays quiet otherwise.
 
 The real ARE Environment + real Claude version is the skip-gated
-``test_are_dynamic_reproduction.py``.
+``test_are_sim_reproduction.py``.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from examples.are_scenario.strategies import (
+from examples.are.sim.email_calendar.strategies import (
     _CORRECTIVE_GOAL,
     CorrectiveSituateStrategy,
     ReconcilingReasonStrategy,

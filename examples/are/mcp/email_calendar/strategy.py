@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sora.memory import WorkingMemory
     from sora.strategies import TickResult
 
-log = logging.getLogger("examples.gaia2.email_calendar")
+log = logging.getLogger("examples.are.mcp.email_calendar")
 
 # Strategy-owned bookkeeping stored on activity.context (the runtime never writes there): how many
 # signal percepts this strategy has already reacted to, so a *new* one — not an already-seen one —

@@ -93,6 +93,15 @@ class ReflectStrategy(Protocol):
         the calls it was already documented as making."""
         ...
 
+    def failed(self, activity: Activity) -> bool:
+        """This strategy's own judgment of whether `activity` has failed — a *judgment call*, not
+        a fact recorded on `Activity` itself, since a different ReflectStrategy may define failure
+        differently (e.g. from a signal, or a partial-success rule) than the default's "resolved
+        operation, not ok" rule. Exposed on the Protocol (not just the default) so callers outside
+        the decision cycle — a reporting hook, a test assertion — go through whichever strategy is
+        actually configured rather than re-deriving the rule themselves."""
+        ...
+
 
 class SituateStrategy(Protocol):
     async def situate(
@@ -314,8 +323,7 @@ class DefaultReflectStrategy:
         # it is what makes reflect() idempotent across the cycles it runs on every activity.
         if activity.state is not ActivityState.READY:
             return result
-        last = activity.last_operation
-        if last is not None and not last.ok:
+        if self.failed(activity):
             activity.state = ActivityState.TERMINATED  # synchronous — Situate sees it this cycle
             log.info("reflect: activity %s failed; storing episode", activity.id)
             self._dispatch(self._record_failure(cycle, activity))
@@ -326,6 +334,11 @@ class DefaultReflectStrategy:
         # Reflect never fills in the decision fields (activity/step/invocation) — it threads
         # `result` through untouched.
         return result
+
+    def failed(self, activity: Activity) -> bool:
+        """The default rule: a resolved-but-not-ok last_operation is definite negative evidence,
+        independent of the plan (see the class docstring's "asymmetric" rules)."""
+        return activity.last_operation is not None and not activity.last_operation.ok
 
     def _dispatch(self, coro: Coroutine[Any, Any, None]) -> None:
         task = asyncio.create_task(coro)

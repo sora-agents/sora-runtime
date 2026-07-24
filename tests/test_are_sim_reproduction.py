@@ -1,10 +1,11 @@
 """Skip-gated end-to-end reproduction: a **dynamic** ARE scenario, in-process, against real Claude.
 
-The counterpart to ``test_are_scenario_reproduction.py`` (which drives the *static*, seeded MCP
+The counterpart to ``test_are_mcp_reproduction.py`` (which drives the *static*, seeded MCP
 world). Here the ARE ``Environment`` event loop runs for real: the task is delivered through the
 ``AgentUserInterface`` (no manual ``transport.submit``), and a mid-run follow-up email lands off the
 agent's own action — the dynamic story the static world can't tell. Same ``build_agent`` path as the
-showcase (``examples/are_scenario/run.py``), scenario injected as a runtime ``AreSimulation``.
+showcase (``sora run examples/are/sim/email_calendar/agent.yaml --scenario ...``), scenario injected
+as a runtime ``AreSimulation``.
 
 **Opt-in and skip-gated** (marked ``integration``, excluded from the default ``pytest`` run): needs
 the ``llm`` extra, the ARE package (``uv sync --all-extras --group are``), and a live
@@ -23,15 +24,22 @@ import pytest
 
 from sora.activity import ActivityState
 
-_CONFIG = Path(__file__).resolve().parent.parent / "examples" / "are_scenario" / "agent.yaml"
-_SCENARIO = "examples.are_scenario.scenario.EmailScheduleScenario"
+_CONFIG = (
+    Path(__file__).resolve().parent.parent
+    / "examples"
+    / "are"
+    / "sim"
+    / "email_calendar"
+    / "agent.yaml"
+)
+_SCENARIO = "examples.are.sim.email_calendar.scenario.EmailScheduleScenario"
 
 
 def _config_with_tmp_memory(tmp_path: Path) -> Path:
     """The real showcase config with its file:// memory dirs redirected under tmp_path (empty
     procedural store per run, and the repo's ``.sora/`` is left untouched)."""
     text = _CONFIG.read_text(encoding="utf-8").replace(
-        "file://./.sora/are_scenario", f"file://{tmp_path}/memory"
+        "file://./.sora/are/sim/email_calendar", f"file://{tmp_path}/memory"
     )
     out = tmp_path / "agent.yaml"
     out.write_text(text, encoding="utf-8")
@@ -39,7 +47,7 @@ def _config_with_tmp_memory(tmp_path: Path) -> Path:
 
 
 @pytest.mark.integration
-async def test_dynamic_are_scenario_reproduction(tmp_path: Path) -> None:
+async def test_are_sim_agent_reproduces_dynamic_scenario(tmp_path: Path) -> None:
     pytest.importorskip("are.simulation")
     pytest.importorskip("anthropic")
     if not os.environ.get("ANTHROPIC_API_KEY"):

@@ -26,6 +26,7 @@ import asyncio
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
@@ -67,6 +68,16 @@ class Simulation(Protocol):
     def stop(self) -> None: ...
     def apps(self) -> list[Any]: ...
     def run(self, fn: Callable[[], _T]) -> _T: ...  # serialize S-ORA's own concurrent app calls
+
+
+@dataclass(frozen=True)
+class ValidationOutcome:
+    """``AreSimulation.validate()``'s result — decouples callers (``report.py``) from ARE's own
+    ``ScenarioValidationResult`` shape, so a fake simulation in a test can produce one without
+    depending on ARE. ``rationale`` is None when the scenario's ``validate()`` didn't supply one."""
+
+    success: bool
+    rationale: str | None = None
 
 
 class AreSimulation:
@@ -122,10 +133,11 @@ class AreSimulation:
         with self._lock:
             return fn()
 
-    def validate(self) -> bool:
+    def validate(self) -> ValidationOutcome:
         """Oracle scoring: run the scenario's validators against the final environment state."""
         assert self._env is not None, "start() the simulation before validating"
-        return bool(self._scenario.validate(self._env).success)
+        result = self._scenario.validate(self._env)
+        return ValidationOutcome(success=bool(result.success), rationale=result.rationale)
 
 
 def load_scenario(ref: str) -> Any:
@@ -397,11 +409,18 @@ class AreTransport:
 
     def __init__(self, simulation: Simulation) -> None:
         self._sim = simulation
+        # Mirrors InProcessTransport.sent (an outbound log for tests/inspection) so a presentation
+        # layer like TerminalSession can stream a reply the same way regardless of transport kind.
+        self.sent: list[tuple[str, dict[str, Any]]] = []
 
     async def send(self, to: str, content: dict[str, Any]) -> None:
         aui = self._sim.aui
         if aui is None:
             return
+        # Record only what was actually delivered — a presentation layer like TerminalSession
+        # polls `.sent` and streams it as the agent's reply, so logging content that never
+        # reached the AUI would show a message the user never actually got.
+        self.sent.append((to, content))
         text = content.get("text", "") if isinstance(content, dict) else str(content)
         await asyncio.to_thread(self._sim.run, lambda: aui.send_message_to_user(text))
 

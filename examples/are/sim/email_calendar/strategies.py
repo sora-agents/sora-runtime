@@ -1,6 +1,6 @@
 """Dynamic-scenario strategies for the in-process ARE showcase.
 
-The static gaia2 demo (``examples/gaia2/email_calendar``) runs one plan to completion. This dynamic
+The static MCP demo (``examples/are/mcp/email_calendar``) runs one plan to completion. This dynamic
 scenario's timeline fires a mid-run follow-up email that *changes the answer* (Monday -> Tuesday).
 Two custom strategies make the agent reconsider through its **own decision cycle** rather than
 blindly finishing the original plan, handling the change whenever it lands:
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from sora.memory import WorkingMemory
     from sora.strategies import TickResult
 
-log = logging.getLogger("examples.are_scenario")
+log = logging.getLogger("examples.are.sim.email_calendar")
 
 # Inbound email ids an activity has already accounted for, stored on activity.context. Both
 # strategies honor it so a given email is handled once: Reason stamps the activity it re-infers for;
@@ -171,7 +171,15 @@ _RECONCILE_INSTRUCTION = (
     "actually visible in the current state right now, referencing its id from a fresh search/list "
     "step. If no stale item is visible, do NOT plan a removal; just create or correct what the new "
     "answer needs. If the current state already satisfies the goal, plan just a short send "
-    "confirming."
+    "confirming.\n"
+    "A follow-up in a thread like this is often a short correction, not a full restatement: it may "
+    "mention only what changed (e.g. the day) and say nothing about details that did not change "
+    "(duration, attendees, location, ...). The most recently arrived email is not necessarily the "
+    "most complete one — do not treat whichever one a search happens to rank first as the whole "
+    "story. Before you finalize a parameter, make sure you have actually read every email in the "
+    "thread that could bear on it: if a search for the topic returns more than one relevant "
+    "result, plan a `get_email_by_id`-style step for each of them, not just the top one, so both "
+    "the original request and the correction are in front of you when you decide."
 )
 
 
@@ -182,9 +190,11 @@ def reconciling_plan_prompt(
 ) -> tuple[str, str]:
     """A commitment-aware ``PlanPrompt``: the default planning content plus an instruction to focus
     the tools it reconciles against (the inbox, so a mid-task email is observed, and any tool it
-    changes, so it can see what it already created) and to reconcile against the *observed* current
+    changes, so it can see what it already created), to reconcile against the *observed* current
     world — deleting/updating only a stale item that is actually visible, never blindly — instead of
-    assuming a fresh start. Wired via ``agent.yaml``'s ``procedural.plan_prompt``; the
-    ``{"steps": [...]}`` response contract is unchanged."""
+    assuming a fresh start, and to read every relevant email in a thread rather than assuming the
+    most recent search hit is the complete request (a follow-up correction typically omits whatever
+    didn't change). Wired via ``agent.yaml``'s ``procedural.plan_prompt``; the ``{"steps": [...]}``
+    response contract is unchanged."""
     system, user = default_plan_prompt(activity, tools, observed)
     return system + _RECONCILE_INSTRUCTION, user

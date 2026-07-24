@@ -4,7 +4,7 @@ Over a subprocess-free ``FakeAdapter``: ``run()`` joins the configured workspace
 (through the predefined ``_join_`` action, so records/manuals land in SemanticMemory), drives the
 decision cycle, and on ``stop()`` leaves the workspace (closing it) as the loop unwinds. No model is
 needed — with no inbound message the cycle selects nothing and Reason is never reached — so this
-isolates the loop mechanics from planning (covered in ``test_gaia2_reproduction.py``).
+isolates the loop mechanics from planning (covered in ``test_are_mcp_email_calendar.py``).
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
     uv sync --all-extras --group are
     export ANTHROPIC_API_KEY=sk-ant-...          # or a .gitignored .env
-    uv run python -m examples.gaia2.email_calendar.run
+    uv run python -m examples.are.mcp.email_calendar.run
 
 Builds the agent from ``agent.yaml``, seeds the scenario's initial task (``task.txt``) as a user
 message (ARE's own USER_MESSAGE routing into the transport is not wired yet — deferred), drives the
@@ -12,13 +12,13 @@ It's also a reference for driving an ``Agent`` programmatically — see README's
 programmatically" — as opposed to `TerminalSession`/`sora run`, the CLI path this same scenario is
 also runnable through:
 
-    uv run sora run examples/gaia2/email_calendar/agent.yaml \
-        --task-file examples/gaia2/email_calendar/task.txt --verbose
+    uv run sora run examples/are/mcp/email_calendar/agent.yaml \
+        --task-file examples/are/mcp/email_calendar/task.txt --verbose
 
 Note on output: the runtime's own INFO trace (join / plan / invoke / resolve / terminate) prints by
 default. Mute it, or raise/lower the level, via LOGLEVEL:
 
-    LOGLEVEL=WARNING uv run python -m examples.gaia2.email_calendar.run
+    LOGLEVEL=WARNING uv run python -m examples.are.mcp.email_calendar.run
 """
 
 from __future__ import annotations

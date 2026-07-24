@@ -185,7 +185,8 @@ def adapter_for(
 
     ``are-sim`` is the in-process ARE integration: it needs a running scenario, so ``simulation``
     (an ``AreSimulation``) is *injected* at runtime; config stays generic (no scenario key); the
-    scenario is a CLI argument the runner turns into the simulation (see examples/are_scenario/run).
+    scenario is a CLI argument the runner turns into the simulation (see ``sora run --scenario``,
+    ``src/sora/cli.py``).
 
     The ``fake`` kind — plus any custom adapter — is an escape hatch: name a factory
     ``(origin) -> WorkspaceAdapter`` via ``factory:`` resolved through ``import_object`` (the

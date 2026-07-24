@@ -146,7 +146,9 @@ async def _stop(session: TerminalSession, task: asyncio.Task[None], stdin: _Pipe
 # ---------------------------------------------------------------------------
 
 
-class _NotInProcessTransport:
+class _NoOutboundLogTransport:
+    """No `.sent` — TerminalSession can't stream a reply from this, regardless of transport kind."""
+
     async def send(self, to: str, content: dict[str, object]) -> None: ...
 
     def receive(self) -> AsyncIterator[Message]:
@@ -157,11 +159,35 @@ class _NotInProcessTransport:
         return _empty()
 
 
-async def test_init_rejects_non_in_process_transport(tmp_path: Path) -> None:
+class _SentOnlyTransport:
+    """Duck-types `AreTransport`'s shape: an outbound `.sent` log, but no `.submit()` — messages
+    arrive from elsewhere (a running scenario's own timeline), not ad hoc terminal input."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, dict[str, object]]] = []
+
+    async def send(self, to: str, content: dict[str, object]) -> None:
+        self.sent.append((to, content))
+
+    def receive(self) -> AsyncIterator[Message]:
+        async def _empty() -> AsyncIterator[Message]:
+            return
+            yield  # pragma: no cover
+
+        return _empty()
+
+
+async def test_init_rejects_transport_without_an_outbound_log(tmp_path: Path) -> None:
     agent = _build_agent(tmp_path)
-    agent.communication = _NotInProcessTransport()
-    with pytest.raises(TypeError, match="InProcessTransport"):
+    agent.communication = _NoOutboundLogTransport()
+    with pytest.raises(TypeError, match="`.sent`"):
         TerminalSession(agent)
+
+
+async def test_init_accepts_a_duck_typed_transport_without_submit(tmp_path: Path) -> None:
+    agent = _build_agent(tmp_path)
+    agent.communication = _SentOnlyTransport()
+    TerminalSession(agent)  # must not raise: .sent is all __init__ requires
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +540,118 @@ async def test_run_prints_trajectory_once_when_an_activity_terminates(
         await _stop(session, task, stdin)
 
 
+async def test_run_notifies_once_when_transport_does_not_support_ad_hoc_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    agent = _build_agent(tmp_path)
+    agent.communication = _SentOnlyTransport()
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    session = TerminalSession(agent, poll_interval=0.0)
+    task = asyncio.create_task(session.run())
+    try:
+        stdin.push_line("hello?")
+        stdin.push_line("still there?")
+        collected = await _collect_until(capsys, "doesn't accept ad hoc input", task)
+        for _ in range(20):  # a second typed line must not print a second notice
+            await asyncio.sleep(0)
+        collected += capsys.readouterr().out
+        assert collected.count("doesn't accept ad hoc input") == 1
+    finally:
+        await _stop(session, task, stdin)
+
+
+async def test_run_exits_via_typed_exit_even_without_submit_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _build_agent(tmp_path)
+    agent.communication = _SentOnlyTransport()
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    session = TerminalSession(agent, poll_interval=0.0)
+    task = asyncio.create_task(session.run())
+    stdin.push_line("exit")
+    await asyncio.wait_for(task, timeout=2)
+    assert task.exception() is None
+
+
+async def test_exit_when_idle_stops_the_session_without_stdin_eof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _build_agent(tmp_path)
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    agent.working.activities["a1"] = Activity(
+        id="a1", goal="what time is it?", context={}, state=ActivityState.TERMINATED
+    )
+
+    session = TerminalSession(agent, poll_interval=0.0, exit_when_idle=0.01)
+    task = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(task, timeout=2)  # must exit on its own, no EOF/typed exit
+        assert task.exception() is None
+    finally:
+        stdin.close()
+
+
+async def test_banner_reflects_headless_scenario_driven_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Neither of the default banner's two lines applies to a headless `--scenario ...
+    # --exit-when-idle` run: this transport won't accept a typed goal, and nobody is watching
+    # stdin to type 'exit' — telling the user either would be actively misleading.
+    agent = _build_agent(tmp_path)
+    agent.communication = _SentOnlyTransport()
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    agent.working.activities["a1"] = Activity(
+        id="a1", goal="what time is it?", context={}, state=ActivityState.TERMINATED
+    )
+
+    session = TerminalSession(agent, poll_interval=0.0, exit_when_idle=0.01)
+    task = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(task, timeout=2)  # exits on its own via the idle timer
+        assert task.exception() is None
+    finally:
+        stdin.close()
+
+    out = capsys.readouterr().out
+    assert "Type a goal in plain English" not in out
+    assert "Type 'exit' or 'quit' to quit" not in out
+    assert "Driven by the running scenario's timeline." in out
+    assert "Exits automatically once idle." in out
+
+
+async def test_exit_when_idle_resets_while_activities_are_still_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _build_agent(tmp_path)
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    # RUNNING (not READY): only READY activities are selected for Reason, so this stays "live" for
+    # the duration of the test without the fake agent's LLM-less ProceduralMemory ever being asked
+    # to infer a plan for it.
+    agent.working.activities["a1"] = Activity(
+        id="a1", goal="what time is it?", context={}, state=ActivityState.RUNNING
+    )
+
+    session = TerminalSession(agent, poll_interval=0.0, exit_when_idle=0.01)
+    task = asyncio.create_task(session.run())
+    try:
+        for _ in range(20):  # a live (non-terminated) activity must not trigger the idle exit
+            await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        # A RUNNING activity never reaches TERMINATED on its own, so stdin EOF (which
+        # `--exit-when-idle` deliberately ignores — see `_read_stdin`) won't stop this session;
+        # only an explicit typed command does.
+        stdin.push_line("exit")
+        await asyncio.wait_for(task, timeout=2)
+
+
 # ---------------------------------------------------------------------------
 # main() — argparse wiring only (build_agent/TerminalSession faked out)
 # ---------------------------------------------------------------------------
@@ -530,12 +668,14 @@ class _FakeSession:
         color: bool | None = None,
         poll_interval: float = 0.02,
         initial_task: str | None = None,
+        exit_when_idle: float | None = None,
     ) -> None:
         _FakeSession.last_calls = {
             "agent": agent,
             "verbose": verbose,
             "color": color,
             "initial_task": initial_task,
+            "exit_when_idle": exit_when_idle,
         }
 
     async def run(self) -> None:
@@ -545,8 +685,9 @@ class _FakeSession:
 def test_main_run_defaults_to_agent_yaml_and_non_verbose(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, object] = {}
 
-    def _fake_build_agent(config_path: str) -> object:
+    def _fake_build_agent(config_path: str, *, simulation: object | None = None) -> object:
         calls["config"] = config_path
+        calls["simulation"] = simulation
         return object()
 
     monkeypatch.setattr("sora.cli.build_agent", _fake_build_agent)
@@ -556,13 +697,15 @@ def test_main_run_defaults_to_agent_yaml_and_non_verbose(monkeypatch: pytest.Mon
     main()
 
     assert calls["config"] == "agent.yaml"
+    assert calls["simulation"] is None
     assert _FakeSession.last_calls["verbose"] is False
     assert _FakeSession.last_calls["color"] is None  # auto: TerminalSession resolves TTY/NO_COLOR
     assert _FakeSession.last_calls["initial_task"] is None
+    assert _FakeSession.last_calls["exit_when_idle"] is None
 
 
 def test_main_run_color_flags_pass_tri_state_through(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("sora.cli.build_agent", lambda config_path: object())
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path, **_: object())
     monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
 
     monkeypatch.setattr(sys, "argv", ["sora", "run", "--no-color"])
@@ -577,7 +720,7 @@ def test_main_run_color_flags_pass_tri_state_through(monkeypatch: pytest.MonkeyP
 def test_main_run_accepts_config_path_and_verbose_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, object] = {}
 
-    def _fake_build_agent(config_path: str) -> object:
+    def _fake_build_agent(config_path: str, *, simulation: object | None = None) -> object:
         calls["config"] = config_path
         return object()
 
@@ -592,7 +735,7 @@ def test_main_run_accepts_config_path_and_verbose_flag(monkeypatch: pytest.Monke
 
 
 def test_main_run_passes_task_flag_through(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("sora.cli.build_agent", lambda config_path: object())
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path, **_: object())
     monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
     monkeypatch.setattr(sys, "argv", ["sora", "run", "--task", "do the thing"])
 
@@ -607,7 +750,7 @@ def test_main_run_reads_task_file_and_strips_it(
     task_file = tmp_path / "task.txt"
     task_file.write_text("  do the thing from a file  \n")
 
-    monkeypatch.setattr("sora.cli.build_agent", lambda config_path: object())
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path, **_: object())
     monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
     monkeypatch.setattr(sys, "argv", ["sora", "run", "--task-file", str(task_file)])
 
@@ -620,6 +763,124 @@ def test_main_run_rejects_task_and_task_file_together(monkeypatch: pytest.Monkey
     monkeypatch.setattr(sys, "argv", ["sora", "run", "--task", "a", "--task-file", "b"])
     with pytest.raises(SystemExit):
         main()
+
+
+def test_main_run_rejects_scenario_and_task_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A scenario delivers its own task through the AUI timeline — combining it with --task/
+    # --task-file is a usage error, caught immediately by argparse rather than silently ignored.
+    monkeypatch.setattr(sys, "argv", ["sora", "run", "--scenario", "pkg.Scenario", "--task", "a"])
+    with pytest.raises(SystemExit):
+        main()
+
+
+def test_main_run_scenario_builds_and_injects_a_simulation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: dict[str, object] = {}
+
+    class _FakeAreSimulation:
+        def __init__(self, scenario: object) -> None:
+            self.scenario = scenario
+
+    def _fake_load_scenario(ref: str) -> str:
+        calls["scenario_ref"] = ref
+        return f"loaded:{ref}"
+
+    monkeypatch.setattr("sora.adapters.are_sim.AreSimulation", _FakeAreSimulation)
+    monkeypatch.setattr("sora.adapters.are_sim.load_scenario", _fake_load_scenario)
+
+    def _fake_build_agent(config_path: str, *, simulation: object | None = None) -> object:
+        calls["simulation"] = simulation
+        return object()
+
+    monkeypatch.setattr("sora.cli.build_agent", _fake_build_agent)
+    monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
+    monkeypatch.setattr(sys, "argv", ["sora", "run", "--scenario", "pkg.mod.MyScenario"])
+
+    main()
+
+    assert calls["scenario_ref"] == "pkg.mod.MyScenario"
+    simulation = calls["simulation"]
+    assert isinstance(simulation, _FakeAreSimulation)
+    assert simulation.scenario == "loaded:pkg.mod.MyScenario"
+    # Feedback printed *before* the (potentially slow, first-import-of-ARE) load_scenario call —
+    # otherwise the terminal sits silent until TerminalSession's own startup banner.
+    assert "loading scenario 'pkg.mod.MyScenario'" in capsys.readouterr().out
+
+
+def test_main_run_without_scenario_prints_no_loading_notice(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path, **_: object())
+    monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
+    monkeypatch.setattr(sys, "argv", ["sora", "run"])
+
+    main()
+
+    assert "loading scenario" not in capsys.readouterr().out
+
+
+def test_main_run_without_scenario_injects_no_simulation(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+
+    def _fake_build_agent(config_path: str, *, simulation: object | None = None) -> object:
+        calls["simulation"] = simulation
+        return object()
+
+    monkeypatch.setattr("sora.cli.build_agent", _fake_build_agent)
+    monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
+    monkeypatch.setattr(sys, "argv", ["sora", "run"])
+
+    main()
+
+    assert calls["simulation"] is None
+
+
+def test_main_run_passes_exit_when_idle_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path, **_: object())
+    monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
+    monkeypatch.setattr(sys, "argv", ["sora", "run", "--exit-when-idle", "8"])
+
+    main()
+
+    assert _FakeSession.last_calls["exit_when_idle"] == 8.0
+
+
+def test_main_run_calls_the_report_hook_with_agent_and_simulation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built_agent = object()
+    report_calls: list[tuple[object, object]] = []
+
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path, **_: built_agent)
+    monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
+    monkeypatch.setattr(
+        "sora.cli.import_object",
+        lambda path: lambda agent, simulation: report_calls.append((agent, simulation)),
+    )
+    monkeypatch.setattr(sys, "argv", ["sora", "run", "--report", "pkg.mod.report"])
+
+    main()
+
+    assert report_calls == [(built_agent, None)]
+
+
+def test_main_run_skips_the_report_hook_when_not_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = False
+
+    def _boom(path: str) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("import_object should not be called without --report")
+
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path, **_: object())
+    monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
+    monkeypatch.setattr("sora.cli.import_object", _boom)
+    monkeypatch.setattr(sys, "argv", ["sora", "run"])
+
+    main()
+
+    assert called is False
 
 
 def test_main_run_makes_the_cwd_importable_for_agent_yaml_dotted_paths(

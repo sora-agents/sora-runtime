@@ -6,6 +6,6 @@ replanning on a mid-scenario follow-up email. ``agent.yaml`` is the config; ``ru
 runner (real ARE MCP server + real Claude).
 """
 
-from examples.gaia2.email_calendar.strategy import ScheduleFromEmailStrategy
+from examples.are.mcp.email_calendar.strategy import ScheduleFromEmailStrategy
 
 __all__ = ["ScheduleFromEmailStrategy"]

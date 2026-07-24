@@ -1,9 +1,10 @@
-# Gaia2 email/calendar showcase — schedule a meeting from an email and reply.
+# ARE-over-MCP email/calendar showcase — schedule a meeting from an email and reply (Gaia2-style,
+# static snapshot).
 #
 # Run on demand against real ARE apps + real Claude:
 #     uv sync --all-extras --group are        # installs the ARE package + the llm/mcp extras
 #     export ANTHROPIC_API_KEY=sk-ant-...      # or put it in a .gitignored .env
-#     uv run python -m examples.gaia2.email_calendar.run   # run from the repo root
+#     uv run python -m examples.are.mcp.email_calendar.run   # run from the repo root
 #
 # The workspace is served by our own *seeded* ARE MCP launcher (are_server.py): the stock ARE MCP
 # server starts apps empty (emails/tasks are delivered by the simulation's event timeline, which the
@@ -14,10 +15,10 @@
 # with a hand-authored one from manuals/ for the same id (ADR-0018) — usage guidance an MCP schema
 # alone can't carry (e.g. "email_id always comes from a prior list_emails/search_emails call").
 agent:
-  name: gaia2-email-calendar
+  name: are-mcp-email-calendar
   strategies:
     # The one custom strategy: model-backed planning (the runtime default) + signal-driven replan.
-    reason: examples.gaia2.email_calendar.ScheduleFromEmailStrategy
+    reason: examples.are.mcp.email_calendar.ScheduleFromEmailStrategy
   memory:
     # File-backed so a followed plan persists and is reused across runs (procedural memory).
     semantic: file://./.sora/memory/semantic
@@ -25,7 +26,7 @@ agent:
     episodic: file://./.sora/memory/episodic
   llm:
     # model id is config (swap freely); the API key stays in the environment, never here.
-    model: claude-opus-4-8
+    model: claude-sonnet-5
   workspaces:
     - origin: { adapter: are-mcp, address: "stdio:are-email-calendar" }
       workspace_id: are
@@ -34,5 +35,5 @@ agent:
       command: python
       args:
         - -m
-        - examples.gaia2.email_calendar.are_server
-      manuals: examples/gaia2/email_calendar/manuals
+        - examples.are.mcp.email_calendar.are_server
+      manuals: examples/are/mcp/email_calendar/manuals
