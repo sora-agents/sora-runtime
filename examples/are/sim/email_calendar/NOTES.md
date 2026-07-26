@@ -22,13 +22,17 @@ plans), so each run infers fresh — there is no stale plan cache to clear betwe
 
 Everything here lives under `examples/are/sim/email_calendar/` and would not ship in the runtime:
 
-- **`ReconcilingReasonStrategy`** — re-infers an in-flight plan when a *new inbound email* appears.
-  The trigger keys on the set of **INBOX email ids** (`_inbound_email_ids`), which knows ARE's
-  `EmailClientApp` state shape (`folders → INBOX → emails[*].email_id`). ARE-email-shaped.
-- **`CorrectiveSituateStrategy`** — spawns a fresh corrective activity when a new inbound email
-  lands *after* the goal already completed. Also keys on inbox ids, and uses a hard-coded
-  `_CORRECTIVE_GOAL` string. Coordinates with Reason via a `_SEEN_INBOUND` set on
-  `activity.context` so a given email is handled exactly once.
+- **`MailDiffInterruptPolicy`** — an `InterruptPolicy` (screened at push time) that raises a hard
+  interrupt on a *genuinely new inbound email*. It diffs the set of **INBOX email ids** carried in
+  the `state_changed` signal payload against what it has already seen, which knows ARE's
+  `EmailClientApp` state shape (`folders → INBOX → emails[*].email_id`). ARE-email-shaped. Stateful,
+  so it also dedups — each new id fires once, the first non-empty inbox is the baseline, and the
+  agent's own reply (landing in SENT) never fires. See [ADR-0020](../../../../docs/adrs/0020-hard-interrupt-and-await-input.md).
+- **`ReconsiderInterruptHandler`** — the paired `InterruptHandler`. On that interrupt it clears the
+  in-flight activity's plan so the default Reason re-infers, or — if the email landed *after* the goal
+  already completed (no live activity) — spawns one fresh corrective activity (a hard-coded
+  `_CORRECTIVE_GOAL` string). A user stop is delegated to `DefaultInterruptHandler`. Reconsideration
+  thus lives in *one* seam, rather than being split across bespoke Reason/Situate strategies.
 - **`reconciling_plan_prompt` / `_RECONCILE_INSTRUCTION`** — a `PlanPrompt` that appends
   dynamic-environment guidance to the default planning content: focus every tool the task changes
   (inbox *and* calendar), and reconcile against the *observed* current state (delete/update only a
@@ -119,6 +123,14 @@ Each of these would replace a chunk of the scaffolding above with a principled m
   intention lifecycle (blocked / impossible / superseded). Replaces "re-infer on every signal" with
   a principled decision about *when* to reconsider a plan. Retires limitation (6).
 
-- **Hard-interrupt preemption** — a pushed signal preempting the current decision phase (via
-  `DecisionCycle.interrupt()`), so the agent can react to a follow-up mid-phase rather than only at a
-  cycle boundary. Complements, rather than replaces, the reconsideration policy above.
+- **Hard-interrupt preemption (shipped — [ADR-0020](../../../../docs/adrs/0020-hard-interrupt-and-await-input.md)).**
+  `DecisionCycle.interrupt()` now preempts the current phase (phase-boundary checkpoints + true
+  mid-flight abandonment of the Reason model call), and this scenario's reconsideration runs through it:
+  `MailDiffInterruptPolicy` screens the pushed `state_changed` signal at push time and raises the
+  interrupt, `ReconsiderInterruptHandler` routes it. **What remains** is the timing payoff, not the
+  mechanism: the ARE bridge emits `state_changed` from `tool.observe()` (Observe-cadence), so the
+  interrupt fires inside the current tick's Observe — there is no in-flight model call to abandon yet, so
+  for the ARE sim this is largely a clean *relocation* of the trigger into the seam. Making the ARE push
+  genuinely **off-cycle** (from the Environment thread) is the deferred unlock that turns this into true
+  mid-Reason abandonment for the email scenario; it complements, rather than replaces, the reconsideration
+  policy (limitation 6). The `/stop` user stop already exercises the async-source path today.

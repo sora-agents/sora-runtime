@@ -19,7 +19,7 @@ from sora.adapters.are_sim import (
 )
 from sora.environment import WorkspaceOrigin
 from sora.manual import Manual
-from sora.perception import NotificationQueueSink
+from sora.perception import Message, NotificationQueueSink
 
 # ------------------------------------------------------------------------------------------------
 # Fakes: minimal stand-ins for ARE App / AppTool / AgentUserInterface / the simulation runtime.
@@ -119,6 +119,9 @@ class FakeAui:
 
     def send_message_to_user(self, content: str) -> None:
         self.sent_to_user.append(content)
+
+    def send_message_to_agent(self, content: str) -> None:  # the user side: user -> agent
+        self._unread.append(SimpleNamespace(sender="User", content=content, timestamp=1.0))
 
 
 class FakeSimulation:
@@ -332,3 +335,16 @@ async def test_transport_send_posts_to_the_user() -> None:
     transport = AreTransport(FakeSimulation([aui]))
     await transport.send("user", {"text": "Booked Monday 10:00 with Bob and Carol."})
     assert aui.sent_to_user == ["Booked Monday 10:00 with Bob and Carol."]
+
+
+async def test_transport_submit_injects_an_ad_hoc_user_message() -> None:
+    # A typed CLI line (or a /stop resume) reaches the agent via send_message_to_agent and surfaces
+    # on the next receive() drain, indistinguishable from a scripted timeline message.
+    aui = FakeAui()
+    transport = AreTransport(FakeSimulation([aui]))
+    msg = Message(sender="user", content={"text": "Never mind, continue"}, received_at=0.0)
+    transport.submit(msg)
+    got = [m async for m in transport.receive()]
+    assert len(got) == 1
+    assert got[0].sender == "user"
+    assert got[0].content == {"text": "Never mind, continue"}

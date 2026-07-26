@@ -16,8 +16,8 @@ share (see the new ADR). The adapter's *workspace* owns start/stop (start on ``d
 ``close``), exactly as ``_McpWorkspace`` owns its subprocess. ``ARE`` (``are.simulation.*``) is an
 optional dependency-group, so every import of it is lazy; the adapter/transport depend only
 on a small duck-typed app/AUI interface (``app_name``/``get_tools``/``get_state`` and AUI
-``get_last_unread_messages``/``send_message_to_user``), which fakes satisfy, so S-ORA-side logic
-stays testable without ARE (see ADR-0003).
+``get_last_unread_messages``/``send_message_to_user``/``send_message_to_agent``), which fakes
+satisfy, so S-ORA-side logic stays testable without ARE (see ADR-0003).
 """
 
 from __future__ import annotations
@@ -405,13 +405,27 @@ class AreInProcessWorkspaceAdapter:
 class AreTransport:
     """``MessageTransport`` over the scenario's ``AgentUserInterface``. ``receive`` drains unread
     USER messages (the task + timeline follow-ups) as ``Message``s; ``send`` posts the agent's reply
-    via ``send_message_to_user``. Shares the running ``AreSimulation`` with the adapter."""
+    via ``send_message_to_user``; ``submit`` injects an ad hoc user message (a typed CLI line, a
+    ``/stop`` resume) via ``send_message_to_agent``, which surfaces on the next ``receive`` drain
+    like any timeline message. Shares the running ``AreSimulation`` with the adapter."""
 
     def __init__(self, simulation: Simulation) -> None:
         self._sim = simulation
         # Mirrors InProcessTransport.sent (an outbound log for tests/inspection) so a presentation
         # layer like TerminalSession can stream a reply the same way regardless of transport kind.
         self.sent: list[tuple[str, dict[str, Any]]] = []
+
+    def submit(self, message: Message) -> None:
+        # The user side of the AUI: a message *from* the user *to* the agent. Routed through
+        # sim.run (like send) so the write is registered on the Environment's own event loop, then
+        # picked up by the next receive() drain — same path as the scenario's timeline messages, so
+        # nothing downstream distinguishes an ad hoc line from a scripted one.
+        aui = self._sim.aui
+        if aui is None:
+            return
+        content = message.content
+        text = content.get("text", "") if isinstance(content, dict) else str(content)
+        self._sim.run(lambda: aui.send_message_to_agent(text))
 
     async def send(self, to: str, content: dict[str, Any]) -> None:
         aui = self._sim.aui

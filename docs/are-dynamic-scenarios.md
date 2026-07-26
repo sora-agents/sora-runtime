@@ -87,30 +87,36 @@ Lazy ARE imports throughout (the optional `are` dependency-group):
 ## Handling the dynamic change (example strategies, not runtime)
 
 The bridge only *surfaces* the mid-run change (a follow-up email); making the agent act on it is the
-application's job, done entirely through the pluggable phase strategies (no runtime change). The
-showcase ships two, in `examples/are/sim/email_calendar/strategies.py`, so the follow-up is handled regardless
-of when it lands relative to the original activity's life:
+application's job, done entirely through pluggable seams (no runtime change). The showcase drives
+reconsideration through a **hard interrupt** ([ADR-0020](adrs/0020-hard-interrupt-and-await-input.md)),
+in `examples/are/sim/email_calendar/strategies.py`, so the follow-up is handled regardless of when it
+lands relative to the original activity's life:
 
-* **`ReconcilingReasonStrategy`** — while the scheduling activity is still in flight, a **new inbound
-  email** invalidates its plan and **re-infers** from the now-updated observations. It calls
-  `procedural.infer` *directly* rather than nulling the plan and delegating: the activity already has
-  an in-flight plan, so `DefaultReasonStrategy` would take its cheap path and merely advance that
-  plan — re-inferring directly is what forces a fresh plan mid-flight.
-* **`CorrectiveSituateStrategy`** — if the email instead lands *after* the goal already completed
-  (an email is only observed state, and never spawns an activity the way a USER message does),
-  it spawns one fresh corrective activity so the agent still reconciles. Situate is already the
-  activity-creation phase; this just triggers on observed inbox state rather than a message.
+* **`MailDiffInterruptPolicy`** (an `InterruptPolicy`) — screens the `state_changed` signals the ARE
+  tools push, at push time. A genuinely new inbound email raises a hard interrupt
+  (`DecisionCycle.interrupt`), preempting the current phase. This is what makes reconsideration
+  *preemptive* rather than only at a cycle boundary.
+* **`ReconsiderInterruptHandler`** (the paired `InterruptHandler`) — on that interrupt, if the
+  scheduling activity is still in flight it **clears its plan** so the default, model-backed Reason
+  re-infers from the now-updated observations (nulling the plan forces a fresh inference, versus the
+  cheap advance-existing-plan path). If the email instead lands *after* the goal already completed
+  (no live activity — an email is only observed state, and never spawns an activity the way a USER
+  message does), it spawns one fresh corrective activity so the agent still reconciles. A user stop is
+  delegated to `DefaultInterruptHandler`. Reconsideration thus lives in *one* seam.
 
-**Why the trigger is inbound-email *content*, not "a signal arrived".** The obvious trigger — re-plan
+**Why the trigger is inbound-email *content*, not "a signal arrived".** The obvious trigger — preempt
 whenever a `state_changed` signal appears — **loops forever**: the agent writes to the very tool it
 watches (its reply), every write emits a `state_changed`, so it re-plans on its own action, replies
 again, and so on. (Signals are also never consumed from `WorkingMemory` — an ADR-0019 decision so one
 signal can satisfy multiple waiters — so a count-based trigger can't drain them either.) The fix keys
 on the set of **INBOX email ids**: a follow-up grows the inbox, while the agent's reply lands in SENT,
-so a self-write is structurally invisible to the trigger. This is example-level, ARE-email-shaped
-logic (`_inbound_email_ids` knows the `folders/INBOX/emails` shape). The general fix — efference /
-read-write tags so *any* self-caused change is filtered regardless of tool — is deferred alongside
-BDI-style commitment policies and hard-interrupt preemption.
+so a self-write is structurally invisible to the policy. This is example-level, ARE-email-shaped
+logic (`_inbox_ids_from_signal` knows the `folders/INBOX/emails` shape). It is also why the runtime
+default is `NeverInterruptPolicy` — with no general way yet to tell the agent's own writes from
+external events, preempting on a signal is opt-in. The general fix — efference / read-write tags so
+*any* self-caused change is filtered regardless of tool — is deferred alongside BDI-style commitment
+policies and an off-cycle ARE push (which would turn this Observe-cadence preemption into true
+mid-Reason abandonment).
 
 **Precondition: the plan must focus the tools it reconciles against** — the inbox *and* every tool
 whose state it changes (here the calendar). Observable properties are only snapshotted for a
@@ -124,13 +130,16 @@ plan step the base planner treats as optional, so `reconciling_plan_prompt` asks
 (Plan auto-caching is disabled runtime-wide — the default Reflect no longer stores completed plans —
 so each run infers fresh; there is no stale cached plan to clear between runs.)
 
-Exactly one path handles a given email (a shared `_SEEN_INBOUND` set on `activity.context` hands off
-between them without double-fixing). The "you may have already acted — inspect current state and
+Each new email is handled exactly once: the policy's own `_seen` id set dedups (each id fires one
+interrupt), and the handler then picks a single path — replan the live activity, or, if none is live,
+spawn one corrective activity. The "you may have already acted — inspect current state and
 undo/modify rather than duplicating" instruction is a commitment-aware
 **plan prompt** (`reconciling_plan_prompt`, wired via `agent.yaml`'s `procedural.plan_prompt`), *not*
 BDI-style commitment machinery (single-minded/open-minded reconsideration as a first-class pluggable
-policy) — that, and hard-interrupt preemption so the reaction is immediate rather than next-tick
-(the `DecisionCycle.interrupt()` item in ROADMAP.md), are deferred. The strategies are pinned by
+policy) — that is deferred. Hard-interrupt preemption itself is now *shipped*
+([ADR-0020](adrs/0020-hard-interrupt-and-await-input.md), the `DecisionCycle.interrupt()` item in
+ROADMAP.md); what remains deferred is only the *timing* — an off-cycle ARE push would turn today's
+Observe-cadence preemption into true mid-Reason abandonment. The policy and handler are pinned by
 deterministic fakes in `tests/test_are_sim_strategies.py`.
 
 ## What this buys
@@ -215,6 +224,8 @@ Four claims were checked directly against ARE's source (`environment.py`, `apps/
 
 * Depends on [ADR-0019](adrs/0019-blocked-state-machinery-and-percept-storage.md) (signal storage; a
   `send_message_to_user` ask-user maps onto `_suspend_`/`_resume_`).
+* Applies [ADR-0020](adrs/0020-hard-interrupt-and-await-input.md) (this scenario's reconsideration runs
+  through the hard-interrupt `InterruptPolicy`/`InterruptHandler` seams).
 * Applies [ADR-0013](adrs/0013-shared-instances-narrow-dependencies.md) (the opaque `simulation`
   injection keeps wiring centralized in bootstrap).
 * Applies [ADR-0012](adrs/0012-percepts-vs-messages.md) (USER messages stay on the transport, not the

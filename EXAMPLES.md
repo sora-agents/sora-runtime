@@ -127,15 +127,17 @@ That auto-caching is **currently disabled**, though: `ReflectStrategy` no longer
 
 ## ARE's dynamic events as reactive interrupts
 
-ARE scenarios can inject mid-scenario events — a follow-up email from Bob ("actually, can we push it to Tuesday?") arriving while the agent is mid-plan. In ARE's default ReAct agent this restarts the turn from scratch. In S-ORA:
+ARE scenarios can inject mid-scenario events — a follow-up email from Bob ("actually, can we push it to Tuesday?") arriving while the agent is mid-plan. In ARE's default ReAct agent this restarts the turn from scratch. In S-ORA, reconsideration is driven by a **hard interrupt** (`DecisionCycle.interrupt()`), screened at push time by a pluggable `InterruptPolicy` and routed by an `InterruptHandler` — see [ADR-0020](docs/adrs/0020-hard-interrupt-and-await-input.md):
 
 1. A scheduled ARE event injects a new email into the inbox.
 2. The runtime surfaces that state change as a `state_changed` signal — in the **in-process path** the focused tool's poll-on-observe diff catches it (the MCP path can only push `resource_updated` for the agent's *own* writes, not a background timeline injection — which is why the dynamic story runs in-process; see below).
-3. `DefaultObserveStrategy` delivers it as a signal `Percept(source="EmailClientApp", ...)` in `wm.signals`.
-4. `ReflectStrategy` sees the signal and marks the current activity's plan stale.
-5. The next `reason()` call re-derives a plan from the updated working memory — new target date, same shape — and execution resumes from step 2 (`get_calendar_events_from_to` with the corrected date).
+3. That signal is screened at push time by the configured `InterruptPolicy`. The showcase's `MailDiffInterruptPolicy` diffs the **INBOX email ids** carried in the signal payload against what it has already seen: a genuinely new inbound email raises a hard interrupt (`interrupt(Signal("new_inbound_email", ...))`), while the agent's own reply — which lands in SENT, not INBOX — never does (the structural self-write filter). The runtime default, `NeverInterruptPolicy`, would let the signal flow cooperatively instead.
+4. The pending interrupt preempts the current phase at the next checkpoint (or abandons an in-flight Reason call), and the `InterruptHandler` runs. The showcase's `ReconsiderInterruptHandler` **clears the in-flight activity's plan** so the (default, model-backed) Reason re-infers a fresh plan against the now-updated observations; if the change landed *after* the goal already completed (no live activity), it spawns one corrective activity.
+5. The next `reason()` call re-derives a plan from the updated working memory — new target date, same shape — and execution resumes from step 2 (`get_calendar_events_from_to` with the corrected date). Reconsideration thus lives in *one* seam (the interrupt handler), not split across bespoke Reason/Situate strategies.
 
-No tool call already in flight is lost: the `_suspend_` / `_resume_` mechanism from the robotic-arm example (below) applies here too, if a long-running ARE operation (e.g., waiting for a user to reply) needs to block the activity until the expected event arrives.
+No tool call already in flight is lost: an interrupt never abandons a dispatched external op (it runs to completion; the interrupt is honored at the next checkpoint after its ack resolves), and the `_suspend_` / `_resume_` mechanism from the robotic-arm example (below) applies here too, if a long-running ARE operation (e.g., waiting for a user to reply) needs to block the activity until the expected event arrives.
+
+Timing caveat: the ARE bridge emits `state_changed` from `tool.observe()`, i.e. *during* the Observe phase (Observe-cadence, for determinism), so for the ARE sim as-is this is largely a clean relocation of the reconsideration trigger into the interrupt seam rather than new timing capability — but it is the exact architecture a genuinely async signal source (a `/stop` user stop today; a future off-cycle ARE push) reuses to abandon an in-flight inference.
 
 ## Running dynamic scenarios in-process
 

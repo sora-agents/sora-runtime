@@ -18,13 +18,15 @@
 agent:
   name: are-sim-email-calendar
   strategies:
-    # Dynamic-scenario strategies: model-backed planning (the runtime default) plus handling a mid-run
-    # state change through the agent's own cycle — Reason re-infers an in-flight plan on a fresh
-    # signal; Situate spawns a corrective activity if the change lands after the goal already completed.
-    # Nothing here is scenario-specific. The static MCP showcase, which never emits signals, keeps the
-    # simpler ScheduleFromEmailStrategy.
-    reason: examples.are.sim.email_calendar.strategies.ReconcilingReasonStrategy
-    situate: examples.are.sim.email_calendar.strategies.CorrectiveSituateStrategy
+    # Dynamic-scenario reconsideration through a hard interrupt: the phase strategies stay the runtime
+    # defaults (model-backed planning, default selection), and a mid-run state change is handled by the
+    # interrupt seam instead — a new inbound email preempts the current phase, and the handler clears
+    # the in-flight plan (Reason re-infers) or spawns a corrective activity if the goal already
+    # completed. Nothing here is scenario-specific. The static MCP showcase, which never emits signals,
+    # keeps the simpler ScheduleFromEmailStrategy and needs neither seam.
+    reason: sora.strategies.DefaultReasonStrategy  # required; the model-backed default does the (re-)planning
+    interrupt_policy: examples.are.sim.email_calendar.strategies.MailDiffInterruptPolicy
+    interrupt: examples.are.sim.email_calendar.strategies.ReconsiderInterruptHandler
   memory:
     semantic: file://./.sora/are/sim/email_calendar/semantic
     procedural: file://./.sora/are/sim/email_calendar/procedural
