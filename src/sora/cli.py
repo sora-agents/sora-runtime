@@ -17,6 +17,7 @@ from sora.activity import ActivityState
 from sora.bootstrap import build_agent, import_object
 from sora.llm import LLMMeter
 from sora.perception import Message
+from sora.types import USER_STOP, Signal
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -26,7 +27,8 @@ log = logging.getLogger("sora.cli")
 
 _PHASES = ("observe", "situate", "reason", "reflect", "act")
 _CYCLE_BEGIN = re.compile(r"^\[cycle (\d+)\] begin$")
-_EXIT_COMMANDS = ("exit", "quit")
+_EXIT_COMMANDS = ("/exit", "/quit")
+_STOP_COMMAND = "/stop"  # reserved control: a hard interrupt (halt current work), not a Message
 
 
 @runtime_checkable
@@ -82,14 +84,14 @@ def _color_enabled(setting: bool | None) -> bool:
 # (it's not a real prompt-toolkit-style redraw), so it just reads as noise. Four variants, not one:
 # a transport that can't accept ad hoc input (e.g. AreTransport, driven by a scenario's own
 # timeline) shouldn't be told to "type a goal", and a session with --exit-when-idle shouldn't be
-# told its only way out is typing 'exit' when it will also stop on its own — either claim would be
+# told its only way out is typing '/exit' when it will also stop on its own — either claim would be
 # actively wrong, not just incomplete, for a headless `--scenario ... --exit-when-idle` run.
 _BANNER = (
     "+----------------------------------------------+\n"
     "| S-ORA -- minimal terminal interface          |\n"
     "|                                              |\n"
     "| Type a goal in plain English to delegate it. |\n"
-    "| Type 'exit' or 'quit' to quit.               |\n"
+    "| Type '/exit' or '/quit' to quit.             |\n"
     "+----------------------------------------------+"
 )
 _BANNER_IDLE_EXIT = (
@@ -97,7 +99,7 @@ _BANNER_IDLE_EXIT = (
     "| S-ORA -- minimal terminal interface          |\n"
     "|                                              |\n"
     "| Type a goal in plain English to delegate it. |\n"
-    "| Auto-exits once idle (or 'exit'/'quit').     |\n"
+    "| Auto-exits once idle (or '/exit', '/quit').  |\n"
     "+----------------------------------------------+"
 )
 _BANNER_NOT_SUBMITTABLE = (
@@ -105,7 +107,7 @@ _BANNER_NOT_SUBMITTABLE = (
     "| S-ORA -- minimal terminal interface          |\n"
     "|                                              |\n"
     "| Driven by the running scenario's timeline.   |\n"
-    "| Type 'exit' or 'quit' to stop watching.      |\n"
+    "| Type '/exit' or '/quit' to stop watching.    |\n"
     "+----------------------------------------------+"
 )
 _BANNER_NOT_SUBMITTABLE_IDLE_EXIT = (
@@ -384,6 +386,24 @@ class TerminalSession:
             if line.lower() in _EXIT_COMMANDS:
                 stop_reading.set()
                 return
+            if line.lower() == _STOP_COMMAND:
+                # Reserved authoritative control: raise a hard interrupt straight into the cycle
+                # (halt current work, stay alive), distinct from a typed line (a cooperative
+                # Message) and from Ctrl-D/exit (shutdown). Direct, not a queued Message, because
+                # a cooperative message would only be read at the next Observe and preempt nothing.
+                await self._agent.cycle.interrupt(Signal(USER_STOP, {}))
+                # Only promise a resume where there's actually a channel to resume through: a
+                # non-submittable transport has no way to accept the instruction, so halting there
+                # is terminal until '/exit'.
+                hint = (
+                    "type an instruction to resume"
+                    if self._submittable is not None
+                    else "no input channel to resume — '/exit' to stop watching"
+                )
+                console.line(
+                    _paint(f"(interrupt: halting current work — {hint})", _DIM, enabled=self._color)
+                )
+                continue
             if not line:
                 continue
             if self._submittable is None:
@@ -392,7 +412,7 @@ class TerminalSession:
                     console.line(
                         _paint(
                             "(this session's transport doesn't accept ad hoc input — it's driven "
-                            "by the running scenario; type 'exit' or Ctrl-D to stop watching)",
+                            "by the running scenario; type '/exit' or Ctrl-D to stop watching)",
                             _DIM,
                             enabled=self._color,
                         )

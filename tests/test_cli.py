@@ -45,7 +45,7 @@ from sora.strategies import (
     Strategies,
 )
 from sora.transport import InProcessTransport
-from sora.types import Plan, Step
+from sora.types import Plan, Signal, Step
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
 
@@ -160,8 +160,9 @@ class _NoOutboundLogTransport:
 
 
 class _SentOnlyTransport:
-    """Duck-types `AreTransport`'s shape: an outbound `.sent` log, but no `.submit()` — messages
-    arrive from elsewhere (a running scenario's own timeline), not ad hoc terminal input."""
+    """A presentable-but-not-submittable transport: an outbound `.sent` log, but no `.submit()` —
+    exercises TerminalSession's graceful degradation when ad hoc input has nowhere to go. (Both
+    shipped transports are now submittable; this stands in for a custom one that isn't.)"""
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, dict[str, object]]] = []
@@ -322,6 +323,46 @@ async def test_run_prints_the_banner_and_submits_stdin_lines_as_user_messages(
         await _stop(session, task, stdin)
 
 
+async def test_run_treats_slash_stop_as_a_hard_interrupt_not_a_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `/stop` is a reserved authoritative control: it must raise a hard interrupt straight into the
+    # cycle (halt current work), never be submitted as an ordinary user Message.
+    agent = _build_agent(tmp_path)
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    transport = agent.communication
+    assert isinstance(transport, InProcessTransport)
+    submitted: list[Message] = []
+    original_submit = transport.submit
+
+    def _spy_submit(message: Message) -> None:
+        submitted.append(message)
+        original_submit(message)
+
+    monkeypatch.setattr(transport, "submit", _spy_submit)
+
+    interrupts: list[Signal] = []
+    original_interrupt = agent.cycle.interrupt
+
+    async def _spy_interrupt(signal: Signal, *, target: str | None = None) -> None:
+        interrupts.append(signal)
+        await original_interrupt(signal, target=target)
+
+    monkeypatch.setattr(agent.cycle, "interrupt", _spy_interrupt)
+
+    session = TerminalSession(agent, poll_interval=0.0)
+    task = asyncio.create_task(session.run())
+    try:
+        stdin.push_line("/stop")
+        await _run_until(lambda: len(interrupts) == 1, task)
+        assert interrupts[0].name == "user_stop"
+        assert submitted == []  # never routed through the cooperative Message path
+    finally:
+        await _stop(session, task, stdin)
+
+
 async def test_run_streams_conversational_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -457,7 +498,7 @@ print("PROCESS_EXITING_CLEANLY", flush=True)
     assert "PROCESS_EXITING_CLEANLY" in stdout, stdout
 
 
-@pytest.mark.parametrize("command", ["exit", "quit", "EXIT", "Quit"])
+@pytest.mark.parametrize("command", ["/exit", "/quit", "/EXIT", "/Quit"])
 async def test_run_exits_cleanly_on_typed_exit_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
 ) -> None:
@@ -572,7 +613,7 @@ async def test_run_exits_via_typed_exit_even_without_submit_support(
 
     session = TerminalSession(agent, poll_interval=0.0)
     task = asyncio.create_task(session.run())
-    stdin.push_line("exit")
+    stdin.push_line("/exit")
     await asyncio.wait_for(task, timeout=2)
     assert task.exception() is None
 
@@ -620,7 +661,7 @@ async def test_banner_reflects_headless_scenario_driven_session(
 
     out = capsys.readouterr().out
     assert "Type a goal in plain English" not in out
-    assert "Type 'exit' or 'quit' to quit" not in out
+    assert "Type '/exit' or '/quit' to quit" not in out
     assert "Driven by the running scenario's timeline." in out
     assert "Exits automatically once idle." in out
 
@@ -648,7 +689,7 @@ async def test_exit_when_idle_resets_while_activities_are_still_live(
         # A RUNNING activity never reaches TERMINATED on its own, so stdin EOF (which
         # `--exit-when-idle` deliberately ignores — see `_read_stdin`) won't stop this session;
         # only an explicit typed command does.
-        stdin.push_line("exit")
+        stdin.push_line("/exit")
         await asyncio.wait_for(task, timeout=2)
 
 
