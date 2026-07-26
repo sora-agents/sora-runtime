@@ -76,6 +76,7 @@ General habits, not tied to one file — the kind of thing that's easy to reintr
 | `Agent`/`DecisionCycle` construction or wiring | [0013](docs/adrs/0013-shared-instances-narrow-dependencies.md) |
 | `WorkingMemory` / the Observe phase | [0012](docs/adrs/0012-percepts-vs-messages.md), [0019](docs/adrs/0019-blocked-state-machinery-and-percept-storage.md) |
 | Blocked state (`_suspend_`/`_resume_`), signal storage/eviction, `completion_signal` | [0019](docs/adrs/0019-blocked-state-machinery-and-percept-storage.md) |
+| Hard interrupt (`interrupt()`, `InterruptHandler`/`InterruptPolicy`, `InputWait`, phase-boundary checkpoints, mid-flight model abandonment) | [0020](docs/adrs/0020-hard-interrupt-and-await-input.md) |
 | Workspace/tool discovery, join/leave | [0005](docs/adrs/0005-workspace-grouping.md), [0006](docs/adrs/0006-workspace-join-leave-lifecycle.md), [0007](docs/adrs/0007-manual-record-separation.md) |
 | Phase strategies / `TickResult` | [0010](docs/adrs/0010-pluggable-phase-strategies.md), [0011](docs/adrs/0011-phase-fusion-via-threaded-result.md) |
 | Manual vs protocol binding; what an adapter extracts vs. authors | [0015](docs/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md), [0003](docs/adrs/0003-adapters-not-tool-authoring.md), [0007](docs/adrs/0007-manual-record-separation.md) |

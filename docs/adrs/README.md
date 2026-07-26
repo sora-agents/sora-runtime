@@ -34,7 +34,8 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0017](0017-parameter-grounding-in-reason.md) | Parameter grounding is a Reason decision (references + escalation); Act stays mechanistic | proposed | Decision cycle |
 | [0018](0018-manual-merge-policy-and-authored-interface.md) | Manual merge policy (adapter owns interface, author owns prose) + optional names-level authored interface | proposed | Tool & workspace model |
 | [0019](0019-blocked-state-machinery-and-percept-storage.md) | Blocked-state machinery: mechanical Observe-hosted suspend/resume + split percept storage | proposed | Decision cycle |
+| [0020](0020-hard-interrupt-and-await-input.md) | Hard-interrupt path: process-scheduling preemption, await-input, and a push-time InterruptPolicy seam | proposed | Decision cycle |
 
 ## Planned
 
-None currently pending — 19 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
+None currently pending — 20 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).

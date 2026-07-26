@@ -7,7 +7,14 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from sora.types import CompletedOperation, OperationAck, PendingOperation, Plan, SignalWait
+    from sora.types import (
+        CompletedOperation,
+        InputWait,
+        OperationAck,
+        PendingOperation,
+        Plan,
+        SignalWait,
+    )
 
 
 class ActivityState(Enum):
@@ -27,11 +34,14 @@ class Activity:
     step_index: int = 0
     pending_operation: PendingOperation | None = None  # set while RUNNING; cleared on resolve
     last_operation: OperationAck | None = None  # most recently resolved result, for Reason to read
-    # set while BLOCKED; the specific signal the activity waits for before returning to READY. Set
-    # by _suspend_, cleared by _resume_. Orthogonal to pending_operation: RUNNING waits on an
-    # operation result (automatic 1:1 resolve), BLOCKED waits on a declared signal (matched in
-    # Observe).
-    blocked_on: SignalWait | None = None
+    # set while BLOCKED; what the activity waits for before returning to READY. Orthogonal to
+    # pending_operation: RUNNING waits on an operation result (automatic 1:1 resolve), BLOCKED waits
+    # on one of two declared things. A SignalWait — a manual-declared completion signal, set by
+    # _suspend_ and cleared by _resume_, matched in Observe. Or an InputWait — the user's next
+    # instruction, set by the interrupt handler when a hard interrupt pauses it, cleared in
+    # Observe when a user Message arrives. Named generally (not blocked_on_signal) to admit
+    # this second variant.
+    blocked_on: SignalWait | InputWait | None = None
     # Append-only trace of resolved operations this activity ran — a later step grounds its params
     # against it (last_operation keeps only the newest, overwritten each step). Transient:
     # not persisted, and episodic learn() captures selectively, not a blind asdict(activity).

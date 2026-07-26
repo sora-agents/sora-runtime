@@ -45,6 +45,11 @@ _DEFAULT_STRATEGIES = {
     "reflect": "sora.strategies.DefaultReflectStrategy",
     "situate": "sora.strategies.DefaultSituateStrategy",
     "act": "sora.strategies.DefaultActStrategy",
+    # The two hard-interrupt seams — selectable like the phase strategies, but not part of the
+    # five-phase Strategies bundle. interrupt = the follow-up handler (default: user stop pauses to
+    # await input); interrupt_policy = which pushed signals preempt (default: none).
+    "interrupt": "sora.strategies.DefaultInterruptHandler",
+    "interrupt_policy": "sora.strategies.NeverInterruptPolicy",
 }
 _DEFAULT_LLM_CLIENT = "sora.adapters.anthropic_llm.AnthropicLLMClient"
 
@@ -331,6 +336,12 @@ def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
         semantic=semantic,
         procedural=procedural,
         episodic=episodic,
+        interrupt_handler=import_object(
+            config.strategies.get("interrupt", _DEFAULT_STRATEGIES["interrupt"])
+        )(),
+        interrupt_policy=import_object(
+            config.strategies.get("interrupt_policy", _DEFAULT_STRATEGIES["interrupt_policy"])
+        )(),
     )
     return Agent(
         cycle=cycle,

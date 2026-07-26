@@ -186,7 +186,7 @@ Every phase has a pluggable strategy. A strategy may short-circuit later phases 
     | S-ORA -- minimal terminal interface          |
     |                                              |
     | Type a goal in plain English to delegate it. |
-    | Type 'exit' or 'quit' to quit.               |
+    | Type '/exit' or '/quit' to quit.             |
     +----------------------------------------------+
     what time is it?
     [invoking clock.get_time...]
@@ -404,6 +404,27 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         # property update") — deferred; hence Activity.blocked_on is named generally, not blocked_on_signal.
 
     @dataclass(frozen=True)
+    class InputWait:          # the second blocked_on variant SignalWait foresaw — see Activity.blocked_on
+        prompt: str | None = None  # optional human-facing note on what's awaited
+        # A `blocked` activity awaiting the user's next instruction, set by the interrupt handler when a
+        # hard interrupt (a user stop) pauses it; cleared in Observe when a user Message arrives (not a
+        # tool signal to match — the awaited stimulus is inbound user input). See ADR-0020.
+
+    @dataclass(frozen=True)
+    class InterruptRequest:   # a pending hard interrupt, recorded on DecisionCycle by interrupt()
+        signal: Signal        # the "why" the interrupt handler reads to route each targeted activity
+        target: str | None = None  # activity id to preempt; None = agent-wide (every schedulable activity)
+        # A pushed signal only becomes an InterruptRequest through an InterruptPolicy; an ordinary signal
+        # that merely matches a wait resumes cooperatively in Observe, never here. See ADR-0020.
+
+    class Abandoned:          # singleton sentinel; the value is ABANDONED (compared via isinstance)
+        # Returned by DecisionCycle.abandon_on_interrupt when a raced model call was dropped mid-flight by
+        # a hard interrupt (it finishes in the background, result discarded). The caller checks for it and
+        # bails *before* applying the mutation the result would have driven — the stale-plan guard. ADR-0020.
+        __slots__ = ()
+    ABANDONED = Abandoned()
+
+    @dataclass(frozen=True)
     class ActionAck:          # returned by ExternalAction.execute() — dispatch, not outcome (see EXAMPLES.md)
         ok: bool
         result: Any = None
@@ -552,7 +573,11 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         both are, structurally, queues of asynchronous notifications awaiting delivery as percepts."""
         def __init__(self) -> None:
             self._queue: asyncio.Queue[tuple[str, T]] = asyncio.Queue()
-        def push(self, source: str, item: T) -> None: ...
+            # Optional synchronous screen, invoked on every push *before* enqueue. The cycle wires this on
+            # its signal_sink so an InterruptPolicy can turn a just-pushed signal into a hard interrupt the
+            # instant it arrives (before the once-per-cycle drain). Left None on result_sink and elsewhere.
+            self.on_push: Callable[[str, T], None] | None = None
+        def push(self, source: str, item: T) -> None: ...   # calls on_push (if set), then enqueues
         async def drain(self) -> AsyncIterator[tuple[str, T]]: ...
 
     # sora/manual.py
@@ -648,8 +673,11 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         step_index: int = 0
         pending_operation: PendingOperation | None = None  # set while RUNNING; runtime clears it on resolve
         last_operation: OperationAck | None = None          # most recently resolved result, for Reason to read
-        blocked_on: SignalWait | None = None                # set while BLOCKED; the signal awaited before READY
-        #                                                     (set by _suspend_, cleared by _resume_) — see below
+        blocked_on: SignalWait | InputWait | None = None    # set while BLOCKED; what's awaited before READY —
+        #                                                     a SignalWait (tool completion signal; set by
+        #                                                     _suspend_, cleared by _resume_ — see below) or an
+        #                                                     InputWait (user's next instruction after a hard
+        #                                                     interrupt; cleared in Observe on a user Message)
         history: list[CompletedOperation] = []              # append-only trace of resolved ops — a later step
         #                                                     grounds param references against it (see Reason
         #                                                     grounding); last_operation keeps only the newest
@@ -1057,6 +1085,45 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         situate: SituateStrategy
         reason: ReasonStrategy
         act: ActStrategy
+    # The two hard-interrupt seams are deliberately NOT in this bundle (which is the decision chain).
+    # They're separate DecisionCycle params, selected via agent.yaml strategies.interrupt /
+    # strategies.interrupt_policy — mechanism and policy for preemption, not a per-phase strategy. See ADR-0020.
+
+    class InterruptPolicy(Protocol):   # decides which pushed signals preempt — consulted at push time
+        def decide(self, source: str, signal: Signal, wm: WorkingMemory) -> InterruptRequest | None:
+            """Consulted synchronously the instant a signal is pushed to signal_sink (via on_push), before
+            the once-per-cycle Observe drain. Return an InterruptRequest to preempt the current phase, or
+            None to let the signal flow cooperatively (reacted to at the next cycle boundary). Sync because
+            push is sync. A stateful policy may diff the signal against remembered state (e.g. a set of
+            inbox ids) to fire only on a genuine external event and filter the agent's own writes — the
+            only distinguishable-external test until read-write/efference tagging lands."""
+
+    class NeverInterruptPolicy:        # the runtime default: no pushed signal ever preempts
+        """Preserves today's cooperative signal path unchanged (drained in Observe, resumes a BLOCKED
+        activity). With no runtime way yet to tell the agent's own writes from external events, preempting
+        on a signal would risk a self-write loop; opting in is a deliberate, application-supplied policy."""
+        def decide(self, source: str, signal: Signal, wm: WorkingMemory) -> InterruptRequest | None: ...
+
+    class InterruptHandler(Protocol):  # decides an interrupted activity's follow-up — the "interrupt handler"
+        async def handle(self, request: InterruptRequest, wm: WorkingMemory, cycle: DecisionCycle) -> bool:
+            """Runs after tick() aborts on a pending interrupt (the process-scheduling 'interrupt handler').
+            Context is already saved (durable on Activity; the per-tick TickResult was discarded, immune to
+            interrupt staleness per ADR-0011), so this only decides the follow-up: map each targeted activity
+            onto an existing state — READY (resume, or replan by clearing plan/step_index), BLOCKED via
+            InputWait (await the user's next instruction), or TERMINATED (drop) — then the
+            ActivitySelectionStrategy picks next. Never abandons an in-flight *external* op: a RUNNING
+            activity is left RUNNING and revisited at the next checkpoint once its ack resolves. Returns True
+            once every targeted activity is routed (request discharged), False while some are still RUNNING."""
+
+    class DefaultInterruptHandler:     # the runtime default: a user stop pauses to await input
+        """Pauses each targeted, schedulable (READY) activity to a resumable point via an InputWait, so the
+        agent halts current work but stays alive; a later user Message resumes it (DefaultObserveStrategy's
+        _resume_on_input). A RUNNING activity (mid external op) is left to finish and routed on a later
+        checkpoint, so a physical side effect always runs to completion. target=None is agent-wide. It is a
+        user-stop handler, not a general router: it recognizes only the USER_STOP signal and treats any
+        other interrupt as unrouted — same halt-to-await-input fallback, logged at warning level, since a
+        custom InterruptPolicy is expected to ship a paired handler for its own signals (ADR-0020)."""
+        async def handle(self, request: InterruptRequest, wm: WorkingMemory, cycle: DecisionCycle) -> bool: ...
 
     class DefaultObserveStrategy:
         """The runtime's built-in default — purely mechanical, no LLM. This is the exact logic
@@ -1075,7 +1142,9 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
                 # Percept, no strategy involved. The *blocked* wait is layered on top below, not fused.
                 activity = next((a for a in cycle.working.activities.values()
                                   if a.pending_operation and a.pending_operation.id == op_id), None)
-                if activity is not None:
+                if activity is not None and activity.state is ActivityState.RUNNING:  # RUNNING guard: a late
+                    #  ack for an activity a hard interrupt already routed away (paused/dropped) must not
+                    #  resurrect it — the op finishes, but its resolve doesn't force a spurious READY
                     invocation = activity.pending_operation.invocation
                     activity.last_operation = ack
                     activity.pending_operation = None
@@ -1087,11 +1156,13 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             # returns to READY; the matched signal is left in place, not evicted. Both mechanical (name
             # equality), via the _suspend_ / _resume_ internal actions — no judgment needed.
             self._suspend_on_completion_signal(cycle, just_resolved)
-            self._resume_on_signal(cycle)
+            self._resume_on_signal(cycle)          # only a SignalWait — matched against observed signals
             if len(cycle.working.signals) > _SIGNAL_RETENTION:     # trim last: today's signal must
                 del cycle.working.signals[:-_SIGNAL_RETENTION]     # survive to be matched above first
             async for message in cycle.communication.receive():
                 cycle.working.messages.append(message)
+            self._resume_on_input(cycle.working)   # an InputWait (hard-interrupt pause) is satisfied by a
+            #                                        user Message, not a signal — resumed here, not above
             return TickResult()
 
     # DefaultReflectStrategy / DefaultSituateStrategy / DefaultActStrategy: the mechanical, no-LLM
@@ -1108,7 +1179,10 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         Reuse is currently always a miss — the default Reflect no longer stores completed plans
         (verbatim replay is unsound), so every activity infers until reusable procedures are distilled
         from episodes; an
-        exhausted plan yields no step. Wired in by bootstrap as sora.reason.default."""
+        exhausted plan yields no step. Wired in by bootstrap as sora.reason.default. Both model calls
+        (infer, and the grounding escalation) go through cycle.abandon_on_interrupt, and each mutation
+        (activity.plan/step_index) is guarded on a non-ABANDONED result, so a mid-inference hard
+        interrupt abandons the call and lands no stale plan (ADR-0020)."""
         async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
                          result: TickResult) -> TickResult: ...
 
@@ -1131,7 +1205,9 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         multi-agent case."""
         def submit(self, message: Message) -> None: ...
     # AreTransport (sora/adapters/are_sim.py) is a second MessageTransport: over a running ARE
-    # scenario's AgentUserInterface — receive() drains unread USER messages, send() -> send_message_to_user.
+    # scenario's AgentUserInterface — receive() drains unread USER messages, send() -> send_message_to_user,
+    # submit() -> send_message_to_agent (an ad hoc user line surfaces on the next receive() drain, so a
+    # scenario-driven session accepts typed input and a /stop resume like the in-process one).
     # Selected by transport.kind: are; shares the AreSimulation with the are-sim workspace. See EXAMPLES.md.
 
     # sora/cycle.py
@@ -1139,10 +1215,17 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         def __init__(self, strategies: Strategies, communication: MessageTransport,
                      actions: ActionRegistry, registry: EnvironmentRegistry,
                      working: WorkingMemory, semantic: SemanticMemory,
-                     procedural: ProceduralMemory, episodic: EpisodicMemory):
+                     procedural: ProceduralMemory, episodic: EpisodicMemory,
+                     interrupt_handler: InterruptHandler | None = None,      # default DefaultInterruptHandler
+                     interrupt_policy: InterruptPolicy | None = None):       # default NeverInterruptPolicy
             self.registry = registry   # the shared, mutation-capable handle, passed to external
             #                            actions at dispatch; WorkingMemory holds the same instance
             #                            read-only (as EnvironmentView) for strategies to reason over.
+            # The two hard-interrupt seams (ADR-0020): interrupt_handler decides an interrupted activity's
+            # next state (default: a user stop pauses it to await input); interrupt_policy screens pushed
+            # signals for ones that should preempt (default: none do — the cooperative path is unchanged).
+            self.interrupt_handler = interrupt_handler or DefaultInterruptHandler()
+            self.interrupt_policy = interrupt_policy or NeverInterruptPolicy()
             # Both sinks live here rather than on WorkingMemory: they're the bridge from
             # asynchronous, off-cycle events into this engine's tick()/interrupt() — not settled
             # state. signal_sink specifically has to be co-located with interrupt() below, since
@@ -1150,28 +1233,74 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             # it eventually lands as a percept," is why it isn't a WorkingMemory field.
             self.signal_sink: NotificationQueueSink[Signal] = NotificationQueueSink()        # tools push here via focus()
             self.result_sink: NotificationQueueSink[OperationAck] = NotificationQueueSink()  # InvokeAction pushes here — internal only
-            ...
+            self.signal_sink.on_push = self._screen_signal   # screen every signal at push time (below)
+            self._interrupt: InterruptRequest | None = None  # a pending hard interrupt (None when idle)
+            self._wake = asyncio.Event()                     # edge that wakes a waiting cycle; set with _interrupt
+            self._abandoned: set[asyncio.Task] = set()       # Reason calls dropped mid-flight; kept referenced
+            ...                                              #   so they finish in background, result discarded
         async def tick(self) -> None:
             """One Observe -> Reflect -> Situate -> Reason -> Act pass, threading a TickResult through
             all five phases and calling each phase's own strategy only for whatever's still missing —
             so a fully-fused Observe (or Reflect) call can skip the rest of the cycle entirely. Takes
             no arguments: registry/working/semantic/procedural/episodic/communication are all shared
             with Agent, constructed once and passed to both — see sora/bootstrap.py. (Dispatch uses
-            self.registry — the mutation-capable handle — not working.registry, which is read-only.)"""
+            self.registry — the mutation-capable handle — not working.registry, which is read-only.)
+            A phase-boundary checkpoint (_preempted) after each phase aborts the tick on a pending hard
+            interrupt: the disposable TickResult is dropped (no staleness, ADR-0011) and Act — the cycle's
+            single external action — is never reached, so an interrupted tick commits nothing external."""
             result = await self.strategies.observe.observe(self)
+            if await self._preempted(): return
             for activity in self.working.activities.values():
                 result = await self.strategies.reflect.reflect(activity, self.working, self, result)
+            if await self._preempted(): return
             # Situate always runs: it re-situates wm for the (possibly already-selected) activity every
             # cycle, and selects only if result.activity is still None. Unlike the step/invocation gates
             # below — genuine forward-fusion short-circuits — Situate is not gated on its own field.
             ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
             result = await self.strategies.situate.situate(ready, self.working, self, result)
+            if await self._preempted(): return
             if result.activity is None:
                 return               # nothing selectable this cycle — at most one action, never a mandatory one
             if result.step is None:
+                # Reason (the default) races its own model calls via abandon_on_interrupt below, so a
+                # mid-inference stop returns here to be caught by the checkpoint rather than blocking.
                 result = await self.strategies.reason.reason(result.activity, self.working, self, result)
+                if await self._preempted(): return
             if result.step is not None:
                 await self._act(result.activity, result.step, result)   # bind-then-dispatch boundary
+
+        async def _preempted(self) -> bool:
+            """Phase-boundary checkpoint. No interrupt pending -> False, tick continues. Otherwise run the
+            handler (routes each targeted activity onto an existing state) and return True to abort the tick.
+            The request clears only once the handler reports it discharged; while a targeted activity is still
+            RUNNING (external op in flight, left to finish) it stays pending, revisited next checkpoint."""
+            if self._interrupt is None: return False
+            if await self.interrupt_handler.handle(self._interrupt, self.working, self):
+                self._interrupt = None
+            return True
+
+        async def abandon_on_interrupt(self, call: Coroutine[Any, Any, T]) -> T | Abandoned:
+            """Race a *side-effect-free* model call against the wake edge, so a hard interrupt mid-inference
+            doesn't block the cycle on the model. Normal completion -> the call's result. Interrupt ->
+            abandon the in-flight call (an LLM call can't be cut mid-generation; it finishes in background,
+            result discarded via self._abandoned) and return ABANDONED, so the caller bails *before* applying
+            the state mutation the result would have driven — the guard that stops an abandoned call from
+            writing a stale plan onto an activity the interrupt handler has since re-routed. Only for pure
+            work: Reason's model calls go through here; Observe/Situate/Act (which mutate as they run) do not,
+            so a phase that model-calls without it just gets checkpoint-after granularity. See ADR-0020."""
+
+        def _screen_signal(self, source: str, signal: Signal) -> None:
+            """signal_sink.on_push: consulted synchronously as each signal is pushed, before the cooperative
+            Observe drain. If the InterruptPolicy elects to preempt, record the request and wake the cycle;
+            otherwise the signal just flows to the drain as before (both paths coexist)."""
+            request = self.interrupt_policy.decide(source, signal, self.working)
+            if request is not None:
+                self._interrupt = request; self._wake.set()
+
+        async def wait_between_ticks(self, interval: float) -> None:
+            """Interruptible idle wait between ticks: sleep up to `interval` but wake immediately if
+            interrupt() (or a signal policy) fired — so a hard interrupt starts the next tick without
+            waiting out the interval — instead of a bare asyncio.sleep. The edge is consumed (cleared) here."""
 
         async def _act(self, selected: Activity, step: Step, result: TickResult) -> None:
             """WAIT is the cycle's no-op sentinel — guarded first, before the registry lookup that
@@ -1190,8 +1319,14 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             # dispatch result.invocation (if set) or step.params to `action` via action.execute,
             # always passing activity_id=selected.id — elided, same as the rest of Act's dispatch today
             ...
-        async def interrupt(self, signal: Signal) -> None:
-            """Preempts the current phase for a high-priority event (10ms target)."""
+        async def interrupt(self, signal: Signal, *, target: str | None = None) -> None:
+            """Raise a hard interrupt: preempt the current phase for an authoritative event (10ms target).
+            Records an InterruptRequest(signal, target) and wakes the loop; the next phase-boundary
+            checkpoint (or the raced Reason call, mid-inference) runs the handler and aborts the tick.
+            `signal` is the "why" the handler reads; `target` names one activity, None = agent-wide. The
+            one wired caller is a user stop from the CLI (/stop) — distinct from Agent.stop()/Ctrl-C
+            (graceful shutdown). A cooperative signal that merely matches a wait resumes in Observe and
+            never comes here; an InterruptPolicy promotes a pushed signal to this path. See ADR-0020."""
 
     class Agent:
         """Owns the pieces that are conceptually the agent's own — tools, memory, transport — built
@@ -1205,14 +1340,19 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             """Join the configured workspaces once at startup (through the _join_ action, so records/
             manuals persist and the tools are already available on the first cycle — README's
             'joined automatically at startup'), then loop await self.cycle.tick() until stop(),
-            leaving the workspaces finally. The join lives here, not in the synchronous
-            bootstrap, because it is async I/O."""
+            each iteration ending in await self.cycle.wait_between_ticks(tick_interval) — an
+            interruptible idle wait, so a hard interrupt (user stop, or a signal a policy preempts on)
+            starts the next tick at once — leaving the workspaces finally. The join lives here, not in the
+            synchronous bootstrap, because it is async I/O."""
         async def stop(self) -> None: ...
 
     # sora/cli.py — the runtime's minimal terminal interface
     class TerminalSession:
         """Streams cycle output to stdout; queues stdin as Message(sender="user", ...) — not a Percept,
-        since terminal input is user communication, not environment stimuli. No UI beyond this."""
+        since terminal input is user communication, not environment stimuli. The reserved line `/stop` is
+        the exception: it calls cycle.interrupt(Signal("user_stop", {})) directly (a hard interrupt —
+        halt current work, stay alive, resume on the next instruction), distinct from Ctrl-C
+        (Agent.stop(), graceful shutdown). No UI beyond this."""
         def __init__(self, agent: Agent, verbose: bool = False): ...
         async def run(self) -> None: ...
 
@@ -1231,8 +1371,9 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
 
     # _SubmittableTransport (private, sora/cli.py): a runtime_checkable Protocol requiring a
     # `submit(Message)` method — the narrower capability of accepting ad hoc input (--task/
-    # --task-file, typed stdin lines), which InProcessTransport has and AreTransport doesn't. Not
-    # part of the public API.
+    # --task-file, typed stdin lines, a /stop resume), which both InProcessTransport and AreTransport
+    # have. A custom presentable-but-not-submittable transport still degrades gracefully (no goal
+    # prompt, /stop can't promise a resume). Not part of the public API.
 
     # sora/scaffold.py — `sora init`'s file generator
     def write_project(project_dir: Path) -> None:

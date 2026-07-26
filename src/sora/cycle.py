@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from sora.action import JoinAction
 from sora.activity import ActivityState
 from sora.perception import NotificationQueueSink
-from sora.types import TOOL_ID, WAIT
+from sora.strategies import DefaultInterruptHandler, NeverInterruptPolicy
+from sora.types import ABANDONED, TOOL_ID, WAIT, Abandoned, InterruptRequest
 
 log = logging.getLogger("sora.cycle")
 
+T = TypeVar("T")
+
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from sora.action import ActionRegistry
     from sora.activity import Activity
     from sora.environment import EnvironmentRegistry
     from sora.memory import EpisodicMemory, ProceduralMemory, SemanticMemory, WorkingMemory
-    from sora.strategies import Strategies, TickResult
+    from sora.strategies import InterruptHandler, InterruptPolicy, Strategies, TickResult
     from sora.transport import MessageTransport
     from sora.types import OperationAck, Signal, Step
 
@@ -34,10 +40,19 @@ class DecisionCycle:
         semantic: SemanticMemory,
         procedural: ProceduralMemory,
         episodic: EpisodicMemory,
+        interrupt_handler: InterruptHandler | None = None,
+        interrupt_policy: InterruptPolicy | None = None,
     ) -> None:
         self.strategies = strategies
         self.communication = communication
         self.actions = actions
+        # The two hard-interrupt seams. interrupt_handler decides an interrupted activity's next
+        # state (default: a user stop pauses it to await input); interrupt_policy screens pushed
+        # signals for ones that should preempt the current phase (default: none do — the cooperative
+        # signal path is unchanged). Both default so existing construction sites (and single-agent
+        # bootstraps that never set them) keep working.
+        self.interrupt_handler: InterruptHandler = interrupt_handler or DefaultInterruptHandler()
+        self.interrupt_policy: InterruptPolicy = interrupt_policy or NeverInterruptPolicy()
         # The mutation-capable handle, passed to external actions at dispatch. WorkingMemory holds
         # this same shared instance read-only (as EnvironmentView) for strategies to reason over.
         self.registry = registry
@@ -52,6 +67,19 @@ class DecisionCycle:
         # eventually lands as a percept," is why it isn't a WorkingMemory field.
         self.signal_sink: NotificationQueueSink[Signal] = NotificationQueueSink()
         self.result_sink: NotificationQueueSink[OperationAck] = NotificationQueueSink()
+        # Screen every signal at push time (before the cooperative Observe drain) so an
+        # InterruptPolicy can raise a hard interrupt the instant a qualifying signal arrives. Only
+        # signal_sink gets the hook; result_sink stays plain enqueue-only.
+        self.signal_sink.on_push = self._screen_signal
+        # A pending hard interrupt (None when idle) and the edge that wakes a waiting cycle.
+        # Set together by interrupt()/_screen_signal; the request clears once the handler routes
+        # it, the wake edge is consumed by wait_between_ticks. See interrupt() / _preempted().
+        self._interrupt: InterruptRequest | None = None
+        self._wake = asyncio.Event()
+        # Model calls abandoned mid-flight by an interrupt (via abandon_on_interrupt): kept
+        # referenced so they finish in background (an LLM call can't be cut mid-generation; we just
+        # discard the result) without asyncio warning about an orphaned task.
+        self._abandoned: set[asyncio.Task[Any]] = set()
         # Monotonic count of ticks run, for observability (the README's `[cycle N]` trace). Read via
         # cycle_count; a richer per-phase presenter (the --verbose CLI) is deferred to CLI polish.
         self._cycle_count = 0
@@ -70,22 +98,99 @@ class DecisionCycle:
         self._cycle_count += 1
         log.debug("[cycle %d] begin", self._cycle_count)
         result = await self.strategies.observe.observe(self)
+        # Checkpoint after every phase boundary: if a hard interrupt is pending (raised by
+        # interrupt() or an InterruptPolicy screening a pushed signal), run the handler and abort
+        # rest of this tick. The abandoned TickResult carries no staleness — it never outlives one
+        # tick() (ADR-0011) — and Act (the cycle's single external action) is never reached, so an
+        # interrupted tick commits nothing external. Reason's model calls are the one unbounded-
+        # latency phase; the default Reason races them against the interrupt itself (via
+        # abandon_on_interrupt), so a mid-inference stop returns here to be caught by the checkpoint
+        # below rather than blocking the tick.
+        if await self._preempted():
+            return
         for activity in list(self.working.activities.values()):
             result = await self.strategies.reflect.reflect(activity, self.working, self, result)
+        if await self._preempted():
+            return
         # Situate always runs: it re-adjusts wm for the (possibly already-selected) activity every
         # cycle, and selects only if result.activity is still None. Unlike the step/invocation gates
         # below — genuine forward-fusion short-circuits — Situate is not gated on its own field.
         ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
         result = await self.strategies.situate.situate(ready, self.working, self, result)
+        if await self._preempted():
+            return
         selected = result.activity
         if selected is None:
             return  # nothing selectable this cycle — at most one action, never a mandatory one
         if result.step is None:
             result = await self.strategies.reason.reason(selected, self.working, self, result)
+            if await self._preempted():
+                return
         step = result.step
         if step is None:
             return
         await self._act(selected, step, result)
+
+    async def _preempted(self) -> bool:
+        """A phase-boundary checkpoint. If no interrupt is pending, return False and let the tick
+        continue. Otherwise run the handler — which routes each targeted activity onto an existing
+        state (the saved-context / interrupt-handler / reschedule shape) — and return True so the
+        caller aborts this tick. The request is cleared only once the handler reports it fully
+        discharged; while some targeted activity is still RUNNING (an external op in flight, left to
+        finish) it stays pending and is revisited on the next checkpoint after that op resolves."""
+        if self._interrupt is None:
+            return False
+        discharged = await self.interrupt_handler.handle(self._interrupt, self.working, self)
+        if discharged:
+            self._interrupt = None
+        return True
+
+    async def abandon_on_interrupt(self, call: Coroutine[Any, Any, T]) -> T | Abandoned:
+        """Race a *side-effect-free* model call against the interrupt wake edge, so a hard interrupt
+        arriving mid-inference doesn't block the cycle waiting on the model. On normal completion,
+        return the call's result. On an interrupt, abandon the in-flight call — an LLM call can't
+        be cut mid-generation, so it finishes in the background and its result is discarded — and
+        return the ABANDONED sentinel, so the caller can bail *before* applying the state mutation
+        the result would have driven (that guard stops an abandoned call from writing a stale plan
+        onto an activity the interrupt handler has since re-routed). The checkpoint after the
+        calling phase then sees the pending interrupt and aborts the tick.
+
+        Only for work that mutates no durable state (Activity/WorkingMemory/external): the caller
+        guarantees the coroutine is pure so discarding it is safe. That is why Reason's model calls
+        go through here but Observe/Situate/Act — which mutate as they run — do not; a phase that
+        model-calls without this helper just gets checkpoint-after granularity (ADR-0020)."""
+        task: asyncio.Task[T] = asyncio.ensure_future(call)
+        wake_task = asyncio.ensure_future(self._wake.wait())
+        try:
+            await asyncio.wait({task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            wake_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wake_task
+        if task.done() and not task.cancelled():
+            return task.result()
+        self._abandoned.add(task)
+        task.add_done_callback(self._abandoned.discard)
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return ABANDONED
+
+    def _screen_signal(self, source: str, signal: Signal) -> None:
+        """signal_sink.on_push: consulted synchronously as each signal is pushed, before the
+        cooperative Observe drain. If the InterruptPolicy elects to preempt, record the request and
+        wake the cycle; otherwise the signal just flows to the drain as before."""
+        request = self.interrupt_policy.decide(source, signal, self.working)
+        if request is not None:
+            self._interrupt = request
+            self._wake.set()
+
+    async def wait_between_ticks(self, interval: float) -> None:
+        """Sleep up to `interval` between ticks, but wake immediately if interrupt() (or a signal
+        policy) fired — so a hard interrupt starts the next tick without waiting out the idle wait
+        (the reactive target), instead of a bare asyncio.sleep. The edge is consumed (cleared) here,
+        so it only shortens the one following sleep."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._wake.wait(), timeout=interval)
+        self._wake.clear()
 
     async def _act(self, selected: Activity, step: Step, result: TickResult) -> None:
         """Act's bind-then-dispatch boundary. "Bind" here is *parameter binding* — grounding the
@@ -118,9 +223,17 @@ class DecisionCycle:
         else:
             await action.execute(self.registry, self, activity_id=selected.id, **step.params)
 
-    async def interrupt(self, signal: Signal) -> None:
-        """Preempts the current phase for a high-priority event (10ms target)."""
-        raise NotImplementedError
+    async def interrupt(self, signal: Signal, *, target: str | None = None) -> None:
+        """Raise a hard interrupt: preempt the current phase for an authoritative event (the 10ms
+        reactive target). Records the request and wakes the loop; the next phase-boundary checkpoint
+        (or the raced Reason call, mid-inference) runs the handler and aborts the tick. `signal`
+        carries the reason the handler reads; `target` names the activity to preempt, None = agent-
+        wide. The one wired caller is a user stop from the CLI — a cooperative signal that merely
+        matches a wait resumes in Observe and never comes here (an InterruptPolicy promotes a
+        pushed signal to this path). `async` for a uniform call surface, though the body doesn't
+        await."""
+        self._interrupt = InterruptRequest(signal, target)
+        self._wake.set()
 
 
 class Agent:
@@ -169,7 +282,9 @@ class Agent:
             await self._start()
             while not self._stopped:
                 await self.cycle.tick()
-                await asyncio.sleep(self._tick_interval)
+                # Interruptible idle wait, not a bare sleep: a hard interrupt (user stop, or a
+                # signal a policy elects to preempt on) wakes the loop at once for the next tick.
+                await self.cycle.wait_between_ticks(self._tick_interval)
         finally:
             for workspace in list(self.registry.joined_workspaces()):
                 await self.registry.leave(workspace.id)

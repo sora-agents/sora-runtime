@@ -25,7 +25,10 @@ from sora.perception import Percept
 from sora.types import (
     OPERATION_NAME,
     TOOL_ID,
+    USER_STOP,
+    Abandoned,
     CompletedOperation,
+    InputWait,
     OperationInvocation,
     SignalWait,
     Step,
@@ -45,6 +48,7 @@ if TYPE_CHECKING:
     from sora.manual import Manual
     from sora.memory import WorkingMemory
     from sora.perception import Message
+    from sora.types import InterruptRequest, Signal
 
 log = logging.getLogger("sora.strategies")
 
@@ -176,6 +180,88 @@ class Strategies:  # bundles the five, so DecisionCycle.__init__ doesn't take fi
     act: ActStrategy
 
 
+class InterruptPolicy(Protocol):
+    def decide(self, source: str, signal: Signal, wm: WorkingMemory) -> InterruptRequest | None:
+        """Consulted synchronously the instant a signal is pushed to signal_sink — before the once-
+        per-cycle Observe drain. Return an InterruptRequest to preempt the current phase (a hard
+        interrupt), or None to let the signal flow cooperatively (reacted to at the next cycle
+        boundary). Sync because push is sync. A stateful policy may diff the signal vs remembered
+        state (e.g. a set of inbox ids) to fire only on a new external event and filter the
+        agent's own writes — the only distinguishable-external test available until read-write/
+        efference tagging lands. Default: NeverInterruptPolicy — no signal ever preempts."""
+        ...
+
+
+class NeverInterruptPolicy:
+    """The runtime default: a pushed signal never becomes an interrupt, so the cooperative signal
+    path (drained in Observe, resumes a BLOCKED activity) is unchanged. With no runtime way yet to
+    tell the agent's own writes from external events, preempting on a signal would risk a self-write
+    loop; opting in is a deliberate, application-supplied policy."""
+
+    def decide(self, source: str, signal: Signal, wm: WorkingMemory) -> InterruptRequest | None:
+        return None
+
+
+class InterruptHandler(Protocol):
+    async def handle(
+        self, request: InterruptRequest, wm: WorkingMemory, cycle: DecisionCycle
+    ) -> bool:
+        """Runs after tick() aborts on a pending interrupt — the process-scheduling 'interrupt
+        handler'. The interrupted activity's context is already saved (durable on Activity; the per-
+        tick TickResult was discarded, immune to interrupt staleness per ADR-0011), so this only
+        decides the follow-up: map each targeted activity onto an existing state — READY (resume, or
+        replan by clearing plan/step_index), BLOCKED via InputWait (await the user's next
+        instruction), or TERMINATED (drop) — then the ActivitySelectionStrategy picks
+        next. Never abandons an in-flight *external* op (side effects): a RUNNING activity is left
+        RUNNING and revisited at the next checkpoint once its ack resolves. Returns True once every
+        targeted activity is routed (the request is discharged and cleared), False when some are
+        still RUNNING and the request must be revisited next tick."""
+        ...
+
+
+class DefaultInterruptHandler:
+    """The runtime default: a user stop. Pauses each targeted, schedulable (READY) activity to a
+    resumable point via an InputWait, so the agent halts current work but stays alive; a later user
+    Message resumes it (DefaultObserveStrategy._resume_on_input). An activity mid-external-op
+    (RUNNING) is left to finish and routed on a later checkpoint, so a physical side effect always
+    runs to completion. target=None is agent-wide; a named target pauses just that activity.
+
+    It is a *user-stop* handler, not a general router: it recognizes only the USER_STOP signal and
+    treats any other interrupt as unrouted — pausing to await human instruction is the fail-safe
+    fallback (halt-and-ask, never barrel ahead), logged at warning level since no handler claimed
+    it. There is no general runtime answer for an arbitrary interrupt signal; that is why a custom
+    InterruptPolicy should ship a paired InterruptHandler for its own signals (see ADR-0020). With
+    the default components only a CLI /stop ever reaches here."""
+
+    async def handle(
+        self, request: InterruptRequest, wm: WorkingMemory, cycle: DecisionCycle
+    ) -> bool:
+        if request.signal.name != USER_STOP:
+            # Unrouted interrupt: a custom policy raised it but no paired handler claimed it. Fall
+            # back to the same halt-to-await-input as a user stop (fail-safe), but log it — a silent
+            # strand (an activity blocked on input no user message ever arrives to satisfy, e.g.
+            # headless) is otherwise invisible. Still routed, not dropped: swallowing an interrupt a
+            # policy deliberately raised would be as surprising as stranding on it.
+            log.warning(
+                "no interrupt handler routed signal %r; pausing targeted activities to await input "
+                "as a fallback (a custom InterruptPolicy should ship a paired InterruptHandler)",
+                request.signal.name,
+            )
+        if request.target is None:
+            targets = list(wm.activities.values())
+        else:
+            target = wm.activities.get(request.target)
+            targets = [target] if target is not None else []
+        pending = False
+        for activity in targets:
+            if activity.state is ActivityState.RUNNING:
+                pending = True  # external op in flight: let it finish, route on a later checkpoint
+            elif activity.state is ActivityState.READY:
+                activity.state = ActivityState.BLOCKED
+                activity.blocked_on = InputWait(prompt=request.signal.name)
+        return not pending
+
+
 class DefaultObserveStrategy:
     """The runtime's built-in default — purely mechanical, no LLM."""
 
@@ -191,7 +277,16 @@ class DefaultObserveStrategy:
             # READY — manual-agnostic, no strategy involved. The *second* kind of waiting (block on
             # a declared completion signal) is layered on top below, never fused into this resolve.
             for activity in wm.activities.values():
-                if activity.pending_operation and activity.pending_operation.id == invocation_id:
+                # Guarded on RUNNING: a late ack for an activity a hard interrupt already routed
+                # away (paused to BLOCKED/InputWait, or dropped to TERMINATED) must not resurrect it
+                # to READY. The in-flight external op was allowed to finish; its result is just no
+                # longer awaited. A RUNNING activity still resolves normally (the interrupt is
+                # honored on the checkpoint *after* this resolve — see DefaultInterruptHandler).
+                if (
+                    activity.pending_operation
+                    and activity.pending_operation.id == invocation_id
+                    and activity.state is ActivityState.RUNNING
+                ):
                     invocation = activity.pending_operation.invocation
                     op = invocation.operation_name
                     activity.last_operation = ack
@@ -214,10 +309,25 @@ class DefaultObserveStrategy:
         # passes above before it's ever subject to eviction (bound orphan growth; newest win).
         if len(wm.signals) > _SIGNAL_RETENTION:
             del wm.signals[:-_SIGNAL_RETENTION]
+        received_message = False
         async for message in cycle.communication.receive():
             wm.messages.append(message)
+            received_message = True
             log.info("observe: message from %s: %r", message.sender, _goal_from_message(message))
+        if received_message:
+            self._resume_on_input(wm)
         return TickResult()
+
+    @staticmethod
+    def _resume_on_input(wm: WorkingMemory) -> None:
+        """A user Message satisfies an InputWait: any activity a hard interrupt paused (a user stop)
+        returns to READY, so the decision cycle can reconsider it with the new instruction now in
+        working memory. The mirror of _resume_on_signal, but the awaited stimulus is inbound user
+        input rather than a tool signal — mechanical, no judgment."""
+        for activity in wm.activities.values():
+            if isinstance(activity.blocked_on, InputWait):
+                activity.state = ActivityState.READY
+                activity.blocked_on = None
 
     async def _suspend_on_completion_signal(
         self, cycle: DecisionCycle, just_resolved: list[tuple[Activity, OperationInvocation]]
@@ -252,7 +362,9 @@ class DefaultObserveStrategy:
         wm = cycle.working
         resume = cycle.actions.internal(ResumeAction.name)
         for activity in wm.activities.values():
-            if activity.blocked_on is None:
+            # Only a SignalWait is satisfied by an observed signal; an InputWait waits on a user
+            # Message and is resumed in _resume_on_input, not here.
+            if not isinstance(activity.blocked_on, SignalWait):
                 continue
             if self._match_signal(wm, activity.blocked_on) is not None:
                 await resume.execute(cycle, activity_id=activity.id)
@@ -572,7 +684,16 @@ class DefaultReasonStrategy:
                 catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
                 log.info("reason: inferring a plan for %r (%d tools)", activity.goal, len(catalog))
                 observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
-                plan = await cycle.procedural.infer(activity, catalog, observed)  # the model call
+                # The one unbounded await: race it against a hard interrupt so a mid-inference stop
+                # abandons it (finishes in background, result discarded) instead of blocking the
+                # cycle. The mutation below is guarded on the outcome, so an abandoned infer never
+                # writes a stale plan onto an activity the interrupt handler has since re-routed.
+                outcome = await cycle.abandon_on_interrupt(
+                    cycle.procedural.infer(activity, catalog, observed)  # the model call
+                )
+                if isinstance(outcome, Abandoned):
+                    return result  # interrupt pending; the checkpoint after Reason aborts the tick
+                plan = outcome
                 log.info("reason: inferred plan with %d steps", len(plan.steps))
             else:
                 log.info(
@@ -583,8 +704,15 @@ class DefaultReasonStrategy:
         if activity.step_index >= len(activity.plan.steps):
             return result  # exhausted -> no step this cycle
         step = activity.plan.steps[activity.step_index]
+        # Grounding may escalate to its own model call; race it too. It is side-effect-free (returns
+        # a Step, mutates no durable state), so abandoning is safe. Advance step_index only on
+        # success, so an abandoned grounding doesn't consume the step.
+        grounded = await cycle.abandon_on_interrupt(
+            self._ground(step, activity, wm, cycle, observed)
+        )
+        if isinstance(grounded, Abandoned):
+            return result
         activity.step_index += 1
-        grounded = await self._ground(step, activity, wm, cycle, observed)
         return replace(result, activity=activity, step=grounded)
 
     async def _ground(

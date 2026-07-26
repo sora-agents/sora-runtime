@@ -31,6 +31,38 @@ class SignalWait:  # what a `blocked` activity is waiting for — see Activity.b
 
 
 @dataclass(frozen=True)
+class InputWait:  # a `blocked` activity awaiting the user's next instruction (see blocked_on)
+    # The second blocked_on variant SignalWait's comment foresaw: same `blocked` state, a different
+    # wait. Set by the interrupt handler when a hard interrupt (a user stop) pauses an activity to a
+    # resumable point; cleared in Observe when a user Message arrives. Not a signal wait — there is
+    # no tool signal to match; the awaited stimulus is inbound user input, so it carries only an
+    # optional human-facing note on what is being waited for.
+    prompt: str | None = None
+
+
+@dataclass(frozen=True)
+class InterruptRequest:  # a pending hard interrupt, recorded on DecisionCycle by interrupt()
+    # The authoritative preemption of current work. `signal` carries the "why" (e.g.
+    # Signal("user_stop", {})) the interrupt handler reads to decide each targeted activity's
+    # follow-up. `target` names the activity to preempt; None is agent-wide (every schedulable
+    # activity). A pushed signal only becomes an InterruptRequest through an InterruptPolicy — an
+    # ordinary signal that merely matches a wait resumes cooperatively in Observe, never here.
+    signal: Signal
+    target: str | None = None
+
+
+class Abandoned:
+    # Singleton sentinel returned by DecisionCycle.abandon_on_interrupt when a raced model call was
+    # dropped mid-flight by a hard interrupt: the call finishes in the background (an LLM call can't
+    # be cut mid-generation) and its result is discarded, so the caller bails without applying the
+    # state mutation the result would have driven. Callers narrow with isinstance(x, Abandoned).
+    __slots__ = ()
+
+
+ABANDONED = Abandoned()
+
+
+@dataclass(frozen=True)
 class OperationInvocation:  # the concrete call, different from Step's abstract decision
     tool_id: str
     operation_name: str
@@ -97,3 +129,8 @@ WAIT = "wait"
 # kwargs), before Act binds them into an OperationInvocation.
 TOOL_ID = "tool_id"
 OPERATION_NAME = "operation_name"
+
+# The Signal.name a CLI /stop raises through DecisionCycle.interrupt() — the one interrupt the
+# runtime default DefaultInterruptHandler recognizes and routes (pause to await input). Shared here
+# so the producer (cli.py) and the consumer's guard (strategies.py) agree on one literal, not two.
+USER_STOP = "user_stop"

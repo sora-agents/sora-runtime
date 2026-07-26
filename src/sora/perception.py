@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -44,8 +44,16 @@ class NotificationQueueSink[T]:  # was QueueSink — too generic a name to keep
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue[tuple[str, T]] = asyncio.Queue()
+        # Optional synchronous screen, invoked on every push *before* enqueueing. The cycle wires
+        # this on its signal_sink so an InterruptPolicy can turn a just-pushed signal into a hard
+        # interrupt the instant it arrives (before the once-per-cycle Observe drain) — the control-
+        # flow role that keeps signal_sink co-located with interrupt(). Left None on result_sink and
+        # in every other use, so those keep the plain enqueue-only behavior.
+        self.on_push: Callable[[str, T], None] | None = None
 
     def push(self, source: str, item: T) -> None:
+        if self.on_push is not None:
+            self.on_push(source, item)
         self._queue.put_nowait((source, item))
 
     async def drain(self) -> AsyncIterator[tuple[str, T]]:
