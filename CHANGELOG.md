@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Project design: conceptual model and API sketch ([README.md](README.md)), a worked two-agent scenario ([EXAMPLES.md](EXAMPLES.md)), and 18 architectural decision records ([docs/adrs/](docs/adrs/)).
+- Project design: conceptual model and API sketch ([README.md](README.md)), a worked two-agent scenario ([EXAMPLES.md](EXAMPLES.md)), and architectural decision records ([docs/architecture/adrs/](docs/architecture/adrs/)).
 - Phase 0 tooling: `uv`-managed environment, `ruff` + `mypy` + `pytest`, pre-commit hooks, CI, licensing, and contribution docs.
 
 No code has been released yet — see [ROADMAP.md](ROADMAP.md) for implementation status.

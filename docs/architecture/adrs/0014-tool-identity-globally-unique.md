@@ -10,7 +10,7 @@ The live layer addresses tools by a bare `Tool.id` everywhere — `EnvironmentRe
 ## Decision Drivers
 
 * Tools are shared across agents (A&A meta-model): cross-agent shared focus and agent-to-agent messaging about a tool need *one* identifier per tool, i.e. global identity
-* Different protocols supply identity differently: Web/WoT tools have their own URIs; MCP tools are only a *name* under one server, unique within it but not across servers (ARE proves this — its tools have no `address` at all; see docs/phase-2-findings.md)
+* Different protocols supply identity differently: Web/WoT tools have their own URIs; MCP tools are only a *name* under one server, unique within it but not across servers (ARE proves this — its tools have no `address` at all)
 * Ids must be stable across disconnect/reconnect: `ToolRecord.id` is persisted and `restore()`/`connect()` must reproduce the same id to re-resolve manuals and refer to the same instance
 * A single registry cannot observe other agents, so it can only *enforce* the locally-visible slice; global uniqueness therefore has to be a by-construction property of the adapter, not something any one registry can verify end to end
 * A collision the registry *can* see must fail loudly, never silently corrupt a sibling workspace
@@ -65,4 +65,3 @@ Enforcement is layered: the adapter *guarantees* global uniqueness by constructi
 
 * Refines [ADR-0007](0007-manual-record-separation.md) (extends instance identity from persistence into the live layer)
 * Depends on [ADR-0005](0005-workspace-grouping.md), [ADR-0006](0006-workspace-join-leave-lifecycle.md), and the adapter-as-seam principle in [ADR-0008](0008-protocol-based-extensibility.md)
-* The `address`-is-not-identity observation and the registry-enforcement change are recorded in [docs/phase-2-findings.md](../phase-2-findings.md); live-layer enforcement is expected to land with the Phase 3 adapter hardening (ROADMAP step 12)

@@ -4,9 +4,9 @@ Design note behind the in-process ARE integration. Records how S-ORA runs a *dyn
 Agents Research Environments) scenario — a live, ticking `Environment` whose event timeline actually
 fires — why that path is **in-process** rather than over MCP, and what validating it against the
 installed ARE source turned up. This is an integration note, not an architectural decision: the
-durable seams it relies on are already fixed by [ADR-0013](adrs/0013-shared-instances-narrow-dependencies.md)
-(centralized wiring), [ADR-0012](adrs/0012-percepts-vs-messages.md) (user messages on the transport),
-and [ADR-0003](adrs/0003-adapters-not-tool-authoring.md) (adapters import tools, never author them).
+durable seams it relies on are already fixed by [ADR-0013](../adrs/0013-shared-instances-narrow-dependencies.md)
+(centralized wiring), [ADR-0012](../adrs/0012-percepts-vs-messages.md) (user messages on the transport),
+and [ADR-0003](../adrs/0003-adapters-not-tool-authoring.md) (adapters import tools, never author them).
 The whole integration lives behind one file (`sora/adapters/are_sim.py`, optional `are` dependency
 group) and one opaque bootstrap kwarg, so it is deletable without touching the runtime core — which is
 exactly why it is a note and not an ADR. The MCP alternative below stays an open exploratory task.
@@ -88,7 +88,7 @@ Lazy ARE imports throughout (the optional `are` dependency-group):
 
 The bridge only *surfaces* the mid-run change (a follow-up email); making the agent act on it is the
 application's job, done entirely through pluggable seams (no runtime change). The showcase drives
-reconsideration through a **hard interrupt** ([ADR-0020](adrs/0020-hard-interrupt-and-await-input.md)),
+reconsideration through a **hard interrupt** ([ADR-0020](../adrs/0020-hard-interrupt-and-await-input.md)),
 in `examples/are/sim/email_calendar/strategies.py`, so the follow-up is handled regardless of when it
 lands relative to the original activity's life:
 
@@ -137,7 +137,7 @@ undo/modify rather than duplicating" instruction is a commitment-aware
 **plan prompt** (`reconciling_plan_prompt`, wired via `agent.yaml`'s `procedural.plan_prompt`), *not*
 BDI-style commitment machinery (single-minded/open-minded reconsideration as a first-class pluggable
 policy) — that is deferred. Hard-interrupt preemption itself is now *shipped*
-([ADR-0020](adrs/0020-hard-interrupt-and-await-input.md), the `DecisionCycle.interrupt()` item in
+([ADR-0020](../adrs/0020-hard-interrupt-and-await-input.md), the `DecisionCycle.interrupt()` item in
 ROADMAP.md); what remains deferred is only the *timing* — an off-cycle ARE push would turn today's
 Observe-cadence preemption into true mid-Reason abandonment. The policy and handler are pinned by
 deterministic fakes in `tests/test_are_sim_strategies.py`.
@@ -206,7 +206,7 @@ Four claims were checked directly against ARE's source (`environment.py`, `apps/
   is right too), `dict`/`dict[...]` → object, and unions split on `|` (`None` dropped) with an
   all-numeric union (`int | float`) → JSON `number` (admits both). Two residual limits the schema
   *can't* close, by nature: a free-form `dict[str, Any]` maps to an untyped object with no key
-  guidance (that's an authored manual's job, [ADR-0018](adrs/0018-manual-merge-policy-and-authored-interface.md)), and any remaining model deviation surfaces
+  guidance (that's an authored manual's job, [ADR-0018](../adrs/0018-manual-merge-policy-and-authored-interface.md)), and any remaining model deviation surfaces
   as a failed `OperationAck` that terminates the activity — a graceful failure, not a crash. Related
   reporting fix: ARE's base `Scenario.validate` only checks the environment didn't enter a `FAILED`
   state and runs any oracle validators, so a scenario with no `validate()` override and no oracle
@@ -222,13 +222,13 @@ Four claims were checked directly against ARE's source (`environment.py`, `apps/
 
 ## Links
 
-* Depends on [ADR-0019](adrs/0019-blocked-state-machinery-and-percept-storage.md) (signal storage; a
+* Depends on [ADR-0019](../adrs/0019-blocked-state-machinery-and-percept-storage.md) (signal storage; a
   `send_message_to_user` ask-user maps onto `_suspend_`/`_resume_`).
-* Applies [ADR-0020](adrs/0020-hard-interrupt-and-await-input.md) (this scenario's reconsideration runs
+* Applies [ADR-0020](../adrs/0020-hard-interrupt-and-await-input.md) (this scenario's reconsideration runs
   through the hard-interrupt `InterruptPolicy`/`InterruptHandler` seams).
-* Applies [ADR-0013](adrs/0013-shared-instances-narrow-dependencies.md) (the opaque `simulation`
+* Applies [ADR-0013](../adrs/0013-shared-instances-narrow-dependencies.md) (the opaque `simulation`
   injection keeps wiring centralized in bootstrap).
-* Applies [ADR-0012](adrs/0012-percepts-vs-messages.md) (USER messages stay on the transport, not the
-  signal/percept path) and [ADR-0003](adrs/0003-adapters-not-tool-authoring.md) (the adapter imports
+* Applies [ADR-0012](../adrs/0012-percepts-vs-messages.md) (USER messages stay on the transport, not the
+  signal/percept path) and [ADR-0003](../adrs/0003-adapters-not-tool-authoring.md) (the adapter imports
   ARE's tools, it does not author them).
 * The ARE-over-MCP alternative (shape b) is tracked as a backlog/exploratory item in ROADMAP.md.

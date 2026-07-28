@@ -19,7 +19,7 @@ on the MCP-adapter hardening).
 - It performs **no write-back**: `last_seen_at` is untouched and nothing is re-persisted. It is a pure
   read-side reconstruction of the last-known snapshot.
 
-This is intentional. [ADR-0014](adrs/0014-tool-identity-globally-unique.md) wants *"the same records
+This is intentional. [ADR-0014](../adrs/0014-tool-identity-globally-unique.md) wants *"the same records
 rebuild the same ids across runs"* — `restore()` trades freshness for speed and reproducibility.
 Freshness is supposed to come from the *other* path: a deliberate `join()`, which calls `discover()`
 and re-persists via `JoinAction` (`store_workspace_record` / `store_tool_record` / `store_manual`).
@@ -67,6 +67,6 @@ Options to weigh (not yet decided):
    onto every agent author.
 
 Cross-references: builds on the ADR-0014 identity model and the join/leave lifecycle
-([ADR-0006](adrs/0006-workspace-join-leave-lifecycle.md)); the removed-tool `connect()` semantics
+([ADR-0006](../adrs/0006-workspace-join-leave-lifecycle.md)); the removed-tool `connect()` semantics
 couple to the MCP-adapter hardening in Track E. The manual-drift row also touches the two-channel
 `Manual` reconciliation deferred to the Manual-reconciliation task.

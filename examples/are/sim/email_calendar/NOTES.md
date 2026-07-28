@@ -10,7 +10,7 @@ strategies. That effort is deliberate scaffolding around real, still-open runtim
 meant to look production-clean. This note records what is example-specific, what is a genuine
 runtime limitation the example papers over, and which foundational extensions would replace the
 scaffolding. The mechanics of *how* it works live in
-[`../../../../docs/are-dynamic-scenarios.md`](../../../../docs/are-dynamic-scenarios.md);
+[`../../../../docs/architecture/notes/are-dynamic-scenarios.md`](../../../../docs/architecture/notes/are-dynamic-scenarios.md);
 this note is the honest catalogue of seams.
 
 Note: plan auto-caching is disabled runtime-wide (the default Reflect no longer stores completed
@@ -27,7 +27,7 @@ Everything here lives under `examples/are/sim/email_calendar/` and would not shi
   the `state_changed` signal payload against what it has already seen, which knows ARE's
   `EmailClientApp` state shape (`folders → INBOX → emails[*].email_id`). ARE-email-shaped. Stateful,
   so it also dedups — each new id fires once, the first non-empty inbox is the baseline, and the
-  agent's own reply (landing in SENT) never fires. See [ADR-0020](../../../../docs/adrs/0020-hard-interrupt-and-await-input.md).
+  agent's own reply (landing in SENT) never fires. See [ADR-0020](../../../../docs/architecture/adrs/0020-hard-interrupt-and-await-input.md).
 - **`ReconsiderInterruptHandler`** — the paired `InterruptHandler`. On that interrupt it clears the
   in-flight activity's plan so the default Reason re-infers, or — if the email landed *after* the goal
   already completed (no live activity) — spawns one fresh corrective activity (a hard-coded
@@ -123,7 +123,7 @@ Each of these would replace a chunk of the scaffolding above with a principled m
   intention lifecycle (blocked / impossible / superseded). Replaces "re-infer on every signal" with
   a principled decision about *when* to reconsider a plan. Retires limitation (6).
 
-- **Hard-interrupt preemption (shipped — [ADR-0020](../../../../docs/adrs/0020-hard-interrupt-and-await-input.md)).**
+- **Hard-interrupt preemption (shipped — [ADR-0020](../../../../docs/architecture/adrs/0020-hard-interrupt-and-await-input.md)).**
   `DecisionCycle.interrupt()` now preempts the current phase (phase-boundary checkpoints + true
   mid-flight abandonment of the Reason model call), and this scenario's reconsideration runs through it:
   `MailDiffInterruptPolicy` screens the pushed `state_changed` signal at push time and raises the

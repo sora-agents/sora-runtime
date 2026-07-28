@@ -4,7 +4,7 @@ Design note behind the cross-workspace-tool-sharing task. Records why the regist
 currently forbids the same tool from appearing in two workspaces, why the Web/hypermedia framing makes
 that constraint look too strict, and the options for relaxing it. No decision is made here — this is
 the analysis that motivates the task; the decision belongs in an ADR that refines
-[ADR-0014](adrs/0014-tool-identity-globally-unique.md), realized when the WoT adapter lands.
+[ADR-0014](../adrs/0014-tool-identity-globally-unique.md), realized when the WoT adapter lands.
 
 ## The constraint today
 
@@ -112,4 +112,4 @@ the WoT adapter and the two-agent lab (Phase 4 backlog). Building refcounting + 
 would be speculative and would prematurely entangle Manual reconciliation. Record the container-vs-index resolution and
 the "shareable ⟺ self-addressed + canonical-address match" rule as an ADR refining ADR-0014, to be
 realized when the WoT adapter lands. Shares the registry-bookkeeping surface (refcounted membership)
-with the dynamic-environments work ([docs/restore-drift-reconciliation.md](restore-drift-reconciliation.md)).
+with the dynamic-environments work ([docs/architecture/notes/restore-drift-reconciliation.md](restore-drift-reconciliation.md)).
