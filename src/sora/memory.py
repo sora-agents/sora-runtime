@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import tempfile
 import uuid
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     from sora.environment import EnvironmentView, Tool
     from sora.llm import LLMClient
     from sora.perception import Message, Percept
+
+log = logging.getLogger("sora.memory")
 
 
 class MemoryBackend(Protocol):  # pluggable: file, DB, vector store
@@ -661,6 +664,7 @@ class ProceduralMemory:
                 "still work). Pass an LLMClient to enable inference."
             )
         system, user = self._prompt(activity, tools, observed or PerceptSnapshot())
+        log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         text = await self._llm.complete(system=system, prompt=user)
         return Plan(id=uuid.uuid4().hex, goal=activity.goal, steps=_parse_plan_steps(text))
 
@@ -689,6 +693,7 @@ class ProceduralMemory:
         system, user = self._ground_prompt(
             activity, operation_name, manual, partial_params, observed or PerceptSnapshot()
         )
+        log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         text = await self._llm.complete(system=system, prompt=user)
         return _parse_params(text)
 

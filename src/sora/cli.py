@@ -10,7 +10,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TextIO, runtime_checkable
 
 from sora import scaffold
 from sora.activity import ActivityState
@@ -138,16 +138,20 @@ def _restore_blocking_stdout() -> None:
 class _Console:
     """Tracks whether the terminal cursor sits at the start of a line, so lines printed through
     here (log trace lines, the agent's replies) are always separated by exactly one newline —
-    never bunched onto the same physical line as whatever printed right before them."""
+    never bunched onto the same physical line as whatever printed right before them. Writes to
+    stdout by default; a `stream` lets the same formatting drive a `--log-file` capture (the
+    blocking-mode dance and its EAGAIN hazard are stdout-only, so they're skipped for a file)."""
 
-    def __init__(self) -> None:
+    def __init__(self, stream: TextIO | None = None) -> None:
+        self._stream = stream if stream is not None else sys.stdout
         self._at_line_start = True
 
     def line(self, text: str) -> None:
-        _restore_blocking_stdout()
+        if self._stream is sys.stdout:
+            _restore_blocking_stdout()
         if not self._at_line_start:
-            print()
-        print(text)
+            print(file=self._stream)
+        print(text, file=self._stream, flush=True)
         self._at_line_start = True
 
 
@@ -158,11 +162,19 @@ class _Presenter(logging.Handler):
     ``cycle.py``'s existing ``"[cycle %d] begin"`` debug record: ``DecisionCycle`` deliberately
     exposes no current-phase/current-activity state for a presenter to read directly."""
 
-    def __init__(self, *, verbose: bool, console: _Console, color: bool = False) -> None:
-        super().__init__(level=logging.DEBUG if verbose else logging.INFO)
+    def __init__(
+        self, *, verbose: bool, console: _Console, color: bool = False, show_debug: bool = False
+    ) -> None:
+        # Always listen at DEBUG so the DEBUG "[cycle N] begin" marker is seen for cycle tracking,
+        # even when the phase trace itself is not shown. `show_debug` then decides whether sub-INFO
+        # *detail* records (model prompts, full plan/result reprs) are actually displayed: off for
+        # the terminal (the --verbose trace stays as terse as it was before those records existed),
+        # on for the --log-file mirror (which is the complete trace, detail included).
+        super().__init__(level=logging.DEBUG)
         self._verbose = verbose
         self._console = console
         self._color = color
+        self._show_debug = show_debug
         self._cycle = 0
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -181,6 +193,11 @@ class _Presenter(logging.Handler):
         begin = _CYCLE_BEGIN.match(message)
         if begin:
             self._cycle = int(begin.group(1))
+            return
+        # Sub-INFO detail (model prompts, full plan/result reprs) is captured for the --log-file
+        # mirror but kept out of the terminal, so --verbose shows the same phase trace it did before
+        # those DEBUG records were added.
+        if record.levelno < logging.INFO and not self._show_debug:
             return
         if self._verbose:
             self._emit_verbose(message)
@@ -216,6 +233,7 @@ class TerminalSession:
         poll_interval: float = 0.02,
         initial_task: str | None = None,
         exit_when_idle: float | None = None,
+        log_file: str | Path | None = None,
     ) -> None:
         communication = agent.communication
         # `_PresentableTransport` is a data-only Protocol — `isinstance` only proves `.sent`
@@ -250,6 +268,10 @@ class TerminalSession:
         self._poll_interval = poll_interval
         self._initial_task = initial_task
         self._exit_when_idle = exit_when_idle
+        # A full, always-verbose trace mirror written to a file regardless of the terminal's own
+        # --verbose setting — the complete execution log (prompts, results, plans) that was
+        # previously only obtainable by running --verbose and copy-pasting the terminal.
+        self._log_file = log_file
 
     async def run(self) -> None:
         console = _Console()
@@ -263,6 +285,17 @@ class TerminalSession:
         sora_log.setLevel(logging.DEBUG)
         sora_log.addHandler(presenter)
         sora_log.addHandler(meter)
+        # Optional --log-file: a second presenter, always verbose and color-free, writing the
+        # complete DEBUG trace to a file through the same formatting as the terminal view. Opened
+        # here so it captures startup (workspace join) too, closed in the finally below.
+        log_handle: TextIO | None = None
+        file_presenter: _Presenter | None = None
+        if self._log_file is not None:
+            log_handle = await asyncio.to_thread(open, self._log_file, "w", encoding="utf-8")
+            file_presenter = _Presenter(
+                verbose=True, console=_Console(stream=log_handle), color=False, show_debug=True
+            )
+            sora_log.addHandler(file_presenter)
         wall_start = time.monotonic()
 
         if self._initial_task:
@@ -338,6 +371,10 @@ class TerminalSession:
                 pass
             sora_log.removeHandler(presenter)
             sora_log.removeHandler(meter)
+            if file_presenter is not None:
+                sora_log.removeHandler(file_presenter)
+            if log_handle is not None:
+                log_handle.close()
             sora_log.setLevel(previous_level)
             wall = time.monotonic() - wall_start
             console.line(_paint(f"-- {meter.summary(wall)} --", _DIM, enabled=self._color))
@@ -468,6 +505,7 @@ def _run(args: argparse.Namespace) -> None:
         color=args.color,
         initial_task=initial_task,
         exit_when_idle=args.exit_when_idle,
+        log_file=args.log_file,
     )
     interrupted = False
     try:
@@ -507,6 +545,15 @@ def main() -> None:
     run_parser.add_argument("config", nargs="?", default="agent.yaml", help="Path to agent.yaml")
     run_parser.add_argument(
         "--verbose", action="store_true", help="Print the per-phase decision-cycle trace"
+    )
+    run_parser.add_argument(
+        "--log-file",
+        metavar="PATH",
+        help=(
+            "Write the complete execution trace (per-phase cycle log, model prompts, operation "
+            "results, and plans) to this file — always full detail, independent of --verbose, "
+            "which only controls what the terminal shows"
+        ),
     )
     color_group = run_parser.add_mutually_exclusive_group()
     color_group.add_argument(

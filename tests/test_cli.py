@@ -206,6 +206,33 @@ def test_console_consecutive_lines_do_not_add_blank_lines(
     assert out == "first\nsecond\n"
 
 
+def test_console_writes_to_a_supplied_stream(capsys: pytest.CaptureFixture[str]) -> None:
+    # The --log-file capture path: a stream-backed console writes there, not to stdout, so the
+    # same presenter formatting can mirror the trace to a file.
+    import io
+
+    sink = io.StringIO()
+    console = _Console(stream=sink)
+    console.line("first")
+    console.line("second")
+    assert sink.getvalue() == "first\nsecond\n"
+    assert capsys.readouterr().out == ""
+
+
+def test_file_presenter_captures_the_full_verbose_trace() -> None:
+    # A file-backed presenter is always verbose (independent of the terminal's --verbose), so a
+    # --log-file always holds the complete per-phase trace even when the terminal view is terse.
+    import io
+
+    sink = io.StringIO()
+    presenter = _Presenter(verbose=True, console=_Console(stream=sink), color=False)
+    presenter.emit(_record("sora.cycle", logging.DEBUG, "[cycle %d] begin", 1))
+    presenter.emit(
+        _record("sora.action", logging.INFO, "act: invoke %s.%s%s", "Clock", "get_time", "")
+    )
+    assert sink.getvalue() == "[cycle 1] Act      - invoke Clock.get_time\n"
+
+
 # ---------------------------------------------------------------------------
 # _Presenter — pure formatting, no agent needed
 # ---------------------------------------------------------------------------
@@ -244,6 +271,37 @@ def test_presenter_verbose_formats_the_cycle_phase_trace(
         "[cycle 1] Act      - invoke Clock.get_time\n"
         "[cycle 2] Reflect  - activity ask-time completed; stored to episodic memory\n"
     )
+
+
+def test_presenter_verbose_hides_debug_detail_but_still_tracks_cycles(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The terminal --verbose trace must NOT show sub-INFO detail (model prompts, full plan/result
+    # reprs) — those are for the --log-file mirror only — while the DEBUG "[cycle N] begin" marker
+    # is still consumed for cycle tracking.
+    presenter = _Presenter(verbose=True, console=_Console())  # show_debug defaults False
+    presenter.emit(_record("sora.cycle", logging.DEBUG, "[cycle %d] begin", 4))
+    presenter.emit(_record("sora.memory", logging.DEBUG, "reason: system prompt\n%s", "SECRET"))
+    presenter.emit(
+        _record("sora.action", logging.INFO, "act: invoke %s.%s%s", "Clock", "get_time", "")
+    )
+    out = capsys.readouterr().out
+    assert "SECRET" not in out  # the DEBUG prompt did not reach the terminal
+    assert out == "[cycle 4] Act      - invoke Clock.get_time\n"  # cycle 4 tracked from the marker
+
+
+def test_file_presenter_shows_debug_detail() -> None:
+    # The --log-file mirror (show_debug=True) is the complete trace: the same DEBUG prompt the
+    # terminal suppresses is captured here.
+    import io
+
+    sink = io.StringIO()
+    presenter = _Presenter(
+        verbose=True, console=_Console(stream=sink), color=False, show_debug=True
+    )
+    presenter.emit(_record("sora.cycle", logging.DEBUG, "[cycle %d] begin", 4))
+    presenter.emit(_record("sora.memory", logging.DEBUG, "reason: system prompt\n%s", "SECRET"))
+    assert sink.getvalue() == "[cycle 4] Reason   - system prompt\nSECRET\n"
 
 
 def test_presenter_verbose_passes_through_unrecognized_prefix(
@@ -637,6 +695,36 @@ async def test_exit_when_idle_stops_the_session_without_stdin_eof(
         stdin.close()
 
 
+async def test_log_file_captures_the_trace_and_is_written_to_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A --log-file run writes the complete trace to the file even in the terse (non-verbose)
+    # terminal view — the startup "joined workspace" line is a DEBUG/INFO record the terse terminal
+    # would still show, but here it proves the file-backed presenter ran and flushed to disk.
+    agent = _build_agent(tmp_path)
+    agent.working.activities["a1"] = Activity(
+        id="a1", goal="what time is it?", context={}, state=ActivityState.TERMINATED
+    )
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    log_path = tmp_path / "trace.log"
+
+    session = TerminalSession(
+        agent, verbose=False, poll_interval=0.0, exit_when_idle=0.01, log_file=log_path
+    )
+    task = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(task, timeout=2)
+        assert task.exception() is None
+    finally:
+        stdin.close()
+
+    assert log_path.exists()
+    captured = log_path.read_text(encoding="utf-8")
+    assert "joined workspace clock" in captured  # a real runtime log record reached the file
+    assert "\x1b[" not in captured  # no ANSI escapes in the file mirror
+
+
 async def test_banner_reflects_headless_scenario_driven_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -710,6 +798,7 @@ class _FakeSession:
         poll_interval: float = 0.02,
         initial_task: str | None = None,
         exit_when_idle: float | None = None,
+        log_file: str | None = None,
     ) -> None:
         _FakeSession.last_calls = {
             "agent": agent,
@@ -717,6 +806,7 @@ class _FakeSession:
             "color": color,
             "initial_task": initial_task,
             "exit_when_idle": exit_when_idle,
+            "log_file": log_file,
         }
 
     async def run(self) -> None:
@@ -743,6 +833,15 @@ def test_main_run_defaults_to_agent_yaml_and_non_verbose(monkeypatch: pytest.Mon
     assert _FakeSession.last_calls["color"] is None  # auto: TerminalSession resolves TTY/NO_COLOR
     assert _FakeSession.last_calls["initial_task"] is None
     assert _FakeSession.last_calls["exit_when_idle"] is None
+    assert _FakeSession.last_calls["log_file"] is None
+
+
+def test_main_run_passes_log_file_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sora.cli.build_agent", lambda config_path, **_: object())
+    monkeypatch.setattr("sora.cli.TerminalSession", _FakeSession)
+    monkeypatch.setattr(sys, "argv", ["sora", "run", "--log-file", "/tmp/trace.log"])
+    main()
+    assert _FakeSession.last_calls["log_file"] == "/tmp/trace.log"
 
 
 def test_main_run_color_flags_pass_tri_state_through(monkeypatch: pytest.MonkeyPatch) -> None:

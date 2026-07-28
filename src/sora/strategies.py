@@ -298,6 +298,7 @@ class DefaultObserveStrategy:
                     just_resolved.append((activity, invocation))
                     if ack.ok:
                         log.info("observe: resolved %s -> ok", op)
+                        log.debug("observe: %s result\n%r", op, ack.result)
                     else:
                         # Surface *why*: a failed op terminates the activity in Reflect, and without
                         # the error the trace just says failed with no cause (e.g. a schema error).
@@ -695,6 +696,7 @@ class DefaultReasonStrategy:
                     return result  # interrupt pending; the checkpoint after Reason aborts the tick
                 plan = outcome
                 log.info("reason: inferred plan with %d steps", len(plan.steps))
+                log.debug("reason: inferred plan with %d steps\n%r", len(plan.steps), plan)
             else:
                 log.info(
                     "reason: reusing cached plan (%d steps) for %r", len(plan.steps), activity.goal
