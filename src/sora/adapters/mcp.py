@@ -195,6 +195,13 @@ class McpWorkspaceAdapter:
                         name=t.name,
                         description=t.description or "",
                         parameters=dict(t.inputSchema or {}),
+                        # MCP's optional result schema, when the server declares one — the same role
+                        # the are-sim adapter derives from a native return type: a resolvable $from.
+                        returns=(
+                            dict(getattr(t, "outputSchema", None) or {})
+                            if getattr(t, "outputSchema", None)
+                            else None
+                        ),
                     )
                 ],
             )

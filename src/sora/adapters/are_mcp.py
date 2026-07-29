@@ -42,6 +42,11 @@ class AreMcpWorkspaceAdapter(McpWorkspaceAdapter):
                     name=op,
                     description=mcp_tool.description or "",
                     parameters=dict(mcp_tool.inputSchema or {}),
+                    returns=(
+                        dict(getattr(mcp_tool, "outputSchema", None) or {})
+                        if getattr(mcp_tool, "outputSchema", None)
+                        else None
+                    ),
                 )
             )
         return [

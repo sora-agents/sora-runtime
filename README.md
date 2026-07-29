@@ -595,6 +595,10 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         completion_signal: str | None = None  # the signal marking a long-running op's real completion
                              #   (its ack means only "accepted") — author-owned (a native description
                              #   can't express it), so merge_manuals keeps it; drives the blocked wait
+        returns: dict | None = None    # JSON-Schema-shaped result shape (array/object/leaf), the
+                             #   counterpart to `parameters` — adapter-synthesized from a native return
+                             #   type/description. Lets a planner author a resolvable `$from` path into
+                             #   a prior result instead of guessing its shape; None if undeterminable
 
     @dataclass(frozen=True)
     class ObservablePropertySpecification:

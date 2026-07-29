@@ -698,9 +698,16 @@ async def test_exit_when_idle_stops_the_session_without_stdin_eof(
 async def test_log_file_captures_the_trace_and_is_written_to_disk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A --log-file run writes the complete trace to the file even in the terse (non-verbose)
-    # terminal view — the startup "joined workspace" line is a DEBUG/INFO record the terse terminal
-    # would still show, but here it proves the file-backed presenter ran and flushed to disk.
+    # A --log-file run writes the trace to the file even in the terse (non-verbose) terminal view —
+    # the startup "joining workspace" line is an INFO record the terse terminal would still show,
+    # and proves the file-backed presenter ran and flushed to disk.
+    #
+    # The sentinel is the *pre-join* record (cycle.py's `startup: joining workspace ...`), logged
+    # synchronously before the join's first await, not the post-join `joined workspace <id>` record.
+    # The pre-seeded TERMINATED activity below makes the session read "idle" before startup finishes
+    # (a state production never reaches — working memory is empty at startup), so with a tiny
+    # exit_when_idle it may cancel the runner mid-join, before the post-join record is emitted. The
+    # pre-join record is flushed regardless, so it's the deterministic proof the file mirror works.
     agent = _build_agent(tmp_path)
     agent.working.activities["a1"] = Activity(
         id="a1", goal="what time is it?", context={}, state=ActivityState.TERMINATED
@@ -721,7 +728,7 @@ async def test_log_file_captures_the_trace_and_is_written_to_disk(
 
     assert log_path.exists()
     captured = log_path.read_text(encoding="utf-8")
-    assert "joined workspace clock" in captured  # a real runtime log record reached the file
+    assert "startup: joining workspace" in captured  # a real runtime log record reached the file
     assert "\x1b[" not in captured  # no ANSI escapes in the file mirror
 
 

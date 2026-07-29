@@ -424,6 +424,95 @@ def test_render_tools_surfaces_operation_parameter_schema() -> None:
     assert "required" not in rendered.split("limit (int)")[1].split("\n")[0]
 
 
+def test_render_tools_surfaces_operation_return_shape() -> None:
+    # Without the result shape the planner guesses the $from path (e.g. `emails.0.id` against a bare
+    # list keyed by `email_id`), it doesn't resolve mechanically, and grounding escalates to the
+    # model. Rendering `returns:` lets it author `0.email_id` and resolve deterministically.
+    manual = Manual(
+        id="EmailClientApp",
+        metadata={},
+        description="mail",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(
+                "search_emails",
+                "search across folders",
+                {"type": "object", "properties": {"query": {"type": "string"}}},
+                returns={
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sender": {"type": "string"},
+                            "email_id": {"type": "string"},
+                        },
+                    },
+                    "description": "A list of emails that match the query.",
+                },
+            )
+        ],
+    )
+    rendered = render_tools({"EmailClientApp": manual})
+    assert "returns: array of object with fields: sender, email_id" in rendered
+    assert "(A list of emails that match the query.)" in rendered
+
+
+def test_render_tools_surfaces_nested_record_fields_in_a_wrapped_result() -> None:
+    # ARE's list_emails returns ReturnedEmails: an object whose `emails` field is a *list of
+    # records* keyed by `email_id`. Flattening that field to a bare `object` hides the very field a
+    # $from path (`emails.0.email_id`) must bind against, forcing the model escalation the returns
+    # rendering exists to remove — so the nested record's field names have to surface.
+    manual = Manual(
+        id="EmailClientApp",
+        metadata={},
+        description="mail",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(
+                "list_emails",
+                "list a folder",
+                {"type": "object", "properties": {"folder": {"type": "string"}}},
+                returns={
+                    "type": "object",
+                    "properties": {
+                        "emails": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "sender": {"type": "string"},
+                                    "email_id": {"type": "string"},
+                                },
+                            },
+                        },
+                        "total_emails": {"type": "integer"},
+                    },
+                },
+            )
+        ],
+    )
+    rendered = render_tools({"EmailClientApp": manual})
+    assert (
+        "returns: object with fields: emails (array of object with fields: sender, email_id), "
+        "total_emails" in rendered
+    )
+
+
+def test_render_tools_omits_absent_return_shape() -> None:
+    # An operation with no declared returns (None) renders no `returns:` line at all.
+    manual = Manual(
+        id="clock",
+        metadata={},
+        description="",
+        observable_properties=[],
+        signals=[],
+        operations=[OperationSpecification("get_time", "", {})],
+    )
+    assert "returns:" not in render_tools({"clock": manual})
+
+
 def test_render_tools_omits_absent_affordance_groups() -> None:
     # An invoke-only tool (no observables/signals) shows operations only — nothing to focus.
     manual = Manual(

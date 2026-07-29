@@ -7,6 +7,8 @@ integration-gated ``test_are_sim_integration.py``.
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +18,8 @@ from sora.adapters.are_sim import (
     AreInProcessWorkspaceAdapter,
     AreTransport,
     _params_schema,
+    _returns_schema,
+    _type_to_schema,
 )
 from sora.environment import WorkspaceOrigin
 from sora.manual import Manual
@@ -36,12 +40,22 @@ class FakeArg:
 
 
 class FakeAppTool:
-    def __init__(self, name: str, fn: Any, *, args: list[FakeArg] | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        fn: Any,
+        *,
+        args: list[FakeArg] | None = None,
+        return_type: Any = None,
+        return_description: str | None = None,
+    ) -> None:
         self.name = name
         self.function = fn
         self.function_description = f"{name} description"
         self.args = args or []
         self.write_operation = False
+        self.return_type = return_type
+        self.return_description = return_description
 
     def __call__(self, **kwargs: Any) -> Any:
         return self.function(**kwargs)
@@ -207,6 +221,116 @@ def test_params_schema_maps_numeric_union_to_number() -> None:
     )
     schema = _params_schema(tool)
     assert schema["properties"]["min_price"]["type"] == "number"
+
+
+# A local mirror of ARE's Email/ReturnedEmails so the return-shape introspection is tested without
+# importing ARE: search_emails returns list[Email] (a bare list), list_emails -> ReturnedEmails.
+@dataclass
+class _Email:
+    sender: str
+    email_id: str
+    is_read: bool
+
+
+@dataclass
+class _ReturnedEmails:
+    emails: list[_Email]
+    total_emails: int
+
+
+@dataclass
+class _Node:
+    # A minimal self-referential record: `get_type_hints` resolves `children` back to the live
+    # class, so `_type_to_schema` would recurse forever without the depth cap. Module-level (not
+    # local to a test) so that resolution against module globals actually finds `_Node`.
+    label: str
+    children: list[_Node]
+
+
+def test_type_to_schema_expands_a_list_of_records_to_field_names() -> None:
+    # The bug's core: search_emails returns a *bare* list[Email], so a resolvable $from path is
+    # `0.email_id` — the schema must surface the record's field names, not a fictional wrapper.
+    schema = _type_to_schema(list[_Email])
+    assert schema["type"] == "array"
+    assert schema["items"]["type"] == "object"
+    assert set(schema["items"]["properties"]) == {"sender", "email_id", "is_read"}
+    assert schema["items"]["properties"]["email_id"] == {"type": "string"}
+
+
+def test_type_to_schema_expands_a_wrapped_record_of_records() -> None:
+    schema = _type_to_schema(_ReturnedEmails)
+    assert schema["type"] == "object"
+    assert schema["properties"]["total_emails"] == {"type": "integer"}
+    emails = schema["properties"]["emails"]
+    assert emails["type"] == "array"
+    assert set(emails["items"]["properties"]) == {"sender", "email_id", "is_read"}
+
+
+def test_type_to_schema_handles_leaf_and_optional_types() -> None:
+    assert _type_to_schema(str) == {"type": "string"}  # a bare id string (add_calendar_event)
+    assert _type_to_schema(str | None) == {"type": "string"}  # unwrap X | None
+    # An all-numeric union collapses to `number` (admits both), like the arg-type mapper; any other
+    # heterogeneous union has no single faithful type, so it degrades to `string`.
+    assert _type_to_schema(int | float) == {"type": "number"}
+    assert _type_to_schema(int | str) == {"type": "string"}
+    # A string annotation (an unresolved `from __future__` hint) routes through the union-aware
+    # mapper, so a `X | None` *string* unwraps too — not the `string` a single-atom mapper gives.
+    assert _type_to_schema("int | None") == {"type": "integer"}
+
+
+def test_type_to_schema_bounds_a_self_referential_record_and_logs_at_the_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # No ARE app record is self-referential, but a foreign/future one could be. The depth cap must
+    # bound it (no RecursionError) and emit one DEBUG line noting the elision, so a dropped $from
+    # path has a trail. `_Node.children: list[_Node]` is the minimal cycle.
+    with caplog.at_level(logging.DEBUG, logger="sora.adapters.are_sim"):
+        schema = _type_to_schema(_Node)
+
+    # Bounded: the deepest reached `children` is a bare array with no `items` (shape below elided).
+    deepest = schema["properties"]["children"]["items"]["properties"]["children"]
+    assert deepest == {"type": "array"}
+    cap_logs = [r for r in caplog.records if "depth cap" in r.getMessage()]
+    assert len(cap_logs) == 1
+    assert cap_logs[0].levelno == logging.DEBUG
+
+
+def test_returns_schema_seeds_the_description_and_is_none_without_a_type() -> None:
+    tool = FakeAppTool(
+        "search_emails",
+        lambda **k: None,
+        return_type=list[_Email],
+        return_description="A list of emails that match the query.",
+    )
+    schema = _returns_schema(tool)
+    assert schema is not None
+    assert schema["type"] == "array"
+    assert schema["description"] == "A list of emails that match the query."
+    # No return_type declared -> no returns schema (an unannotated op, a hand-authored manual).
+    assert _returns_schema(FakeAppTool("noop", lambda **k: None)) is None
+
+
+def test_returns_schema_resolves_via_the_functions_own_annotation() -> None:
+    # The production path: ARE's AppTool.return_type is a *string* (`from __future__ annotations`),
+    # so `_returns_schema` resolves the real type off the underlying function's return annotation
+    # via get_type_hints against its module globals — not the raw `return_type`. Here `return_type`
+    # is deliberately left None so only the function-resolution path can produce a shape.
+    def search() -> list[_Email]:  # annotation resolves against this module (where _Email lives)
+        return []
+
+    schema = _returns_schema(FakeAppTool("search_emails", search))
+    assert schema is not None
+    assert schema["type"] == "array"
+    assert set(schema["items"]["properties"]) == {"sender", "email_id", "is_read"}
+
+
+def test_returns_schema_is_none_for_a_void_operation() -> None:
+    # A `-> None` op has no result to reference; it must declare no shape, not a fictitious `string`
+    # leaf a planner could bind an empty-path $from against.
+    def send() -> None:
+        return None
+
+    assert _returns_schema(FakeAppTool("send_email", send)) is None
 
 
 async def test_invoke_calls_the_app_op_and_returns_ack() -> None:

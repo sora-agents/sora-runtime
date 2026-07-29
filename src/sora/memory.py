@@ -263,9 +263,15 @@ PLAN_SYSTEM_PROMPT = (
     "When a parameter's value depends on the RESULT of an earlier step (e.g. an id or address you "
     "only learn by first listing/searching), you do NOT know it yet — never invent a literal. "
     "Instead reference the earlier result:\n"
-    '  {"$from": "<operation_name>", "path": "<dotted path into that result>"} '
-    '(e.g. {"$from": "search_emails", "path": "emails.0.id"}), or\n'
+    '  {"$from": "<operation_name>", "path": "<dotted path into that operation\'s result>"}, or\n'
     '  {"$decide": "<what value is needed>"} when picking the value needs judgement.\n'
+    "For a $from path, read the referenced operation's declared `returns:` shape in the tool "
+    "catalog and index into THAT: a numeric segment indexes a list position, a name indexes a "
+    "field. So if an operation returns an array of records, the id of the first record is "
+    '{"$from": "<op>", "path": "0.<id_field>"}; if it returns a single record, just "<id_field>"; '
+    'if it returns a bare value, the empty path "". A path that does not match the declared shape '
+    "will not resolve against the real result, so match the field names and nesting shown under "
+    "`returns:` exactly (do not assume a wrapper key or a field name that isn't listed there).\n"
     "A reference must be the WHOLE value of its key, never embedded inside a larger string — "
     '{"text": "It is {"$from": ...}."} is invalid and will be sent to the user unresolved, '
     "literal braces and all. To report a not-yet-known result in prose, make the field itself a "
@@ -341,6 +347,7 @@ def _render_operations(manual: Manual) -> list[str]:
             head = f"      - operation `{op.name}`"
             out.append(head + (f": {op.description}" if op.description else ""))
             out += _render_params(op.parameters)
+            out += _render_returns(op.returns)
         return out
     body = _prose(manual.section(ManualSection.OPERATIONS))
     return ["    operations (invoke):", f"      {body}"] if body is not None else []
@@ -363,6 +370,58 @@ def _render_params(schema: dict[str, Any]) -> list[str]:
             f"            - {name} ({kind}{flag})" + (f": {description}" if description else "")
         )
     return out
+
+
+def _render_returns(schema: dict[str, Any] | None) -> list[str]:
+    """Render an operation's declared result shape (``OperationSpecification.returns``) so a planner
+    can author a ``$from`` path into it (which field/index yields an id) instead of guessing. Empty/
+    absent -> nothing (the op reads as a bare/undeclared result)."""
+    if not isinstance(schema, dict) or not schema:
+        return []
+    out = [f"          returns: {_describe_return_shape(schema)}"]
+    description = schema.get("description")
+    if isinstance(description, str) and description.strip():
+        out.append(f"            ({description.strip()})")
+    return out
+
+
+# How deep the shape rendering expands nested records. A record whose field is itself a list of
+# records (ARE's ReturnedEmails.emails -> list[Email]) needs its inner field names surfaced too, or
+# the planner can't author the nested `$from` path. Bounded so an arbitrary (e.g. MCP-supplied)
+# outputSchema can't render an unboundedly long line.
+_MAX_SHAPE_DEPTH = 4
+
+
+def _describe_return_shape(schema: dict[str, Any], depth: int = 0) -> str:
+    """A compact, path-oriented rendering of a JSON-Schema-shaped result: an array says what it
+    holds, an object lists its field names (what a ``$from`` path indexes into), a leaf its type.
+    Recurses into both an array's item shape and each object field's nested array/object shape (up
+    to ``_MAX_SHAPE_DEPTH``), so a record nested inside a record still shows the field names a path
+    binds against — otherwise a wrapped list-of-records (list_emails -> ReturnedEmails.emails) would
+    hide the very field a ``$from`` needs."""
+    kind = schema.get("type")
+    if kind == "array":
+        items = schema.get("items")
+        if isinstance(items, dict) and items and depth < _MAX_SHAPE_DEPTH:
+            inner = _describe_return_shape(items, depth + 1)
+        else:
+            inner = "value"
+        return f"array of {inner}"
+    if kind == "object":
+        properties = schema.get("properties")
+        if isinstance(properties, dict) and properties and depth < _MAX_SHAPE_DEPTH:
+            fields = [_describe_field(name, spec, depth) for name, spec in properties.items()]
+            return "object with fields: " + ", ".join(fields)
+        return "object"
+    return str(kind) if kind else "value"
+
+
+def _describe_field(name: str, spec: Any, depth: int) -> str:
+    """A field name, annotated with its nested shape in parens when the field is itself an array or
+    object (a record's field the planner must index further into); leaf fields render bare."""
+    if isinstance(spec, dict) and spec.get("type") in ("array", "object"):
+        return f"{name} ({_describe_return_shape(spec, depth + 1)})"
+    return name
 
 
 def _render_affordances(
@@ -543,14 +602,18 @@ class GroundPrompt(Protocol):
 
 def render_history(history: list[CompletedOperation]) -> str:
     """Render an activity's executed operations + results for a grounding prompt. Public so a custom
-    ``GroundPrompt`` can reuse it."""
+    ``GroundPrompt`` can reuse it. Results are the grounder's ground truth for resolving a reference
+    (the id a ``$from``/``$decide`` needs to pick), so they're rendered with a much larger cap than
+    the observed-state renderers — a search returning several records must not have a later record's
+    id truncated off the end (the failure that made a second email invisible to grounding)."""
     if not history:
         return "(nothing executed yet)"
     lines = []
     for completed in history:
         outcome = completed.ack.result if completed.ack.ok else f"ERROR: {completed.ack.result}"
         args = json.dumps(completed.invocation.params)
-        lines.append(f"- {completed.invocation.operation_name}({args}) -> {_truncate(outcome)}")
+        rendered = _truncate(outcome, _HISTORY_RESULT_LIMIT)
+        lines.append(f"- {completed.invocation.operation_name}({args}) -> {rendered}")
     return "\n".join(lines)
 
 
@@ -601,6 +664,13 @@ def _parse_params(text: str) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError(f"grounded params is not a JSON object: {params!r}")
     return params
+
+
+# Operation results carry the identifiers a reference resolves against, so history is rendered with
+# a generous cap (bounded, but large enough that a multi-record search result isn't cut mid-record).
+# Observed properties/signals are re-observed state that would grow every prompt, so they keep the
+# smaller default below — this is why the two aren't one shared limit.
+_HISTORY_RESULT_LIMIT = 4000
 
 
 def _truncate(value: Any, limit: int = 400) -> str:

@@ -40,6 +40,14 @@ class OperationSpecification:  # was Operation — renamed for symmetry with the
     # express, so merge_manuals keeps the authored value even though the adapter otherwise owns
     # operations. None = synchronous op, no extra wait.
     completion_signal: str | None = None
+    # The shape of what this operation *returns*, JSON-Schema-shaped (an array/object with named
+    # fields, or a leaf type) — the counterpart to `parameters`. Adapter-owned like `parameters`:
+    # synthesized from a native return type/description (see the are-sim adapter's return
+    # introspection, or an MCP `outputSchema`). Its purpose is to let a planner author a
+    # *resolvable* `$from` reference — a dotted path into a prior step's result — instead of
+    # guessing the result's shape (a wrong guess silently escalates the reference to the model).
+    # None when the adapter can't determine it (an unannotated op, a hand-authored manual).
+    returns: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

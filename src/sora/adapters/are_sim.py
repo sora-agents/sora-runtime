@@ -23,12 +23,16 @@ satisfy, so S-ORA-side logic stays testable without ARE (see ADR-0003).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import logging
 import threading
 import time
+import typing
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from types import UnionType
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, Union
 
 from sora.manual import (
     Manual,
@@ -45,6 +49,8 @@ if TYPE_CHECKING:
     from sora.manual import ManualSource, ToolRecord, WorkspaceRecord
 
 _T = TypeVar("_T")
+
+log = logging.getLogger("sora.adapters.are_sim")
 
 _AUI_APP = "AgentUserInterface"  # ARE's user-message app; routed via the transport, not as a tool
 
@@ -221,12 +227,125 @@ def _params_schema(app_tool: Any) -> dict[str, Any]:
     return schema
 
 
+# How deep to expand a returned record's nested records into a JSON-Schema shape. A list of records
+# whose fields include another list of records (ARE's ReturnedEmails -> list[Email]) is the deepest
+# real shape; today no ARE app record even reaches this cap (the deepest is record-in-record, and
+# none are self- or mutually-referential). The cap is defensive: a foreign/future annotation that
+# *is* self-referential (`children: list[Node]`, resolved back to the live class by
+# ``get_type_hints``) would otherwise recurse into a ``RecursionError``. When the cap actually
+# elides a nested shape, ``_type_to_schema`` emits a DEBUG log — silent in normal runs, and a lead
+# when a planner ``$from`` path won't resolve because the shape below the cap was dropped.
+_MAX_RETURN_DEPTH = 3
+
+_PRIMITIVE_JSON = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+
+def _log_depth_cap(tp: Any) -> None:
+    """A returned type expandable past ``_MAX_RETURN_DEPTH`` was clipped to a leaf. Benign — an
+    over-deep or (unexpectedly) self-referential annotation is bounded rather than crashing — so
+    this is DEBUG, not a warning: no ARE app record reaches the cap today, and the record shape
+    stays valid, just shallower than the source type."""
+    log.debug(
+        "return-type introspection hit depth cap %d at %r; nested shape below it is elided "
+        "(a planner $from path can't index past this point)",
+        _MAX_RETURN_DEPTH,
+        tp,
+    )
+
+
+def _type_to_schema(tp: Any, depth: int = 0) -> dict[str, Any]:
+    """Best-effort JSON-Schema fragment for a Python return annotation — deep enough that a planner
+    can author a ``$from`` path into it (list nesting + a record's field names), no deeper. Handles
+    ``list[X]`` (and tuple/set), ``X | None`` unions, dataclasses (one level of fields), and the
+    JSON primitives; anything else (or past the depth cap) degrades to a bare ``string`` rather than
+    raising. A *string* annotation (an unresolved ``from __future__ import annotations`` hint)
+    reuses the union-aware arg-type string mapper (so ``'int | None'`` maps to integer, not the
+    ``string`` a single-atom mapper would give)."""
+    if isinstance(tp, str):
+        return _json_type(tp)
+    origin = typing.get_origin(tp)
+    if origin in (Union, UnionType):
+        members = [a for a in typing.get_args(tp) if a is not type(None)]
+        if len(members) == 1:
+            return _type_to_schema(members[0], depth)
+        # An all-numeric union (``int | float``) has a single faithful JSON type; anything else
+        # heterogeneous doesn't — same rule the arg-type mapper (`_json_type`) applies.
+        if members and {_type_to_schema(m, depth).get("type") for m in members} <= {
+            "integer",
+            "number",
+        }:
+            return {"type": "number"}
+        return {"type": "string"}
+    if origin in (list, set, frozenset) or tp in (list, set, frozenset):
+        args = typing.get_args(tp)
+        schema: dict[str, Any] = {"type": "array"}
+        if args and args[0] is not ...:
+            if depth < _MAX_RETURN_DEPTH:
+                schema["items"] = _type_to_schema(args[0], depth + 1)
+            else:
+                _log_depth_cap(tp)
+        return schema
+    if origin is tuple or tp is tuple:
+        return {"type": "array"}
+    if isinstance(tp, type) and dataclasses.is_dataclass(tp):
+        if depth >= _MAX_RETURN_DEPTH:
+            _log_depth_cap(tp)
+            return {"type": "string"}
+        try:
+            hints = typing.get_type_hints(tp)
+        except Exception:
+            hints = {f.name: f.type for f in dataclasses.fields(tp)}
+        properties = {
+            f.name: _type_to_schema(hints.get(f.name, Any), depth + 1)
+            for f in dataclasses.fields(tp)
+        }
+        return {"type": "object", "properties": properties}
+    if tp in _PRIMITIVE_JSON:
+        return {"type": _PRIMITIVE_JSON[tp]}
+    if tp is dict or origin is dict:
+        return {"type": "object"}
+    return {"type": "string"}
+
+
+def _resolved_return_type(app_tool: Any) -> Any:
+    """The operation's return annotation as a *resolved* type, not a string. ARE's app modules use
+    ``from __future__ import annotations``, so ``AppTool.return_type`` is the raw annotation string
+    (``'list[Email]'``) — useless for field-name introspection. Resolve it against the underlying
+    function's own module globals (where ``Email``/``ReturnedEmails`` are defined) via
+    ``get_type_hints``; fall back to the raw ``return_type`` (a real type in a fake, or a string we
+    can only shallow-map) when there's no function or resolution fails."""
+    func = getattr(app_tool, "function", None)
+    if func is not None:
+        try:
+            resolved = typing.get_type_hints(func).get("return")
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            return resolved
+    return getattr(app_tool, "return_type", None)
+
+
+def _returns_schema(app_tool: Any) -> dict[str, Any] | None:
+    """The operation's declared result shape, or None. Synthesized from the resolved return type
+    (see ``_resolved_return_type``) and seeded with the ``return_description`` prose so a planner
+    sees both the shape to index a ``$from`` path into and what it means. A ``-> None`` op (resolved
+    to ``NoneType``) has no result to reference, so it declares no shape — otherwise it would render
+    a fictitious leaf a planner could bind an empty-path ``$from`` against."""
+    tp = _resolved_return_type(app_tool)
+    if tp is None or tp is type(None):
+        return None
+    schema = _type_to_schema(tp)
+    description = getattr(app_tool, "return_description", None)
+    return {**schema, "description": description} if description else schema
+
+
 def _operation_specs(app: Any) -> list[OperationSpecification]:
     return [
         OperationSpecification(
             name=_op_name(app, at),
             description=getattr(at, "function_description", None) or "",
             parameters=_params_schema(at),
+            returns=_returns_schema(at),
         )
         for at in app.get_tools()
     ]

@@ -95,6 +95,29 @@ def test_bad_path_missing_step_and_soft_ref_are_unresolved() -> None:
         assert resolved["x"] == params["x"]  # left in place for the escalation to replace
 
 
+def test_bare_list_result_resolves_by_index_then_field() -> None:
+    # ARE's search_emails returns a *bare* list[Email] keyed by `email_id` — so the resolvable path
+    # is `0.email_id` / `1.email_id`. Surfacing that return shape to the planner (so it emits these
+    # instead of the fictional `emails.0.id`) is what keeps both emails read mechanically, with no
+    # model escalation — the fix for the second email never being read.
+    history = [
+        _history(
+            "search_emails",
+            [{"email_id": "followup", "content": "Tuesday"}, {"email_id": "original"}],
+        )
+    ]
+    ref0 = {"id": {"$from": "search_emails", "path": "0.email_id"}}
+    ref1 = {"id": {"$from": "search_emails", "path": "1.email_id"}}
+    first, u1 = resolve_references(ref0, history)
+    second, u2 = resolve_references(ref1, history)
+    assert (first["id"], u1) == ("followup", [])
+    assert (second["id"], u2) == ("original", [])  # the second record is reachable, not truncated
+    # The old guessed shape (a fictional `emails` wrapper) does NOT resolve against a bare list —
+    # it escalates, which is exactly the failure the returns rendering removes.
+    _, u3 = resolve_references({"id": {"$from": "search_emails", "path": "emails.0.id"}}, history)
+    assert u3 == ["id"]
+
+
 def test_latest_matching_history_entry_wins() -> None:
     history = [_history("list", {"v": 1}), _history("list", {"v": 2})]
     resolved, _ = resolve_references({"x": {"$from": "list", "path": "v"}}, history)
