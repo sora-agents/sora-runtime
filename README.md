@@ -861,9 +861,26 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         def __init__(self, inner: LLMClient) -> None: ...
         async def complete(self, *, system: str, prompt: str) -> str: ...
 
-    class LLMMeter(logging.Handler):   # tallies the `sora.llm` cues: call count + in-model seconds
-        """A run surface (TerminalSession, an example runner) attaches it to the `sora` logger and
-        calls summary() at the end — no reference to the client (which bootstrap hands off) needed."""
+    @dataclass(frozen=True)
+    class LLMUsage:                    # provider-native token accounting for one round-trip
+        """Surfaced by the *concrete* client (opt-in via its `instrument:` config), not the outer
+        timing decorator: token counts live only in the provider's response, where no wrapper can
+        see them — the one thing that can't be metered from outside. `output_tokens` folds in
+        thinking, and adaptive thinking doesn't return the thinking as countable text, so the
+        deliberation share is *estimated* as output the answer doesn't explain: output_tokens minus
+        the answer's tokens (from the measured `answer_chars`). `log_llm_usage(usage)` emits it as a
+        `sora.llm` usage record, paired with (distinct from) the timing `done` cue."""
+        input_tokens: int; output_tokens: int; answer_chars: int
+        @property
+        def thinking_tokens(self) -> int: ...   # est: output the answer doesn't account for
+        @property
+        def thinking_share(self) -> float: ...
+
+    class LLMMeter(logging.Handler):   # tallies the `sora.llm` cues: calls + in-model seconds, and
+        """(when the client is instrumented) token totals + thinking share. A run surface
+        (TerminalSession, an example runner) attaches it to the `sora` logger and calls summary() at
+        the end — no reference to the client (which bootstrap hands off) needed. Token tally is
+        opt-in: an uninstrumented client emits no usage record and summary() reports timing only."""
         def summary(self, wall_seconds: float | None = None) -> str: ...
 
     # sora/memory.py

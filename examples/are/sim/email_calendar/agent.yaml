@@ -37,7 +37,12 @@ agent:
     # memory.procedural URI above (that's the plan *store*; this overrides the plan *prompt*).
     plan_prompt: examples.are.sim.email_calendar.strategies.reconciling_plan_prompt
   llm:
-    model: claude-sonnet-5
+    model: claude-opus-4-8
+    # Emit per-call token accounting (input/output tokens + thinking-vs-answer share) into the
+    # end-of-run LLM summary, on top of the wall-clock timing. Diagnostic for spotting which calls
+    # are thinking-bound (e.g. grounding a datetime) vs answer-heavy. Passed straight through as an
+    # AnthropicLLMClient ctor kwarg; drop it (or set false) to meter timing only.
+    instrument: true
   transport:
     # The ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies
     # via send_message_to_user. Shares the running simulation with the are-sim workspace below.

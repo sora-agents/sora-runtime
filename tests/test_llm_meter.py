@@ -7,7 +7,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from sora.llm import LLMMeter, MeteredLLMClient
+from sora.llm import LLMMeter, LLMUsage, MeteredLLMClient, log_llm_usage
 
 
 @pytest.fixture
@@ -127,3 +127,64 @@ def test_llm_meter_ignores_unrelated_records() -> None:
     meter = LLMMeter()
     meter.handle(logging.LogRecord("sora.cycle", logging.INFO, __file__, 0, "observe: x", (), None))
     assert meter.calls == 0  # only records carrying llm_event="done" are counted
+
+
+def test_llm_usage_estimates_thinking_from_output_minus_answer() -> None:
+    # A tiny answer (40 chars ~= 10 tokens) behind a large output (800) reads as thinking-bound —
+    # the exact case adaptive thinking hides from a thinking-block char count (which would see ~0).
+    usage = LLMUsage(1200, 800, answer_chars=40)
+    assert usage.answer_tokens == 10  # 40 / _CHARS_PER_TOKEN
+    assert usage.thinking_tokens == 790  # output the answer doesn't explain
+    assert usage.thinking_share == 790 / 800
+    # An answer as long as the output is answer-bound: near-0 thinking, clamped, never negative.
+    assert LLMUsage(500, 200, answer_chars=1000).thinking_tokens == 0
+    assert LLMUsage(500, 200, answer_chars=1000).thinking_share == 0.0
+    # No output at all -> 0.0, never a divide-by-zero.
+    assert LLMUsage(10, 0, answer_chars=0).thinking_share == 0.0
+
+
+def test_log_llm_usage_emits_one_usage_record(_llm_logging_enabled: None) -> None:
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(handler)
+    try:
+        log_llm_usage(LLMUsage(1200, 800, answer_chars=40))
+    finally:
+        logger.removeHandler(handler)
+
+    (record,) = records
+    assert record.__dict__["llm_event"] == "usage"  # distinct from the timing "done" event
+    assert record.__dict__["llm_input_tokens"] == 1200
+    assert record.__dict__["llm_output_tokens"] == 800
+    assert record.__dict__["llm_answer_chars"] == 40
+    # The cue shows the answer size beside the output for a quick eyeball: ~10 answer of 800 out.
+    assert "~10 answer, ~99% thinking" in record.getMessage()  # 790/800, rounded
+
+
+def test_llm_meter_tallies_usage_and_summary_reports_tokens(_llm_logging_enabled: None) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        # Two instrumented calls: a thinking-bound one (tiny answer) and an answer-heavy one.
+        log_llm_usage(LLMUsage(1000, 900, answer_chars=40))  # ~10 answer tok, ~890 thinking
+        log_llm_usage(LLMUsage(500, 200, answer_chars=600))  # ~150 answer tok, ~50 thinking
+    finally:
+        logger.removeHandler(meter)
+
+    assert meter.usage_calls == 2
+    assert (meter.input_tokens, meter.output_tokens) == (1500, 1100)
+    # Aggregate share is over pooled totals: (1100 out - 640/4 answer tok) / 1100.
+    assert meter.thinking_share == (1100 - round(640 / 4)) / 1100
+    summary = meter.summary()
+    assert "1500 in / 1100 out tokens (~160 answer, ~85% thinking)" in summary
+
+
+def test_llm_meter_summary_omits_tokens_when_uninstrumented() -> None:
+    # With no usage records (client not instrumented), summary reports timing only — unchanged.
+    meter = LLMMeter()
+    meter.calls = 2
+    meter.total_seconds = 3.0
+    assert "tokens" not in meter.summary()
