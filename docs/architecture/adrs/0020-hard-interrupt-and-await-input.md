@@ -8,15 +8,14 @@
 `DecisionCycle.interrupt()` was a stub and nobody called it. Signals flowed only
 *cooperatively*: a focused tool pushes to `signal_sink`, the once-per-cycle Observe drain lands it in
 `WorkingMemory.signals`, and a `BLOCKED` activity waiting on it returns to `READY` — always at a cycle
-boundary, never mid-phase. The README fixes one target this leaves open: reactiveness "backed by a hard
-interrupt for high-priority events", "not a hard per-phase timeout, since an in-flight model call can't
-be safely cut off mid-generation." Four coupled questions had to be answered together:
+boundary, never mid-phase. Reactiveness is "backed by a hard interrupt for high-priority events" —
+preempting the current phase promptly, not only at the next cooperative boundary. Four coupled questions
+had to be answered together:
 
 1. **When is a hard interrupt mandated, and by whom?** Matching any blocked wait is too broad (a robotic
    arm reaching position would preempt an unrelated running activity); letting every tool author declare
    an interrupting signal grants too much power without a trust model.
-2. **How is the current phase preempted** without either losing committed external side effects or
-   waiting out an unbounded model call?
+2. **How is the current phase preempted** without losing committed external side effects?
 3. **What happens to the interrupted activity** — does it need a new state?
 4. **Where does the policy decision live** — the judgment that *this* pushed signal should preempt,
    versus flow cooperatively?
@@ -52,9 +51,8 @@ be safely cut off mid-generation." Four coupled questions had to be answered tog
 ## Decision Outcome
 
 Chosen: **a hard interrupt modeled on process scheduling — save context, run a pluggable handler, let
-the existing scheduler pick next — preempting via phase-boundary checkpoints plus true mid-flight
-abandonment of the Reason model call, and screening which pushed signals preempt through a pluggable,
-push-time `InterruptPolicy`. No new activity state.**
+the existing scheduler pick next — preempting via phase-boundary checkpoints, and screening which pushed
+signals preempt through a pluggable, push-time `InterruptPolicy`. No new activity state.**
 
 **Source & signature.** `interrupt(signal, *, target=None)` records an `InterruptRequest(signal, target)`
 and sets an `asyncio.Event` (`_wake`). `signal` carries the *why* the handler reads; `target` names one
@@ -67,37 +65,22 @@ next tick). This is distinct from `Agent.stop()` / Ctrl-C (graceful loop shutdow
 **Preemption mechanism.** `tick()` gains a **phase-boundary checkpoint** (`_preempted`) after each phase:
 if an interrupt is pending, run the handler and abort the rest of the tick. The abandoned `TickResult`
 carries no staleness — it never outlives one `tick()` (ADR-0011) — and Act (the cycle's single external
-action) is never reached, so an interrupted tick commits nothing external. Reason is the one
-unbounded-latency phase, so its **model calls** are **raced** against `_wake`
-(`asyncio.wait(FIRST_COMPLETED)`) rather than merely checkpointed after: on an interrupt mid-inference the
-in-flight call is **abandoned** — kept referenced in an `_abandoned` set so it finishes in the background
-and its result is discarded (an LLM call can't be cut mid-generation; "let it finish, ignore the result").
-The inter-tick idle wait becomes `wait_between_ticks(interval)` (a `wait_for` on `_wake`, then clear), so
-an interrupt starts the next tick at once instead of sleeping out the interval.
+action) is never reached, so an interrupted tick commits nothing external. No phase blocks on an
+unbounded-latency call: model calls run off-cycle as async internal actions
+([ADR-0021](0021-llm-calls-as-async-internal-actions.md)), so the cycle is always within a bounded phase and
+the checkpoint after it meets the reactive target — there is no in-phase model call to cut short. The
+inter-tick idle wait is `wait_between_ticks(interval)` (a `wait_for` on `_wake`, then clear), so an interrupt
+starts the next tick at once instead of sleeping out the interval.
 
-**The race is a reusable primitive, and it races the *call* not the *phase*.** The mechanism is a
-`DecisionCycle.abandon_on_interrupt(coro)` helper: it races one **side-effect-free** coroutine (the model
-call) against `_wake`, returning the result normally or an `ABANDONED` sentinel on interrupt (detaching,
-not cancelling — the HTTP finishes, result discarded). `DefaultReasonStrategy` wraps *just* its model
-calls (`infer`, and the grounding escalation) in it and **guards every durable mutation
-(`activity.plan`/`step_index`) behind a non-`ABANDONED` result**. This is deliberate on two counts.
-*(1) Correctness:* an earlier design raced the whole `reason()` call, so an abandoned Reason kept running
-detached and wrote `activity.plan` in the background *after* the interrupt handler had already re-routed
-the activity — clobbering, e.g., a reconsideration handler that cleared the plan. Racing the pure call
-and guarding the mutation closes that stale-write race. *(2) Generality:* any phase strategy that needs a
-model call abandonable can call the same helper. It is **opt-in, not automatic**, because racing a phase
-is only safe when its in-flight work has no durable side effects — true of Reason's model calls (pure
-reads returning a value), but not of Observe/Situate/Act, which mutate working memory / activities /
-dispatch external ops as they run. A phase that model-calls *without* the helper simply gets
-checkpoint-after granularity (safe, just not the 10ms target); auto-wrapping every phase would trade that
-latency gap for a torn-durable-state hazard.
-
-**Invariant — abandon the model, never the external op.** A model result and the disposable `TickResult`
-are the *only* things discarded. An already-dispatched external operation (side effects) is never
-abandoned: a `RUNNING` activity is left `RUNNING`, its op runs to completion, and the interrupt is honored
-at the next checkpoint *after* its ack resolves. The handler reports this by returning `False` (not yet
-discharged) while any targeted activity is still `RUNNING`, so the request is revisited next checkpoint;
-`True` once every targeted activity is routed.
+**Invariant — never abandon a dispatched external op.** The disposable `TickResult` is the only thing an
+interrupted tick discards. An already-dispatched external operation (side effects) is never abandoned: a
+`RUNNING` activity is left `RUNNING`, its op runs to completion, and the interrupt is honored at the next
+checkpoint *after* its ack resolves. The handler reports this by returning `False` (not yet discharged)
+while any targeted activity is still `RUNNING`, so the request is revisited next checkpoint; `True` once
+every targeted activity is routed. An activity `RUNNING` on an off-cycle *inference* is treated the same
+way — left to resolve, its result discarded if the handler re-routed it in the meantime (the stale-result
+reconciliation of [ADR-0021](0021-llm-calls-as-async-internal-actions.md), modeled on the late-ack guard
+below).
 
 **No new state — a pluggable `InterruptHandler` maps onto existing states.** The interrupted activity's
 context is already saved (durable on the `Activity` dataclass — the PCB; the per-tick `TickResult` is the
@@ -132,47 +115,36 @@ state (e.g. a set of inbox ids), which is application-shaped.
 `strategies.interrupt` / `strategies.interrupt_policy` (mirroring the phase-strategy `import_object`
 pattern — deliberately *not* folded into the five-field `Strategies` bundle, which is the decision chain).
 
-**Example policy (ARE mail-diff).** The dynamic ARE showcase supplies `MailDiffInterruptPolicy` (diffs
-INBOX email ids straight from the `state_changed` payload — fires on a genuine new inbound email, never on
-the baseline, a SENT self-write, or a non-inbox signal) paired with a reconsidering `InterruptHandler`
-(clears a live plan → the default Reason re-infers, or spawns one corrective activity if the goal already
-completed). This centralizes reconsideration in *one* seam — the interrupt handler — replacing the
-example's earlier in-Reason/in-Situate trigger strategies. Honest timing caveat: The ARE bridge emits
-`state_changed` from `tool.observe()`, i.e. *during* the Observe phase (Observe-cadence, for determinism),
-not off a background thread. So for the ARE sim today the policy fires inside the current tick's Observe
-and aborts *that* tick's Reason/Act — there is no in-flight model call to abandon yet, and this is largely
-a clean *relocation* of the INBOX-id logic into the seam rather than new timing capability. But it is the
-exact architecture a genuinely asynchronous signal source (a user stop today; a future off-cycle ARE push)
-reuses to abandon an in-flight inference, and it keeps the mechanism/policy split clean. The two future
-unlocks are separately deferred: general **efference / read-write tagging** (retires the INBOX-id keying)
-and an **off-cycle ARE push** from the Environment thread (retires this caveat → true mid-Reason
-abandonment for the email scenario).
+**Example policy.** A concrete `InterruptPolicy` paired with a matching `InterruptHandler` exercises the seam
+end-to-end: the dynamic ARE showcase supplies one that treats a genuine new inbound event as a
+reconsideration trigger, centralizing reconsideration in this *one* seam rather than in bespoke
+Reason/Situate strategies. The worked walkthrough — the policy's payload keying, the Observe-cadence timing
+of that example's signal source, and how a reconsidering handler composes with off-cycle inference — lives
+with the example (`EXAMPLES.md`, and the ARE dynamic-scenarios note
+`docs/architecture/notes/are-dynamic-scenarios.md`); the requirement that such a handler invalidate an
+in-flight inference is [ADR-0021](0021-llm-calls-as-async-internal-actions.md)'s.
 
 ### Positive Consequences
 
 * Authoritative preemption (10ms target) without a per-phase timeout and without a new activity state.
-* No side effect is ever lost or double-applied: only a model result / disposable `TickResult` is
-  discarded; a dispatched external op always runs to completion.
+* No side effect is ever lost or double-applied: only the disposable `TickResult` (and an off-cycle
+  inference result the handler invalidated) is discarded; a dispatched external op always runs to completion.
 * The default changes nothing — `NeverInterruptPolicy` + `DefaultInterruptHandler` preserve the
   cooperative signal path and add only the user-stop capability; no self-write loop by default.
-* Mechanism (interrupt/checkpoint/abandon) and policy (which signals preempt, what happens next) are
+* Mechanism (interrupt/checkpoint) and policy (which signals preempt, what happens next) are
   cleanly split across two pluggable seams, reusing the ADR-0010/0011 posture.
 
 ### Negative Consequences
 
-* For the ARE sim as-is the policy seam is mostly a relocation, not new timing benefit (Observe-cadence
-  push) — the mid-generation-abandon payoff only materializes for a genuinely async producer (a user stop
-  today).
+* The push-time policy seam gives no mid-phase benefit over the cooperative path when the signal source only
+  produces at Observe-cadence (as a synchronous, observe-driven bridge does): the interrupt is seen at the
+  same drain the cooperative path would use. It earns its keep only for a genuinely off-cycle producer — and
+  even then it changes only *when* the interrupt is seen, never whether an in-flight call is cut (it never is).
 * Distinguishing the agent's own writes from external events is still application-shaped (INBOX-id
   diffing) until efference tagging lands; `NeverInterruptPolicy` is the safe default precisely because no
   general test exists yet.
 * A user stop pauses to `InputWait` but does not itself decide replan-vs-drop per activity — that nuance
   is the handler's, and the default keeps every paused activity resumable rather than judging intent.
-* Mid-flight abandonment is **opt-in per model call** (`abandon_on_interrupt`), not a property of the
-  cycle: a custom phase strategy that awaits a model call *without* the helper gets checkpoint-after
-  granularity — the interrupt is honored only once that call returns, so a hung call blocks the tick. This
-  is the accepted cost of not being able to safely auto-abandon phases that mutate durable state; the
-  contract is documented (model-call-heavy work belongs in Reason, or must route through the helper).
 * Manual-declared interrupting signals and a trust model for them remain deferred; the only wired source
   is the CLI user stop.
 * `DefaultInterruptHandler` is a *user-stop* handler, not a general router: it recognizes only the
@@ -187,6 +159,10 @@ abandonment for the email scenario).
 
 * Builds on [ADR-0011](0011-phase-fusion-via-threaded-result.md) (the per-tick `TickResult` is disposable,
   so an abandoned tick carries no staleness — what makes checkpoint-and-abort safe).
+* Superseded in part by [ADR-0021](0021-llm-calls-as-async-internal-actions.md): the mid-flight abandonment
+  of the Reason model call (`abandon_on_interrupt`, the `_abandoned` set) is retired now that model calls run
+  off-cycle; what this ADR retains is the interrupt / checkpoint / await-input / policy machinery and the
+  external-op invariant.
 * Extends [ADR-0019](0019-blocked-state-machinery-and-percept-storage.md): `InputWait` is the second
   `blocked_on` variant that ADR foresaw; the cooperative signal resume it defines is left intact, the hard
   interrupt is layered beside it.

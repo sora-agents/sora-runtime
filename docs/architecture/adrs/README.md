@@ -25,7 +25,7 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0008](0008-protocol-based-extensibility.md) | Every extension point is an open Protocol, never a closed enum or base class | proposed | Extensibility |
 | [0009](0009-five-phase-decision-cycle.md) | Five fixed decision-cycle phases, one external action per cycle | proposed | Decision cycle |
 | [0010](0010-pluggable-phase-strategies.md) | Every phase has an independently pluggable strategy | proposed | Decision cycle |
-| [0011](0011-phase-fusion-via-threaded-result.md) | Phase fusion via a per-cycle threaded result | proposed | Decision cycle |
+| [0011](0011-phase-fusion-via-threaded-result.md) | Per-cycle threaded result: field-gated phase short-circuiting | proposed | Decision cycle |
 | [0012](0012-percepts-vs-messages.md) | Percepts and messages kept as two distinct channels | proposed | Decision cycle |
 | [0013](0013-shared-instances-narrow-dependencies.md) | Agent/DecisionCycle share instances; narrow explicit dependencies everywhere | proposed | Composition & wiring |
 | [0014](0014-tool-identity-globally-unique.md) | Tool identity is globally unique, guaranteed by the protocol adapter | proposed | Tool & workspace model |
@@ -35,7 +35,8 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0018](0018-manual-merge-policy-and-authored-interface.md) | Manual merge policy (adapter owns interface, author owns prose) + optional names-level authored interface | proposed | Tool & workspace model |
 | [0019](0019-blocked-state-machinery-and-percept-storage.md) | Blocked-state machinery: mechanical Observe-hosted suspend/resume + split percept storage | proposed | Decision cycle |
 | [0020](0020-hard-interrupt-and-await-input.md) | Hard-interrupt path: process-scheduling preemption, await-input, and a push-time InterruptPolicy seam | proposed | Decision cycle |
+| [0021](0021-llm-calls-as-async-internal-actions.md) | LLM calls as off-cycle, deferred-result internal actions (supersedes ADR-0020's mid-flight abandonment) | proposed | Decision cycle |
 
 ## Planned
 
-None currently pending — 20 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
+None currently pending — 21 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).

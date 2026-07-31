@@ -14,12 +14,13 @@ Grounding lives in Reason (deciding a value is reasoning); Act stays mechanistic
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from fakes import FakeAdapter, FakeTool, FakeWorkspace
 from sora.action import default_action_registry, invoke_step
-from sora.activity import Activity
+from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
 from sora.manual import Manual
@@ -237,13 +238,35 @@ async def test_reason_escalates_unresolvable_reference_to_model(tmp_path: Path) 
         step_index=0,
         history=[_history("search_emails", {"emails": [{"id": 99}]})],
     )
+    working.activities["a"] = activity  # the off-cycle _ground_ action looks it up here
 
+    # A soft ref can't resolve mechanically: Reason fires _ground_ off-cycle -> RUNNING, no step.
     result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None
+    # state read into a fresh local before each assert so mypy doesn't carry a narrowing across the
+    # observe() that mutates it (same idiom as test_interrupt.py).
+    state = activity.state
+    assert state is ActivityState.RUNNING
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "ground"
+    assert activity.step_index == 0  # not advanced while the escalation is in flight
 
-    assert result.step is not None
-    assert result.step.params["email_id"] == 99  # from the model escalation
+    await asyncio.sleep(0)  # let the background _ground_ task run and push its result
     assert len(spy.ground_calls) == 1
     assert spy.ground_calls[0][0] == "reply_to_email"
+
+    # The grounded params land in a later Observe; the next Reason pass consumes them into the step.
+    await DefaultObserveStrategy().observe(cycle)
+    assert activity.grounded_params == {"email_id": 99, "body": "hi"}
+    state = activity.state
+    assert state is ActivityState.READY
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is not None
+    assert result.step.params["email_id"] == 99  # from the model escalation
+    assert activity.grounded_params is None  # consumed
+    assert activity.step_index == 1
+    assert len(spy.ground_calls) == 1  # not re-escalated
 
 
 async def test_reason_grounds_send_content_mechanically_without_model(tmp_path: Path) -> None:
@@ -290,13 +313,24 @@ async def test_reason_escalates_unresolvable_send_content_to_model(tmp_path: Pat
         step_index=0,
         history=[_history("get_time", "12:00")],
     )
+    working.activities["a"] = activity  # the off-cycle _ground_ action looks it up here
 
+    # A soft ref in send content escalates the same off-cycle way: RUNNING, no step this cycle.
     result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "ground"
 
-    assert result.step is not None
-    assert result.step.params["content"] == {"time": "12:00"}  # from the model escalation
+    await asyncio.sleep(0)  # let the background _ground_ task run and push its result
     assert len(spy.ground_calls) == 1
     assert spy.ground_calls[0][0] == "send"
+
+    # The grounded content lands in a later Observe; the next Reason pass folds it into the step.
+    await DefaultObserveStrategy().observe(cycle)
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is not None
+    assert result.step.params["content"] == {"time": "12:00"}  # from the model escalation
+    assert activity.step_index == 1
 
 
 async def test_reason_send_without_dict_content_is_untouched(tmp_path: Path) -> None:
@@ -343,8 +377,10 @@ async def test_reason_ground_escalation_receives_current_properties_and_signals(
         step_index=0,
         history=[_history("search_emails", {"emails": [{"id": 99}]})],
     )
+    working.activities["a"] = activity  # the off-cycle _ground_ action looks it up here
 
     await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)  # let the background _ground_ task run so it records what it was asked
 
     assert len(spy.ground_percepts) == 1
     assert spy.ground_percepts[0] == PerceptSnapshot([prop_percept], [signal_percept])

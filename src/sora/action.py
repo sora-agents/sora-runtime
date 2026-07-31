@@ -9,21 +9,36 @@ import uuid
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.activity import Activity, ActivityState
+from sora.llm import current_inference_id
 from sora.manual import ToolRecord, WorkspaceRecord
 from sora.types import (
     OPERATION_NAME,
     TOOL_ID,
     ActionAck,
+    InferenceResult,
     OperationInvocation,
+    PendingInference,
     PendingOperation,
     Step,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from sora.cycle import DecisionCycle
     from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
+    from sora.manual import Manual
 
 log = logging.getLogger("sora.action")
+
+
+def _spawn_tracked(tasks: set[asyncio.Task[None]], coro: Coroutine[Any, Any, None]) -> None:
+    """Fire a background coroutine and hold a strong ref to its task until it finishes, so it isn't
+    GC'd mid-flight. The shared off-cycle-dispatch idiom behind _invoke_/_infer_/_ground_ — each
+    action keeps its own task set (distinct lifetimes) but routes the spawn through here."""
+    task = asyncio.create_task(coro)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
 
 
 class InternalAction(Protocol):
@@ -107,9 +122,7 @@ class InvokeAction:  # predefined external action: _invoke_
         )
         activity.state = ActivityState.RUNNING  # implicit, unconditional — see Activities
         log.info("act: invoke %s.%s%s", tool_id, operation_name, f" {params}" if params else "")
-        task = asyncio.create_task(self._call(cycle, tool, operation_name, params, invocation_id))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        _spawn_tracked(self._tasks, self._call(cycle, tool, operation_name, params, invocation_id))
         return ActionAck(ok=True)  # immediate — the round-trip runs off-cycle, cycle never blocks
 
     async def _call(
@@ -319,10 +332,112 @@ class ResumeAction:  # predefined internal action: _resume_
         log.info("observe: resumed activity %s", activity.id)
 
 
+# The two LLM calls are internal actions too — dispatched off-cycle exactly like _invoke_: set a
+# pending marker, go RUNNING, create_task, return at once so the cycle never blocks (ADR-0021).
+# Reason fires them when it needs a plan/param it can't produce mechanically; the result resolves a
+# cycle or more later via inference_sink. ProceduralMemory still owns the model handle and the
+# prompt/parse — the action just wraps that call in the off-cycle dispatch. pending_inference is
+# mutually exclusive with pending_operation (a cycle emits one internal *or* one external action).
+# A model call that raises (malformed output, no LLM, a network error) resolves with an *error*
+# InferenceResult rather than leaving the task to die silently and strand the activity RUNNING
+# forever — Observe terminates the activity on it (the failure surfaces, cycle-synchronized).
+
+
+class InferAction:  # predefined internal action: _infer_ — the async plan model call
+    name = "infer"
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        catalog: dict[str, Manual] = kwargs["tools"]  # id -> Manual, the planning catalog
+        observed = kwargs.get("observed")
+        inf_id = uuid.uuid4().hex
+        activity.pending_inference = PendingInference(
+            id=inf_id, kind="plan", requested_at=time.time()
+        )
+        activity.state = ActivityState.RUNNING  # off-cycle, like _invoke_ — immediate, never blocks
+        log.info("reason: inferring a plan for %r (%d tools)", activity.goal, len(catalog))
+        _spawn_tracked(self._tasks, self._call(cycle, activity, inf_id, catalog, observed))
+
+    async def _call(
+        self,
+        cycle: DecisionCycle,
+        activity: Activity,
+        inf_id: str,
+        catalog: dict[str, Manual],
+        observed: Any,
+    ) -> None:
+        # Tag this task's metered round-trip with the inference id (task-local, isolated per task)
+        # so the meter can attribute its cost to *this* inference — and move it to the wasted bucket
+        # if the result is later discarded (interrupt/supersede). See sora.llm.current_inference_id.
+        current_inference_id.set(inf_id)
+        try:
+            plan = await cycle.procedural.infer(activity, catalog, observed)  # the LLMClient call
+        except Exception as exc:  # noqa: BLE001 — any model/parse/wire failure resolves as an error
+            log.exception("reason: infer failed for activity %s", activity.id)
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))
+            return
+        cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=plan))
+
+
+class GroundAction:  # predefined internal action: _ground_ — the async param-grounding escalation
+    name = "ground"
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        inf_id = uuid.uuid4().hex
+        activity.pending_inference = PendingInference(
+            id=inf_id, kind="ground", requested_at=time.time()
+        )
+        activity.state = ActivityState.RUNNING
+        log.info("reason: grounding %s params via the model", kwargs["operation_name"])
+        _spawn_tracked(
+            self._tasks,
+            self._call(
+                cycle,
+                activity,
+                inf_id,
+                kwargs["operation_name"],
+                kwargs.get("manual"),
+                kwargs["partial_params"],
+                kwargs.get("observed"),
+            ),
+        )
+
+    async def _call(
+        self,
+        cycle: DecisionCycle,
+        activity: Activity,
+        inf_id: str,
+        operation_name: str,
+        manual: Manual | None,
+        partial_params: dict[str, Any],
+        observed: Any,
+    ) -> None:
+        current_inference_id.set(
+            inf_id
+        )  # attribute this round-trip's cost to this call (see infer)
+        try:
+            params = await cycle.procedural.ground(
+                activity, operation_name, manual, partial_params, observed
+            )
+        except Exception as exc:  # noqa: BLE001 — any model/parse/wire failure resolves as an error
+            log.exception("reason: ground failed for activity %s", activity.id)
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))
+            return
+        cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=params))
+
+
 def default_action_registry() -> ActionRegistry:
-    """The predefined action space, assembled once: the six external actions plus the six internal
-    working-memory actions. bootstrap and test harnesses register everything through this rather
-    than naming each action inline."""
+    """The predefined action space, assembled once: the six external actions plus the eight internal
+    actions (six working-memory levers plus the two off-cycle model calls _infer_/_ground_).
+    bootstrap and test harnesses register everything through this rather than naming each action
+    inline."""
     registry = ActionRegistry()
     for external in (
         InvokeAction(),
@@ -340,6 +455,8 @@ def default_action_registry() -> ActionRegistry:
         FilterPerceptionsAction(),
         SuspendAction(),
         ResumeAction(),
+        InferAction(),
+        GroundAction(),
     ):
         registry.register_internal(internal)
     return registry

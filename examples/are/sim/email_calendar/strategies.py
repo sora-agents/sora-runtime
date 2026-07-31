@@ -27,10 +27,11 @@ the general fix — efference / read-write tags so *any* self-caused change is f
 
 Timing caveat: today the ARE bridge emits ``state_changed`` from ``tool.observe()``, i.e. *during*
 the Observe phase (Observe-cadence, for determinism), not off a background thread. So the interrupt
-fires inside the current tick's Observe and aborts that tick's Reason/Act — there is no in-flight
-model call to abandon yet. The seam is the same one a genuinely asynchronous signal source (or an
-off-cycle ARE push) would reuse to abandon an in-flight inference; making the ARE push off-cycle is
-separately deferred.
+fires inside the current tick's Observe and aborts that tick before Reason/Act. Reason's model calls
+already run off-cycle (``_infer_``/``_ground_`` — ADR-0021), so an inference may be in flight from
+an earlier tick when the interrupt lands; the handler invalidates it (``pending_inference`` cleared)
+and its result is discarded when it resolves, rather than writing a stale plan. Making the ARE push
+itself off-cycle (a genuinely asynchronous signal source) is separately deferred.
 
 Precondition — the plan MUST focus the tools it reconciles against: the inbox (or ``state_changed``
 signals never carry INBOX state, so the policy never fires) and every tool whose state it changes
@@ -115,7 +116,15 @@ class ReconsiderInterruptHandler:
     interrupt into the agent's own decision cycle: every live (non-terminated) activity has its plan
     cleared so the default Reason re-infers against the updated observations; if the change landed
     after the goal completed (no live activity), one corrective activity is spawned. Any other
-    interrupt — a user stop — is delegated to the runtime default (pause to await input)."""
+    interrupt — a user stop — is delegated to the runtime default (pause to await input).
+
+    Because infer/ground now run off-cycle (ADR-0021), an activity may be RUNNING on an in-flight
+    inference when the interrupt lands. Clearing that ``pending_inference`` invalidates it — the
+    background call still finishes (an LLM call can't be cut mid-generation) but its result is
+    discarded on resolve (its id no longer matches the live one) — and the activity returns to READY
+    so it re-infers against the now-updated observations. An inference has no external side effect,
+    so dropping it is safe; an in-flight *external* op is left running (the base handler's
+    invariant), only its stale plan cleared."""
 
     def __init__(self) -> None:
         self._default = DefaultInterruptHandler()
@@ -128,10 +137,10 @@ class ReconsiderInterruptHandler:
         live = [a for a in wm.activities.values() if a.state is not ActivityState.TERMINATED]
         if live:
             for activity in live:
-                activity.plan = (
-                    None  # drop the stale plan -> the default Reason re-infers a fresh one
-                )
-                activity.step_index = 0
+                # Drop the stale plan (and any parked/in-flight deliberation) -> the default Reason
+                # re-infers a fresh one. reset_for_replan invalidates a RUNNING infer/ground back to
+                # READY (side-effect-free, discarded on resolve); an external op is left running.
+                activity.reset_for_replan()
             return True
         # The change landed after the goal completed: no live activity to replan -> spawn corrective
         # work (a distinct goal so DefaultSituateStrategy treats it as new, its own fresh plan).

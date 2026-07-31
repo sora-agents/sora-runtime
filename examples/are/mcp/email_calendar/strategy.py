@@ -47,8 +47,9 @@ class ScheduleFromEmailStrategy:
         if activity.plan is not None and signal_count > reacted:
             # A fresh state-change signal arrived while a plan was in flight -> invalidate it so the
             # default re-plans from the now-updated working memory instead of blindly advancing.
+            # reset_for_replan also clears any parked grounded_params, so the new plan's first
+            # groundable step never consumes the old plan's stale params.
             log.info("reason: state-change signal mid-plan -> re-planning %r", activity.goal)
-            activity.plan = None
-            activity.step_index = 0
+            activity.reset_for_replan()
         activity.context[_REACTED_SIGNALS] = signal_count
         return await self._default.reason(activity, wm, cycle, result)

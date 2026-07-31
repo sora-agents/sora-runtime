@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from sora.action import (
     CreateActivityAction,
     FilterPerceptionsAction,
+    GroundAction,
+    InferAction,
     InvokeAction,
     LoadManualAction,
     ResumeAction,
@@ -20,13 +22,13 @@ from sora.action import (
     UnloadManualAction,
 )
 from sora.activity import ActivityState
+from sora.llm import log_llm_discarded
 from sora.memory import PerceptSnapshot
 from sora.perception import Percept
 from sora.types import (
     OPERATION_NAME,
     TOOL_ID,
     USER_STOP,
-    Abandoned,
     CompletedOperation,
     InputWait,
     OperationInvocation,
@@ -223,8 +225,11 @@ class DefaultInterruptHandler:
     """The runtime default: a user stop. Pauses each targeted, schedulable (READY) activity to a
     resumable point via an InputWait, so the agent halts current work but stays alive; a later user
     Message resumes it (DefaultObserveStrategy._resume_on_input). An activity mid-external-op
-    (RUNNING) is left to finish and routed on a later checkpoint, so a physical side effect always
-    runs to completion. target=None is agent-wide; a named target pauses just that activity.
+    (RUNNING on a pending_operation) is left to finish and routed on a later checkpoint, so a
+    physical side effect always runs to completion. An activity RUNNING only on an off-cycle
+    infer/ground (pending_inference) has no side effect to protect, so it is paused *now* — its
+    inference invalidated (discarded on resolve) — rather than waiting out an unbounded model call
+    (ADR-0021). target=None is agent-wide; a named target pauses just that activity.
 
     It is a *user-stop* handler, not a general router: it recognizes only the USER_STOP signal and
     treats any other interrupt as unrouted — pausing to await human instruction is the fail-safe
@@ -254,9 +259,13 @@ class DefaultInterruptHandler:
             targets = [target] if target is not None else []
         pending = False
         for activity in targets:
-            if activity.state is ActivityState.RUNNING:
+            if activity.state is ActivityState.RUNNING and activity.pending_operation is not None:
                 pending = True  # external op in flight: let it finish, route on a later checkpoint
-            elif activity.state is ActivityState.READY:
+            elif activity.state in (ActivityState.READY, ActivityState.RUNNING):
+                # READY, or RUNNING only on a side-effect-free inference: drop the inference (no
+                # reason to wait out an unbounded model call) and pause to await the user's next
+                # instruction.
+                activity.discard_inference()
                 activity.state = ActivityState.BLOCKED
                 activity.blocked_on = InputWait(prompt=request.signal.name)
         return not pending
@@ -304,6 +313,7 @@ class DefaultObserveStrategy:
                         # the error the trace just says failed with no cause (e.g. a schema error).
                         log.warning("observe: resolved %s -> FAILED: %s", op, _truncate(ack.result))
                     break
+        await self._resolve_inferences(cycle)
         await self._suspend_on_completion_signal(cycle, just_resolved)
         await self._resume_on_signal(cycle)
         # Trim last: a signal that just arrived this tick must survive to be matched by the two
@@ -318,6 +328,55 @@ class DefaultObserveStrategy:
         if received_message:
             self._resume_on_input(wm)
         return TickResult()
+
+    @staticmethod
+    async def _resolve_inferences(cycle: DecisionCycle) -> None:
+        """Drain the off-cycle infer()/ground() results and apply each to the activity still RUNNING
+        on it. An unambiguous 1:1 match on pending_inference.id, resolved to READY — never a Percept
+        (deliberation output, not observed state — ADR-0019/0021), so it never touches the
+        perception path. `kind == "plan"` lands the Plan and resets step_index; `"ground"` parks
+        the resolved params on grounded_params for Reason's next pass to consume. A result carrying
+        an `error` (the model call raised) terminates the activity instead of stranding it RUNNING
+        forever — the failure surfaces, cycle-synchronized, the way a failed op does. Stale results
+        are discarded by the same guard the external-op late-ack uses: a result whose id no longer
+        matches the live pending_inference (an interrupt handler re-routed or re-inferred the
+        activity), or whose activity is no longer RUNNING, is dropped — the background call ran to
+        completion (an LLM call can't be cut mid-generation) but its result is no longer wanted."""
+        wm = cycle.working
+        async for inf_id, res in cycle.inference_sink.drain():
+            for activity in wm.activities.values():
+                if (
+                    activity.pending_inference is not None
+                    and activity.pending_inference.id == inf_id
+                    and activity.state is ActivityState.RUNNING
+                ):
+                    kind = activity.pending_inference.kind
+                    activity.pending_inference = None
+                    if res.error is not None:
+                        activity.grounded_params = None
+                        activity.state = ActivityState.TERMINATED
+                        log.error(
+                            "observe: %s for activity %s failed (%s) -> terminated",
+                            kind,
+                            activity.id,
+                            res.error,
+                        )
+                    elif kind == "plan":
+                        activity.plan = res.value  # type: ignore[assignment]  # kind=="plan" => Plan
+                        activity.step_index = 0
+                        activity.state = ActivityState.READY
+                        log.info("observe: resolved inferred plan for activity %s", activity.id)
+                    else:
+                        activity.grounded_params = res.value  # type: ignore[assignment]  # => dict
+                        activity.state = ActivityState.READY
+                        log.info("observe: resolved grounded params for activity %s", activity.id)
+                    break
+            else:
+                # No live activity claimed this result: it was invalidated (an interrupt re-routed
+                # the activity) or superseded (a re-inference gave a new id). The background model
+                # call ran to completion and was already metered, so its cost is real but wasted —
+                # tell the meter to move it to the wasted bucket (a no-op when uninstrumented).
+                log_llm_discarded(inf_id)
 
     @staticmethod
     def _resume_on_input(wm: WorkingMemory) -> None:
@@ -659,61 +718,56 @@ class DefaultReasonStrategy:
     * an activity that already has a plan with steps left is the cheap path — read the current step
       and advance ``step_index``: no model call, no procedural lookup;
     * an activity with no plan gets one by *reuse* first (``procedural.retrieve``) and only *infers*
-      a fresh one on a miss. Reuse is currently always a miss — the default Reflect no longer stores
-      completed plans (auto-caching a plan for verbatim replay is unsound), so every activity infers
-      until reusable procedures are distilled from episodes. Infer passes
-      the currently-joined tools (id -> Manual) as the planning catalog and a ``PerceptSnapshot``
-      of ``wm.properties``/``wm.signals`` as the agent's known world state (the strategy holds
-      `wm`; a memory module never reaches into the environment or working memory itself — it only
-      sees what's extracted and handed to it). The same snapshot is reused by the grounding
-      escalation below it, rather than each rebuilding its own;
+      a fresh one on a miss — firing the ``_infer_`` internal action, which moves the activity to
+      RUNNING and yields no step this cycle; the plan lands a later cycle via ``inference_sink`` and
+      Reason then advances it. Reuse is currently always a miss — the default Reflect no longer
+      stores completed plans (auto-caching a plan for verbatim replay is unsound), so every activity
+      infers until reusable procedures are distilled from episodes. Infer passes the currently-
+      joined tools (id -> Manual) as the planning catalog and a ``PerceptSnapshot`` of
+      ``wm.properties``/``wm.signals`` as the agent's known world state (the strategy holds `wm`; a
+      memory module never reaches into the environment or working memory itself — it only sees
+      what's extracted and handed to it);
     * an exhausted plan yields no step — the cycle returns, and Reflect terminates the activity the
       next cycle on the same "plan present and fully consumed" rule (so this branch is normally only
       reached by a just-inferred empty plan).
 
-    Mutates the activity (plan/step_index) in place, like the other phase defaults. The model itself
-    lives behind ``ProceduralMemory.infer``; this strategy makes zero model calls on the cheap
-    path."""
+    Mutates the activity (plan/step_index) in place, like the other phase defaults. Both model calls
+    run **off-cycle** as the ``_infer_``/``_ground_`` internal actions (isolated in
+    ``ProceduralMemory.infer``/``ground``): the cheap path — advancing an existing plan's step_index
+    and mechanically resolving its params — makes zero model calls and stays same-cycle; only the
+    escalations park the activity in RUNNING and resolve a later cycle. No phase blocks on a model
+    call, so there is nothing to race or abandon (ADR-0021)."""
 
     async def reason(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
-        observed: PerceptSnapshot | None = None
         if activity.plan is None:
             plan = await cycle.procedural.retrieve(activity)  # reuse across runs (cheap)
             if plan is None:
+                # Miss -> fire _infer_ off-cycle: it moves the activity to RUNNING and returns at
+                # once, so the cycle never blocks on the model. The plan lands a later cycle via
+                # inference_sink (Observe attaches it and resets step_index); this Reason yields no
+                # step now. Situate won't reselect a RUNNING activity, so no re-fire meanwhile.
                 catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
-                log.info("reason: inferring a plan for %r (%d tools)", activity.goal, len(catalog))
                 observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
-                # The one unbounded await: race it against a hard interrupt so a mid-inference stop
-                # abandons it (finishes in background, result discarded) instead of blocking the
-                # cycle. The mutation below is guarded on the outcome, so an abandoned infer never
-                # writes a stale plan onto an activity the interrupt handler has since re-routed.
-                outcome = await cycle.abandon_on_interrupt(
-                    cycle.procedural.infer(activity, catalog, observed)  # the model call
+                infer = cycle.actions.internal(InferAction.name)
+                await infer.execute(
+                    cycle, activity_id=activity.id, tools=catalog, observed=observed
                 )
-                if isinstance(outcome, Abandoned):
-                    return result  # interrupt pending; the checkpoint after Reason aborts the tick
-                plan = outcome
-                log.info("reason: inferred plan with %d steps", len(plan.steps))
-                log.debug("reason: inferred plan with %d steps\n%r", len(plan.steps), plan)
-            else:
-                log.info(
-                    "reason: reusing cached plan (%d steps) for %r", len(plan.steps), activity.goal
-                )
+                return result  # RUNNING on the inference; plan lands a later cycle
+            log.info(
+                "reason: reusing cached plan (%d steps) for %r", len(plan.steps), activity.goal
+            )
             activity.plan = plan
             activity.step_index = 0
         if activity.step_index >= len(activity.plan.steps):
             return result  # exhausted -> no step this cycle
         step = activity.plan.steps[activity.step_index]
-        # Grounding may escalate to its own model call; race it too. It is side-effect-free (returns
-        # a Step, mutates no durable state), so abandoning is safe. Advance step_index only on
-        # success, so an abandoned grounding doesn't consume the step.
-        grounded = await cycle.abandon_on_interrupt(
-            self._ground(step, activity, wm, cycle, observed)
-        )
-        if isinstance(grounded, Abandoned):
-            return result
+        grounded = await self._ground(step, activity, wm, cycle)
+        if grounded is None:
+            return result  # escalated via _ground_ (RUNNING); the step lands a later cycle
+        # Advance only once a concrete step is emitted, so a step awaiting its grounding escalation
+        # isn't skipped — step_index stays put across the RUNNING cycles until _ground_ resolves.
         activity.step_index += 1
         return replace(result, activity=activity, step=grounded)
 
@@ -723,26 +777,28 @@ class DefaultReasonStrategy:
         activity: Activity,
         wm: WorkingMemory,
         cycle: DecisionCycle,
-        observed: PerceptSnapshot | None = None,
-    ) -> Step:
+    ) -> Step | None:
         """Ground a step's reference-bearing params against this run's execution history for *this
         cycle* plus the agent's currently observed properties/signals, leaving the stored plan's
         references intact so procedural reuse keeps a reusable skeleton. Deciding a param value is
         a *reasoning* act, so it lives here, not in Act (which stays mechanistic). Hybrid: resolve
-        references deterministically; escalate to one model call (``procedural.ground``) only for
-        what can't be resolved mechanically. A step with no references is a pure no-op — the cheap
-        path makes no model call. Only ``invoke`` (an operation's params) and ``send`` (its
-        ``content``) carry a groundable bag today — e.g. a ``send`` reporting an earlier operation's
-        result back to the user; ``focus``/``unfocus`` carry only a bare ``tool_id``, nothing to
-        ground. ``observed`` lets a caller that already built the current-tick snapshot (``reason``,
-        when it just inferred a plan) pass it through instead of ``_resolve`` rebuilding its own."""
+        references deterministically; escalate to one **off-cycle** model call (the ``_ground_``
+        internal action) only for what can't be resolved mechanically. Returns the concrete Step
+        when grounding is complete (no references, references resolved mechanically, or a prior
+        ``_ground_`` escalation's params consumed from ``activity.grounded_params``), or ``None``
+        when it just fired ``_ground_`` — the activity is now RUNNING and the step lands a later
+        cycle. A step with no references is a pure no-op — the cheap path makes no model call. Only
+        ``invoke`` (an operation's params) and ``send`` (its ``content``) carry a groundable bag
+        today; ``focus``/``unfocus`` carry only a bare ``tool_id``, nothing to ground."""
         if step.next_action == InvokeAction.name:
             routing = {k: v for k, v in step.params.items() if k in (TOOL_ID, OPERATION_NAME)}
             op_params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
             manual = _manual_for(wm, routing.get(TOOL_ID))
             resolved = await self._resolve(
-                activity, wm, cycle, op_params, routing[OPERATION_NAME], manual, observed
+                activity, wm, cycle, op_params, routing[OPERATION_NAME], manual
             )
+            if resolved is None:
+                return None  # escalated to _ground_; RUNNING now
             if resolved == op_params:
                 return step  # no references -> unchanged, reuse the original Step
             return replace(step, params={**routing, **resolved})
@@ -750,9 +806,9 @@ class DefaultReasonStrategy:
             content = step.params.get("content")
             if not isinstance(content, dict):
                 return step  # nothing groundable
-            resolved = await self._resolve(
-                activity, wm, cycle, content, SendAction.name, None, observed
-            )
+            resolved = await self._resolve(activity, wm, cycle, content, SendAction.name, None)
+            if resolved is None:
+                return None
             if resolved == content:
                 return step
             return replace(step, params={**step.params, "content": resolved})
@@ -766,16 +822,30 @@ class DefaultReasonStrategy:
         params: dict[str, Any],
         operation_name: str,
         manual: Manual | None,
-        observed: PerceptSnapshot | None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        """Mechanically resolve ``params`` against history; if anything can't be, escalate to the
+        off-cycle ``_ground_`` action and return ``None``. When a prior escalation already resolved
+        (``activity.grounded_params`` set by Observe), consume and return those instead — the 1:1
+        counterpart to the plan landing on ``activity.plan``. step_index hasn't advanced across the
+        RUNNING cycles, so the parked params belong to exactly this step."""
+        if activity.grounded_params is not None:
+            resolved = activity.grounded_params  # the escalation resolved; consume it
+            activity.grounded_params = None
+            return resolved
         resolved, unresolved = resolve_references(params, activity.history)
-        if unresolved:
-            log.info("reason: grounding %s params %s via the model", operation_name, unresolved)
-            observed = observed or PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
-            resolved = await cycle.procedural.ground(
-                activity, operation_name, manual, resolved, observed
-            )
-        return resolved
+        if not unresolved:
+            return resolved  # cheap path — resolved mechanically, no model call
+        observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+        ground = cycle.actions.internal(GroundAction.name)
+        await ground.execute(
+            cycle,
+            activity_id=activity.id,
+            operation_name=operation_name,
+            manual=manual,
+            partial_params=resolved,
+            observed=observed,
+        )
+        return None  # RUNNING on the grounding escalation; params land a later cycle
 
 
 class DefaultActStrategy:

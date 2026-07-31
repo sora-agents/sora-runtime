@@ -6,9 +6,10 @@ call itself. ``DefaultReasonStrategy``:
 
 * if the activity already has a plan with steps remaining, reads the current step and advances
   ``step_index`` — the cheap path, no ``retrieve``/``infer`` at all;
-* otherwise retrieves a cached ``Plan`` for the goal (reuse across runs), or, on a miss, calls
-  ``ProceduralMemory.infer(...)`` — the single model call, passing the currently-joined tools as
-  the planning catalog;
+* otherwise retrieves a cached ``Plan`` for the goal (reuse across runs), or, on a miss, fires the
+  ``_infer_`` internal action — the single model call, run **off-cycle** (ADR-0021): the activity
+  parks in RUNNING and yields no step this cycle; the plan lands a later Observe via
+  ``inference_sink`` and Reason then advances it;
 * on an exhausted plan, yields no step (the cycle returns; Reflect terminates it next cycle).
 
 The model itself lives behind ``ProceduralMemory.infer`` (see ``test_procedural_memory.py``); these
@@ -207,12 +208,18 @@ async def test_reason_infers_plan_on_cache_miss_with_joined_tool_catalog(tmp_pat
     spy = SpyProcedural(retrieve=None, infer=inferred)
     cycle, working = _cycle(registry, tmp_path, procedural=spy)
     activity = Activity(id="a", goal="g", context={})
+    working.activities["a"] = activity  # the off-cycle _infer_ action looks it up here
 
+    # A cache miss fires _infer_ off-cycle: Reason yields no step this cycle, the activity parks
+    # in RUNNING, and the plan is not applied yet — it lands on a later Observe.
     result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None
+    assert activity.state is ActivityState.RUNNING
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "plan"
+    assert activity.plan is None
 
-    assert activity.plan is inferred
-    assert activity.step_index == 1
-    assert result.step == inferred.steps[0]
+    await asyncio.sleep(0)  # let the background _infer_ task run and push its result
     assert len(spy.retrieve_calls) == 1
     assert len(spy.infer_calls) == 1
     called_activity, called_tools, called_observed = spy.infer_calls[0]
@@ -221,6 +228,16 @@ async def test_reason_infers_plan_on_cache_miss_with_joined_tool_catalog(tmp_pat
     assert called_tools == {tool.id: tool.manual}
     # No percepts observed yet in this test -> infer() still gets the (empty) current snapshot.
     assert called_observed == PerceptSnapshot()
+
+    # The plan lands in a later Observe (step_index reset, activity READY); Reason then advances it.
+    await DefaultObserveStrategy().observe(cycle)
+    assert activity.plan is inferred
+    assert activity.step_index == 0
+    assert activity.state is ActivityState.READY
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step == inferred.steps[0]
+    assert activity.step_index == 1
+    assert len(spy.infer_calls) == 1  # advanced the landed plan, did not re-infer
 
 
 async def test_reason_infer_receives_current_properties_and_signals(tmp_path: Path) -> None:
@@ -233,12 +250,14 @@ async def test_reason_infer_receives_current_properties_and_signals(tmp_path: Pa
     spy = SpyProcedural(retrieve=None, infer=inferred)
     cycle, working = _cycle(registry, tmp_path, procedural=spy)
     activity = Activity(id="a", goal="g", context={})
+    working.activities["a"] = activity  # the off-cycle _infer_ action looks it up here
     prop_percept = Percept("EmailClientApp", ObservableProperty("unread_count", 3), 0.0)
     signal_percept = Percept("EmailClientApp", Signal("new_email", {"id": 1}), 0.0)
     working.properties[("EmailClientApp", "unread_count")] = prop_percept
     working.signals.append(signal_percept)
 
     await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)  # let the background _infer_ task run so it records what it was asked
 
     _activity, _tools, called_observed = spy.infer_calls[0]
     assert called_observed == PerceptSnapshot([prop_percept], [signal_percept])

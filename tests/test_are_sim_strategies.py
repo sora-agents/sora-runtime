@@ -45,7 +45,7 @@ from sora.strategies import (
     Strategies,
 )
 from sora.transport import InProcessTransport
-from sora.types import InputWait, InterruptRequest, Plan, Signal, Step
+from sora.types import InputWait, InterruptRequest, PendingInference, Plan, Signal, Step
 
 _GOAL = "schedule the team sync Alice emailed about, then reply to her"
 
@@ -165,6 +165,33 @@ async def test_handler_clears_a_live_plan_for_reinference(tmp_path: Path) -> Non
     assert activity.step_index == 0
     assert activity.state is ActivityState.READY  # still selectable
     assert len(working.activities) == 1  # no corrective spawned while an activity is live
+
+
+async def test_handler_invalidates_an_in_flight_inference(tmp_path: Path) -> None:
+    # A follow-up can land while the activity is RUNNING on an off-cycle infer/ground (ADR-0021).
+    # The handler clears pending_inference (so the background result is discarded on resolve) and
+    # grounded_params, and returns the activity to READY so the default Reason re-infers.
+    cycle, working = _cycle(tmp_path)
+    activity = Activity(
+        id="a1",
+        goal=_GOAL,
+        context={},
+        state=ActivityState.RUNNING,
+        plan=Plan(id="p1", goal=_GOAL, steps=[Step(next_action="wait", params={})]),
+        step_index=1,
+        pending_inference=PendingInference(id="inf-old", kind="plan", requested_at=0.0),
+        grounded_params={"stale": True},
+    )
+    working.activities["a1"] = activity
+
+    request = InterruptRequest(Signal("new_inbound_email", {"email_ids": ["followup"]}))
+    discharged = await ReconsiderInterruptHandler().handle(request, working, cycle)
+
+    assert discharged is True
+    assert activity.plan is None  # stale plan dropped
+    assert activity.pending_inference is None  # in-flight inference invalidated (discarded later)
+    assert activity.grounded_params is None  # a resolved escalation's params were stale too
+    assert activity.state is ActivityState.READY  # returned from RUNNING so Reason re-infers
 
 
 async def test_handler_spawns_one_corrective_when_no_live_activity(tmp_path: Path) -> None:

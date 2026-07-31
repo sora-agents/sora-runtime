@@ -64,9 +64,11 @@ from sora.types import (
     TOOL_ID,
     WAIT,
     ActionAck,
+    InferenceResult,
     ObservableProperty,
     OperationAck,
     OperationInvocation,
+    PendingInference,
     PendingOperation,
     Plan,
     Signal,
@@ -711,6 +713,69 @@ async def test_tick_skips_bind_for_non_binding_action(tmp_path: Path) -> None:
 
     assert spy.bind_calls == 0  # send declares no binding
     assert transport.sent == [("agent-b", {"text": "hi"})]
+
+
+# --------------------------------------------------------------------------------------------------
+# Concurrency — an activity RUNNING on an off-cycle inference never stalls another's action (0021)
+# --------------------------------------------------------------------------------------------------
+
+
+def _inferring_activity(activity_id: str, inf_id: str) -> Activity:
+    """A RUNNING activity with a bound ``pending_inference`` — an infer in flight off-cycle, the
+    deferred-result waiting state Situate skips (it selects only READY activities)."""
+    return Activity(
+        id=activity_id,
+        goal="plan something",
+        context={},
+        state=ActivityState.RUNNING,
+        pending_inference=PendingInference(id=inf_id, kind="plan", requested_at=0.0),
+    )
+
+
+async def test_activity_advances_while_another_is_running_on_an_inference(tmp_path: Path) -> None:
+    # The headline win of off-cycle infer/ground (ADR-0021): while activity A is RUNNING on an
+    # in-flight inference, activity B's ready plan still advances and dispatches its external action
+    # in the same cycle — no head-of-line blocking, unlike a synchronous infer that stalls the whole
+    # tick and starves B.
+    tool = FakeTool("EmailClientApp", invoke_results={"list_emails": {"emails": []}})
+    registry, origin = _registry_with(tool)
+    cycle, working = _cycle(tmp_path, reason=_PlanFollowingReason(), registry=registry)
+    await registry.join(origin)
+    a = _inferring_activity("a", inf_id="inf-a")
+    b = Activity(
+        id="b",
+        goal="triage",
+        context={},
+        plan=Plan(id="p", goal="triage", steps=[invoke_step("EmailClientApp", "list_emails")]),
+        step_index=0,
+    )
+    working.activities["a"] = a
+    working.activities["b"] = b
+
+    await cycle.tick()
+
+    # A is untouched — its inference is still outstanding, not stalled or resolved by B's cycle.
+    a_state = a.state
+    assert a_state is ActivityState.RUNNING
+    assert a.pending_inference is not None
+    assert a.pending_inference.id == "inf-a"
+    # B advanced and dispatched its invoke this very cycle (RUNNING on its own pending_operation).
+    assert b.step_index == 1
+    b_state = b.state
+    assert b_state is ActivityState.RUNNING
+    assert b.pending_operation is not None
+    await asyncio.sleep(0)  # let B's off-cycle invoke round-trip reach the tool
+    assert [op for op, _ in tool.invocations] == ["list_emails"]
+
+    # A's deferred plan lands on a later Observe, independent of B — the wait was concurrent,
+    # not serialized behind B's action.
+    plan = Plan(id="pa", goal="plan something", steps=[Step(next_action=WAIT, params={})])
+    cycle.inference_sink.push("inf-a", InferenceResult(id="inf-a", value=plan))
+    await DefaultObserveStrategy().observe(cycle)
+    assert a.plan is plan
+    a_state = a.state
+    assert a_state is ActivityState.READY
+    assert a.pending_inference is None
 
 
 async def test_tick_end_to_end_invoke_then_resolve(tmp_path: Path) -> None:

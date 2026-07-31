@@ -5,28 +5,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING
 
 from sora.action import JoinAction
 from sora.activity import ActivityState
 from sora.perception import NotificationQueueSink
 from sora.strategies import DefaultInterruptHandler, NeverInterruptPolicy
-from sora.types import ABANDONED, TOOL_ID, WAIT, Abandoned, InterruptRequest
+from sora.types import TOOL_ID, WAIT, InterruptRequest
 
 log = logging.getLogger("sora.cycle")
 
-T = TypeVar("T")
-
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
-
     from sora.action import ActionRegistry
     from sora.activity import Activity
     from sora.environment import EnvironmentRegistry
     from sora.memory import EpisodicMemory, ProceduralMemory, SemanticMemory, WorkingMemory
     from sora.strategies import InterruptHandler, InterruptPolicy, Strategies, TickResult
     from sora.transport import MessageTransport
-    from sora.types import OperationAck, Signal, Step
+    from sora.types import InferenceResult, OperationAck, Signal, Step
 
 
 class DecisionCycle:
@@ -60,13 +56,16 @@ class DecisionCycle:
         self.semantic = semantic
         self.procedural = procedural
         self.episodic = episodic
-        # Both sinks live here rather than on WorkingMemory: they're the bridge from
+        # These sinks live here rather than on WorkingMemory: they're the bridge from
         # asynchronous, off-cycle events into this engine's tick()/interrupt() — not settled
         # state. signal_sink specifically has to be co-located with interrupt() below, since a
         # pushed Signal can preempt the current phase; that control-flow role, not "where it
-        # eventually lands as a percept," is why it isn't a WorkingMemory field.
+        # eventually lands as a percept," is why it isn't a WorkingMemory field. result_sink carries
+        # invoke() acks; inference_sink carries off-cycle infer()/ground() results (an
+        # InferenceResult, never a Percept — ADR-0019/0021).
         self.signal_sink: NotificationQueueSink[Signal] = NotificationQueueSink()
         self.result_sink: NotificationQueueSink[OperationAck] = NotificationQueueSink()
+        self.inference_sink: NotificationQueueSink[InferenceResult] = NotificationQueueSink()
         # Screen every signal at push time (before the cooperative Observe drain) so an
         # InterruptPolicy can raise a hard interrupt the instant a qualifying signal arrives. Only
         # signal_sink gets the hook; result_sink stays plain enqueue-only.
@@ -76,10 +75,6 @@ class DecisionCycle:
         # it, the wake edge is consumed by wait_between_ticks. See interrupt() / _preempted().
         self._interrupt: InterruptRequest | None = None
         self._wake = asyncio.Event()
-        # Model calls abandoned mid-flight by an interrupt (via abandon_on_interrupt): kept
-        # referenced so they finish in background (an LLM call can't be cut mid-generation; we just
-        # discard the result) without asyncio warning about an orphaned task.
-        self._abandoned: set[asyncio.Task[Any]] = set()
         # Monotonic count of ticks run, for observability (the README's `[cycle N]` trace). Read via
         # cycle_count; a richer per-phase presenter (the --verbose CLI) is deferred to CLI polish.
         self._cycle_count = 0
@@ -91,7 +86,7 @@ class DecisionCycle:
     async def tick(self) -> None:
         """One Observe -> Reflect -> Situate -> Reason -> Act pass, threading a TickResult through
         all five phases and calling each phase's own strategy only for whatever's still missing —
-        so a fully-fused Observe (or Reflect) call can skip the rest of the cycle entirely.
+        so a field an earlier phase already filled short-circuits the later phase.
         working/semantic/procedural/episodic/communication/registry are all shared with Agent,
         constructed once and passed to both — see sora/bootstrap.py. (Dispatch in _act() uses
         self.registry — the mutation-capable handle — not working.registry, which is read-only.)"""
@@ -102,10 +97,10 @@ class DecisionCycle:
         # interrupt() or an InterruptPolicy screening a pushed signal), run the handler and abort
         # rest of this tick. The abandoned TickResult carries no staleness — it never outlives one
         # tick() (ADR-0011) — and Act (the cycle's single external action) is never reached, so an
-        # interrupted tick commits nothing external. Reason's model calls are the one unbounded-
-        # latency phase; the default Reason races them against the interrupt itself (via
-        # abandon_on_interrupt), so a mid-inference stop returns here to be caught by the checkpoint
-        # below rather than blocking the tick.
+        # interrupted tick commits nothing external. Reason's model calls run off-cycle as the
+        # _infer_/_ground_ internal actions (never blocking the tick), so no phase sits inside a
+        # model call for a checkpoint to interrupt — the phase-boundary checkpoints alone meet the
+        # reactive target (ADR-0021).
         if await self._preempted():
             return
         for activity in list(self.working.activities.values()):
@@ -144,35 +139,6 @@ class DecisionCycle:
         if discharged:
             self._interrupt = None
         return True
-
-    async def abandon_on_interrupt(self, call: Coroutine[Any, Any, T]) -> T | Abandoned:
-        """Race a *side-effect-free* model call against the interrupt wake edge, so a hard interrupt
-        arriving mid-inference doesn't block the cycle waiting on the model. On normal completion,
-        return the call's result. On an interrupt, abandon the in-flight call — an LLM call can't
-        be cut mid-generation, so it finishes in the background and its result is discarded — and
-        return the ABANDONED sentinel, so the caller can bail *before* applying the state mutation
-        the result would have driven (that guard stops an abandoned call from writing a stale plan
-        onto an activity the interrupt handler has since re-routed). The checkpoint after the
-        calling phase then sees the pending interrupt and aborts the tick.
-
-        Only for work that mutates no durable state (Activity/WorkingMemory/external): the caller
-        guarantees the coroutine is pure so discarding it is safe. That is why Reason's model calls
-        go through here but Observe/Situate/Act — which mutate as they run — do not; a phase that
-        model-calls without this helper just gets checkpoint-after granularity (ADR-0020)."""
-        task: asyncio.Task[T] = asyncio.ensure_future(call)
-        wake_task = asyncio.ensure_future(self._wake.wait())
-        try:
-            await asyncio.wait({task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            wake_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await wake_task
-        if task.done() and not task.cancelled():
-            return task.result()
-        self._abandoned.add(task)
-        task.add_done_callback(self._abandoned.discard)
-        task.add_done_callback(lambda t: t.cancelled() or t.exception())
-        return ABANDONED
 
     def _screen_signal(self, source: str, signal: Signal) -> None:
         """signal_sink.on_push: consulted synchronously as each signal is pushed, before the
@@ -226,12 +192,12 @@ class DecisionCycle:
     async def interrupt(self, signal: Signal, *, target: str | None = None) -> None:
         """Raise a hard interrupt: preempt the current phase for an authoritative event (the 10ms
         reactive target). Records the request and wakes the loop; the next phase-boundary checkpoint
-        (or the raced Reason call, mid-inference) runs the handler and aborts the tick. `signal`
-        carries the reason the handler reads; `target` names the activity to preempt, None = agent-
-        wide. The one wired caller is a user stop from the CLI — a cooperative signal that merely
-        matches a wait resumes in Observe and never comes here (an InterruptPolicy promotes a
-        pushed signal to this path). `async` for a uniform call surface, though the body doesn't
-        await."""
+        runs the handler and aborts the tick (no phase blocks on a model call — infer/ground run
+        off-cycle — so the checkpoints alone meet the target). `signal` carries the reason the
+        handler reads; `target` names the activity to preempt, None = agent-wide. The one wired
+        caller is a user stop from the CLI — a cooperative signal that merely matches a wait resumes
+        in Observe and never comes here (an InterruptPolicy promotes a pushed signal to this path).
+        `async` for a uniform call surface, though the body doesn't await."""
         self._interrupt = InterruptRequest(signal, target)
         self._wake.set()
 

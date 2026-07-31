@@ -1,18 +1,22 @@
-"""Hard-interrupt path: DecisionCycle.interrupt(), phase-boundary checkpoints, mid-flight model-call
-abandonment, and the pluggable InterruptHandler / InterruptPolicy seams (Phase 4 A3).
+"""Hard-interrupt path: DecisionCycle.interrupt(), phase-boundary checkpoints, the stale-inference
+reconciliation, and the pluggable InterruptHandler / InterruptPolicy seams.
 
 A hard interrupt is an *authoritative* preemption of current work (the wired source is a user stop),
 modelled on process scheduling: it saves context (durable on Activity; the per-tick TickResult is
 discarded, immune to interrupt staleness per ADR-0011), runs a handler, then the scheduler picks
 next. No new activity state — the default handler pauses a schedulable activity to
-BLOCKED via an InputWait (await the user's next instruction). An in-flight *external* op is never
-abandoned; only a Reason model call / the disposable TickResult is. Reuses tests/fakes.py + a real
+BLOCKED via an InputWait (await the user's next instruction). Nothing in-flight is cut mid-flight:
+an external op finishes and its ack is honored at the next checkpoint; an off-cycle infer/ground
+(ADR-0021) likewise runs to completion, but a result whose id no longer matches the activity's live
+``pending_inference`` (a handler re-routed it) is discarded on resolve rather than applied — the
+same ``state is RUNNING`` reconciliation the late-ack guard uses. Reuses tests/fakes.py + a real
 FileMemoryBackend cycle, mirroring tests/test_blocked.py.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -42,11 +46,12 @@ from sora.strategies import (
     TickResult,
 )
 from sora.types import (
-    Abandoned,
+    InferenceResult,
     InputWait,
     InterruptRequest,
     OperationAck,
     OperationInvocation,
+    PendingInference,
     PendingOperation,
     Plan,
     Signal,
@@ -93,55 +98,6 @@ class _NoopSituate:
         cycle: DecisionCycle,
         result: TickResult,
     ) -> TickResult:
-        return result
-
-
-class _HangingReason:
-    """A Reason whose model call is a hangable coroutine routed through `cycle.abandon_on_interrupt`
-    — the shape the default Reason uses. `entered` fires once the call is in flight; `release` lets
-    the abandoned call finish cleanly at teardown (an abandoned call is *not* cancelled in
-    production; the test releases it only to avoid a leaked pending task)."""
-
-    def __init__(self) -> None:
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def reason(
-        self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
-    ) -> TickResult:
-        async def _model_call() -> str:
-            self.entered.set()
-            await self.release.wait()
-            return "a plan"  # a stand-in model result, discarded on abandonment
-
-        outcome = await cycle.abandon_on_interrupt(_model_call())
-        if isinstance(outcome, Abandoned):
-            return result  # bail without mutating; the checkpoint after Reason aborts the tick
-        return result
-
-
-class _AbandonableInferReason:
-    """Mirrors DefaultReasonStrategy's structure: a hangable model call via `abandon_on_interrupt`
-    whose result is written to `activity.plan` ONLY when not abandoned. Lets a test prove an
-    abandoned call never lands its mutation late (the stale-plan race the guard closes)."""
-
-    def __init__(self) -> None:
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-        self.plan = Plan(id="p", goal="g", steps=[Step(next_action="wait", params={})])
-
-    async def reason(
-        self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
-    ) -> TickResult:
-        async def _infer() -> Plan:
-            self.entered.set()
-            await self.release.wait()
-            return self.plan
-
-        outcome = await cycle.abandon_on_interrupt(_infer())
-        if isinstance(outcome, Abandoned):
-            return result  # guarded: no mutation when the call was abandoned
-        activity.plan = outcome
         return result
 
 
@@ -203,6 +159,17 @@ def _running(activity_id: str, op_id: str) -> Activity:
             invocation=OperationInvocation(tool_id="t", operation_name="move", params={}),
             invoked_at=0.0,
         ),
+    )
+
+
+def _inferring(activity_id: str, *, inf_id: str, kind: str) -> Activity:
+    """An activity RUNNING on an off-cycle infer/ground — the deferred-result waiting state."""
+    return Activity(
+        id=activity_id,
+        goal="g",
+        context={},
+        state=ActivityState.RUNNING,
+        pending_inference=PendingInference(id=inf_id, kind=kind, requested_at=0.0),
     )
 
 
@@ -292,63 +259,127 @@ async def test_default_handler_falls_back_and_warns_on_a_non_user_stop_interrupt
 
 
 # --------------------------------------------------------------------------------------------------
-# Mid-flight model-call abandonment — interrupt during Reason bails without waiting on the call
+# Off-cycle inference resolve — an infer/ground result lands 1:1 on its RUNNING activity, next cycle
 # --------------------------------------------------------------------------------------------------
 
 
-async def test_interrupt_abandons_in_flight_reason(tmp_path: Path) -> None:
-    reason = _HangingReason()
-    cycle, working, _ = _cycle(tmp_path, reason=reason, situate=_SelectFirst())
-    working.activities["a1"] = _ready("a1")
+async def test_inference_result_resolves_plan_and_readies_activity(tmp_path: Path) -> None:
+    # The happy path of the deferred-result mechanism: an activity RUNNING on a pending_inference
+    # (kind="plan") picks up the Plan from inference_sink in Observe, resets step_index, goes READY.
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("a1", inf_id="inf-1", kind="plan")
+    activity.step_index = 7  # a stale index from before; the resolve must reset it to 0
+    working.activities["a1"] = activity
+    plan = Plan(id="p", goal="g", steps=[Step(next_action="wait", params={})])
+    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=plan))
 
-    tick = asyncio.ensure_future(cycle.tick())
-    await asyncio.wait_for(reason.entered.wait(), timeout=1.0)  # Reason is mid-flight
-    await cycle.interrupt(Signal("user_stop", {}))
-    await asyncio.wait_for(tick, timeout=1.0)  # the tick completes instead of hanging on the model
+    await DefaultObserveStrategy().observe(cycle)
 
-    assert working.activities["a1"].state is ActivityState.BLOCKED  # handler ran, paused it
-    assert (
-        cycle._abandoned
-    )  # the hung call was abandoned (kept referenced), not awaited or cancelled
-
-    reason.release.set()  # let the abandoned call finish so no pending task leaks past the test
-    await asyncio.sleep(0)
-
-
-async def test_abandoned_model_call_never_lands_its_mutation(tmp_path: Path) -> None:
-    # The stale-plan race the guard closes: an abandoned infer must not write its (now-stale) plan
-    # onto an activity *after* the interrupt handler has re-routed it. With the mutation guarded on
-    # the abandon outcome, the plan the handler left in place is never clobbered by the late result.
-    strat = _AbandonableInferReason()
-    cycle, working, _ = _cycle(tmp_path, reason=strat, situate=_SelectFirst())
-    working.activities["a1"] = _ready("a1")  # plan is None
-
-    tick = asyncio.ensure_future(cycle.tick())
-    await asyncio.wait_for(strat.entered.wait(), timeout=1.0)  # infer is mid-flight
-    await cycle.interrupt(Signal("user_stop", {}))
-    await asyncio.wait_for(tick, timeout=1.0)
-
-    activity = working.activities["a1"]
-    assert activity.state is ActivityState.BLOCKED  # handler ran (user stop -> paused)
-    assert activity.plan is None  # guarded: the abandoned infer's mutation was skipped
-
-    strat.release.set()  # let the abandoned infer resolve in the background
-    await asyncio.sleep(0)
-    assert working.activities["a1"].plan is None  # still not clobbered after it completes
+    assert activity.plan is plan
+    assert activity.step_index == 0
+    assert activity.pending_inference is None
+    assert activity.state is ActivityState.READY
 
 
-async def test_abandon_on_interrupt_returns_the_value_absent_an_interrupt(tmp_path: Path) -> None:
-    # The no-interrupt path: the raced call completes normally, its value is returned, and the
-    # caller applies the mutation as usual (nothing is abandoned).
-    strat = _AbandonableInferReason()
-    cycle, working, _ = _cycle(tmp_path, reason=strat, situate=_SelectFirst())
-    working.activities["a1"] = _ready("a1")
-    strat.release.set()  # the call completes immediately; no interrupt is raised
+async def test_ground_inference_result_parks_grounded_params(tmp_path: Path) -> None:
+    # kind="ground": the resolved params land on grounded_params (for Reason's next pass), not plan.
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("a1", inf_id="inf-1", kind="ground")
+    working.activities["a1"] = activity
+    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value={"to": "boss@x"}))
 
-    await cycle.tick()
+    await DefaultObserveStrategy().observe(cycle)
 
-    assert working.activities["a1"].plan is strat.plan  # value applied
-    assert not cycle._abandoned  # nothing was abandoned
+    assert activity.grounded_params == {"to": "boss@x"}
+    assert activity.plan is None  # a ground result never touches the plan
+    assert activity.pending_inference is None
+    assert activity.state is ActivityState.READY
+
+
+# --------------------------------------------------------------------------------------------------
+# Stale-inference discard — a result for an activity a handler re-routed never lands its mutation
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_stale_inference_is_discarded_when_pending_cleared(tmp_path: Path) -> None:
+    # The reconsideration shape (ReconsiderInterruptHandler): a handler cleared pending_inference
+    # and returned the activity to READY. The in-flight call still finishes, but its result no
+    # longer matches any live pending_inference, so Observe discards it, not writing a stale plan.
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _ready("a1")  # pending_inference is None — the handler invalidated it
+    working.activities["a1"] = activity
+    stale = Plan(id="stale", goal="g", steps=[Step(next_action="wait", params={})])
+    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=stale))
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.plan is None  # the stale plan was not applied
+    assert activity.state is ActivityState.READY  # not flipped by the discarded result
+
+
+async def test_stale_inference_is_discarded_after_reinference(tmp_path: Path) -> None:
+    # A handler re-fired inference: pending_inference now carries a *new* id. The old call's result
+    # (inf-1) no longer matches the live one (inf-2), so it's discarded and the activity stays
+    # RUNNING awaiting the fresh result — the id guard, mirroring the external-op late-ack guard.
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("a1", inf_id="inf-2", kind="plan")  # the *new* in-flight inference
+    working.activities["a1"] = activity
+    stale = Plan(id="stale", goal="g", steps=[Step(next_action="wait", params={})])
+    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=stale))  # the old one
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.plan is None  # the superseded result was discarded
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.id == "inf-2"  # still awaiting the fresh inference
+    assert activity.state is ActivityState.RUNNING
+
+
+async def test_failed_inference_terminates_instead_of_stranding(tmp_path: Path) -> None:
+    # A model call that raised (malformed output, no LLM, a network error) resolves with an error
+    # InferenceResult rather than dying silently and leaving the activity RUNNING forever. Observe
+    # terminates the activity so the failure surfaces (like a failed op), never a permanent hang.
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("a1", inf_id="inf-1", kind="plan")
+    working.activities["a1"] = activity
+    cycle.inference_sink.push(
+        "inf-1", InferenceResult(id="inf-1", error="ValueError: bad plan JSON")
+    )
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    state = activity.state
+    assert state is ActivityState.TERMINATED  # surfaced, not stranded RUNNING
+    assert activity.pending_inference is None
+    assert activity.plan is None
+
+
+async def test_discarded_inference_emits_a_meter_cue(tmp_path: Path) -> None:
+    # The Observe->meter wiring: a result no live activity claims (invalidated/superseded) emits a
+    # `discarded` sora.llm cue, so LLMMeter can fold that call's already-metered cost into its
+    # wasted bucket instead of counting it as useful work.
+    cycle, working, _ = _cycle(tmp_path)
+    working.activities["a1"] = _ready("a1")  # pending_inference None -> the result is orphaned
+    cycle.inference_sink.push(
+        "inf-1", InferenceResult(id="inf-1", value=Plan(id="p", goal="g", steps=[]))
+    )
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    previous = logger.level
+    logger.setLevel(logging.INFO)  # the cue is INFO; without this it's dropped before any handler
+    logger.addHandler(handler)
+    try:
+        await DefaultObserveStrategy().observe(cycle)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    discarded = [r for r in records if r.__dict__.get("llm_event") == "discarded"]
+    assert len(discarded) == 1
+    assert discarded[0].__dict__["llm_inference_id"] == "inf-1"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -377,6 +408,33 @@ async def test_running_external_op_is_not_abandoned(tmp_path: Path) -> None:
     assert state is ActivityState.BLOCKED
     assert isinstance(activity.blocked_on, InputWait)
     assert cycle._interrupt is None  # discharged now
+
+
+async def test_user_stop_pauses_an_inference_running_activity_at_once(tmp_path: Path) -> None:
+    # The counterpart to the external-op invariant: an activity RUNNING only on an off-cycle
+    # infer/ground has no side effect to protect, so a user stop must NOT wait out the (unbounded)
+    # model call. The handler drops the inference and pauses to BLOCKED immediately, discharging the
+    # interrupt this cycle — unlike an in-flight external op, which keeps it pending (ADR-0021).
+    cycle, working, _ = _cycle(tmp_path, situate=_NoopSituate())
+    activity = _inferring("a1", inf_id="inf-1", kind="plan")
+    working.activities["a1"] = activity
+
+    await cycle.interrupt(Signal("user_stop", {}))
+    await cycle.tick()
+
+    state = activity.state
+    assert state is ActivityState.BLOCKED  # paused now, not left RUNNING for the model to finish
+    assert isinstance(activity.blocked_on, InputWait)
+    assert activity.pending_inference is None  # inference invalidated (discarded on resolve)
+    assert cycle._interrupt is None  # discharged this cycle — no external op held it pending
+
+    # The now-stale result, arriving after the handler dropped it, is discarded — never resurrects.
+    stale = Plan(id="p", goal="g", steps=[])
+    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=stale))
+    await DefaultObserveStrategy().observe(cycle)
+    state = activity.state
+    assert state is ActivityState.BLOCKED
+    assert activity.plan is None
 
 
 # --------------------------------------------------------------------------------------------------

@@ -120,7 +120,7 @@ def test_report_prints_failed_when_an_activity_s_last_operation_was_not_ok(
 
     report(agent, None)
 
-    assert "agent outcome: FAILED" in capsys.readouterr().out
+    assert "agent outcome: ❌ FAILED" in capsys.readouterr().out
 
 
 def test_report_prints_are_validation_pass(
@@ -130,7 +130,7 @@ def test_report_prints_are_validation_pass(
     report(agent, _FakeSimulation(ok=True))
 
     out = capsys.readouterr().out
-    assert "ARE validation: PASS" in out
+    assert "ARE validation: ✅ PASS" in out
 
 
 def test_report_prints_are_validation_fail(

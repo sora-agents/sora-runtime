@@ -135,7 +135,7 @@ The decision cycle follows 5 steps:
 
 The five phases are a ceiling, not a quota: every cycle runs the pipeline, but a given cycle may conclude with one external action, with internal work only (e.g., storing experiences), or with nothing to do — at most one external action per cycle, never a mandatory one.
 
-How many model calls a cycle costs is a configuration choice, not a property of the runtime. Observe and Reflect are deterministic by default: Observe mechanically ingests percepts and messages (an LLM-backed Observe is possible where perception itself needs interpretation — e.g., describing a camera snapshot — but that is an addition, not a fusion entry point), and Reflect's completion judgment may be deterministic or model-backed, with summarizing and storing dispatched asynchronously so they never block the cycle. Situate → Reason → Act form the decision chain proper — select an activity, advance its plan, bind a concrete invocation — and are the natural unit to fuse into a single model call, made after this cycle's percepts and messages are already in working memory. In the common case — an already-inferred plan being advanced, mechanical defaults — a cycle costs zero model calls. A hard interrupt can preempt the current phase for high-priority signals, independent of where the cycle is mid-flight — this is what backs the 10ms reactiveness target, deliberately not a hard per-phase timeout, since an in-flight model call can't be safely cut off mid-generation.
+How many model calls a cycle costs is a configuration choice, not a property of the runtime. Observe and Reflect are deterministic by default: Observe mechanically ingests percepts and messages (an LLM-backed Observe is possible where perception itself needs interpretation — e.g., describing a camera snapshot — which runs off-cycle as an async internal action whose result lands as a percept a later cycle, not a fusion entry point), and Reflect's completion judgment may be deterministic or model-backed, with summarizing and storing dispatched asynchronously so they never block the cycle. Situate → Reason → Act form the decision chain proper — select an activity, advance its plan, bind a concrete invocation. The model calls this can need — infer a plan, ground a param — run off-cycle as internal actions: the activity waits in RUNNING and the result lands a later cycle, so no phase ever blocks the cycle. Fusing selection and planning into a single model call is a narrow synchronous-mode option, not the default, since it re-serializes that concurrency (ADR-0021). In the common case — an already-inferred plan being advanced, mechanical defaults — a cycle costs zero model calls. A hard interrupt can preempt the current phase for high-priority signals, independent of where the cycle is mid-flight — the 10ms reactiveness target, met by phase-boundary checkpoints; because model calls run off-cycle, no phase blocks on one, so there is no in-flight model call to cut short.
 
 Every phase has a pluggable strategy. A strategy may short-circuit later phases by producing their answer directly — e.g., Situate deciding the step and the concrete invocation in the same call that selects the activity — so that a single underlying computation can serve multiple phases. The shared decision value lives only for the duration of one cycle.
 
@@ -417,13 +417,6 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         # A pushed signal only becomes an InterruptRequest through an InterruptPolicy; an ordinary signal
         # that merely matches a wait resumes cooperatively in Observe, never here. See ADR-0020.
 
-    class Abandoned:          # singleton sentinel; the value is ABANDONED (compared via isinstance)
-        # Returned by DecisionCycle.abandon_on_interrupt when a raced model call was dropped mid-flight by
-        # a hard interrupt (it finishes in the background, result discarded). The caller checks for it and
-        # bails *before* applying the mutation the result would have driven — the stale-plan guard. ADR-0020.
-        __slots__ = ()
-    ABANDONED = Abandoned()
-
     @dataclass(frozen=True)
     class ActionAck:          # returned by ExternalAction.execute() — dispatch, not outcome (see EXAMPLES.md)
         ok: bool
@@ -459,6 +452,21 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         id: str                 # correlates to what InvokeAction pushed into result_sink
         invocation: OperationInvocation
         invoked_at: float
+
+    @dataclass(frozen=True)
+    class PendingInference:   # tracks one in-flight infer()/ground() — lives on Activity, mutually exclusive
+        id: str                 #   with pending_operation (a cycle emits one action). Correlates to what
+        kind: str               #   _infer_/_ground_ pushed into inference_sink. kind: "plan" (infer ->
+        requested_at: float     #   Activity.plan) or "ground" (ground -> the pending step's params). An
+        #                         interrupt handler that re-routes the activity clears/replaces this; a result
+        #                         whose id no longer matches the live pending_inference is discarded on resolve
+        #                         (the stale-inference guard, mirroring pending_operation's late-ack). ADR-0021.
+
+    @dataclass(frozen=True)
+    class InferenceResult:    # what infer()/ground() resolve to — arrives async via inference_sink, never a
+        id: str                 #   Percept (deliberation output, not observed state — ADR-0019/0021).
+        value: Plan | dict      # correlates to PendingInference.id; a Plan (kind="plan") or grounded params
+        #                         (kind="ground"). DefaultObserveStrategy applies it on resolve.
 
     @dataclass(frozen=True)
     class CompletedOperation:   # one resolved invocation + its ack — an entry in Activity.history
@@ -675,7 +683,12 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         state: ActivityState = ActivityState.READY
         plan: Plan | None = None    # once set, Reason can just advance it instead of (re)planning
         step_index: int = 0
-        pending_operation: PendingOperation | None = None  # set while RUNNING; runtime clears it on resolve
+        pending_operation: PendingOperation | None = None  # set while RUNNING on an invoke; cleared on resolve
+        pending_inference: PendingInference | None = None  # set while RUNNING on an off-cycle infer()/ground();
+        #                                                    mutually exclusive with pending_operation; resolved
+        #                                                    in Observe via inference_sink (ADR-0021)
+        grounded_params: dict | None = None                # a resolved _ground_ escalation's concrete params,
+        #                                                    consumed by Reason's next pass to emit the step
         last_operation: OperationAck | None = None          # most recently resolved result, for Reason to read
         blocked_on: SignalWait | InputWait | None = None    # set while BLOCKED; what's awaited before READY —
         #                                                     a SignalWait (tool completion signal; set by
@@ -844,7 +857,37 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             activity.state = ActivityState.READY                       # signal was observed (the caller
             activity.blocked_on = None       # matched it — the signal itself stays in working memory)
 
-    def default_action_registry() -> ActionRegistry:   # the six external + six internal, assembled once
+    # The two LLM calls are internal actions too — dispatched off-cycle exactly like _invoke_ (set a
+    # pending marker, go RUNNING, create_task, return at once; the cycle never blocks). Reason fires them
+    # inline when it needs a plan/param it can't produce mechanically; the result resolves a cycle or more
+    # later via inference_sink (ADR-0021). ProceduralMemory still owns the model handle and the prompt/parse.
+    class InferAction:                 # predefined internal action: _infer_ — the async plan model call
+        name = "infer"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            activity = cycle.working.activities[kwargs["activity_id"]]
+            inf_id = new_id()
+            activity.pending_inference = PendingInference(id=inf_id, kind="plan", requested_at=now())
+            activity.state = ActivityState.RUNNING   # off-cycle, like _invoke_ — immediate, never blocks
+            asyncio.create_task(self._call(cycle, activity, inf_id,
+                                           kwargs["tools"], kwargs.get("observed")))  # tools: id->Manual
+        async def _call(self, cycle, activity, inf_id, catalog, observed) -> None:
+            plan = await cycle.procedural.infer(activity, catalog, observed)          # the LLMClient call
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=plan))
+
+    class GroundAction:                # predefined internal action: _ground_ — the async param-grounding escalation
+        name = "ground"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            activity = cycle.working.activities[kwargs["activity_id"]]
+            inf_id = new_id()
+            activity.pending_inference = PendingInference(id=inf_id, kind="ground", requested_at=now())
+            activity.state = ActivityState.RUNNING
+            asyncio.create_task(self._call(cycle, activity, inf_id, kwargs))
+        async def _call(self, cycle, activity, inf_id, kw) -> None:
+            params = await cycle.procedural.ground(activity, kw["operation_name"], kw.get("manual"),
+                                                   kw["partial_params"], kw.get("observed"))
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=params))
+
+    def default_action_registry() -> ActionRegistry:   # the six external + eight internal, assembled once
         ...                                            # what bootstrap and test harnesses register through
 
     # sora/llm.py — the one seam onto a language model; wire-format-neutral on purpose
@@ -861,7 +904,10 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
     class MeteredLLMClient:            # transparent decorator bootstrap wraps every client in
         """Times each round-trip and logs a `sora.llm` cue carrying the elapsed seconds. Not a
         breach of the non-ownership contract — that forbids the *client itself* growing timing;
-        this instruments one from the outside, so the concrete client stays a bare round-trip."""
+        this instruments one from the outside, so the concrete client stays a bare round-trip. Each
+        `done`/`usage` cue is tagged with `current_inference_id` (a ContextVar the _infer_/_ground_
+        action sets, task-local per background call) so the meter can attribute a round-trip to the
+        off-cycle inference that drove it."""
         def __init__(self, inner: LLMClient) -> None: ...
         async def complete(self, *, system: str, prompt: str) -> str: ...
 
@@ -884,7 +930,12 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         """(when the client is instrumented) token totals + thinking share. A run surface
         (TerminalSession, an example runner) attaches it to the `sora` logger and calls summary() at
         the end — no reference to the client (which bootstrap hands off) needed. Token tally is
-        opt-in: an uninstrumented client emits no usage record and summary() reports timing only."""
+        opt-in: an uninstrumented client emits no usage record and summary() reports timing only.
+        A `discarded` cue (from `log_llm_discarded`, emitted by Observe when an off-cycle inference's
+        result is invalidated/superseded — ADR-0021) folds that call's already-metered cost into a
+        `wasted_*` bucket: the call ran to completion and is real, billed cost (kept in the grand
+        totals), but did no useful work, so summary() shows used vs. discarded side by side. With no
+        discards the summary is byte-for-byte the terse pre-existing line."""
         def summary(self, wall_seconds: float | None = None) -> str: ...
 
     # sora/memory.py
@@ -1013,9 +1064,10 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
     class TickResult:
         """The decision surface for one cycle. Every phase strategy receives and returns one of these.
         Whatever's still None, DecisionCycle fills in by calling the next phase's own strategy — so a
-        fully-decomposed configuration produces one field at a time, and a fully-fused one can fill in
-        everything from a single Observe (or Reflect) call. Lives only for the duration of one tick()
-        call — nothing persists across cycles, so there's no cache to key or invalidate."""
+        field an earlier phase already filled short-circuits the later phase (a cached plan skips Reason,
+        a resolved step skips Act's bind). One model call may fill several fields at once (fusion) — a
+        narrow, opt-in use, not the goal (ADR-0011/0021). Lives only for the duration of one tick() call —
+        nothing persists across cycles, so there's no cache to key or invalidate."""
         activity: Activity | None = None
         step: Step | None = None      # this cycle's concrete decision — not the whole (possibly multi-step) Plan
         invocation: OperationInvocation | None = None
@@ -1024,8 +1076,9 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         async def observe(self, cycle: DecisionCycle) -> TickResult:
             """Mutates cycle.working (properties, signals, messages) as a side effect — same as the
             default below. Default: mechanical, no model call, returns an empty TickResult(). An LLM-backed
-            Observe is for interpreting raw perception itself (e.g., describing a camera snapshot),
-            not for deciding the cycle — decision-chain fusion starts at Situate, not here."""
+            Observe is for interpreting raw perception itself (e.g., describing a camera snapshot) — and,
+            like every model call, runs off-cycle as an async internal action whose result lands as a
+            percept a later cycle (ADR-0021), never blocking Observe or deciding the cycle."""
 
     class ReflectStrategy(Protocol):
         async def reflect(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
@@ -1061,10 +1114,12 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             respected and situated, not overridden. Also responsible for activity creation: if
             wm.messages has one that doesn't correspond to any existing activity, invokes the internal
             _create_activity_ action (via cycle) before selecting. Head of the decision chain (Situate
-            -> Reason -> Act) and the intended entry point for fusing the remaining phases into one
-            model call — it runs after this cycle's percepts and messages are already in working memory.
-            May additionally fill in step/invocation, short-circuiting Reason/Act (those forward-fusion
-            gates remain; only Situate's own activity gate is removed)."""
+            -> Reason -> Act), running after this cycle's percepts and messages are in working memory. May
+            additionally fill in step/invocation, short-circuiting Reason/Act (those forward-fill gates
+            remain; only Situate's own activity gate is removed). Fusing selection *and* planning into one
+            model call is possible but re-serializes multi-activity concurrency (no activity is selected
+            until it returns), so it belongs to a synchronous simple-mode configuration, not the async
+            default — see ADR-0021."""
 
     class ActivitySelectionStrategy(Protocol):   # Situate's scheduler; own pluggable sub-strategy
         async def select(self, ready: list[Activity], wm: WorkingMemory,
@@ -1075,19 +1130,20 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             activity-creation and wm-adjustment. `async` + `cycle` let such a policy consult memory
             or a model; the default (RoundRobinActivitySelection) consults neither."""
 
-    class ReasonStrategy(Protocol):   # pluggable; default targets 1 LLM call/cycle
+    class ReasonStrategy(Protocol):   # pluggable; default makes at most one (off-cycle) model call/cycle
         async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
                           result: TickResult) -> TickResult:
             """Only called if result.step is still None. Typical implementation: if activity.plan is
             already set and still valid, just read activity.plan.steps[activity.step_index] and advance
             the index — no model call. Otherwise, retrieve a cached Plan via cycle.procedural.retrieve()
-            or infer a new one (the expensive path), reset step_index to 0, and use its first Step.
+            or fire the _infer_ internal action — an off-cycle model call that moves the activity to
+            RUNNING and yields no step this cycle; the plan lands a later cycle via inference_sink.
             Deciding when a plan counts as invalidated is entirely up to the implementation. Also
             *grounds* the step: a param whose value depends on an earlier result is a reference the
-            default resolves against activity.history, escalating to cycle.procedural.ground() only
-            when it can't be resolved mechanically — deciding a value is reasoning, so it lives here
-            (ADR-0017). May additionally fill in invocation, short-circuiting Act — this is where the
-            historical 'tool hallucination' risk lives if it does."""
+            default resolves against activity.history, escalating via the _ground_ internal action (same
+            off-cycle shape) only when it can't be resolved mechanically — deciding a value is reasoning,
+            so it lives here (ADR-0017/0021). May additionally fill in invocation, short-circuiting Act —
+            this is where the historical 'tool hallucination' risk lives if it does."""
 
     class ActStrategy(Protocol):
         async def bind(self, step: Step, manual: Manual | None, cycle: DecisionCycle,
@@ -1171,6 +1227,20 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
                     activity.pending_operation = None
                     activity.state = ActivityState.READY
                     just_resolved.append((activity, invocation))
+            async for inf_id, res in cycle.inference_sink.drain():
+                # Off-cycle infer()/ground() result: 1:1 match to the live pending_inference, never a Percept.
+                # Discarded if the activity was re-routed (id no longer matches the live one) — the same
+                # stale-guard as a late ack. On match: plan -> Activity.plan; ground -> grounded_params for
+                # the pending step (consumed by Reason's next pass). Then RUNNING -> READY.
+                activity = next((a for a in cycle.working.activities.values()
+                                  if a.pending_inference and a.pending_inference.id == inf_id), None)
+                if activity is not None and activity.state is ActivityState.RUNNING:
+                    if activity.pending_inference.kind == "plan":
+                        activity.plan = res.value; activity.step_index = 0
+                    else:
+                        activity.grounded_params = res.value
+                    activity.pending_inference = None
+                    activity.state = ActivityState.READY
             # Suspend pass: a resolved, successful op whose manual declares a completion_signal blocks
             # until that signal is observed — unless it already arrived (early signal -> stay READY,
             # don't block). Resume pass: a BLOCKED activity whose blocked_on matches an observed signal
@@ -1193,17 +1263,20 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
 
     class DefaultReasonStrategy:
         """Reason's default — the effective default Reason strategy (Reason has no *mechanical*
-        default; planning is inherently the model path). Deterministic orchestration around the one
-        model call, which is isolated in ProceduralMemory.infer: cheap path advances an existing
-        plan's step_index (no model, no lookup); else reuse a cached plan (procedural.retrieve) or
-        infer a fresh one (procedural.infer, passing the joined tools id->Manual as the catalog).
-        Reuse is currently always a miss — the default Reflect no longer stores completed plans
-        (verbatim replay is unsound), so every activity infers until reusable procedures are distilled
-        from episodes; an
-        exhausted plan yields no step. Wired in by bootstrap as sora.reason.default. Both model calls
-        (infer, and the grounding escalation) go through cycle.abandon_on_interrupt, and each mutation
-        (activity.plan/step_index) is guarded on a non-ABANDONED result, so a mid-inference hard
-        interrupt abandons the call and lands no stale plan (ADR-0020)."""
+        default; planning is inherently the model path). Deterministic orchestration around two
+        off-cycle model calls, isolated in ProceduralMemory.infer/ground and dispatched as the _infer_
+        / _ground_ internal actions: the cheap path advances an existing plan's step_index (no model, no
+        lookup) and grounds its params against activity.history; else, when a plan is needed, reuse a
+        cached plan (procedural.retrieve) or fire _infer_ (passing the joined tools id->Manual as the
+        catalog) — which moves the activity to RUNNING and returns no step this cycle; the plan lands a
+        later cycle via inference_sink, and Reason then advances it. A param that can't be resolved
+        mechanically fires _ground_ the same way (RUNNING, no step; the resolved params land as
+        activity.grounded_params, consumed next pass to emit the concrete step). While an activity is
+        RUNNING on an inference Reason simply yields no step for it — no model call blocks the cycle, so
+        there is nothing to race or abandon (ADR-0021, superseding ADR-0020's mid-flight abandonment).
+        Reuse is currently always a miss — the default Reflect no longer stores completed plans (verbatim
+        replay is unsound), so every activity infers until reusable procedures are distilled from
+        episodes; an exhausted plan yields no step. Wired in by bootstrap as sora.reason.default."""
         async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
                          result: TickResult) -> TickResult: ...
 
@@ -1247,22 +1320,23 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             # signals for ones that should preempt (default: none do — the cooperative path is unchanged).
             self.interrupt_handler = interrupt_handler or DefaultInterruptHandler()
             self.interrupt_policy = interrupt_policy or NeverInterruptPolicy()
-            # Both sinks live here rather than on WorkingMemory: they're the bridge from
-            # asynchronous, off-cycle events into this engine's tick()/interrupt() — not settled
-            # state. signal_sink specifically has to be co-located with interrupt() below, since
-            # a pushed Signal can preempt the current phase; that control-flow role, not "where
-            # it eventually lands as a percept," is why it isn't a WorkingMemory field.
+            # These sinks live here rather than on WorkingMemory: they bridge asynchronous, off-cycle
+            # events into this engine's tick()/interrupt() — not settled state. signal_sink specifically
+            # has to be co-located with interrupt() below, since a pushed Signal can preempt the current
+            # phase; that control-flow role, not "where it eventually lands as a percept," is why it isn't
+            # a WorkingMemory field. result_sink carries invoke() acks; inference_sink carries off-cycle
+            # infer()/ground() results (InferenceResult, never a Percept — ADR-0021).
             self.signal_sink: NotificationQueueSink[Signal] = NotificationQueueSink()        # tools push here via focus()
             self.result_sink: NotificationQueueSink[OperationAck] = NotificationQueueSink()  # InvokeAction pushes here — internal only
+            self.inference_sink: NotificationQueueSink[InferenceResult] = NotificationQueueSink()  # _infer_/_ground_ push here — internal only
             self.signal_sink.on_push = self._screen_signal   # screen every signal at push time (below)
             self._interrupt: InterruptRequest | None = None  # a pending hard interrupt (None when idle)
             self._wake = asyncio.Event()                     # edge that wakes a waiting cycle; set with _interrupt
-            self._abandoned: set[asyncio.Task] = set()       # Reason calls dropped mid-flight; kept referenced
-            ...                                              #   so they finish in background, result discarded
+            ...
         async def tick(self) -> None:
             """One Observe -> Reflect -> Situate -> Reason -> Act pass, threading a TickResult through
             all five phases and calling each phase's own strategy only for whatever's still missing —
-            so a fully-fused Observe (or Reflect) call can skip the rest of the cycle entirely. Takes
+            so a field an earlier phase already filled short-circuits the later phase. Takes
             no arguments: registry/working/semantic/procedural/episodic/communication are all shared
             with Agent, constructed once and passed to both — see sora/bootstrap.py. (Dispatch uses
             self.registry — the mutation-capable handle — not working.registry, which is read-only.)
@@ -1276,15 +1350,15 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             if await self._preempted(): return
             # Situate always runs: it re-situates wm for the (possibly already-selected) activity every
             # cycle, and selects only if result.activity is still None. Unlike the step/invocation gates
-            # below — genuine forward-fusion short-circuits — Situate is not gated on its own field.
+            # below — genuine forward-fill short-circuits — Situate is not gated on its own field.
             ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
             result = await self.strategies.situate.situate(ready, self.working, self, result)
             if await self._preempted(): return
             if result.activity is None:
                 return               # nothing selectable this cycle — at most one action, never a mandatory one
             if result.step is None:
-                # Reason (the default) races its own model calls via abandon_on_interrupt below, so a
-                # mid-inference stop returns here to be caught by the checkpoint rather than blocking.
+                # Reason fires its model calls off-cycle as _infer_/_ground_ internal actions, so it never
+                # blocks here — an activity RUNNING on an inference simply yields no step this cycle (ADR-0021).
                 result = await self.strategies.reason.reason(result.activity, self.working, self, result)
                 if await self._preempted(): return
             if result.step is not None:
@@ -1299,16 +1373,6 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             if await self.interrupt_handler.handle(self._interrupt, self.working, self):
                 self._interrupt = None
             return True
-
-        async def abandon_on_interrupt(self, call: Coroutine[Any, Any, T]) -> T | Abandoned:
-            """Race a *side-effect-free* model call against the wake edge, so a hard interrupt mid-inference
-            doesn't block the cycle on the model. Normal completion -> the call's result. Interrupt ->
-            abandon the in-flight call (an LLM call can't be cut mid-generation; it finishes in background,
-            result discarded via self._abandoned) and return ABANDONED, so the caller bails *before* applying
-            the state mutation the result would have driven — the guard that stops an abandoned call from
-            writing a stale plan onto an activity the interrupt handler has since re-routed. Only for pure
-            work: Reason's model calls go through here; Observe/Situate/Act (which mutate as they run) do not,
-            so a phase that model-calls without it just gets checkpoint-after granularity. See ADR-0020."""
 
         def _screen_signal(self, source: str, signal: Signal) -> None:
             """signal_sink.on_push: consulted synchronously as each signal is pushed, before the cooperative
@@ -1343,7 +1407,7 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         async def interrupt(self, signal: Signal, *, target: str | None = None) -> None:
             """Raise a hard interrupt: preempt the current phase for an authoritative event (10ms target).
             Records an InterruptRequest(signal, target) and wakes the loop; the next phase-boundary
-            checkpoint (or the raced Reason call, mid-inference) runs the handler and aborts the tick.
+            checkpoint runs the handler and aborts the tick.
             `signal` is the "why" the handler reads; `target` names one activity, None = agent-wide. The
             one wired caller is a user stop from the CLI (/stop) — distinct from Agent.stop()/Ctrl-C
             (graceful shutdown). A cooperative signal that merely matches a wait resumes in Observe and

@@ -51,17 +51,6 @@ class InterruptRequest:  # a pending hard interrupt, recorded on DecisionCycle b
     target: str | None = None
 
 
-class Abandoned:
-    # Singleton sentinel returned by DecisionCycle.abandon_on_interrupt when a raced model call was
-    # dropped mid-flight by a hard interrupt: the call finishes in the background (an LLM call can't
-    # be cut mid-generation) and its result is discarded, so the caller bails without applying the
-    # state mutation the result would have driven. Callers narrow with isinstance(x, Abandoned).
-    __slots__ = ()
-
-
-ABANDONED = Abandoned()
-
-
 @dataclass(frozen=True)
 class OperationInvocation:  # the concrete call, different from Step's abstract decision
     tool_id: str
@@ -74,6 +63,33 @@ class PendingOperation:  # tracks one in-flight invoke — lives on Activity, no
     id: str  # correlates to what InvokeAction pushed into result_sink
     invocation: OperationInvocation
     invoked_at: float
+
+
+@dataclass(frozen=True)
+class PendingInference:  # tracks one in-flight infer()/ground() — lives on Activity, not WM
+    # Mutually exclusive with PendingOperation (a cycle emits either one external action or one
+    # internal action, so an activity is RUNNING on at most one of them). `id` correlates to what
+    # _infer_/_ground_ pushed into inference_sink; the resolve in Observe discards a result whose id
+    # no longer matches the live pending_inference — the stale-inference guard mirroring
+    # pending_operation's late-ack guard. `kind` picks the landing zone: "plan" (infer ->
+    # Activity.plan) or "ground" (ground -> Activity.grounded_params). See ADR-0021.
+    id: str
+    kind: str  # "plan" | "ground"
+    requested_at: float
+
+
+@dataclass(frozen=True)
+class InferenceResult:  # what infer()/ground() resolve to — arrives async via inference_sink
+    # Deliberation output, not observed environment state, so never a Percept (ADR-0019/0021): it
+    # rides its own inference_sink, not result_sink or the perception path. `id` correlates to the
+    # PendingInference it resolves; on success `value` is a Plan (kind="plan") or a grounded params
+    # dict (kind="ground") and `error` is None. A model call that raised (malformed output, no LLM,
+    # a network error) resolves with `error` set and `value` None instead of stranding the activity
+    # RUNNING forever — Observe terminates the activity on it. DefaultObserveStrategy applies it on
+    # resolve.
+    id: str
+    value: Plan | dict[str, Any] | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
