@@ -70,7 +70,7 @@ class EmailScheduleScenario(Scenario):  # type: ignore[misc]  # ARE is an untype
                 content="Small change — could we do Tuesday instead of Monday? Thanks!",
             ),
             folder_name=EmailFolderName.INBOX,
-        ).depends_on(None, delay_seconds=8)
+        ).depends_on(None, delay_seconds=20)
 
         # Oracle events model the ideal response, for ARE's own oracle-mode tooling
         # (run_and_validate) — not for validate() below, which never checks whether these
@@ -110,46 +110,61 @@ class EmailScheduleScenario(Scenario):  # type: ignore[misc]  # ARE is an untype
         check literally (see build_events_flow) — the weekday is the signal that the agent used
         the follow-up's correction rather than the stale original Monday request.
 
-        The gate is deliberately narrow: a Tuesday event with Bob and Carol as attendees, plus a
-        reply to Alice. Title wording and exact meeting length are Alice's incidental phrasing, not
-        what this scenario is testing (whether the mid-run correction actually drove a replan) — so
-        they're reported for visibility but don't block success. Attendees are matched by substring,
-        not exact name, since "Bob Smith" is as valid an answer as "Bob"."""
+        Four required terms: the calendar event is on a Tuesday, lasts 30 minutes, and includes Bob
+        and Carol as attendees — all three on the *same* event — plus Alice got a reply. The weekday
+        is the signal that the agent used the follow-up's correction; the 30-minute length and the
+        attendees are Alice's explicit ask (the follow-up changed only the day). The three calendar
+        terms are also reported individually as any()-across-all-events booleans, purely for
+        diagnostics: when the same-event gate fails but all three singletons pass, the rationale
+        shows the terms were met by different events. Title wording is Alice's incidental phrasing,
+        not what this scenario tests, so it doesn't block success. Attendees are matched by
+        substring, not exact name, since "Bob Smith" is as valid an answer as "Bob"."""
         try:
             calendar_app = env.get_app("CalendarApp")
-            # Candidates, not a single boolean: an event can have the right attendees and still
-            # miss on weekday, or nothing may have the right attendees at all — the rationale needs
-            # to say which, instead of collapsing both into one False.
-            candidates = []
+            events = []
             for calendar_event in calendar_app.events.values():
                 attendees_text = " ".join(calendar_event.attendees).lower()
-                if "bob" not in attendees_text or "carol" not in attendees_text:
-                    continue
                 start = datetime.fromtimestamp(calendar_event.start_datetime, tz=UTC)
                 duration_minutes = (
                     calendar_event.end_datetime - calendar_event.start_datetime
                 ) / 60
-                candidates.append((calendar_event, start, duration_minutes))
+                events.append((calendar_event, attendees_text, start, duration_minutes))
 
-            scheduled_on_tuesday = any(start.weekday() == 1 for _, start, _ in candidates)
+            # The gate: one event must satisfy all three calendar terms together.
+            calendar_event_matches = any(
+                start.weekday() == 1
+                and duration_minutes == 30
+                and "bob" in attendees_text
+                and "carol" in attendees_text
+                for _, attendees_text, start, duration_minutes in events
+            )
+            # Per-term any()-across-events booleans, diagnostics only: they pinpoint which term
+            # missed, and reveal a split where three different events each satisfy one term.
+            scheduled_on_tuesday = any(start.weekday() == 1 for _, _, start, _ in events)
+            lasts_30min = any(duration_minutes == 30 for _, _, _, duration_minutes in events)
+            attendees_include_bob_and_carol = any(
+                "bob" in attendees_text and "carol" in attendees_text
+                for _, attendees_text, _, _ in events
+            )
 
             email_app = env.get_app("EmailClientApp")
             sent_emails = email_app.folders[EmailFolderName.SENT].emails
             replied_to_alice = any(ALICE_ADDRESS in email.recipients for email in sent_emails)
 
-            success = scheduled_on_tuesday and replied_to_alice
-            if candidates:
+            success = calendar_event_matches and replied_to_alice
+            if events:
                 detail = "; ".join(
                     f"{event.title!r} start={start.isoformat()} ({start.strftime('%A')}) "
-                    f"duration={duration_minutes:g}min"
-                    for event, start, duration_minutes in candidates
+                    f"duration={duration_minutes:g}min attendees={event.attendees!r}"
+                    for event, _, start, duration_minutes in events
                 )
             else:
-                titles = [e.title for e in calendar_app.events.values()]
-                detail = f"no event with bob+carol as attendees; calendar has {titles!r}"
+                detail = "calendar is empty"
             rationale = (
-                f"scheduled_on_tuesday={scheduled_on_tuesday}, replied_to_alice={replied_to_alice}"
-                f" [{detail}]"
+                f"calendar_event_matches={calendar_event_matches}, "
+                f"replied_to_alice={replied_to_alice} "
+                f"(scheduled_on_tuesday={scheduled_on_tuesday}, lasts_30min={lasts_30min}, "
+                f"attendees_include_bob_and_carol={attendees_include_bob_and_carol}) [{detail}]"
             )
             return ScenarioValidationResult(success=success, rationale=rationale)
         except Exception as e:

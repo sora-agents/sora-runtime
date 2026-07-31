@@ -26,7 +26,7 @@ def report(agent: Agent, simulation: Any | None) -> None:
     # still-RUNNING/BLOCKED activity would read a verdict its own strategy never validated there.
     reflect = agent.cycle.strategies.reflect
     failed = any(reflect.failed(a) for a in activities if a.state is ActivityState.TERMINATED)
-    print(f"\nagent outcome: {'FAILED' if failed else 'completed'}")
+    print(f"\nagent outcome: {'❌ FAILED' if failed else 'completed'}")
 
     if simulation is None:
         return
@@ -37,7 +37,7 @@ def report(agent: Agent, simulation: Any | None) -> None:
     try:
         outcome = simulation.validate()
         print(
-            f"ARE validation: {'PASS' if outcome.success else 'FAIL'} "
+            f"ARE validation: {'✅ PASS' if outcome.success else 'FAIL'} "
             "(environment-level; vacuous unless the scenario overrides validate())"
         )
         if outcome.rationale:

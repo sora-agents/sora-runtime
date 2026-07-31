@@ -27,6 +27,7 @@ htmlcov/
 # namespaced under .sora/ to avoid colliding with unrelated "memory" conventions
 .sora/
 my-agent/
+logs/
 
 # Environment
 .env
