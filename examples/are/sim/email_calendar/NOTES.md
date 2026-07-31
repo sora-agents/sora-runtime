@@ -33,14 +33,27 @@ Everything here lives under `examples/are/sim/email_calendar/` and would not shi
   already completed (no live activity) — spawns one fresh corrective activity (a hard-coded
   `_CORRECTIVE_GOAL` string). A user stop is delegated to `DefaultInterruptHandler`. Reconsideration
   thus lives in *one* seam, rather than being split across bespoke Reason/Situate strategies.
-- **`reconciling_plan_prompt` / `_RECONCILE_INSTRUCTION`** — a `PlanPrompt` that appends
-  dynamic-environment guidance to the default planning content: focus every tool the task changes
-  (inbox *and* calendar), and reconcile against the *observed* current state (delete/update only a
-  stale item you can currently see, since a step has no "skip if empty"). Written to read
-  generally, but it is still hand-tuned prose selected to make this scenario behave.
-- **`run.py` settle loop** — exits after a quiet window (`_SETTLE_S`) rather than on the first
-  terminated activity, because a follow-up may spawn corrective work after the original completes,
-  and the runner cannot tell a follow-up's `state_changed` from one the agent caused itself.
+- **`reconciling_plan_prompt` / `_RECONCILE_INSTRUCTION`** — a `PlanPrompt` appending
+  dynamic-environment guidance to the default planning content, **split into three fragments with
+  different fates**:
+  - `_OBSERVE_TO_NOTICE_CHANGE` — *scaffolding* for limitation 4 (perception gated on a model-driven
+    `focus`). Domain-neutral rule, email/calendar only in its examples.
+  - `_RECONCILE_AGAINST_OBSERVED` — *scaffolding* for limitation 1 (no guarded/skip-if-empty step).
+    Domain-neutral rule, email/calendar only in its examples.
+  - `_THREAD_READING` — **not scaffolding**: email-thread domain knowledge (a follow-up is usually a
+    partial correction; read every relevant message, not just the top search hit). Its proper home is
+    the email-client Manual (or semantic memory), so it travels with the tool; it lives in the example
+    only because the are-sim adapter synthesizes manuals and has no hand-authored one to pair
+    ([ADR-0015](../../../../docs/architecture/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md)).
+    Relocating it is tracked below.
+
+  The first two are candidates to *promote* (example-free) into `PLAN_SYSTEM_PROMPT` or to *retire*
+  once their gaps close; all three are still hand-tuned prose selected to make this scenario behave.
+- **`--exit-when-idle` quiet-window settle** — headless runs exit after a quiet window
+  (`sora run --exit-when-idle N`) rather than on the first terminated activity, because a follow-up
+  may spawn corrective work after the original goal completes, and the runner cannot tell a
+  follow-up's `state_changed` from one the agent caused itself. (There is no bespoke `run.py` here;
+  `report.py` only appends the agent-outcome and `validate()` lines to the standard trace.)
 
 Two related changes were made in the **runtime** (not example-specific), because they are generally
 correct:
@@ -61,22 +74,40 @@ correct:
 
 These are the seams the example works around. Each is a real runtime gap, not a bug in the example.
 
-1. **No conditional execution / plan branching.** A planned step always runs; there is no
-   "skip if empty" and no branch. This is why a blind `delete_calendar_event` crashed when no stale
-   event existed, and why reconciliation had to be pushed into *observation-time judgement* in the
-   prompt ("delete only what you can currently see"). That mitigation is **probabilistic** — it
-   relies on the model omitting the delete when it observes nothing to delete.
+1. **No guarded/conditional execution (a planned step always runs).** There is no "skip if empty"
+   and no branch. The *observed* failure this once produced — a blind `delete_calendar_event` on a
+   stale event that didn't exist — had **two** contributing causes, **both now mitigated**, which is
+   why it no longer crashes:
+   - **Cross-run plan replay (resolved).** A *corrected* plan (with a `delete`/reconcile step),
+     stored on completion by the old plan auto-caching, was replayed verbatim from a clean slate
+     where no stale event existed. Gone — plan auto-caching is disabled runtime-wide; every activity
+     infers fresh (see limitation 2).
+   - **`$from`-null reaching invoke (resolved).** Independently, an unconditional
+     `delete {event_id: $from search_events}` whose search returned empty used to walk the path to
+     `None` and call `delete(None)`. `resolve_references` now catches a bad path (an empty-list index
+     is an `IndexError`) and **escalates the param to the off-cycle `_ground_` call** instead of
+     dispatching `None`.
+
+   What **remains** is the general gap: with no guarded step, a superfluous `delete`/`update` can
+   still be *planned and attempted* — the runtime just hands its unresolvable param to the model to
+   ground rather than crashing. So the failure mode is **degraded from a deterministic crash to a
+   probabilistic mis-action**, held off only by (a) the reconcile prompt's `_RECONCILE_AGAINST_OBSERVED`
+   fragment and (b) the model's ground-time judgement. The deterministic fix — a runtime rule that
+   *skips* an `invoke` whose required param resolves to null (or true guarded steps) — retires both
+   soft guards and lets that prompt fragment be dropped. *(Caveat: a genuine `None` result on an empty
+   path still passes through to invoke — the `_MISSING` sentinel only guards the missing-history case
+   — so a `None`-invoke is narrowed, not categorically impossible.)*
 
 2. **Auto-caching the corrected plan (resolved — plan caching is now disabled).** Previously, on
    completion `DefaultReflectStrategy` stored `activity.plan`; after a mid-flight re-inference that
    was the *corrected* plan (with a `delete`/reconcile step), stored under the original goal. Two
    problems: (a) it was the **uncommon** case — the common case (no follow-up: focus → search → add →
    reply) is abandoned before completing on a dynamic run, so it never got cached; (b) a corrected
-   plan is replayed **verbatim** by the retrieve path, so from a clean slate its unconditional
-   `delete {event_id: $from search_events}` hits an empty search → `None` → a crash. The correction
-   is **experience, not a reusable procedure**. This is now avoided by **disabling plan auto-caching
-   runtime-wide** — the default Reflect records only an episode (`episodic.learn`). Safely *reusing*
-   a distilled common-case procedure is future work (see "episodic → procedural consolidation").
+   plan is replayed **verbatim** by the retrieve path, so from a clean slate it re-ran a `delete`
+   with nothing to delete (the crash mechanics are in limitation 1). The correction is **experience,
+   not a reusable procedure**. This is now avoided by **disabling plan auto-caching runtime-wide** —
+   the default Reflect records only an episode (`episodic.learn`). Safely *reusing* a distilled
+   common-case procedure is future work (see "episodic → procedural consolidation").
 
 3. **Self-caused state changes are indistinguishable from external ones.** The agent writes to the
    very tool it observes; every write emits `state_changed`. A naive "a signal arrived → re-infer"
@@ -87,7 +118,10 @@ These are the seams the example works around. Each is a real runtime gap, not a 
 4. **Observation requires focus, and focus is model-driven.** Observable properties are snapshotted
    only for *focused* tools, so the plan must explicitly `focus` every tool it reconciles against.
    `focus` is an ordinary plan step the base planner treats as optional, so we lean on the prompt to
-   request it. If the model omits a focus, the dynamic behavior silently never triggers.
+   request it. If the model omits a focus, the dynamic behavior silently never triggers. Note the
+   base prompt motivates focus only to *read what you need now* (it even says unfocus when done), so
+   the specific missing motivation is *holding* focus to catch a future change and to re-see your own
+   writes across a replan — that is what `_OBSERVE_TO_NOTICE_CHANGE` supplies.
 
 5. **Observation-aware inference can bake run-specific literals.** A plan inferred while a tool is
    focused may hard-code a visible id; mitigated by the core-prompt "keep identifiers as references"

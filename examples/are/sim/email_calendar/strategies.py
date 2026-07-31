@@ -149,33 +149,67 @@ class ReconsiderInterruptHandler:
         return True
 
 
-_RECONCILE_INSTRUCTION = (
-    "\nThis is a DYNAMIC environment: the task can change WHILE you work — a follow-up email may "
-    "arrive mid-task and change the answer (a different day, time, or attendee). To notice such a "
-    "change you must keep *observing* the tools involved, so make your FIRST steps a `focus` on "
-    "the email inbox (where updates arrive) AND on any other tool whose state this task changes "
-    "(e.g. the calendar), and keep them focused until the task is done — an unfocused tool's state "
-    "is not observed, so you will neither see a follow-up email that arrives later nor see what "
-    "you have already created. "
+# The reconciling plan prompt appends dynamic-environment guidance to the default planning content.
+# It is split into three fragments with *different fates*, so the "scaffolding vs. domain knowledge"
+# seam is explicit rather than buried in one blob:
+#
+#   _OBSERVE_TO_NOTICE_CHANGE  — SCAFFOLDING for a runtime gap (limitation 4): perception is gated
+#       on a model-driven `focus` step, and the base prompt motivates focus only to "read what you
+#       need now, unfocus when done" — it has no notion of holding focus to catch a *future* change
+#       or to re-see your own writes across a replan. Domain-neutral RULE; email/calendar only in
+#       the examples. Candidate to promote (example-free) into PLAN_SYSTEM_PROMPT, or to retire once
+#       the runtime auto-focuses tools a plan touches.
+#   _RECONCILE_AGAINST_OBSERVED — SCAFFOLDING for a runtime gap (limitation 1): no guarded/skip-if-
+#       empty step, so the prompt must tell the model to delete/update only a stale item it can
+#       currently see. Domain-neutral RULE; email/calendar only in the examples. Retired by guarded
+#       steps / skip-invoke-on-null.
+#   _THREAD_READING — NOT scaffolding: genuine email-thread domain knowledge (a follow-up is usually
+#       a partial correction; read every relevant message, not just the top search hit). This does
+#       not belong in a runtime prompt — its home is the email-client Manual (or semantic memory),
+#       so it travels with the tool instead of being re-tuned per example. It lives here only
+#       because the are-sim adapter *synthesizes* manuals and has no hand-authored one to pair
+#       (ADR-0015);
+#       relocating it is the tracked follow-up.
+
+_OBSERVE_TO_NOTICE_CHANGE = (
+    "\nThis is a DYNAMIC environment: the task can change WHILE you work — a new input may arrive "
+    "mid-task and change the answer. To notice such a change you must keep *observing* the tools "
+    "involved, because an unfocused tool's state is not observed. So make your FIRST steps a "
+    "`focus` on every channel where an update could arrive (here, the email inbox) AND on every "
+    "tool whose state this task changes (here, the calendar), and keep them focused until the task "
+    "is done — otherwise you will neither see a later change nor see what you have already "
+    "created.\n"
+)
+
+_RECONCILE_AGAINST_OBSERVED = (
     "You may be re-planning AFTER earlier steps already took effect: an item may already have been "
-    "created, a message already sent, for the OLD answer — leaving it in place would be a "
+    "created, or a message already sent, for the OLD answer — leaving it in place would be a "
     "duplicate or an obsolete artifact (two meetings on the calendar, an outdated reply). "
     "Reconcile against what you can CURRENTLY SEE in the observed state. Every step you plan WILL "
-    "run — there is no "
-    "'skip if empty' and no conditionals — so only plan to DELETE or UPDATE a stale item that is "
-    "actually visible in the current state right now, referencing its id from a fresh search/list "
-    "step. If no stale item is visible, do NOT plan a removal; just create or correct what the new "
-    "answer needs. If the current state already satisfies the goal, plan just a short send "
-    "confirming.\n"
+    "run — there is no 'skip if empty' and no conditionals — so only plan to DELETE or UPDATE a "
+    "stale item that is actually visible in the current state right now, referencing its id from a "
+    "fresh search/list step. If no stale item is visible, do NOT plan a removal; just create or "
+    "correct what the new answer needs. If the current state already satisfies the goal, plan just "
+    "a short send confirming.\n"
+)
+
+# Domain knowledge, quarantined — belongs in the email-client Manual (see the note above).
+_THREAD_READING = (
     "A follow-up in a thread like this is often a short correction, not a full restatement: it may "
     "mention only what changed (e.g. the day) and say nothing about details that did not change "
     "(duration, attendees, location, ...). The most recently arrived email is not necessarily the "
     "most complete one — do not treat whichever one a search happens to rank first as the whole "
-    "story. Before you finalize a parameter, make sure you have actually read every email in the "
-    "thread that could bear on it: if a search for the topic returns more than one relevant "
-    "result, plan a `get_email_by_id`-style step for each of them, not just the top one, so both "
-    "the original request and the correction are in front of you when you decide."
+    "story. When your CURRENT observations already show more than one relevant email in the thread "
+    "(e.g. a follow-up has arrived and the inbox you focused now holds both the original and the "
+    "correction), plan a `get_email_by_id`-style step for EACH of them, not just the top one, so "
+    "both are in front of you when you decide. But do NOT speculatively read results that may not "
+    "exist: if only one relevant email is visible to you right now, plan exactly ONE read (the top "
+    "result). You never need to pre-plan for a follow-up that has not arrived — when new mail "
+    "lands the runtime re-plans automatically, and that fresh plan will see and read every email "
+    "then present."
 )
+
+_RECONCILE_INSTRUCTION = _OBSERVE_TO_NOTICE_CHANGE + _RECONCILE_AGAINST_OBSERVED + _THREAD_READING
 
 
 def reconciling_plan_prompt(
@@ -189,7 +223,9 @@ def reconciling_plan_prompt(
     world — deleting/updating only a stale item that is actually visible, never blindly — instead of
     assuming a fresh start, and to read every relevant email in a thread rather than assuming the
     most recent search hit is the complete request (a follow-up correction typically omits whatever
-    didn't change). Wired via ``agent.yaml``'s ``procedural.plan_prompt``; the ``{"steps": [...]}``
-    response contract is unchanged."""
+    didn't change). That last clause is the ``_THREAD_READING`` fragment — email domain knowledge
+    quarantined here until it can move to the email-client Manual (ADR-0015); the other two
+    fragments are gap-scaffolding for limitations 1 and 4. Wired via ``agent.yaml``'s
+    ``procedural.plan_prompt``; the ``{"steps": [...]}`` response contract is unchanged."""
     system, user = default_plan_prompt(activity, tools, observed)
     return system + _RECONCILE_INSTRUCTION, user
