@@ -25,7 +25,7 @@ import pytest
 from fakes import FakeAdapter, FakeTool, FakeWorkspace
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
-from sora.cli import _BANNER, TerminalSession, _Console, _Presenter, main
+from sora.cli import _BANNER, _DIM, _MAGENTA, _RESET, TerminalSession, _Console, _Presenter, main
 from sora.cycle import Agent, DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
 from sora.memory import (
@@ -343,6 +343,23 @@ def test_presenter_terse_hides_the_llm_cue(capsys: pytest.CaptureFixture[str]) -
     presenter = _Presenter(verbose=False, console=_Console())
     presenter.emit(_record("sora.llm", logging.INFO, "~ llm (%.2fs)", 1.24))
     assert capsys.readouterr().out == ""  # counted in the summary, but not shown live in terse mode
+
+
+def test_presenter_paints_a_normal_llm_cue_magenta(capsys: pytest.CaptureFixture[str]) -> None:
+    presenter = _Presenter(verbose=True, console=_Console(), color=True)
+    presenter.emit(_record("sora.llm", logging.INFO, "~ llm (%.2fs)", 1.24))
+    assert capsys.readouterr().out == f"{_MAGENTA}~ llm (1.24s){_RESET}\n"
+
+
+def test_presenter_dims_a_discarded_llm_cue(capsys: pytest.CaptureFixture[str]) -> None:
+    # A discarded cue is dimmed (not magenta) so it reads as de-emphasized/voided against the normal
+    # per-call cues; the `[id]` tag ties it back to the metrics lines it voids.
+    presenter = _Presenter(verbose=True, console=_Console(), color=True)
+    record = _record("sora.llm", logging.INFO, "~ llm [32a3ad56] discarded (result superseded)")
+    record.llm_event = "discarded"  # the field the presenter keys the dim color on
+    presenter.emit(record)
+    out = capsys.readouterr().out
+    assert out == f"{_DIM}~ llm [32a3ad56] discarded (result superseded){_RESET}\n"
 
 
 # ---------------------------------------------------------------------------

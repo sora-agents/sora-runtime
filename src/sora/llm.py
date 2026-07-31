@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import time
 from dataclasses import dataclass
@@ -11,6 +12,25 @@ from typing import Protocol
 # the CLI presenter surfaces them as a per-call cue, `LLMMeter` tallies them, and neither has to
 # reach into the reasoning path to do it.
 _llm_log = logging.getLogger("sora.llm")
+
+
+# Correlates each metered round-trip to the off-cycle inference (the _infer_/_ground_ internal
+# action) that drove it, so the meter can later fold a *discarded* inference's cost — interrupted or
+# superseded, but still run to completion (ADR-0021) — into a separate "wasted" bucket instead of
+# conflating it with useful work. The action sets it around the model call; it stays None for any
+# other LLM use (which is therefore never attributable to a discard). ContextVars are task-local and
+# copied per task at creation, so a background inference sets its own without touching siblings.
+current_inference_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_inference_id", default=None
+)
+
+
+def _id_tag(inference_id: str | None) -> str:
+    """A short, eyeballable inference-id prefix for the per-call cues (``[32a3ad56] ``), so a later
+    ``discarded`` cue is visibly the *same* call as its usage/timing lines — which is otherwise
+    unrecoverable, since the discard is only known a cycle after those lines already printed. Empty
+    for a call not driven by an off-cycle inference (id ``None``), leaving those lines unchanged."""
+    return f"[{inference_id[:8]}] " if inference_id else ""
 
 
 # A response's answer text averages ~this many characters per token (English/JSON prose). Only used
@@ -62,8 +82,10 @@ def log_llm_usage(usage: LLMUsage) -> None:
     module — the client only supplies the provider-native numbers. Paired with, and distinct from,
     ``MeteredLLMClient``'s timing record: one call emits at most one ``done`` (seconds) and, when
     the client is instrumented, one ``usage`` (tokens). ``LLMMeter`` tallies both."""
+    inference_id = current_inference_id.get()
     _llm_log.info(
-        "~ llm usage: %d in / %d out tok (~%d answer, ~%.0f%% thinking)",
+        "~ llm %susage: %d in / %d out tok (~%d answer, ~%.0f%% thinking)",
+        _id_tag(inference_id),
         usage.input_tokens,
         usage.output_tokens,
         usage.answer_tokens,
@@ -73,7 +95,23 @@ def log_llm_usage(usage: LLMUsage) -> None:
             "llm_input_tokens": usage.input_tokens,
             "llm_output_tokens": usage.output_tokens,
             "llm_answer_chars": usage.answer_chars,
+            "llm_inference_id": inference_id,
         },
+    )
+
+
+def log_llm_discarded(inference_id: str) -> None:
+    """Emit a ``sora.llm`` record marking an off-cycle inference's result as discarded — interrupted
+    or superseded (ADR-0021). The model call ran to completion and was already metered (its cost is
+    real, provider-billed), but it did no useful work, so ``LLMMeter`` moves that id's metered cost
+    into its wasted bucket. Emitted from Observe, the one place a discard is decided; a no-op for
+    the tally if the id was never metered (an uninstrumented run still logs the cue). The ``[id]``
+    tag matches the one on this call's usage/timing cues, so the reader can see which lines it
+    voids."""
+    _llm_log.info(
+        "~ llm %sdiscarded (result superseded)",
+        _id_tag(inference_id),
+        extra={"llm_event": "discarded", "llm_inference_id": inference_id},
     )
 
 
@@ -117,8 +155,16 @@ class MeteredLLMClient:
             return await self._inner.complete(system=system, prompt=prompt)
         finally:
             elapsed = time.perf_counter() - start
+            inference_id = current_inference_id.get()
             _llm_log.info(
-                "~ llm (%.2fs)", elapsed, extra={"llm_event": "done", "llm_seconds": elapsed}
+                "~ llm %s(%.2fs)",
+                _id_tag(inference_id),
+                elapsed,
+                extra={
+                    "llm_event": "done",
+                    "llm_seconds": elapsed,
+                    "llm_inference_id": inference_id,
+                },
             )
 
     async def aclose(self) -> None:
@@ -146,17 +192,47 @@ class LLMMeter(logging.Handler):
         self.input_tokens = 0
         self.output_tokens = 0
         self.answer_chars = 0
+        # The wasted subset of the grand totals above: an inference whose result was discarded
+        # (interrupted/superseded) still ran to completion, so its cost is counted in the totals —
+        # these break out how much of that cost did no useful work, so a run surface can show used
+        # vs. wasted side by side without hiding real (billed) cost.
+        self.wasted_calls = 0
+        self.wasted_seconds = 0.0
+        self.wasted_input_tokens = 0
+        self.wasted_output_tokens = 0
+        # Per-inference-id partials, retained so a later `discarded` cue can fold that call's
+        # already-metered cost into the wasted buckets (one round-trip per id; popped on discard).
+        # An id never discarded lingers here for the run — bounded by call count, negligible.
+        self._seconds_by_id: dict[str, float] = {}
+        self._tokens_by_id: dict[str, tuple[int, int]] = {}  # id -> (input, output)
 
     def emit(self, record: logging.LogRecord) -> None:
         event = getattr(record, "llm_event", None)
+        inference_id = getattr(record, "llm_inference_id", None)
         if event == "done":
             self.calls += 1
-            self.total_seconds += getattr(record, "llm_seconds", 0.0)
+            seconds = getattr(record, "llm_seconds", 0.0)
+            self.total_seconds += seconds
+            if inference_id is not None:
+                self._seconds_by_id[inference_id] = seconds
         elif event == "usage":
             self.usage_calls += 1
-            self.input_tokens += getattr(record, "llm_input_tokens", 0)
-            self.output_tokens += getattr(record, "llm_output_tokens", 0)
+            input_tokens = getattr(record, "llm_input_tokens", 0)
+            output_tokens = getattr(record, "llm_output_tokens", 0)
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
             self.answer_chars += getattr(record, "llm_answer_chars", 0)
+            if inference_id is not None:
+                self._tokens_by_id[inference_id] = (input_tokens, output_tokens)
+        elif event == "discarded" and inference_id is not None:
+            seconds = self._seconds_by_id.pop(inference_id, None)
+            if seconds is not None:  # the discarded call was metered (timing always is)
+                self.wasted_calls += 1
+                self.wasted_seconds += seconds
+            tokens = self._tokens_by_id.pop(inference_id, None)
+            if tokens is not None:  # ...and, when the client is instrumented, its tokens too
+                self.wasted_input_tokens += tokens[0]
+                self.wasted_output_tokens += tokens[1]
 
     def _pooled(self) -> LLMUsage:
         """This run's usage as one ``LLMUsage`` over the pooled totals, so the answer/thinking
@@ -171,7 +247,13 @@ class LLMMeter(logging.Handler):
 
     def summary(self, wall_seconds: float | None = None) -> str:
         plural = "" if self.calls == 1 else "s"
-        text = f"{self.calls} LLM call{plural}, {self.total_seconds:.1f}s in-model"
+        text = f"{self.calls} LLM call{plural}"
+        if self.wasted_calls:  # break out used vs. discarded only when something was discarded
+            text += f" ({self.calls - self.wasted_calls} used, {self.wasted_calls} discarded)"
+        text += f", {self.total_seconds:.1f}s in-model"
+        if self.wasted_seconds:
+            used_seconds = self.total_seconds - self.wasted_seconds
+            text += f" ({used_seconds:.1f}s used, {self.wasted_seconds:.1f}s wasted)"
         if wall_seconds is not None:
             text += f", {wall_seconds:.1f}s wall"
         if self.usage_calls:
@@ -180,4 +262,6 @@ class LLMMeter(logging.Handler):
                 f"; {self.input_tokens} in / {self.output_tokens} out tokens "
                 f"(~{pooled.answer_tokens} answer, ~{pooled.thinking_share * 100:.0f}% thinking)"
             )
+            if self.wasted_output_tokens:
+                text += f"; {self.wasted_output_tokens} out discarded"
         return text

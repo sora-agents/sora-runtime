@@ -184,10 +184,14 @@ class _Presenter(logging.Handler):
         if record.name.startswith(log.name):
             return
         # `MeteredLLMClient`'s per-call cue: a live "the model is thinking" signal, shown only under
-        # --verbose (it's noise in the terse view, but the end-of-run summary still counts it).
+        # --verbose (it's noise in the terse view, but the end-of-run summary still counts it). A
+        # `discarded` cue (an interrupted/superseded inference — its output voided) is dimmed so it
+        # reads as de-emphasized against the normal magenta cues, matching its `[id]` tag by eye.
         if record.name == "sora.llm":
             if self._verbose:
-                self._console.line(_paint(record.getMessage(), _MAGENTA, enabled=self._color))
+                discarded = getattr(record, "llm_event", None) == "discarded"
+                color = _DIM if discarded else _MAGENTA
+                self._console.line(_paint(record.getMessage(), color, enabled=self._color))
             return
         message = record.getMessage()
         begin = _CYCLE_BEGIN.match(message)

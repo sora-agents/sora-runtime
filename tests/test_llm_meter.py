@@ -7,7 +7,14 @@ from collections.abc import Iterator
 
 import pytest
 
-from sora.llm import LLMMeter, LLMUsage, MeteredLLMClient, log_llm_usage
+from sora.llm import (
+    LLMMeter,
+    LLMUsage,
+    MeteredLLMClient,
+    current_inference_id,
+    log_llm_discarded,
+    log_llm_usage,
+)
 
 
 @pytest.fixture
@@ -188,3 +195,147 @@ def test_llm_meter_summary_omits_tokens_when_uninstrumented() -> None:
     meter.calls = 2
     meter.total_seconds = 3.0
     assert "tokens" not in meter.summary()
+
+
+def test_log_llm_discarded_emits_a_discard_record(_llm_logging_enabled: None) -> None:
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(handler)
+    try:
+        log_llm_discarded("inf-9")
+    finally:
+        logger.removeHandler(handler)
+
+    (record,) = records
+    assert record.__dict__["llm_event"] == "discarded"  # distinct from "done"/"usage"
+    assert record.__dict__["llm_inference_id"] == "inf-9"
+
+
+@pytest.mark.asyncio
+async def test_per_call_cues_carry_a_short_inference_id_tag(_llm_logging_enabled: None) -> None:
+    # The usage/timing/discarded cues share a `[id]` tag so a discarded cue is visibly the *same*
+    # call as its metrics lines — they can't be marked discarded at print time (that's known a cycle
+    # later), so the shared tag is how a reader correlates them.
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(handler)
+    token = current_inference_id.set("32a3ad56cdb2421c")  # a full id; the tag shows the first 8
+    try:
+        await MeteredLLMClient(_StubClient()).complete(system="s", prompt="p")
+        log_llm_usage(LLMUsage(1000, 800, answer_chars=40))
+    finally:
+        current_inference_id.reset(token)
+    log_llm_discarded("32a3ad56cdb2421c")
+    logger.removeHandler(handler)
+
+    messages = [r.getMessage() for r in records]
+    assert all("[32a3ad56]" in m for m in messages)  # every cue for this call carries the tag
+    assert any(m.startswith("~ llm [32a3ad56] usage:") for m in messages)
+    assert any(m.startswith("~ llm [32a3ad56] (") for m in messages)  # the timing cue
+    assert any(m == "~ llm [32a3ad56] discarded (result superseded)" for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_per_call_cues_have_no_tag_without_an_inference_id(
+    _llm_logging_enabled: None,
+) -> None:
+    # A call not driven by an off-cycle inference (id unset) keeps the byte-for-byte pre-existing
+    # cue text — no tag — so uninstrumented / non-inference LLM use reads exactly as before.
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(handler)
+    try:
+        await MeteredLLMClient(_StubClient()).complete(system="s", prompt="p")
+        log_llm_usage(LLMUsage(1000, 800, answer_chars=40))
+    finally:
+        logger.removeHandler(handler)
+
+    messages = [r.getMessage() for r in records]
+    assert any(m.startswith("~ llm usage:") for m in messages)  # no "[...]" tag
+    assert any(m.startswith("~ llm (") for m in messages)
+    assert all("[" not in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_llm_meter_moves_a_discarded_inference_to_the_wasted_bucket(
+    _llm_logging_enabled: None,
+) -> None:
+    # A call attributed to an inference id (via the contextvar) that is later discarded: its metered
+    # time and tokens are counted in the grand totals (real, billed cost) AND broken out as wasted.
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    token = current_inference_id.set("inf-1")
+    try:
+        await MeteredLLMClient(_StubClient()).complete(system="s", prompt="p")  # done, tagged inf-1
+        log_llm_usage(LLMUsage(1000, 800, answer_chars=40))  # usage, tagged inf-1
+        log_llm_discarded("inf-1")  # the result was invalidated/superseded -> wasted
+    finally:
+        current_inference_id.reset(token)
+        logger.removeHandler(meter)
+
+    assert meter.calls == 1  # still counted in the totals (the call really ran and was billed)
+    assert meter.wasted_calls == 1  # ...and broken out as wasted
+    assert meter.wasted_seconds == meter.total_seconds  # the one call's whole time was wasted
+    assert (meter.wasted_input_tokens, meter.wasted_output_tokens) == (1000, 800)
+
+
+@pytest.mark.asyncio
+async def test_llm_meter_keeps_a_used_inference_out_of_the_wasted_bucket(
+    _llm_logging_enabled: None,
+) -> None:
+    # The complement: an inference that resolves normally (no discard cue) stays fully used.
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    token = current_inference_id.set("inf-1")
+    try:
+        await MeteredLLMClient(_StubClient()).complete(system="s", prompt="p")
+        log_llm_usage(LLMUsage(1000, 800, answer_chars=40))
+    finally:
+        current_inference_id.reset(token)
+        logger.removeHandler(meter)
+
+    assert meter.calls == 1
+    assert meter.wasted_calls == 0
+    assert meter.wasted_seconds == 0.0
+    assert (meter.wasted_input_tokens, meter.wasted_output_tokens) == (0, 0)
+
+
+def test_llm_meter_summary_shows_used_and_wasted_split() -> None:
+    # When something was discarded, summary breaks out used vs. wasted side by side; the grand
+    # totals stay the headline (real cost), with the wasted subset annotated.
+    meter = LLMMeter()
+    meter.calls = 5
+    meter.total_seconds = 12.3
+    meter.wasted_calls = 1
+    meter.wasted_seconds = 2.1
+    meter.usage_calls = 5
+    meter.input_tokens = 1500
+    meter.output_tokens = 1100
+    meter.answer_chars = 640
+    meter.wasted_output_tokens = 300
+
+    summary = meter.summary(30.0)
+
+    assert "5 LLM calls (4 used, 1 discarded)" in summary
+    assert "12.3s in-model (10.2s used, 2.1s wasted)" in summary
+    assert "30.0s wall" in summary
+    assert "1500 in / 1100 out tokens" in summary
+    assert "300 out discarded" in summary
+
+
+def test_llm_meter_summary_unchanged_when_nothing_discarded() -> None:
+    # No discards -> the terse pre-existing format, so a normal run reads exactly as before.
+    meter = LLMMeter()
+    meter.calls = 3
+    meter.total_seconds = 4.0
+    assert meter.summary() == "3 LLM calls, 4.0s in-model"
+    assert "used" not in meter.summary()
+    assert "wasted" not in meter.summary()
