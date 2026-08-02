@@ -353,13 +353,16 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         activity = cycle.working.activities[kwargs["activity_id"]]
         catalog: dict[str, Manual] = kwargs["tools"]  # id -> Manual, the planning catalog
         observed = kwargs.get("observed")
+        messages = kwargs.get("messages")  # snapshot of recent user messages at fire time
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
             id=inf_id, kind="plan", requested_at=time.time()
         )
         activity.state = ActivityState.RUNNING  # off-cycle, like _invoke_ — immediate, never blocks
         log.info("reason: inferring a plan for %r (%d tools)", activity.goal, len(catalog))
-        _spawn_tracked(self._tasks, self._call(cycle, activity, inf_id, catalog, observed))
+        _spawn_tracked(
+            self._tasks, self._call(cycle, activity, inf_id, catalog, observed, messages)
+        )
 
     async def _call(
         self,
@@ -368,13 +371,14 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         inf_id: str,
         catalog: dict[str, Manual],
         observed: Any,
+        messages: Any,
     ) -> None:
         # Tag this task's metered round-trip with the inference id (task-local, isolated per task)
         # so the meter can attribute its cost to *this* inference — and move it to the wasted bucket
         # if the result is later discarded (interrupt/supersede). See sora.llm.current_inference_id.
         current_inference_id.set(inf_id)
         try:
-            plan = await cycle.procedural.infer(activity, catalog, observed)  # the LLMClient call
+            plan = await cycle.procedural.infer(activity, catalog, observed, messages)  # LLM call
         except Exception as exc:  # noqa: BLE001 — any model/parse/wire failure resolves as an error
             log.exception("reason: infer failed for activity %s", activity.id)
             cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))

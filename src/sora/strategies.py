@@ -325,8 +325,11 @@ class DefaultObserveStrategy:
             wm.messages.append(message)
             received_message = True
             log.info("observe: message from %s: %r", message.sender, _goal_from_message(message))
-        if received_message:
-            self._resume_on_input(wm)
+        if received_message and self._resume_on_input(wm):
+            # A resume consumed this batch as reconsideration input for the resumed activity —
+            # claim it so Situate won't also mint a ghost activity from the same follow-up (the
+            # double-duty bug). A normal message (no InputWait) is turned into a goal as before.
+            wm.messages_cursor = len(wm.messages)
         return TickResult()
 
     @staticmethod
@@ -379,15 +382,24 @@ class DefaultObserveStrategy:
                 log_llm_discarded(inf_id)
 
     @staticmethod
-    def _resume_on_input(wm: WorkingMemory) -> None:
+    def _resume_on_input(wm: WorkingMemory) -> bool:
         """A user Message satisfies an InputWait: any activity a hard interrupt paused (a user stop)
         returns to READY, so the decision cycle can reconsider it with the new instruction now in
         working memory. The mirror of _resume_on_signal, but the awaited stimulus is inbound user
-        input rather than a tool signal — mechanical, no judgment."""
+        input rather than a tool signal — mechanical, no judgment. The plan is *cleared* on resume
+        (not kept) so Reason re-infers with the follow-up message and the executed history visible —
+        a bare resume would keep advancing the stale plan and never see the instruction. Returns
+        whether any activity was resumed, so the caller can claim the message batch as
+        reconsideration input rather than letting Situate mint a ghost activity from it."""
+        resumed = False
         for activity in wm.activities.values():
             if isinstance(activity.blocked_on, InputWait):
                 activity.state = ActivityState.READY
                 activity.blocked_on = None
+                activity.plan = None  # force a replan so the follow-up instruction is seen
+                activity.step_index = 0
+                resumed = True
+        return resumed
 
     async def _suspend_on_completion_signal(
         self, cycle: DecisionCycle, just_resolved: list[tuple[Activity, OperationInvocation]]
@@ -614,15 +626,16 @@ class DefaultSituateStrategy:
 
     @staticmethod
     async def _create_activities_from_messages(wm: WorkingMemory, cycle: DecisionCycle) -> None:
-        if not wm.messages:
-            return  # nothing to handle -> the internal action is never required this cycle
+        if wm.messages_cursor >= len(wm.messages):
+            return  # nothing new since last processed -> the internal action isn't required
         create = cycle.actions.internal(CreateActivityAction.name)
         goals = {a.goal for a in wm.activities.values()}
-        for message in wm.messages:
+        for message in wm.messages[wm.messages_cursor :]:  # only messages not yet routed/claimed
             goal = _goal_from_message(message)
             if goal not in goals:  # an unhandled message maps to no existing activity (by goal)
                 await create.execute(cycle, goal=goal)
                 goals.add(goal)
+        wm.messages_cursor = len(wm.messages)  # claim the batch -> each message handled once
 
     @staticmethod
     async def _adjust_working_memory(wm: WorkingMemory, cycle: DecisionCycle) -> None:
@@ -752,7 +765,11 @@ class DefaultReasonStrategy:
                 observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
                 infer = cycle.actions.internal(InferAction.name)
                 await infer.execute(
-                    cycle, activity_id=activity.id, tools=catalog, observed=observed
+                    cycle,
+                    activity_id=activity.id,
+                    tools=catalog,
+                    observed=observed,
+                    messages=list(wm.messages),  # recent user instructions, snapshot at fire time
                 )
                 return result  # RUNNING on the inference; plan lands a later cycle
             log.info(

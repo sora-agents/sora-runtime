@@ -34,11 +34,13 @@ from sora.memory import (
     ProceduralMemory,
     default_ground_prompt,
     default_plan_prompt,
+    render_history,
+    render_messages,
     render_properties,
     render_signals,
     render_tools,
 )
-from sora.perception import Percept
+from sora.perception import Message, Percept
 from sora.types import (
     CompletedOperation,
     ObservableProperty,
@@ -314,6 +316,7 @@ async def test_infer_uses_injected_prompt(tmp_path: Path) -> None:
         activity: Activity,
         tools: dict[str, Manual],
         observed: PerceptSnapshot,
+        messages: list[Message],
     ) -> tuple[str, str]:
         return "SYS: plan tersely", (
             f"CUSTOM goal={activity.goal} tools={sorted(tools)} "
@@ -364,6 +367,57 @@ def test_default_plan_prompt_includes_percept_rendering() -> None:
     assert system == PLAN_SYSTEM_PROMPT
     assert render_properties(properties) in user
     assert render_signals(signals) in user
+
+
+def test_render_messages_empty_and_populated() -> None:
+    # The user-instruction channel: a bounded recent window of messages, "(none)" when empty.
+    assert render_messages([]) == "(none)"
+    msgs = [
+        Message(sender="user", content={"text": "schedule the sync"}, received_at=0.0),
+        Message(sender="user", content={"text": "actually make it Tuesday"}, received_at=1.0),
+    ]
+    rendered = render_messages(msgs)
+    assert "user: schedule the sync" in rendered
+    assert "user: actually make it Tuesday" in rendered
+
+
+def test_default_plan_prompt_renders_history_and_messages() -> None:
+    # A replan sees what has already been executed (so it doesn't repeat a side-effecting step) and
+    # the recent user instructions (so a follow-up reaches inference, not just the goal string).
+    tools = {"EmailClientApp": fake_manual("EmailClientApp", ["send_email"])}
+    activity = _activity("reply to Alice")
+    activity.history.append(
+        CompletedOperation(
+            OperationInvocation(tool_id="EmailClientApp", operation_name="send_email", params={}),
+            OperationAck(ok=True, result={"sent": True}),
+        )
+    )
+    messages = [Message(sender="user", content={"text": "nothing, continue"}, received_at=0.0)]
+    _, user = default_plan_prompt(activity, tools, PerceptSnapshot(), messages)
+    assert render_history(activity.history) in user
+    assert render_messages(messages) in user
+
+
+async def test_infer_forwards_messages_to_prompt(tmp_path: Path) -> None:
+    # The recent user messages reach the injected PlanPrompt (and thus the model), off the goal.
+    captured: dict[str, object] = {}
+
+    def capturing_prompt(
+        activity: Activity,
+        tools: dict[str, Manual],
+        observed: PerceptSnapshot,
+        messages: list[Message],
+    ) -> tuple[str, str]:
+        captured["messages"] = messages
+        return "SYS", "USER"
+
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm, prompt=capturing_prompt)
+    messages = [Message(sender="user", content={"text": "make it Tuesday"}, received_at=0.0)]
+
+    await mem.infer(_activity("g"), {}, PerceptSnapshot(), messages)
+
+    assert captured["messages"] == messages
 
 
 # --------------------------------------------------------------------------------------------------

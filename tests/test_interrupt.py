@@ -218,8 +218,13 @@ async def test_pending_interrupt_aborts_tick_before_reason(tmp_path: Path) -> No
 
 
 async def test_user_stop_pauses_then_message_resumes(tmp_path: Path) -> None:
-    cycle, working, transport = _cycle(tmp_path, situate=_NoopSituate())
-    working.activities["a1"] = _ready("a1")
+    # Real Situate (not a noop) so the resume path and activity-creation both run this tick: the
+    # follow-up must resume the paused activity AND not also spawn a ghost activity from its text.
+    cycle, working, transport = _cycle(tmp_path)
+    a1 = _ready("a1")
+    a1.plan = Plan(id="p", goal="g", steps=[Step(next_action="wait", params={})])
+    a1.step_index = 1  # mid-plan, to prove the resume clears it rather than resuming in place
+    working.activities["a1"] = a1
 
     await cycle.interrupt(Signal("user_stop", {}))
     await cycle.tick()
@@ -233,9 +238,18 @@ async def test_user_stop_pauses_then_message_resumes(tmp_path: Path) -> None:
     # The user's next instruction resumes the paused activity through the normal cycle.
     transport._inbound.append(Message(sender="user", content={"text": "carry on"}, received_at=0.0))
     await cycle.tick()
+    paused = working.activities["a1"]
     state = paused.state
     assert state is ActivityState.READY
     assert paused.blocked_on is None
+    # Plan cleared so Reason re-infers with the follow-up + executed history visible, rather than
+    # silently advancing the stale plan and never seeing the instruction (the resume bug).
+    assert paused.plan is None
+    assert paused.step_index == 0
+    # The follow-up was claimed as reconsideration input (messages_cursor), so Situate did NOT
+    # mint a ghost activity from its text — the double-duty bug this fix closes.
+    assert list(working.activities) == ["a1"]
+    assert working.messages_cursor == len(working.messages)
 
 
 async def test_default_handler_falls_back_and_warns_on_a_non_user_stop_interrupt(

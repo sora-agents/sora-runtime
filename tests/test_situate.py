@@ -165,6 +165,24 @@ async def test_situate_derives_goal_from_content_without_text_key(tmp_path: Path
     assert created.goal == str({"query": "ping"})  # deterministic fallback, no interpretation
 
 
+async def test_situate_cursor_processes_each_message_once(tmp_path: Path) -> None:
+    # The consumed-cursor claims a handled message so a later tick never re-spawns its activity from
+    # the append-only log — even once the original activity is gone and goal-dedup can't catch it.
+    registry, _ = _registry_with()
+    cycle, working, _ = _cycle(registry, tmp_path)
+    working.messages.append(_user_message("what time is it?"))
+
+    await DefaultSituateStrategy().situate([], working, cycle, TickResult())
+    assert len(working.activities) == 1
+    assert working.messages_cursor == 1  # the batch is claimed
+
+    # Drop the created activity (as if it completed) so goal-dedup would NOT block a re-spawn; the
+    # cursor is what keeps the still-present message from being processed a second time.
+    working.activities.clear()
+    await DefaultSituateStrategy().situate([], working, cycle, TickResult())
+    assert working.activities == {}  # not re-spawned
+
+
 # --------------------------------------------------------------------------------------------------
 # Selection
 # --------------------------------------------------------------------------------------------------

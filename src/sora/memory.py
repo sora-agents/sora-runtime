@@ -134,6 +134,12 @@ class WorkingMemory:  # transient, in-process, fast
     signals: list[Percept] = field(default_factory=list)
     # inbound agent-to-agent communication — kept distinct
     messages: list[Message] = field(default_factory=list)
+    # Count of messages already routed (turned into an activity goal by Situate, or claimed as
+    # reconsideration input by a resume) — a consumed-cursor over the append-only log so each
+    # message drives activity-creation at most once and a later tick never re-scans the whole log.
+    # Storage stays uncapped (no eviction), so this index is always valid; bounding `messages` with
+    # a retention cap is deferred (front-eviction would have to adjust the cursor).
+    messages_cursor: int = 0
     focused_tools: dict[str, Tool] = field(default_factory=dict)
     # manuals pulled from SemanticMemory by _load_ (removed by _unload_) — distinct from
     # focused_tools: focusing a tool is an external action, loading its manual is internal.
@@ -502,6 +508,29 @@ def render_signals(signals: list[Percept]) -> str:
     )
 
 
+# The plan prompt renders a bounded recent window of user messages, not the whole log: `messages`
+# storage is intentionally uncapped (so the consumed-cursor stays valid), so an unbounded render
+# would grow every prompt. Newest-last; only the most recent are shown.
+_MESSAGE_RENDER = 10
+
+
+def render_messages(messages: list[Message]) -> str:
+    """Render the recent inbound user messages (``WorkingMemory.messages``) for a planning prompt —
+    the channel that carries user *instructions / steering* (a follow-up after a stop, a mid-task
+    correction) into inference, distinct from an activity's goal string. An append log like
+    ``render_signals``; only the most recent ``_MESSAGE_RENDER`` are shown (storage is uncapped, so
+    the prompt window is capped here instead), each length-capped. ``(none)`` when empty. Public so
+    a custom ``PlanPrompt`` can reuse it."""
+    if not messages:
+        return "(none)"
+    lines = []
+    for m in messages[-_MESSAGE_RENDER:]:
+        text = m.content.get("text")
+        rendered = text if isinstance(text, str) else _render_json(m.content)
+        lines.append(f"- {m.sender}: {_truncate(rendered)}")
+    return "\n".join(lines)
+
+
 class PlanPrompt(Protocol):
     """Builds the ``(system, user_prompt)`` pair ``infer()`` sends to the LLM, from the activity,
     the available tools, and the agent's currently observed world state. Injected into
@@ -517,6 +546,7 @@ class PlanPrompt(Protocol):
         activity: Activity,
         tools: dict[str, Manual],
         observed: PerceptSnapshot,
+        messages: list[Message],
     ) -> tuple[str, str]: ...
 
 
@@ -524,18 +554,25 @@ def default_plan_prompt(
     activity: Activity,
     tools: dict[str, Manual],
     observed: PerceptSnapshot | None = None,
+    messages: list[Message] | None = None,
 ) -> tuple[str, str]:
     """The built-in ``PlanPrompt``: the fixed ``PLAN_SYSTEM_PROMPT`` (the JSON step vocabulary) plus
-    a user prompt rendering the goal, the tool catalog, and the agent's currently observed world
-    state (``observed`` is omittable — an unrelated caller isn't forced to supply one). Reuse
-    ``PLAN_SYSTEM_PROMPT`` / ``render_tools`` / ``render_properties`` / ``render_signals`` when
-    writing a custom one."""
+    a user prompt rendering the goal, the tool catalog, the agent's currently observed world state,
+    the results of operations already executed, and recent user instructions (``observed`` /
+    ``messages`` are omittable — an unrelated caller isn't forced to supply them). Rendering the
+    executed history lets a *replan* (e.g. after a user stop clears the plan) see what has already
+    been done and not repeat a side-effecting step; rendering recent messages makes a follow-up
+    instruction visible to inference rather than reaching the model only as a goal string. Reuse
+    ``PLAN_SYSTEM_PROMPT`` / ``render_tools`` / ``render_properties`` / ``render_signals`` /
+    ``render_history`` / ``render_messages`` when writing a custom one."""
     observed = observed or PerceptSnapshot()
     user = (
         f"Goal: {activity.goal}\n\n"
         f"Available tools and their operations:\n{render_tools(tools)}\n\n"
         f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
-        f"Recently observed signals:\n{render_signals(observed.signals)}"
+        f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
+        f"Results of operations already executed:\n{render_history(activity.history)}\n\n"
+        f"Recent instructions from the user:\n{render_messages(messages or [])}"
     )
     return PLAN_SYSTEM_PROMPT, user
 
@@ -716,6 +753,7 @@ class ProceduralMemory:
         activity: Activity,
         tools: dict[str, Manual],
         observed: PerceptSnapshot | None = None,
+        messages: list[Message] | None = None,
     ) -> Plan:
         """Produce a new multi-step Plan when no cached one fits — the expensive path, one model
         call producing a whole sequence of Steps at once. This is querying procedural memory for
@@ -723,8 +761,9 @@ class ProceduralMemory:
         available ``tools`` (keyed by tool id -> its Manual, supplied by the caller that holds the
         live registry — a memory module never reaches into the environment), and the caller's
         current ``observed`` world-state snapshot (so planning isn't blind to already-observed
-        properties/signals — omittable, defaulting to none observed) via the injected
-        ``PlanPrompt``, calls the pluggable ``LLMClient``, then converts the model's JSON answer to
+        properties/signals — omittable, defaulting to none observed) and any recent user
+        ``messages`` (so a follow-up instruction reaches inference, not just the goal string) via
+        the injected ``PlanPrompt``, calls the pluggable ``LLMClient``, converts the model's JSON to
         the runtime's own ``Plan``/``Step`` vocabulary. That conversion is the anti-corruption
         boundary; malformed output raises ``ValueError`` rather than a half-built plan. Without an
         LLM the module is store/retrieve only and this raises."""
@@ -733,7 +772,7 @@ class ProceduralMemory:
                 "ProceduralMemory has no LLM configured; cannot infer a plan (store/retrieve "
                 "still work). Pass an LLMClient to enable inference."
             )
-        system, user = self._prompt(activity, tools, observed or PerceptSnapshot())
+        system, user = self._prompt(activity, tools, observed or PerceptSnapshot(), messages or [])
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         text = await self._llm.complete(system=system, prompt=user)
         return Plan(id=uuid.uuid4().hex, goal=activity.goal, steps=_parse_plan_steps(text))

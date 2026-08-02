@@ -85,6 +85,7 @@ class SpyProcedural(ProceduralMemory):
         self._infer_plan = infer
         self.retrieve_calls: list[Activity] = []
         self.infer_calls: list[tuple[Activity, dict[str, Manual], PerceptSnapshot]] = []
+        self.infer_messages: list[list[Message]] = []
 
     async def retrieve(self, activity: Activity) -> Plan | None:
         self.retrieve_calls.append(activity)
@@ -95,8 +96,10 @@ class SpyProcedural(ProceduralMemory):
         activity: Activity,
         tools: dict[str, Manual],
         observed: PerceptSnapshot | None = None,
+        messages: list[Message] | None = None,
     ) -> Plan:
         self.infer_calls.append((activity, tools, observed or PerceptSnapshot()))
+        self.infer_messages.append(list(messages or []))
         if self._infer_plan is None:
             raise AssertionError("infer() was called but no infer plan was configured")
         return self._infer_plan
@@ -261,6 +264,26 @@ async def test_reason_infer_receives_current_properties_and_signals(tmp_path: Pa
 
     _activity, _tools, called_observed = spy.infer_calls[0]
     assert called_observed == PerceptSnapshot([prop_percept], [signal_percept])
+
+
+async def test_reason_infer_receives_recent_user_messages(tmp_path: Path) -> None:
+    # A follow-up instruction reaches inference as ambient context, not only via the goal string:
+    # Reason snapshots wm.messages into the off-cycle _infer_ call.
+    tool = FakeTool("EmailClientApp", invoke_results={"list_emails": {"emails": []}})
+    registry, origin = _registry_with(tool)
+    await registry.join(origin)
+    inferred = Plan(id="p", goal="g", steps=[invoke_step("EmailClientApp", "list_emails")])
+    spy = SpyProcedural(retrieve=None, infer=inferred)
+    cycle, working = _cycle(registry, tmp_path, procedural=spy)
+    activity = Activity(id="a", goal="g", context={})
+    working.activities["a"] = activity
+    message = Message(sender="user", content={"text": "make it Tuesday"}, received_at=0.0)
+    working.messages.append(message)
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)  # let the background _infer_ task run so it records what it was asked
+
+    assert spy.infer_messages[0] == [message]
 
 
 # --------------------------------------------------------------------------------------------------

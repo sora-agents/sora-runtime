@@ -90,7 +90,12 @@ mapping each targeted activity onto an *existing* state: `READY` (resume, or rep
 instruction), or `TERMINATED` (drop). Then the existing `ActivitySelectionStrategy` (ADR-0016) picks
 next. `DefaultInterruptHandler` is the user-stop default: pause each schedulable (`READY`) targeted
 activity to `BLOCKED`/`InputWait` (halt but stay alive); a later user `Message` resumes it in Observe
-(`_resume_on_input`, mirroring `_resume_on_signal` against `wm.messages`).
+(`_resume_on_input`, mirroring `_resume_on_signal` against `wm.messages`). The resume **clears the
+plan** (`plan`/`step_index`) so Reason re-infers with the follow-up message and executed history
+visible — a bare resume would advance the stale plan and never see the instruction. The follow-up
+batch is **claimed** as reconsideration input (`messages_cursor`), so Situate does not also mint a
+ghost activity from its text. Inbound messages are ambient inference context generally (rendered
+into every plan prompt via `render_messages`), not only in the post-stop case.
 
 **`InputWait` — the second `blocked_on` variant SignalWait foresaw.** `blocked_on: SignalWait | InputWait
 | None`. Same `BLOCKED` state, a different awaited stimulus: not a tool signal (nothing to name-match) but

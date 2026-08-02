@@ -168,3 +168,28 @@ Each of these would replace a chunk of the scaffolding above with a principled m
   genuinely **off-cycle** (from the Environment thread) is the deferred unlock that turns this into true
   mid-Reason abandonment for the email scenario; it complements, rather than replaces, the reconsideration
   policy (limitation 6). The `/stop` user stop already exercises the async-source path today.
+
+- **Replan-by-amend on resume (show the un-executed remainder).** On a `/stop` resume the runtime
+  clears the plan (`plan`/`step_index`) and Reason authors a fresh plan seeing goal + executed history
+  + the follow-up message. For an unchanged-intent follow-up ("nothing, continue") that re-derives a
+  plan the model effectively already had. A refinement: also render the *un-executed remainder*
+  (`plan.steps[step_index:]`) so the resume inference is an *amend* ("here's the plan you were running,
+  these steps remain, here's the new input") rather than an author-from-scratch. It does **not** save
+  the inference call — seeing the message requires an infer, which requires clearing the plan (a bare
+  resume never sees it) — so it is not a token-cost win; the payoff is steadier, less-divergent output,
+  collapsing to "reproduce the remainder" for a no-op message. Needs the pre-resume `step_index`
+  preserved (currently zeroed) and must render the remainder *as pending against history-as-done* to
+  avoid re-running an already-executed side-effecting step (the re-send hazard, limitation 1). Gate on
+  evidence that no-op resumes actually diverge or cost too much.
+
+- **Cache-oriented plan-prompt layout.** The plan prompt renders sections in *attention* order today —
+  goal, tools, observed properties/signals, executed history, then user messages **last** (the freshest
+  instruction most salient, best for reconsideration). Prompt caching is not wired: the
+  `LLMClient.complete` seam sets no `cache_control` (caching is a cycle/agent concern by design). When
+  it lands, the real lever is a stable-prefix cache breakpoint after the *system prompt + tool catalog*
+  (the large, slow-changing chunks), with the volatile block (properties/signals, history, messages)
+  after it. A second-order tweak then: order that volatile block most-stable-first — messages and
+  append-only history churn less than re-observed properties/signals, so they *could* precede observables
+  — weighed against the recency cost of moving the fresh instruction earlier. Micro-ordering messages vs.
+  observables is a rounding error next to caching the catalog, so revisit this *when caching exists*, not
+  before.

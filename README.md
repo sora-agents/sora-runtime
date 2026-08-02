@@ -276,7 +276,7 @@ sentence, but it costs one extra `ProceduralMemory.ground()` model call at run t
     # my_agent/prompts.py
     from sora.memory import PLAN_SYSTEM_PROMPT, render_tools
 
-    def cheap_plan_prompt(activity, tools, observed):
+    def cheap_plan_prompt(activity, tools, observed, messages):
         system = PLAN_SYSTEM_PROMPT + (
             "\nPrefer a bare $from copy over $decide phrasing for send content, even if it reads "
             "less like a sentence — minimizing model calls matters more than prose here."
@@ -970,6 +970,8 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         properties: dict[tuple[str, str], Percept]
         signals: list[Percept]
         messages: list[Message]        # inbound agent-to-agent communication — kept distinct
+        messages_cursor: int           # count already routed (goal) or claimed (resume); a consumed-
+                                        # cursor over the append-only log so each message is handled once
         focused_tools: dict[str, Tool]
         loaded_manuals: dict[str, Manual]  # manuals pulled from SemanticMemory by _load_ (removed by
                                             # _unload_) — distinct from focused_tools: focusing a tool
@@ -993,11 +995,13 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         properties: list[Percept] = field(default_factory=list)
         signals: list[Percept] = field(default_factory=list)
 
-    class PlanPrompt(Protocol):   # builds infer()'s (system, user) prompt from (activity, tools, observed)
+    class PlanPrompt(Protocol):   # builds infer()'s (system, user) prompt from (activity, tools, observed, messages)
         def __call__(self, activity: Activity, tools: dict[str, Manual],
-                     observed: PerceptSnapshot) -> tuple[str, str]: ...
+                     observed: PerceptSnapshot, messages: list[Message]) -> tuple[str, str]: ...
         #   default_plan_prompt is the built-in one; PLAN_SYSTEM_PROMPT / render_tools /
-        #   render_properties / render_signals are reusable pieces a custom PlanPrompt can lean on.
+        #   render_properties / render_signals / render_history / render_messages are reusable pieces.
+        #   messages are recent user instructions (a follow-up after a stop, a mid-task correction),
+        #   ambient context distinct from the goal string; history lets a replan skip a done step.
         #   The response contract ({"steps":[...]}) stays fixed — customize the *prompt*, not the
         #   parse. PLAN_SYSTEM_PROMPT also tells the model to emit a *reference* —
         #   {"$from": "<op>", "path": "<dotted path>"} or {"$decide": "..."} — for a param whose
@@ -1023,7 +1027,8 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             most-relevant-first — see MemoryBackend), so this stays one line regardless of backend.
             The cheap path: skips infer() entirely when it hits."""
         async def infer(self, activity: Activity, tools: dict[str, Manual],
-                        observed: PerceptSnapshot | None = None) -> Plan:
+                        observed: PerceptSnapshot | None = None,
+                        messages: list[Message] | None = None) -> Plan:
             """Produces a new multi-step Plan when no cached one fits — the model path: one LLMClient
             call producing a whole sequence of Steps at once. This is procedural memory querying its
             'implicit knowledge encoded in LLM weights'. `tools` (id -> its Manual) is the planning

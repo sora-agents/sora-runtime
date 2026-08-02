@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from sora.cycle import DecisionCycle
     from sora.manual import Manual
     from sora.memory import PerceptSnapshot, WorkingMemory
+    from sora.perception import Message
 
 log = logging.getLogger("examples.are.sim.email_calendar")
 
@@ -216,6 +217,7 @@ def reconciling_plan_prompt(
     activity: Activity,
     tools: dict[str, Manual],
     observed: PerceptSnapshot | None = None,
+    messages: list[Message] | None = None,
 ) -> tuple[str, str]:
     """A commitment-aware ``PlanPrompt``: the default planning content plus an instruction to focus
     the tools it reconciles against (the inbox, so a mid-task email is observed, and any tool it
@@ -227,5 +229,5 @@ def reconciling_plan_prompt(
     quarantined here until it can move to the email-client Manual (ADR-0015); the other two
     fragments are gap-scaffolding for limitations 1 and 4. Wired via ``agent.yaml``'s
     ``procedural.plan_prompt``; the ``{"steps": [...]}`` response contract is unchanged."""
-    system, user = default_plan_prompt(activity, tools, observed)
+    system, user = default_plan_prompt(activity, tools, observed, messages)
     return system + _RECONCILE_INSTRUCTION, user
