@@ -34,10 +34,10 @@ Everything here lives under `examples/are/sim/email_calendar/` and would not shi
   `_CORRECTIVE_GOAL` string). A user stop is delegated to `DefaultInterruptHandler`. Reconsideration
   thus lives in *one* seam, rather than being split across bespoke Reason/Situate strategies.
 - **`reconciling_plan_prompt` / `_RECONCILE_INSTRUCTION`** — a `PlanPrompt` appending
-  dynamic-environment guidance to the default planning content, **split into three fragments with
+  dynamic-environment guidance to the default planning content, **split into fragments with
   different fates**:
-  - `_OBSERVE_TO_NOTICE_CHANGE` — *scaffolding* for limitation 4 (perception gated on a model-driven
-    `focus`). Domain-neutral rule, email/calendar only in its examples.
+  - `_OBSERVE_TO_NOTICE_CHANGE` — *(retired)* was scaffolding for limitation 4 (perception gated on a
+    model-driven `focus`). Dropped now that `JoinAction` auto-focuses joined tools — see below.
   - `_RECONCILE_AGAINST_OBSERVED` — *scaffolding* for limitation 1 (no guarded/skip-if-empty step).
     Domain-neutral rule, email/calendar only in its examples. **Narrowed** by the runtime required-
     null skip (`DefaultActStrategy.bind`) but not yet droppable — it still covers the stale-but-non-
@@ -125,13 +125,16 @@ These are the seams the example works around. Each is a real runtime gap, not a 
    this by keying on **INBOX ids** — the agent's reply lands in SENT, invisible to the trigger — but
    that is ARE-email-shaped, not general.
 
-4. **Observation requires focus, and focus is model-driven.** Observable properties are snapshotted
-   only for *focused* tools, so the plan must explicitly `focus` every tool it reconciles against.
-   `focus` is an ordinary plan step the base planner treats as optional, so we lean on the prompt to
-   request it. If the model omits a focus, the dynamic behavior silently never triggers. Note the
-   base prompt motivates focus only to *read what you need now* (it even says unfocus when done), so
-   the specific missing motivation is *holding* focus to catch a future change and to re-see your own
-   writes across a replan — that is what `_OBSERVE_TO_NOTICE_CHANGE` supplies.
+4. **Observation requires focus (mitigated, not resolved).** Observable properties are snapshotted
+   only for *focused* tools. This *was* model-driven — the plan had to explicitly `focus` every tool
+   it reconciled against, and `focus` is an ordinary step the base planner treats as optional, so if
+   the model omitted one the dynamic behavior silently never triggered. **Mitigated** by
+   `JoinAction` now auto-focusing every tool of a joined workspace, so perception no longer hinges on
+   a model focus step and `_OBSERVE_TO_NOTICE_CHANGE` is retired. This is a **temporary mechanical
+   fallback**: focusing *everything* joined gives up the per-cycle observation-cost narrowing that
+   intentional focus buys. The real fix — reliable, intentional model-driven focus/unfocus that
+   attends to only the tools that matter (and *holds* that focus across a replan) — is still future
+   work; `_focus_`/`_unfocus_` remain the seam for it.
 
 5. **Observation-aware inference can bake run-specific literals.** A plan inferred while a tool is
    focused may hard-code a visible id; mitigated by the core-prompt "keep identifiers as references"

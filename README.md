@@ -258,9 +258,10 @@ tools' manuals into working memory (`_load_`), unloads any no longer backed by a
 next cycle. Signals are **fire-and-forget** and are never dropped by `_filter_`: a signal may still
 matter to another (or a `blocked`) activity, so its retention/eviction is owned by the blocked-state
 machinery's fixed retention cap, not a per-cycle prune — satisfying a wait never evicts a signal
-early. The default does not auto-*focus* —
-focusing is an external action (one per cycle, dispatched at Act), so an agent that needs to perceive
-a tool's properties/signals emits `_focus_` as a plan step.
+early. As a temporary fallback the runtime auto-focuses a workspace's tools on `_join_`, so an agent
+perceives its joined tools without a `focus` step. The intended path is still intentional focusing —
+an external action (one per cycle, dispatched at Act) that a richer strategy emits as a `_focus_`
+plan step (and `_unfocus_` to narrow observation cost); that override is unaffected.
 
 #### Customizing the planning/grounding prompts
 
@@ -786,6 +787,11 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
                     address=tool.address,   # None unless this tool overrides the workspace's address
                     discovered_at=now(), last_seen_at=now(),
                 ))
+                # Temporary fallback: auto-focus every joined tool so perception doesn't hinge on a
+                # model `focus` step (an unfocused tool's state isn't observed). Goal is intentional,
+                # model-driven focus; `_focus_`/`_unfocus_` stay as that path / a manual override.
+                await tool.focus(cycle.signal_sink)
+                cycle.working.focused_tools[tool.id] = tool
             # workspace_id addresses it (for a later _leave_); tool_ids are a self-contained
             # snapshot of what was gained, legible after leave / across an agent boundary.
             # The snapshot is useful for logging (e.g., saving an episode to memory).

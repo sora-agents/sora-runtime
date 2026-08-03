@@ -214,6 +214,16 @@ class JoinAction:  # predefined external action: _join_ — implies discover/con
                     last_seen_at=now,
                 )
             )
+            # Auto-focus every joined tool (same effect FocusAction performs), so perception no
+            # longer hinges on the model emitting — and holding — a `focus` step: an unfocused
+            # tool's state isn't observed, so without this a mid-task change (or the agent's own
+            # writes) silently goes unseen. This is a **temporary mechanical fallback**, not the
+            # intended design: the goal is reliable, intentional model-driven focus/unfocus that
+            # attends to only the tools that matter (bounding per-cycle observation cost).
+            # `_focus_`/`_unfocus_` stay available as that eventual path and as a manual override;
+            # leaving unfocuses these again (LeaveAction), so the join/leave pair stays symmetric.
+            await tool.focus(cycle.signal_sink)
+            cycle.working.focused_tools[tool.id] = tool
         # workspace_id addresses it (for a later _leave_); tool_ids are a self-contained snapshot
         # of what was gained, legible after leave / across an agent boundary (see EXAMPLES.md).
         # the snapshot is useful for logging, e.g. saving an episode to memory

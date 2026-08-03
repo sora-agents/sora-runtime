@@ -364,6 +364,45 @@ async def test_join_registers_tools_and_persists_records(tmp_path: Path) -> None
     assert stored_manual.id == tool.manual.id
 
 
+async def test_join_focuses_all_workspace_tools(tmp_path: Path) -> None:
+    # Temporary mechanical fallback: joining a workspace focuses *all* its tools, so perception no
+    # longer hinges on the model emitting a focus step. Every joined tool lands in focused_tools and
+    # gets its signals wired to the cycle's own signal_sink (the eventual goal is intentional,
+    # model-driven focus — this stands in until that's reliable).
+    signal = Signal(name="new_email", payload={"n": 1})
+    email = FakeTool("EmailClientApp", signals_on_focus=[signal])
+    calendar = FakeTool("CalendarApp")
+    registry, _ = _registry_with(email, calendar)
+    cycle, working, _ = _cycle(registry, tmp_path)
+
+    ack = await JoinAction().execute(registry, cycle, activity_id="a1", origin=_ORIGIN)
+
+    assert ack.ok is True
+    # Every tool the workspace exposed is now focused (pre-populated from the joined set) — with no
+    # explicit _focus_ dispatch.
+    assert working.focused_tools == {"EmailClientApp": email, "CalendarApp": calendar}
+    assert email.focused is True and calendar.focused is True
+    # The subscription is the cycle's own sink — the tool replayed its signal into it.
+    drained = [item async for item in cycle.signal_sink.drain()]
+    assert drained == [("EmailClientApp", signal)]
+
+
+async def test_leave_after_autofocus_unfocuses_without_a_manual_focus(tmp_path: Path) -> None:
+    # Join auto-focuses, so leaving must tear that focus down even though no _focus_ was ever
+    # dispatched — the join/leave pair stays symmetric.
+    tool = FakeTool("EmailClientApp", signals_on_focus=[Signal("new_email", {"n": 1})])
+    registry, workspace = _registry_with(tool)
+    cycle, working, _ = _cycle(registry, tmp_path)
+    await JoinAction().execute(registry, cycle, activity_id="a1", origin=_ORIGIN)
+    assert "EmailClientApp" in working.focused_tools  # auto-focused by join, not a manual focus
+
+    await LeaveAction().execute(registry, cycle, activity_id="a1", workspace_id="ws")
+
+    assert "EmailClientApp" not in working.focused_tools
+    assert tool.focused is False
+    assert workspace.closed is True
+
+
 async def test_leave_closes_and_deregisters(tmp_path: Path) -> None:
     tool = FakeTool("EmailClientApp")
     registry, workspace = _registry_with(tool)

@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeTool, FakeWorkspace, ScriptedTransport
-from sora.action import SendAction, default_action_registry, invoke_step
+from sora.action import JoinAction, SendAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
@@ -192,6 +192,25 @@ async def test_observe_emits_signal_percepts_from_signal_sink(tmp_path: Path) ->
     percept = working.signals[0]
     assert percept.source == "EmailClientApp"
     assert percept.payload == signal
+
+
+async def test_observe_sees_a_joined_tools_state_without_an_explicit_focus(tmp_path: Path) -> None:
+    # Joining a workspace auto-focuses all its tools (temporary fallback), so a joined tool's
+    # observable property and its signals reach working memory with NO _focus_ step — the
+    # silent-failure mode (perception dead until the model remembered to focus) is gone.
+    prop = ObservableProperty(name="unread", value=3)
+    signal = Signal(name="new_email", payload={"n": 1})
+    tool = FakeTool("EmailClientApp", properties=[prop], signals_on_focus=[signal])
+    origin = WorkspaceOrigin(adapter="fake", address="fake://ws")
+    workspace = FakeWorkspace("ws", origin, [tool])
+    registry = EnvironmentRegistry(adapters={origin: FakeAdapter("fake", workspace)})
+    cycle, working = _cycle(tmp_path, registry=registry)
+
+    await JoinAction().execute(registry, cycle, activity_id="a1", origin=origin)
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert working.properties[(tool.id, "unread")].payload == prop
+    assert [p.payload for p in working.signals] == [signal]
 
 
 async def test_observe_appends_inbound_messages(tmp_path: Path) -> None:

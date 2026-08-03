@@ -33,13 +33,13 @@ an earlier tick when the interrupt lands; the handler invalidates it (``pending_
 and its result is discarded when it resolves, rather than writing a stale plan. Making the ARE push
 itself off-cycle (a genuinely asynchronous signal source) is separately deferred.
 
-Precondition — the plan MUST focus the tools it reconciles against: the inbox (or ``state_changed``
-signals never carry INBOX state, so the policy never fires) and every tool whose state it changes
-(here the calendar). Observable properties/signals are only produced for a *focused* tool
-(``DefaultObserveStrategy``), so without a ``focus`` step the agent runs
-blind to a follow-up and can't see what it already created (and would blindly delete a non-existent
-item, since a step has no "skip if empty"). Focus is optional to the base planner,
-so ``reconciling_plan_prompt`` asks for it explicitly.
+Observation precondition — met by the runtime now, not the prompt. Observable properties/signals
+are only produced for a *focused* tool (``DefaultObserveStrategy``), and the follow-up path is dead
+without them (no ``state_changed`` from the inbox -> the policy never fires; no view of what the
+agent already created). ``JoinAction`` now auto-focuses every tool of a joined workspace, so this
+holds mechanically — the plan no longer has to emit a ``focus`` step. That auto-focus is a
+*temporary* fallback (the goal is reliable intentional focus/unfocus); until then
+``reconciling_plan_prompt`` no longer scaffolds it.
 """
 
 from __future__ import annotations
@@ -151,15 +151,9 @@ class ReconsiderInterruptHandler:
 
 
 # The reconciling plan prompt appends dynamic-environment guidance to the default planning content.
-# It is split into three fragments with *different fates*, so the "scaffolding vs. domain knowledge"
-# seam is explicit rather than buried in one blob:
+# It is split into fragments with *different fates*, so the "scaffolding vs. domain knowledge" seam
+# is explicit rather than buried in one blob:
 #
-#   _OBSERVE_TO_NOTICE_CHANGE  — SCAFFOLDING for a runtime gap (limitation 4): perception is gated
-#       on a model-driven `focus` step, and the base prompt motivates focus only to "read what you
-#       need now, unfocus when done" — it has no notion of holding focus to catch a *future* change
-#       or to re-see your own writes across a replan. Domain-neutral RULE; email/calendar only in
-#       the examples. Candidate to promote (example-free) into PLAN_SYSTEM_PROMPT, or to retire once
-#       the runtime auto-focuses tools a plan touches.
 #   _RECONCILE_AGAINST_OBSERVED — SCAFFOLDING for a runtime gap (limitation 1): no guarded/skip-if-
 #       empty step, so the prompt must tell the model to delete/update only a stale item it can
 #       currently see. Domain-neutral RULE; email/calendar only in the examples. Retired by guarded
@@ -171,16 +165,6 @@ class ReconsiderInterruptHandler:
 #       because the are-sim adapter *synthesizes* manuals and has no hand-authored one to pair
 #       (ADR-0015);
 #       relocating it is the tracked follow-up.
-
-_OBSERVE_TO_NOTICE_CHANGE = (
-    "\nThis is a DYNAMIC environment: the task can change WHILE you work — a new input may arrive "
-    "mid-task and change the answer. To notice such a change you must keep *observing* the tools "
-    "involved, because an unfocused tool's state is not observed. So make your FIRST steps a "
-    "`focus` on every channel where an update could arrive (here, the email inbox) AND on every "
-    "tool whose state this task changes (here, the calendar), and keep them focused until the task "
-    "is done — otherwise you will neither see a later change nor see what you have already "
-    "created.\n"
-)
 
 _RECONCILE_AGAINST_OBSERVED = (
     "You may be re-planning AFTER earlier steps already took effect: an item may already have been "
@@ -210,7 +194,7 @@ _THREAD_READING = (
     "then present."
 )
 
-_RECONCILE_INSTRUCTION = _OBSERVE_TO_NOTICE_CHANGE + _RECONCILE_AGAINST_OBSERVED + _THREAD_READING
+_RECONCILE_INSTRUCTION = _RECONCILE_AGAINST_OBSERVED + _THREAD_READING
 
 
 def reconciling_plan_prompt(
@@ -219,15 +203,15 @@ def reconciling_plan_prompt(
     observed: PerceptSnapshot | None = None,
     messages: list[Message] | None = None,
 ) -> tuple[str, str]:
-    """A commitment-aware ``PlanPrompt``: the default planning content plus an instruction to focus
-    the tools it reconciles against (the inbox, so a mid-task email is observed, and any tool it
-    changes, so it can see what it already created), to reconcile against the *observed* current
-    world — deleting/updating only a stale item that is actually visible, never blindly — instead of
-    assuming a fresh start, and to read every relevant email in a thread rather than assuming the
-    most recent search hit is the complete request (a follow-up correction typically omits whatever
-    didn't change). That last clause is the ``_THREAD_READING`` fragment — email domain knowledge
-    quarantined here until it can move to the email-client Manual (ADR-0015); the other two
-    fragments are gap-scaffolding for limitations 1 and 4. Wired via ``agent.yaml``'s
+    """A commitment-aware ``PlanPrompt``: the default planning content plus an instruction to
+    reconcile against the *observed* current world — deleting/updating only a stale item that is
+    actually visible, never blindly — instead of assuming a fresh start, and to read every relevant
+    email in a thread rather than assuming the most recent search hit is the complete request (a
+    follow-up correction typically omits whatever didn't change). That last clause is the
+    ``_THREAD_READING`` fragment — email domain knowledge quarantined here until it can move to the
+    email-client Manual (ADR-0015); the first is gap-scaffolding for limitation 1. The focus-first
+    scaffolding (``_OBSERVE_TO_NOTICE_CHANGE``) is gone — ``JoinAction`` auto-focuses joined tools
+    now, so perception no longer hinges on a model focus step. Wired via ``agent.yaml``'s
     ``procedural.plan_prompt``; the ``{"steps": [...]}`` response contract is unchanged."""
     system, user = default_plan_prompt(activity, tools, observed, messages)
     return system + _RECONCILE_INSTRUCTION, user

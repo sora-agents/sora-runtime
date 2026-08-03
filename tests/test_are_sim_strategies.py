@@ -224,16 +224,19 @@ async def test_handler_delegates_a_user_stop_to_the_default(tmp_path: Path) -> N
 
 
 # --------------------------------------------------------------------------------------------------
-# reconciling_plan_prompt: asks the planner to focus the inbox (the observation precondition)
+# reconciling_plan_prompt: no longer instructs focusing (the runtime auto-focuses joined tools now)
 # --------------------------------------------------------------------------------------------------
 
 
-def test_reconciling_prompt_instructs_focusing_the_inbox() -> None:
-    # The whole dynamic path is dead without a focus step (an unfocused tool's state isn't observed,
-    # so no state_changed signal and the policy never fires), and the base planner treats focus as
-    # optional — so the prompt must ask for it.
+def test_reconciling_prompt_no_longer_scaffolds_focus() -> None:
+    # The _OBSERVE_TO_NOTICE_CHANGE fragment is retired: joining a workspace auto-focuses all its
+    # tools, so the prompt no longer *directs* the model to make focus its first steps and hold it.
+    # (The base prompt still lists focus as an available action, and the surviving _THREAD_READING
+    # fragment still mentions the focused inbox — neither is the retired directive.) The reconcile
+    # guidance (don't duplicate a stale item) stays until A5/A6 land.
     activity = Activity(id="probe", goal=_GOAL, context={})
     system, _user = reconciling_plan_prompt(activity, {})
-    assert "focus" in system.lower()
-    assert "inbox" in system.lower()
-    assert "duplicate" in system.lower()  # keeps the reconcile-don't-duplicate guidance
+    lowered = system.lower()
+    assert "make your first steps a" not in lowered  # the retired focus-first directive
+    assert "keep them focused until the task is done" not in lowered
+    assert "duplicate" in lowered  # keeps the reconcile-don't-duplicate guidance
