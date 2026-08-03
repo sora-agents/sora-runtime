@@ -870,15 +870,51 @@ class DefaultActStrategy:
     ActStrategy): bind an ``invoke`` Step straight to an OperationInvocation, splitting the
     tool_id/operation_name routing keys out of the operation's own params. A model-backed
     ActStrategy would instead ground under-specified params against the manual's schema here; the
-    default assumes the Step already carries concrete params, so binding is just the key-split."""
+    default assumes the Step already carries concrete params, so binding is just the key-split.
+
+    One mechanical guard sits here (still no judgment, so Act stays mechanistic per ADR-0017): a
+    **required** param that resolves to null is a schema violation, so the invoke is *skipped* — no
+    invocation is emitted and the cycle dispatches nothing this step (`_act`). Grounding (Reason)
+    has already run by now, so a null at bind time is a value the model declined or could not fill,
+    not an un-grounded reference; dispatching the operation anyway is the historic blind-`delete`
+    mis-action, degraded to a probabilistic one and previously held off only by a prompt fragment.
+    The guard needs the operation's schema (`OperationSpecification.parameters`, adapter-
+    synthesized) to know which params are required; with no manual/spec/declared ``required`` it
+    cannot tell, so it does not fire and binds as before — the same structured-spec dependency the
+    thread-reading Manual relocation has. It narrows, not eliminates, a null-invoke: an *optional*
+    null still passes through by design (many operations take legitimately-optional params)."""
 
     async def bind(
         self, step: Step, manual: Manual | None, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
         params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
+        operation_name = step.params[OPERATION_NAME]
+        null_required = _null_required_params(manual, operation_name, params)
+        if null_required:
+            log.warning(
+                "act: skipping invoke %s.%s — required param(s) %s resolved to null",
+                step.params[TOOL_ID],
+                operation_name,
+                null_required,
+            )
+            return result  # no invocation -> _act dispatches nothing this step (skip-and-continue)
         invocation = OperationInvocation(
             tool_id=step.params[TOOL_ID],
-            operation_name=step.params[OPERATION_NAME],
+            operation_name=operation_name,
             params=params,
         )
         return replace(result, invocation=invocation)
+
+
+def _null_required_params(
+    manual: Manual | None, operation_name: str, params: dict[str, Any]
+) -> list[str]:
+    """The operation's *required* params (per its schema) that resolve to null in ``params`` —
+    either an explicit None or absent entirely (a required key the step never supplied). Empty when
+    the schema is unavailable (no manual, the manual doesn't describe this op, or it declares no
+    ``required``): required-ness is then unknowable, so the guard can't fire and binding goes on."""
+    spec = manual.operation(operation_name) if manual is not None else None
+    if spec is None:
+        return []
+    required = spec.parameters.get("required", [])
+    return [key for key in required if params.get(key) is None]

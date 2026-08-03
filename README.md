@@ -1156,8 +1156,12 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             """Only called if result.invocation is still None. *Parameter binding*: split an invoke
             Step's routing keys from its (by now already-grounded) params into a concrete
             OperationInvocation. Mechanistic — deciding param *values* is Reason's grounding, not
-            Act's (ADR-0017). Distinct from a *protocol binding* (WoT forms/security, an MCP session)
-            — how the adapter's Tool reaches the instance, never surfaced here (ADR-0015). `cycle` is
+            Act's (ADR-0017). One mechanical guard still lives here (no judgment, so Act stays
+            mechanistic): a *required* param that resolves to null (per the manual's
+            OperationSpecification schema) is a schema violation, so the default emits no invocation
+            and the invoke is skipped; without a schema, required-ness is unknowable and binding
+            proceeds. Distinct from a *protocol binding* (WoT forms/security, an MCP session) — how
+            the adapter's Tool reaches the instance, never surfaced here (ADR-0015). `cycle` is
             available for implementations that cache bindings rather than re-deriving one each time."""
 
     @dataclass(frozen=True)
@@ -1398,8 +1402,11 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             declare whether the step needs binding (requires_binding) — only _invoke_ does, so the
             generic cycle stays uncoupled from any one action's name and a custom binding action binds
             too — then dispatch exactly one external action: the bound invocation's routing keys +
-            params when present, else the raw step params (invoke resolves its tool through the
-            registry, not the focus set)."""
+            params when present; a *non*-binding action with no invocation dispatches its raw step
+            params (invoke resolves its tool through the registry, not the focus set); a *binding*
+            action that produced no invocation is a deliberate skip (e.g. bind's required-null guard)
+            and dispatches nothing this step — Reason has already advanced step_index, so the activity
+            continues."""
             if step.next_action == "wait":
                 return
             action = self.actions.external(step.next_action)

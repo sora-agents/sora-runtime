@@ -186,8 +186,11 @@ class DecisionCycle:
                 operation_name=invocation.operation_name,
                 **invocation.params,
             )
-        else:
+        elif not action.requires_binding:
             await action.execute(self.registry, self, activity_id=selected.id, **step.params)
+        # else: a binding action produced no invocation — a deliberate skip (e.g. the mechanical
+        # guard against dispatching an invoke whose required param resolved to null). Dispatch
+        # nothing this step; Reason has already advanced step_index, so the activity continues.
 
     async def interrupt(self, signal: Signal, *, target: str | None = None) -> None:
         """Raise a hard interrupt: preempt the current phase for an authoritative event (the 10ms

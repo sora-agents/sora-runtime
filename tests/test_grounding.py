@@ -23,7 +23,7 @@ from sora.action import default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
-from sora.manual import Manual
+from sora.manual import Manual, OperationSpecification
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -405,3 +405,167 @@ async def test_reason_reference_free_step_is_cheap_no_ground(tmp_path: Path) -> 
     assert result.step is plan_step  # no references -> the exact same Step object, untouched
     assert isinstance(result.step, Step)
     assert spy.ground_calls == []
+
+
+# --------------------------------------------------------------------------------------------------
+# DefaultActStrategy.bind — guarded skip when a *required* param resolves to null
+#
+# Grounding (above) runs first in Reason, so by bind time a param is either a concrete value or a
+# genuine null the model declined/could-not fill. Dispatching an invoke with a null *required* param
+# is a mis-action (the historic blind-delete crash, now degraded to a probabilistic mis-action held
+# off only by a prompt fragment). bind makes it a mechanical guarantee: consult the operation's
+# schema (adapter-synthesized OperationSpecification.parameters), and skip the dispatch when a
+# required param is null. It stays *mechanistic* (schema-driven, no judgment) — ADR-0017. Without a
+# schema (no manual / spec / declared `required`) required-ness is unknown, so it cannot guard and
+# falls back to dispatching — the same structured-spec dependency A6 has.
+# --------------------------------------------------------------------------------------------------
+
+
+def _manual_with_required(tool_id: str, op: str, required: list[str]) -> Manual:
+    return Manual(
+        id=tool_id,
+        metadata={},
+        description="",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(
+                name=op,
+                description="",
+                parameters={"properties": {k: {} for k in required}, "required": list(required)},
+            )
+        ],
+    )
+
+
+async def test_bind_skips_invoke_when_required_param_is_null(tmp_path: Path) -> None:
+    cycle, _, _ = _cycle(tmp_path, ScriptedProcedural(), FakeTool("email"))
+    manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
+    step = invoke_step("email", "reply_to_email", email_id=None, body="hi")
+
+    result = await DefaultActStrategy().bind(step, manual, cycle, TickResult())
+
+    assert result.invocation is None  # skipped -> the cycle dispatches nothing this cycle
+
+
+async def test_bind_skips_invoke_when_required_param_absent(tmp_path: Path) -> None:
+    # A required key missing from the step params entirely resolves to null the same as an explicit
+    # None — a schema-invalid invoke, so the guard skips it rather than dispatch it malformed.
+    cycle, _, _ = _cycle(tmp_path, ScriptedProcedural(), FakeTool("email"))
+    manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
+    step = invoke_step("email", "reply_to_email", body="hi")  # email_id absent
+
+    result = await DefaultActStrategy().bind(step, manual, cycle, TickResult())
+
+    assert result.invocation is None
+
+
+async def test_bind_dispatches_when_all_required_params_present(tmp_path: Path) -> None:
+    cycle, _, _ = _cycle(tmp_path, ScriptedProcedural(), FakeTool("email"))
+    manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
+    step = invoke_step("email", "reply_to_email", email_id="e1", body="hi")
+
+    result = await DefaultActStrategy().bind(step, manual, cycle, TickResult())
+
+    assert result.invocation == OperationInvocation(
+        tool_id="email", operation_name="reply_to_email", params={"email_id": "e1", "body": "hi"}
+    )
+
+
+async def test_bind_dispatches_when_required_param_is_falsy_not_null(tmp_path: Path) -> None:
+    # 0 / "" / False are legitimate values, not null — the guard keys on null (None/absent) only.
+    cycle, _, _ = _cycle(tmp_path, ScriptedProcedural(), FakeTool("clock"))
+    manual = _manual_with_required("clock", "set_volume", ["level"])
+    step = invoke_step("clock", "set_volume", level=0)
+
+    result = await DefaultActStrategy().bind(step, manual, cycle, TickResult())
+
+    assert result.invocation is not None
+    assert result.invocation.params == {"level": 0}
+
+
+async def test_bind_dispatches_when_null_param_is_optional(tmp_path: Path) -> None:
+    # A null value on a param the schema does *not* mark required is legitimate (many operations
+    # take optional params) — it passes straight through, only required-null is guarded.
+    cycle, _, _ = _cycle(tmp_path, ScriptedProcedural(), FakeTool("email"))
+    manual = _manual_with_required("email", "search_emails", ["query"])  # cc not required
+    step = invoke_step("email", "search_emails", query="alice", cc=None)
+
+    result = await DefaultActStrategy().bind(step, manual, cycle, TickResult())
+
+    assert result.invocation is not None
+    assert result.invocation.params == {"query": "alice", "cc": None}
+
+
+async def test_bind_dispatches_null_when_schema_unavailable(tmp_path: Path) -> None:
+    # No schema (manual=None, or a manual that doesn't describe this op, or one with no declared
+    # `required`) => required-ness is unknowable, so the guard cannot fire and bind falls back to
+    # dispatching. This is the structured-spec dependency the ARE example satisfies (specs are
+    # adapter-synthesized); a hand-authored-only manual would not, and stays on the model judgment.
+    cycle, _, _ = _cycle(tmp_path, ScriptedProcedural(), FakeTool("email"))
+    step = invoke_step("email", "reply_to_email", email_id=None, body="hi")
+
+    no_manual = await DefaultActStrategy().bind(step, None, cycle, TickResult())
+    assert no_manual.invocation is not None  # can't know required-ness -> dispatch (unchanged)
+
+    # A manual that describes the op but declares no `required` key is equally non-committal.
+    bare = Manual(
+        id="email",
+        metadata={},
+        description="",
+        observable_properties=[],
+        signals=[],
+        operations=[OperationSpecification(name="reply_to_email", description="", parameters={})],
+    )
+    bare_result = await DefaultActStrategy().bind(step, bare, cycle, TickResult())
+    assert bare_result.invocation is not None
+
+
+async def test_cycle_skips_invoke_dispatch_when_required_param_null(tmp_path: Path) -> None:
+    # End-to-end through the cycle: a plan step whose required param grounds to null must never
+    # reach the tool. The step is *not* re-run — step_index advances (skip-and-continue), so the
+    # activity progresses to its next step rather than deadlocking on the guarded one.
+    manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
+    tool = FakeTool("email", manual=manual, invoke_results={"reply_to_email": {"sent": True}})
+    cycle, working, registry = _cycle(tmp_path, ScriptedProcedural(), tool)
+    await registry.join(_ORIGIN)
+    step = invoke_step("email", "reply_to_email", email_id=None, body="hi")
+    activity = Activity(
+        id="a",
+        goal="reply",
+        context={},
+        plan=Plan(id="p", goal="reply", steps=[step]),
+        step_index=0,
+    )
+    working.activities["a"] = activity
+
+    await cycle.tick()
+    await asyncio.sleep(0)  # let any dispatched background invoke run before asserting
+
+    assert tool.invocations == []  # guarded — never dispatched with a null email_id
+    assert activity.pending_operation is None  # never went RUNNING on an op
+    state = activity.state
+    assert state is ActivityState.READY  # not stuck RUNNING; free to advance
+    assert activity.step_index == 1  # advanced -> skip-and-continue, not stuck on the step
+
+
+async def test_cycle_dispatches_invoke_when_required_params_present(tmp_path: Path) -> None:
+    # Control for the skip test: identical setup, required param present -> dispatches normally.
+    manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
+    tool = FakeTool("email", manual=manual, invoke_results={"reply_to_email": {"sent": True}})
+    cycle, working, registry = _cycle(tmp_path, ScriptedProcedural(), tool)
+    await registry.join(_ORIGIN)
+    step = invoke_step("email", "reply_to_email", email_id="e1", body="hi")
+    activity = Activity(
+        id="a",
+        goal="reply",
+        context={},
+        plan=Plan(id="p", goal="reply", steps=[step]),
+        step_index=0,
+    )
+    working.activities["a"] = activity
+
+    await cycle.tick()
+    await asyncio.sleep(0)  # let the dispatched background invoke run
+
+    assert tool.invocations == [("reply_to_email", {"email_id": "e1", "body": "hi"})]

@@ -39,7 +39,9 @@ Everything here lives under `examples/are/sim/email_calendar/` and would not shi
   - `_OBSERVE_TO_NOTICE_CHANGE` — *scaffolding* for limitation 4 (perception gated on a model-driven
     `focus`). Domain-neutral rule, email/calendar only in its examples.
   - `_RECONCILE_AGAINST_OBSERVED` — *scaffolding* for limitation 1 (no guarded/skip-if-empty step).
-    Domain-neutral rule, email/calendar only in its examples.
+    Domain-neutral rule, email/calendar only in its examples. **Narrowed** by the runtime required-
+    null skip (`DefaultActStrategy.bind`) but not yet droppable — it still covers the stale-but-non-
+    null id a true guarded step would catch (see limitation 1).
   - `_THREAD_READING` — **not scaffolding**: email-thread domain knowledge (a follow-up is usually a
     partial correction; read every relevant message, not just the top search hit). Its proper home is
     the email-client Manual (or semantic memory), so it travels with the tool; it lives in the example
@@ -88,15 +90,23 @@ These are the seams the example works around. Each is a real runtime gap, not a 
      is an `IndexError`) and **escalates the param to the off-cycle `_ground_` call** instead of
      dispatching `None`.
 
-   What **remains** is the general gap: with no guarded step, a superfluous `delete`/`update` can
-   still be *planned and attempted* — the runtime just hands its unresolvable param to the model to
-   ground rather than crashing. So the failure mode is **degraded from a deterministic crash to a
-   probabilistic mis-action**, held off only by (a) the reconcile prompt's `_RECONCILE_AGAINST_OBSERVED`
-   fragment and (b) the model's ground-time judgement. The deterministic fix — a runtime rule that
-   *skips* an `invoke` whose required param resolves to null (or true guarded steps) — retires both
-   soft guards and lets that prompt fragment be dropped. *(Caveat: a genuine `None` result on an empty
-   path still passes through to invoke — the `_MISSING` sentinel only guards the missing-history case
-   — so a `None`-invoke is narrowed, not categorically impossible.)*
+   The deterministic guard is now in place: `DefaultActStrategy.bind` **skips an `invoke` whose
+   *required* param resolves to null** (an explicit `None` or a required key the step never supplied),
+   consulting the operation's adapter-synthesized schema (`OperationSpecification.parameters`) to know
+   which params are required. This also closes the caveat the old text named — a genuine `None` on an
+   empty path (`_walk_path(None, "") -> None`, which resolves cleanly and never escalates) is now
+   skipped rather than dispatched, *for a required param*.
+
+   What **remains** — so `_RECONCILE_AGAINST_OBSERVED` is **narrowed, not dropped** — is the general
+   gap: (a) a null on a param the schema marks *optional* still passes through by design (many
+   operations take legitimately-optional params), and (b) with no true guarded/conditional step, a
+   superfluous `delete`/`update` grounded to a **plausible-but-stale, non-null** id can still be
+   planned and attempted — the guard keys on null, not on staleness. So the failure mode stays
+   **degraded from a deterministic crash to a probabilistic mis-action**, now held off by (a) the
+   guaranteed required-null skip, (b) the reconcile prompt's `_RECONCILE_AGAINST_OBSERVED` fragment,
+   and (c) the model's ground-time judgement. Retiring that fragment awaits true guarded steps; until
+   then it stays honest scaffolding. Also depends on structured specs being available: a hand-authored-
+   only manual (no `required` schema) leaves required-ness unknowable, so the guard can't fire there.
 
 2. **Auto-caching the corrected plan (resolved — plan caching is now disabled).** Previously, on
    completion `DefaultReflectStrategy` stored `activity.plan`; after a mid-flight re-inference that
