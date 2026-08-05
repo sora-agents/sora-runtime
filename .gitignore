@@ -29,6 +29,11 @@ htmlcov/
 my-agent/
 logs/
 
+# Gaia2 scenario JSON fetched from HuggingFace (examples/gaia2/scripts/fetch_scenario.py) —
+# Meta's dataset content, gated by the HF dataset terms; fetch on demand, don't redistribute
+scenario.json
+*.scenario.json
+
 # Environment
 .env
 .env.*
