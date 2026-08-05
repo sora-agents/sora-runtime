@@ -16,7 +16,9 @@ import pytest
 
 from sora.adapters.are_sim import (
     AreInProcessWorkspaceAdapter,
+    AreSimulation,
     AreTransport,
+    ValidationOutcome,
     _params_schema,
     _returns_schema,
     _type_to_schema,
@@ -149,6 +151,9 @@ class FakeSimulation:
 
     def stop(self) -> None:
         self.stopped = True
+
+    def is_running(self) -> bool:
+        return self.started and not self.stopped
 
     def apps(self) -> list[Any]:
         return list(self._apps)
@@ -472,3 +477,41 @@ async def test_transport_submit_injects_an_ad_hoc_user_message() -> None:
     assert len(got) == 1
     assert got[0].sender == "user"
     assert got[0].content == {"text": "Never mind, continue"}
+
+
+# ------------------------------------------------------------------------------------------------
+# AreSimulation.validate() — surfaces ARE's in-band validation exception, preserves unscored None.
+# ------------------------------------------------------------------------------------------------
+
+
+def _sim_with_validate_result(result: Any) -> AreSimulation:
+    # AreSimulation.validate() only needs a scenario with a validate(env) method and a non-None
+    # _env (past the start() assert) — no ARE Environment required.
+    sim = AreSimulation(SimpleNamespace(validate=lambda env: result))
+    sim._env = object()
+    return sim
+
+
+def test_validate_raises_when_judge_errors_in_band() -> None:
+    # ARE reports a judge/validator error as success=None *with* an in-band exception on the result
+    # (it does not raise). validate() must re-raise it so the caller records an 'exception', not a
+    # silent unscored run — otherwise a judge crash is indistinguishable from 'no judge attached'.
+    boom = RuntimeError("judge boom")
+    sim = _sim_with_validate_result(
+        SimpleNamespace(success=None, exception=boom, rationale="graph error")
+    )
+    with pytest.raises(RuntimeError, match="judge boom"):
+        sim.validate()
+
+
+def test_validate_preserves_unscored_none_without_exception() -> None:
+    # success=None and no exception is a genuine unscored verdict, not an error — pass it through.
+    sim = _sim_with_validate_result(SimpleNamespace(success=None, exception=None, rationale=None))
+    assert sim.validate() == ValidationOutcome(success=None, rationale=None)
+
+
+def test_validate_passes_through_scored_verdicts() -> None:
+    sim = _sim_with_validate_result(
+        SimpleNamespace(success=False, exception=None, rationale="wrong tool")
+    )
+    assert sim.validate() == ValidationOutcome(success=False, rationale="wrong tool")

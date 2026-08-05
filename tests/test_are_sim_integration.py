@@ -25,7 +25,7 @@ from are.simulation.apps.email_client import (  # noqa: E402
     EmailFolderName,
 )
 from are.simulation.scenarios.scenario import Scenario  # noqa: E402
-from are.simulation.types import Event  # noqa: E402
+from are.simulation.types import Event, EventType  # noqa: E402
 
 from sora.adapters.are_sim import (  # noqa: E402
     AreInProcessWorkspaceAdapter,
@@ -121,5 +121,37 @@ async def test_dynamic_scenario_bridges_task_and_timeline_email() -> None:
         # an app op invokes through the bridge
         ack = await email_tool.invoke("list_emails")
         assert ack.ok is True
+    finally:
+        await workspace.close()
+
+
+async def test_invoke_is_logged_as_are_agent_event() -> None:
+    """A plain ``invoke`` already lands an ARE ``AGENT`` ``CompletedEvent`` in ``env.event_log`` —
+    the thing Gaia2's event-graph judge matches against. ARE's app operation methods are decorated
+    ``@event_registered(event_type=AGENT)``, so calling one inside a running ``Environment``
+    self-registers the event; S-ORA does not (and must not) wrap invokes in ARE's ``register_event``
+    on top, which would double-log. This test guards that invariant."""
+    sim = AreSimulation(_DynamicScenario())
+    origin = WorkspaceOrigin(adapter="are-sim", address="insim:are")
+    adapter = AreInProcessWorkspaceAdapter(workspace_id="are", origin=origin, simulation=sim)
+
+    workspace = (await adapter.discover())[0]
+    email_tool = next(t for t in workspace.tools() if "Email" in t.id)
+    try:
+
+        def agent_events() -> list[Any]:
+            env = sim._env
+            assert env is not None  # started by discover()
+            return [e for e in env.event_log.list_view() if e.event_type == EventType.AGENT]
+
+        before = len(agent_events())
+        ack = await email_tool.invoke("list_emails")
+        assert ack.ok is True
+
+        after = agent_events()
+        # exactly one new AGENT event (no double-logging): the app + operation the judge keys on
+        assert len(after) == before + 1
+        assert after[-1].tool_name == "EmailClientApp__list_emails"
+        assert after[-1].action.function_name == "list_emails"
     finally:
         await workspace.close()

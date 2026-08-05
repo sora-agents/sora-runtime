@@ -72,6 +72,7 @@ class Simulation(Protocol):
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
+    def is_running(self) -> bool: ...  # scenario timeline still advancing (the eval done-signal)
     def apps(self) -> list[Any]: ...
     def run(self, fn: Callable[[], _T]) -> _T: ...  # serialize S-ORA's own concurrent app calls
 
@@ -82,7 +83,8 @@ class ValidationOutcome:
     ``ScenarioValidationResult`` shape, so a fake simulation in a test can produce one without
     depending on ARE. ``rationale`` is None when the scenario's ``validate()`` didn't supply one."""
 
-    success: bool
+    success: bool | None  # None = unscored: ARE's judge produced no verdict (a caller with no judge
+    # attached decides that upstream — ARE's *base* validate() returns a bool, not None)
     rationale: str | None = None
 
 
@@ -125,8 +127,25 @@ class AreSimulation:
             self._env.stop()
         self._started = False
 
+    def is_running(self) -> bool:
+        """True while the scenario's event loop is still advancing (ARE
+        ``EnvironmentState.RUNNING``). Flips to False when the timeline completes
+        (``scenario.duration`` reached) or fails: ARE's ``_event_loop`` sets ``STOPPED``/``FAILED``
+        on loop exit, *after* every scheduled user turn and the per-turn judge
+        ``ConditionCheckEvent``s have fired. So an eval runner that waits for this to go False
+        before calling ``validate()`` scores a fully-played-out scenario, riding through the idle
+        gaps between turns that a quiet-window heuristic would exit on prematurely."""
+        return self._env is not None and self._started and bool(self._env.is_running())
+
     def apps(self) -> list[Any]:
         return list(getattr(self._scenario, "apps", None) or [])
+
+    def environment(self) -> Any:
+        """The live ARE ``Environment`` (or None before ``start()``). Exposed for eval tooling that
+        exports a completed run's trace — ARE's ``JsonScenarioExporter`` needs the Environment. It's
+        deliberately *not* on the ``Simulation`` Protocol, which stays the minimal runtime surface
+        the adapter/transport share; only concrete eval code touches this."""
+        return self._env
 
     @property
     def aui(self) -> Any:
@@ -143,7 +162,15 @@ class AreSimulation:
         """Oracle scoring: run the scenario's validators against the final environment state."""
         assert self._env is not None, "start() the simulation before validating"
         result = self._scenario.validate(self._env)
-        return ValidationOutcome(success=bool(result.success), rationale=result.rationale)
+        # A judge/validator that *errored* reports success=None with an in-band exception (ARE puts
+        # it on the result rather than raising). Re-raise it so a caller's try/except records the
+        # run as an 'exception', not a silent unscored one — dropping it here would make a judge
+        # crash indistinguishable from 'no judge attached'.
+        if result.success is None and result.exception is not None:
+            raise result.exception
+        # Preserve None (unscored/vacuous) rather than coercing to False — a run with no judge
+        # attached is distinct from a genuine FAIL, and the eval reporter surfaces that difference.
+        return ValidationOutcome(success=result.success, rationale=result.rationale)
 
 
 def load_scenario(ref: str) -> Any:
@@ -163,6 +190,39 @@ def load_scenario(ref: str) -> Any:
 
     obj = import_object(ref)
     return obj() if isinstance(obj, type) else obj
+
+
+def attach_judge(
+    scenario: Any,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+    endpoint: str | None = None,
+    offline_validation: bool = False,
+) -> None:
+    """Attach ARE's GraphPerEvent judge so ``AreSimulation.validate()`` scores a benchmark scenario
+    against its oracle event graph (the Gaia2 scoring path) instead of the ``success=None`` no-op.
+
+    Runs ARE's ``preprocess_scenario``, which itself executes the scenario's ``OracleEvent``s in
+    oracle mode to populate ``oracle_run_event_log`` and then sets ``scenario.judge`` /
+    ``scenario.validate``. Call *after* ``load_scenario`` and *before* ``AreSimulation.start()``.
+    Only meaningful for scenarios that carry ``OracleEvent``s (Gaia2 JSON does). ``model=None`` uses
+    ARE's default judge model. The judge model is contacted at ``validate()`` time, not here — so
+    this call is offline; oracle-mode replay of the OracleEvents is deterministic and modelless."""
+    from are.simulation.agents.are_simulation_agent_config import LLMEngineConfig
+    from are.simulation.scenarios.scenario_imported_from_json.utils import preprocess_scenario
+    from are.simulation.validation.configs import GraphPerEventJudgeConfig, create_judge_engine
+
+    engine_config = (
+        LLMEngineConfig(model_name=model, provider=provider, endpoint=endpoint)
+        if model is not None
+        else None  # None -> ARE's default judge model/provider
+    )
+    preprocess_scenario(
+        scenario,
+        judge_config=GraphPerEventJudgeConfig(engine=create_judge_engine(engine_config)),
+        offline_validation=offline_validation,
+    )
 
 
 # -- app -> S-ORA usage-interface extraction ------------------------------------------------------

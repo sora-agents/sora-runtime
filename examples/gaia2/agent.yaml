@@ -1,0 +1,39 @@
+# Default S-ORA agent for the Gaia2 benchmark. Deliberately **generic** and scenario-agnostic:
+# it selects the in-process ARE workspace (`are-sim`) and ARE transport (user turns routed through
+# the scenario's AgentUserInterface), but names no scenario — a Gaia2 scenario is a per-run input
+# supplied by the benchmark driver, never config. The same config runs any Gaia2 scenario.
+#
+#     uv sync --all-extras --group are          # ARE package + the llm extra
+#     export ANTHROPIC_API_KEY=sk-ant-...        # or a .gitignored .env
+#     # score one scenario (the correctness gate):
+#     python -m examples.gaia2.run_benchmark \
+#         --scenario /path/to/gaia2_scenario.json \
+#         --judge-model claude-sonnet-5 --judge-provider anthropic --exit-when-idle 8
+#
+# See examples/gaia2/run_benchmark.py for the driver and its flags.
+agent:
+  name: gaia2-default
+  strategies:
+    # The model-backed default planner + default selection. No interrupt policy is wired here:
+    # core's default is NeverInterruptPolicy, which is correct for the static capabilities
+    # (Execution/Search). The dynamic axes (Adaptability/Time/Ambiguity) will want a
+    # reconsideration InterruptPolicy that re-plans on any state-change signal — that is
+    # per-capability tuning, still to be built; examples/are/sim/email_calendar/strategies.py's
+    # MailDiffInterruptPolicy is the template (it is email-specific, so not reused verbatim here).
+    reason: sora.strategies.DefaultReasonStrategy
+  memory:
+    semantic: file://./.sora/gaia2/semantic
+    procedural: file://./.sora/gaia2/procedural
+    episodic: file://./.sora/gaia2/episodic
+  llm:
+    # Hold this constant between the S-ORA run and the ReAct baseline for a fair same-model
+    # comparison; the driver's --model flag can override it per run.
+    model: claude-opus-4-8
+    instrument: true
+  transport:
+    # ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies via
+    # send_message_to_user (the per-turn boundary Gaia2's online judge keys on).
+    kind: are
+  workspaces:
+    - origin: { adapter: are-sim, address: "insim:are" }
+      workspace_id: are

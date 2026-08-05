@@ -712,6 +712,32 @@ async def test_exit_when_idle_stops_the_session_without_stdin_eof(
         stdin.close()
 
 
+async def test_stop_when_predicate_ends_the_session_and_is_polled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The eval stop-controller seam (examples/gaia2 uses it for a timeline-aware done condition): a
+    # stop_when predicate ends a headless run without stdin EOF, and is *polled* each loop (not
+    # checked once) — it rides one poll returning False, then stops. It takes precedence over the
+    # idle heuristic, so passing both here must still stop via the predicate.
+    agent = _build_agent(tmp_path)
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    calls = {"n": 0}
+
+    def _stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    session = TerminalSession(agent, poll_interval=0.0, stop_when=_stop, exit_when_idle=999.0)
+    task = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(task, timeout=2)  # exits on its own via the predicate, no EOF
+        assert task.exception() is None
+        assert calls["n"] >= 2  # polled across loops, not a one-shot check
+    finally:
+        stdin.close()
+
+
 async def test_log_file_captures_the_trace_and_is_written_to_disk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

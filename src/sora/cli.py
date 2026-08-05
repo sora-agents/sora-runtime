@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TextIO, runtime_checkable
 
@@ -237,6 +238,7 @@ class TerminalSession:
         poll_interval: float = 0.02,
         initial_task: str | None = None,
         exit_when_idle: float | None = None,
+        stop_when: Callable[[], bool] | None = None,
         log_file: str | Path | None = None,
     ) -> None:
         communication = agent.communication
@@ -272,6 +274,12 @@ class TerminalSession:
         self._poll_interval = poll_interval
         self._initial_task = initial_task
         self._exit_when_idle = exit_when_idle
+        # stop_when is the headless *stop-controller* injection seam: a predicate the loop polls to
+        # decide when to end a scripted run, letting an eval runner (e.g. examples/gaia2) impose a
+        # turn-/timeline-aware done condition without this file learning what a "turn" is. It takes
+        # precedence over exit_when_idle; both are None for an interactive session, which is then
+        # unchanged (it ends on stdin EOF / '/exit').
+        self._stop_when = stop_when
         # A full, always-verbose trace mirror written to a file regardless of the terminal's own
         # --verbose setting — the complete execution log (prompts, results, plans) that was
         # previously only obtainable by running --verbose and copy-pasting the terminal.
@@ -341,7 +349,10 @@ class TerminalSession:
                         _paint(str(content.get("text", content)), _BOLD, enabled=self._color)
                     )
                 self._print_new_trajectories(console, printed_trajectories)
-                if self._exit_when_idle is not None:
+                if self._stop_when is not None:
+                    if self._stop_when():
+                        break
+                elif self._exit_when_idle is not None:
                     activities = list(self._agent.working.activities.values())
                     idle = bool(activities) and all(
                         a.state is ActivityState.TERMINATED for a in activities
@@ -385,13 +396,11 @@ class TerminalSession:
             console.line(_paint("Goodbye.", _DIM, enabled=self._color))
 
     def _banner(self) -> str:
+        # Both exit_when_idle and stop_when are auto-exit (headless) modes for banner purposes.
+        auto_exit = self._exit_when_idle is not None or self._stop_when is not None
         if self._submittable is None:
-            return (
-                _BANNER_NOT_SUBMITTABLE_IDLE_EXIT
-                if self._exit_when_idle is not None
-                else _BANNER_NOT_SUBMITTABLE
-            )
-        return _BANNER_IDLE_EXIT if self._exit_when_idle is not None else _BANNER
+            return _BANNER_NOT_SUBMITTABLE_IDLE_EXIT if auto_exit else _BANNER_NOT_SUBMITTABLE
+        return _BANNER_IDLE_EXIT if auto_exit else _BANNER
 
     def _print_new_trajectories(self, console: _Console, printed: set[str]) -> None:
         for activity in self._agent.working.activities.values():
