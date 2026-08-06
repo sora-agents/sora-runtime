@@ -6,6 +6,16 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def walk_path(value: Any, path: str) -> Any:
+    """Walk a dotted path into a nested value — a numeric segment indexes a list, else a dict. The
+    one path grammar shared by reference resolution (``$from``/``$bind`` in strategies) and the
+    data-ops' per-element key paths (``by``/``where.path`` in action). Raises on a bad path; callers
+    decide whether that's an escalation signal (grounding) or a skip (a mechanical predicate)."""
+    for segment in filter(None, path.split(".")):
+        value = value[int(segment)] if segment.isdigit() else value[segment]
+    return value
+
+
 @dataclass(frozen=True)
 class ObservableProperty:
     name: str
@@ -74,8 +84,12 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     # pending_operation's late-ack guard. `kind` picks the landing zone: "plan" (infer ->
     # Activity.plan) or "ground" (ground -> Activity.grounded_params). See ADR-0021.
     id: str
-    kind: str  # "plan" | "subgoal" | "ground" — "subgoal" lands like "plan" (into Activity.plan)
+    # "plan" | "subgoal" | "ground" | "select". "subgoal" lands like "plan" (into Activity.plan);
+    # "select" is a $decide data-op filter (ADR-0023) whose surviving subset lands into
+    # Activity.bindings[out] — the one kind that carries `out`.
+    kind: str
     requested_at: float
+    out: str | None = None  # target binding name for kind=="select"; None for the others
 
 
 @dataclass(frozen=True)
@@ -88,7 +102,9 @@ class InferenceResult:  # what infer()/ground() resolve to — arrives async via
     # RUNNING forever — Observe terminates the activity on it. DefaultObserveStrategy applies it on
     # resolve.
     id: str
-    value: Plan | dict[str, Any] | None = None
+    # Plan (kind "plan"/"subgoal"), grounded params dict (kind "ground"), or the surviving-subset
+    # list (kind "select" — a $decide data-op filter, ADR-0023).
+    value: Plan | dict[str, Any] | list[Any] | None = None
     error: str | None = None
 
 

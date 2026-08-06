@@ -304,6 +304,42 @@ PLAN_SYSTEM_PROMPT = (
     'judgement rather than a uniform template, use "mode": "deliberative" with just the "goal" — '
     "the runtime plans "
     "that sub-goal separately when it is reached.\n"
+    "To NARROW or RESHAPE a collection before you act on it — keep only the qualifying items, "
+    "dedupe, sort, take the top few, gather per-item results, or reduce to a single number — emit "
+    "one data-op step per transform (they compose in order, one per step; do NOT do it all at "
+    'once). Each reads an `in` collection ({"$from": ...}, a prior {"$bind": "<name>"}, or a '
+    "literal list) and writes a named result under `out`, which later steps read as "
+    '{"$bind": "<name>", "path": "..."} (the same $bind you use for a sub-goal element). The '
+    "data-ops:\n"
+    '  {"action": "filter", "in": ..., "out": "<name>", "where": ...}  keep matching items; '
+    '`where` is either {"path": "<field>", "op": "<eq|ne|lt|le|gt|ge|between|in>", "value": <v>} '
+    "(a mechanical comparison; `between` takes [lo, hi], `in` takes a list) or "
+    '{"$decide": "<predicate in words>"} when keeping an item needs judgement,\n'
+    '  {"action": "distinct", "in": ..., "out": "<name>", "by": "<field>"}  drop duplicates (omit '
+    "`by` to dedupe whole items),\n"
+    '  {"action": "sort", "in": ..., "out": "<name>", "by": "<field>", "desc": true|false},\n'
+    '  {"action": "take", "in": ..., "out": "<name>", "n": <count>}  the first n items,\n'
+    '  {"action": "collect", "from": "<operation_name>", "out": "<name>"}  gather the results of '
+    "every run of that operation — use it after a mechanical sub-goal that invoked one operation "
+    "per item, to turn the scattered per-item results into one list,\n"
+    '  {"action": "reduce", "in": ..., "out": "<name>", "op": "<sum|min|max|count|mean>", '
+    '"by": "<field>"}  aggregate to a single value.\n'
+    "So the 'save each QUALIFYING apartment' shape is: search -> `filter` the results into a "
+    '`qualifying` binding -> a mechanical sub-goal whose "in" is {"$bind": "qualifying"}. To act '
+    "on values a tool produced per item (e.g. a crime rate per zip), map with a mechanical "
+    "sub-goal, then `collect` its results before filtering or reducing them.\n"
+    "Keep deliberative sub-goals RARE and SMALL. A deliberative sub-goal re-plans with the model "
+    "when it is reached, so its goal must REDUCE the problem to a concrete, hard-to-template slice "
+    "— it must NOT restate the task, or a large part of it, as another sub-goal. If you are about "
+    'to write a deliberative "goal" that echoes the parent goal, STOP and decompose the work HERE '
+    "instead — into concrete invoke steps, data-ops, and mechanical sub-goals. Repeating one tool "
+    "call over a collection is a MECHANICAL sub-goal; keeping / deduping / sorting / limiting / "
+    "gathering / aggregating a collection is DATA-OP steps; a value that needs judgement is "
+    "$decide. Reserve a deliberative sub-goal for a small, genuinely heterogeneous continuation "
+    "whose SHAPE — not merely its values — is unknown until you see run-time state (e.g. reconcile "
+    "a saved shortlist, then send each relative a tailored email). Prefer a single flat plan that "
+    "reduces to concrete steps: the runtime REFUSES a deliberative sub-goal that merely re-states "
+    "an ancestor, so a plan that leans on them instead of reducing will stall and do nothing.\n"
     "You are also given the agent's currently observed properties (persistent state, e.g. a "
     "thermostat reading) and recently observed signals (transient events, e.g. a notification) as "
     "already-known facts about the current world. Use them to decide WHAT to do — which branch to "
@@ -724,6 +760,42 @@ def _parse_params(text: str) -> dict[str, Any]:
     return params
 
 
+# --- select: the model-escalated data-op filter predicate ($decide) — ADR-0023 -------------------
+
+SELECT_SYSTEM_PROMPT = (
+    "You are filtering a list down to the subset that satisfies a natural-language predicate. You "
+    "are given the goal, the predicate, and the list items each on its own line prefixed by its "
+    "0-based index. Decide which items satisfy the predicate, judging each item ON ITS OWN DATA.\n"
+    'Respond with ONLY a JSON object of the form {"keep": [<indices>]} — the 0-based indices of '
+    "the items to KEEP — and nothing else, no prose, no markdown fences. Keep an item only if it "
+    'clearly satisfies the predicate; if none do, respond {"keep": []}.'
+)
+
+
+def _parse_keep(text: str, count: int) -> list[int]:
+    """Parse the ``{"keep": [<indices>]}`` selection contract into the in-range indices to keep,
+    preserving the model's order. Out-of-range or non-integer entries are dropped (defensive against
+    a stray index) and a repeated index collapses to its first occurrence (so the filtered subset
+    never duplicates an item — a duplicate would double-act a downstream fan-out); a structurally
+    malformed answer raises, the anti-corruption boundary that infer/ground share."""
+    try:
+        data = json.loads(_strip_code_fences(text))
+        keep = data["keep"]
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(
+            f"could not parse a selection from model output: {exc!r}\n---\n{text}"
+        ) from exc
+    if not isinstance(keep, list):
+        raise ValueError(f"selection 'keep' is not a JSON array: {keep!r}")
+    seen: set[int] = set()
+    kept: list[int] = []
+    for i in keep:
+        if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < count and i not in seen:
+            seen.add(i)
+            kept.append(i)
+    return kept
+
+
 # Operation results carry the identifiers a reference resolves against, so history is rendered with
 # a generous cap (bounded, but large enough that a multi-record search result isn't cut mid-record).
 # Observed properties/signals are re-observed state that would grow every prompt, so they keep the
@@ -826,6 +898,26 @@ class ProceduralMemory:
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         text = await self._llm.complete(system=system, prompt=user)
         return _parse_params(text)
+
+    async def select(self, activity: Activity, collection: list[Any], predicate: str) -> list[Any]:
+        """Filter ``collection`` to the subset satisfying a natural-language ``predicate`` — the
+        model-escalated ``$decide`` half of the ``filter`` data-op (ADR-0023). One model call over
+        the whole collection (a batching simplification of the per-element ideal): it renders each
+        item with its index, asks for a ``{"keep": [<indices>]}`` answer, and returns the kept items
+        in the model's order. The index contract keeps the model from re-serializing (and mangling)
+        the items. Reuses the same ``LLMClient`` seam as ``infer``/``ground``; no LLM -> raises."""
+        if self._llm is None:
+            raise RuntimeError(
+                "ProceduralMemory has no LLM configured; cannot evaluate a $decide filter. Pass a "
+                "client."
+            )
+        items = "\n".join(
+            f"{index}: {json.dumps(item, default=str)}" for index, item in enumerate(collection)
+        )
+        user = f"Goal: {activity.goal}\nPredicate: {predicate}\nItems:\n{items}"
+        log.debug("reason: system prompt\n%s\nUser prompt\n%s", SELECT_SYSTEM_PROMPT, user)
+        text = await self._llm.complete(system=SELECT_SYSTEM_PROMPT, prompt=user)
+        return [collection[index] for index in _parse_keep(text, len(collection))]
 
     async def store(self, plan: Plan) -> None:
         """Persists a Plan that was actually followed to completion, so future retrieve() calls

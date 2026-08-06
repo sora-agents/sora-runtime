@@ -747,6 +747,9 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
     class ActionRegistry:
         def register_internal(self, action: InternalAction) -> None: ...
         def register_external(self, action: ExternalAction) -> None: ...
+        def register_data_op(self, action: InternalAction) -> None: ...   # plan-composable data-ops (ADR-0023)
+        def data_op(self, name: str) -> InternalAction: ...               #   dispatched by Reason, not Act
+        def is_data_op(self, name: str) -> bool: ...
 
     class InvokeAction:                # predefined external action: _invoke_
         name = "invoke"
@@ -916,7 +919,37 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
                                                    kw["partial_params"], kw.get("observed"))
             cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=params))
 
-    def default_action_registry() -> ActionRegistry:   # the six external + eight internal, assembled once
+    # Data-ops (ADR-0023): the plan's composable data-processing layer. Each is an InternalAction in
+    # ActionRegistry's dedicated data-op bucket (not _internal), so only these — never a runtime-only
+    # lever — are dispatchable from a plan step, and the collection-`filter` never collides with the
+    # perception-prune `FilterPerceptionsAction`. A data-op reads a run-time collection Reason already
+    # resolved (from history via $from, a prior binding via $bind, or a literal) and writes a named
+    # binding into Activity.bindings[out], which a later step reads via {"$bind": "<name>"}. The
+    # pipeline is imperative — one op per step (a declarative $foreach/$select binding spec stays
+    # rejected, ADR-0022 (a)). Mechanical ops run inline; only FilterAction's $decide predicate
+    # escalates, to one off-cycle ProceduralMemory.select over the whole collection (kind="select",
+    # landing in bindings[out] via Observe — like _ground_). The vocabulary is a tunable coverage
+    # decision; developers register their own richer transforms via register_data_op.
+    class FilterAction:                # data-op: _filter_ — keep matching elements
+        name = "filter"                # where: {"path","op","value"} (eq/ne/lt/le/gt/ge/between/in) or {"$decide": ...}
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None: ...
+    class DistinctAction:              # data-op: _distinct_ — dedupe (optionally by a key path)
+        name = "distinct"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None: ...
+    class SortAction:                  # data-op: _sort_ — order by a key path (desc?)
+        name = "sort"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None: ...
+    class TakeAction:                  # data-op: _take_ — first n elements (Spark/FP take; = SQL LIMIT)
+        name = "take"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None: ...
+    class CollectAction:               # data-op: _collect_ — gather a fan-out's per-op history results (MapReduce gather)
+        name = "collect"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None: ...
+    class ReduceAction:                # data-op: _reduce_ — aggregate to a scalar (sum/min/max/count/mean)
+        name = "reduce"
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None: ...
+
+    def default_action_registry() -> ActionRegistry:   # six external + eight internal + six data-ops
         ...                                            # what bootstrap and test harnesses register through
 
     # sora/llm.py — the one seam onto a language model; wire-format-neutral on purpose

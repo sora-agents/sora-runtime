@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.action import (
+    CollectAction,
     CreateActivityAction,
     FilterPerceptionsAction,
     GroundAction,
@@ -36,7 +37,12 @@ from sora.types import (
     OperationInvocation,
     SignalWait,
     Step,
+    walk_path,
 )
+
+# The dotted-path walker lives in sora.types now (shared with the data-ops in sora.action, which
+# can't import this module); keep the private alias so the many call sites below stay untouched.
+_walk_path = walk_path
 
 # Bound on retained signals: they're consumption-evicted (a matched signal leaves when its activity
 # resumes), but an *orphan* — one that arrives before its waiter, or that nothing ever waits on —
@@ -356,8 +362,22 @@ class DefaultObserveStrategy:
                     and activity.state is ActivityState.RUNNING
                 ):
                     kind = activity.pending_inference.kind
+                    out = activity.pending_inference.out  # set only for kind=="select"
                     activity.pending_inference = None
-                    if res.error is not None:
+                    if res.error is not None and kind == "select":
+                        # A $decide filter is a transform, not control flow: a transient model or
+                        # parse failure degrades to an empty shortlist (the pipeline does nothing
+                        # this run) rather than terminating the activity — keeps the data-op alive.
+                        assert out is not None
+                        activity.bindings[out] = []
+                        activity.state = ActivityState.READY
+                        log.warning(
+                            "observe: $decide filter for %s failed (%s) -> empty binding %r",
+                            activity.id,
+                            res.error,
+                            out,
+                        )
+                    elif res.error is not None:
                         activity.grounded_params = None
                         activity.state = ActivityState.TERMINATED
                         log.error(
@@ -382,6 +402,20 @@ class DefaultObserveStrategy:
                         activity.step_index = 0
                         activity.state = ActivityState.READY
                         log.info("observe: entered sub-plan for activity %s", activity.id)
+                    elif kind == "select":
+                        # A $decide data-op filter (ADR-0023): the surviving subset lands into the
+                        # named binding, exactly like a mechanical filter would have written it. Not
+                        # a Percept (deliberation output, not observed state) — same as plan/ground.
+                        assert out is not None  # a "select" pending always carries its target name
+                        activity.bindings[out] = (
+                            res.value
+                        )  # value is Any-typed dict; no cast needed
+                        activity.state = ActivityState.READY
+                        log.info(
+                            "observe: resolved $decide filter -> binding %r for activity %s",
+                            out,
+                            activity.id,
+                        )
                     else:
                         activity.grounded_params = res.value  # type: ignore[assignment]  # => dict
                         activity.state = ActivityState.READY
@@ -687,15 +721,21 @@ class DefaultSituateStrategy:
 _REF_FROM = "$from"
 _REF_PATH = "path"
 _REF_DECIDE = "$decide"
-# The named-binding read token (ADR-0022). Distinct from $from (which reads Activity.history): $bind
-# reads a named binding — here, the current loop element of a mechanical sub-goal, substituted
-# eagerly at fan-out time. (Binding names from a plan's context guard are a later addition.)
+# The named-binding read token. Distinct from $from (which reads Activity.history): $bind reads a
+# named binding — either a data-op's output binding in Activity.bindings (ADR-0023), resolved here
+# at ground/fan-out time against that dict, or the current loop element of a mechanical sub-goal
+# (ADR-0022), which is substituted eagerly at fan-out by _substitute_bindings and so never reaches
+# this resolver. The two coexist: the loop element is gone before grounding runs, so any $bind left
+# here is a binding read.
 _REF_BIND = "$bind"
+_REF_NAME = "$bind"  # the binding-name key inside a $bind reference (same token, read as a key)
 _MISSING = object()  # sentinel: no matching history entry (distinct from a genuine None result)
 
 
 def _is_reference(value: Any) -> bool:
-    return isinstance(value, dict) and (_REF_FROM in value or _REF_DECIDE in value)
+    return isinstance(value, dict) and (
+        _REF_FROM in value or _REF_DECIDE in value or _REF_BIND in value
+    )
 
 
 def _latest_result(history: list[CompletedOperation], operation_name: str) -> Any:
@@ -706,11 +746,22 @@ def _latest_result(history: list[CompletedOperation], operation_name: str) -> An
     return _MISSING
 
 
-def _walk_path(value: Any, path: str) -> Any:
-    """Walk a dotted path into a nested result — a numeric segment indexes a list, else a dict."""
-    for segment in filter(None, path.split(".")):
-        value = value[int(segment)] if segment.isdigit() else value[segment]
-    return value
+def _resolve_ref(
+    ref: dict[str, Any], history: list[CompletedOperation], bindings: dict[str, Any]
+) -> Any:
+    """Resolve one *hard* reference — ``$from`` (history) or ``$bind`` (a named binding) — to its
+    value, walking the ``path`` into it. ``_MISSING`` when the source is absent (no such op ran / no
+    such binding). Raises on a bad path (a present source, wrong path) so the caller can distinguish
+    "escalate" from "left in place". ``$decide`` is soft and never resolved here."""
+    if _REF_FROM in ref:
+        result = _latest_result(history, str(ref[_REF_FROM]))
+        return _MISSING if result is _MISSING else _walk_path(result, ref.get(_REF_PATH, ""))
+    if _REF_NAME in ref:
+        name = ref[_REF_NAME]
+        if name not in bindings:
+            return _MISSING
+        return _walk_path(bindings[name], ref.get(_REF_PATH, ""))
+    return _MISSING
 
 
 def _manual_for(wm: WorkingMemory, tool_id: str | None) -> Manual | None:
@@ -724,13 +775,16 @@ def _manual_for(wm: WorkingMemory, tool_id: str | None) -> Manual | None:
 
 
 def resolve_references(
-    op_params: dict[str, Any], history: list[CompletedOperation]
+    op_params: dict[str, Any],
+    history: list[CompletedOperation],
+    bindings: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Resolve a step's operation params against execution history. Non-reference values pass
-    through; a hard reference is resolved deterministically; anything that can't be resolved
-    mechanically (soft ref, missing step, bad path) is left in place and its key returned in
-    ``unresolved`` for the caller to escalate. Never raises an exception on a bad path — that's
-    an escalation signal, not an error."""
+    """Resolve a step's operation params against execution history and named bindings. Non-reference
+    values pass through; a hard reference (``$from``/``$bind``) is resolved deterministically;
+    anything that can't be resolved mechanically (soft ``$decide``, missing source, bad path) is
+    left in place and its key returned in ``unresolved`` for the caller to escalate. Never raises on
+    a bad path — that's an escalation signal, not an error."""
+    binds = bindings or {}
     resolved = dict(op_params)
     unresolved: list[str] = []
     for key, value in op_params.items():
@@ -739,14 +793,15 @@ def resolve_references(
         if _REF_DECIDE in value:
             unresolved.append(key)
             continue
-        result = _latest_result(history, value.get(_REF_FROM))
-        if result is _MISSING:
-            unresolved.append(key)
-            continue
         try:
-            resolved[key] = _walk_path(result, value.get(_REF_PATH, ""))
+            got = _resolve_ref(value, history, binds)
         except (KeyError, IndexError, TypeError, ValueError):
             unresolved.append(key)
+            continue
+        if got is _MISSING:
+            unresolved.append(key)
+        else:
+            resolved[key] = got
     return resolved, unresolved
 
 
@@ -805,21 +860,48 @@ def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
     return goals
 
 
-def _resolve_collection(ref: Any, history: list[CompletedOperation]) -> list[Any] | None:
-    """The list a mechanical sub-goal iterates: a ``$from`` reference resolved against history (the
-    common case — the collection is a prior step's result), or a literal list. ``None`` when it
-    can't be resolved to a list (missing step, bad path, or a non-list value) — the caller treats
-    that as an empty fan-out, mirroring ``resolve_references``' never-raise contract."""
+def _as_collection(value: Any) -> list[Any] | None:
+    """Coerce a resolved value to the list a fan-out/pipeline iterates. A list is itself; an
+    ``{id -> record}`` **mapping** (ARE's ``list_all_apartments`` / ``search_apartments`` /
+    ``list_saved_apartments``, the common id-keyed shape) iterates its *values* — the id is carried
+    inside each record, so values-iteration is lossless. To qualify, a non-empty dict must have
+    *every* value a mapping; a dict that doesn't (a single record's fields, a ``{"results": [...]}``
+    envelope, an ``{id -> scalar}`` map) is NOT mechanically a collection -> ``None``, so the caller
+    warns rather than silently fanning out over field values. An empty dict is an empty collection;
+    a scalar is ``None``. (Richer shape recovery — envelope unwrap, model escalation — deferred.)"""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        if not value:
+            return []  # an empty {id -> record} map is an empty collection, not "unresolvable"
+        if all(isinstance(v, dict) for v in value.values()):
+            return list(value.values())
+        return (
+            None  # not an id->record map: refuse to guess (single record / envelope / id->scalar)
+        )
+    return None
+
+
+def _resolve_collection(
+    ref: Any, history: list[CompletedOperation], bindings: dict[str, Any] | None = None
+) -> list[Any] | None:
+    """The collection a mechanical sub-goal iterates or a data-op transforms: a ``$from`` reference
+    resolved against history, a ``$bind`` reference resolved against named bindings (a prior data-op
+    output), or a literal list. A resolved mapping iterates its values (see ``_as_collection``).
+    ``None`` when it can't be resolved to a collection (missing source, bad path, a non-collection
+    value, or a soft ``$decide``) — the caller treats that as an empty fan-out/pipeline, mirroring
+    ``resolve_references``' never-raise contract."""
     if not _is_reference(ref):
-        return ref if isinstance(ref, list) else None
-    result = _latest_result(history, ref.get(_REF_FROM))
-    if result is _MISSING:
-        return None
+        return _as_collection(ref)
+    if _REF_DECIDE in ref:
+        return None  # a $decide collection is soft — not mechanically resolvable
     try:
-        value = _walk_path(result, ref.get(_REF_PATH, ""))
+        value = _resolve_ref(ref, history, bindings or {})
     except (KeyError, IndexError, TypeError, ValueError):
         return None
-    return value if isinstance(value, list) else None
+    if value is _MISSING:
+        return None
+    return _as_collection(value)
 
 
 def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
@@ -842,12 +924,15 @@ def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
     return obj
 
 
-def _expand_mechanical(step: Step, history: list[CompletedOperation]) -> list[Step]:
+def _expand_mechanical(
+    step: Step, history: list[CompletedOperation], bindings: dict[str, Any] | None = None
+) -> list[Step]:
     """Fan a mechanical sub-goal out to one concrete ``Step`` per element of its ``in`` collection,
-    the element substituted for ``{"$bind": "<as>"}`` in its ``template``. Empty (or an unresolvable
-    collection) -> no steps, so the sub-goal simply vanishes from the plan."""
+    the element substituted for ``{"$bind": "<as>"}`` in its ``template``. The ``in`` collection may
+    be a ``$from`` (history) or a ``$bind`` (a data-op output binding, e.g. a filtered shortlist).
+    Empty (or an unresolvable collection) -> no steps, so the sub-goal simply vanishes."""
     ref = step.params.get("in")
-    elements = _resolve_collection(ref, history)
+    elements = _resolve_collection(ref, history, bindings)
     if elements is None:
         # Unresolvable (vs. a genuinely empty list): the `in` reference points at an op that never
         # ran or a value that isn't a list — most likely a plan bug (no narrowing search ran first),
@@ -940,6 +1025,17 @@ class DefaultReasonStrategy:
                 if outcome is _SUBGOAL_SPLICED:
                     continue  # mechanical: spliced the expansion in place -> read the first step
                 return result  # deliberative fired _infer_ (RUNNING), or the guard halted (BLOCKED)
+            if cycle.actions.is_data_op(step.next_action):
+                # A data-op transforms a run-time value into a named binding (ADR-0023). Advance
+                # past it either way: a mechanical op wrote its binding now (read the next step this
+                # cycle); a $decide filter fired an off-cycle model call and the activity is now
+                # RUNNING, its result landing in bindings[out] a later cycle — so on resume we
+                # continue after the op, not re-run it (unlike _ground_, whose step still runs).
+                parked = await self._data_op(step, activity, cycle)
+                activity.step_index += 1
+                if parked:
+                    return result  # RUNNING on the select escalation; binding lands a later cycle
+                continue
             grounded = await self._ground(step, activity, wm, cycle)
             if grounded is None:
                 return result  # escalated via _ground_ (RUNNING); the step lands a later cycle
@@ -947,6 +1043,39 @@ class DefaultReasonStrategy:
             # escalation isn't skipped — step_index stays put across RUNNING cycles until it lands.
             activity.step_index += 1
             return replace(result, activity=activity, step=grounded)
+
+    @staticmethod
+    async def _data_op(step: Step, activity: Activity, cycle: DecisionCycle) -> bool:
+        """Execute one data-op step (ADR-0023) and report whether it *parked* the activity on an
+        off-cycle model call (only a ``$decide`` filter does). Resolves the op's input collection
+        here — a ``collect`` gathers the per-element results of a fanned-out operation straight from
+        ``history`` (its ``from`` is an operation name, not an ``in`` reference); every other op
+        resolves ``in`` from history/bindings, an unresolvable input becoming an empty collection
+        (the fan-out's never-raise contract). Dispatches from the data-op bucket; the op writes its
+        result into ``activity.bindings[out]`` (or, for the escalation, Observe does so later)."""
+        if step.next_action == CollectAction.name:
+            op_name = step.params.get("from")
+            collection: list[Any] = [
+                completed.ack.result
+                for completed in activity.history
+                if completed.invocation.operation_name == op_name
+            ]
+            passthrough = {k: v for k, v in step.params.items() if k != "from"}
+        else:
+            resolved = _resolve_collection(
+                step.params.get("in"), activity.history, activity.bindings
+            )
+            if resolved is None:
+                log.warning(
+                    "data-op %s: input %r did not resolve to a list; using an empty collection",
+                    step.next_action,
+                    step.params.get("in"),
+                )
+            collection = resolved if resolved is not None else []
+            passthrough = {k: v for k, v in step.params.items() if k != "in"}
+        op = cycle.actions.data_op(step.next_action)
+        await op.execute(cycle, activity_id=activity.id, collection=collection, **passthrough)
+        return activity.pending_inference is not None
 
     async def _subgoal(
         self, step: Step, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle
@@ -991,7 +1120,7 @@ class DefaultReasonStrategy:
         plan = activity.plan
         assert plan is not None  # reason() only dispatches a step off a set plan
         i = activity.step_index
-        expanded = _expand_mechanical(step, activity.history)
+        expanded = _expand_mechanical(step, activity.history, activity.bindings)
         activity.plan = replace(plan, steps=plan.steps[:i] + expanded + plan.steps[i + 1 :])
         log.info(
             "reason: sub-goal %r fanned out to %d step(s)", step.params.get("goal"), len(expanded)
@@ -1075,7 +1204,7 @@ class DefaultReasonStrategy:
             resolved = activity.grounded_params  # the escalation resolved; consume it
             activity.grounded_params = None
             return resolved
-        resolved, unresolved = resolve_references(params, activity.history)
+        resolved, unresolved = resolve_references(params, activity.history, activity.bindings)
         if not unresolved:
             return resolved  # cheap path — resolved mechanically, no model call
         observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))

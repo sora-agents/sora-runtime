@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -21,6 +22,7 @@ from sora.types import (
     PendingInference,
     PendingOperation,
     Step,
+    walk_path,
 )
 
 if TYPE_CHECKING:
@@ -76,6 +78,11 @@ class ActionRegistry:
     def __init__(self) -> None:
         self._internal: dict[str, InternalAction] = {}
         self._external: dict[str, ExternalAction] = {}
+        # Data-ops (ADR-0023) are InternalActions too, but kept in their own bucket: they're the set
+        # a *plan* may compose as steps, dispatched by Reason. Keeping them out of `_internal`
+        # bounds what a (possibly hallucinated) plan step can drive — never a runtime-only lever
+        # like _suspend_/_infer_ — and lets the collection-`filter` coexist with the perception one.
+        self._data_ops: dict[str, InternalAction] = {}
 
     def register_internal(self, action: InternalAction) -> None:
         self._internal[action.name] = action
@@ -83,11 +90,21 @@ class ActionRegistry:
     def register_external(self, action: ExternalAction) -> None:
         self._external[action.name] = action
 
+    def register_data_op(self, action: InternalAction) -> None:
+        """Register a plan-composable data-op (a built-in, or a dev's own richer transform)."""
+        self._data_ops[action.name] = action
+
     def internal(self, name: str) -> InternalAction:
         return self._internal[name]
 
     def external(self, name: str) -> ExternalAction:
         return self._external[name]
+
+    def data_op(self, name: str) -> InternalAction:
+        return self._data_ops[name]
+
+    def is_data_op(self, name: str) -> bool:
+        return name in self._data_ops
 
 
 class InvokeAction:  # predefined external action: _invoke_
@@ -453,11 +470,210 @@ class GroundAction:  # predefined internal action: _ground_ — the async param-
         cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=params))
 
 
+# --- data-ops: composable structured-value transforms (ADR-0023) ---------------------------------
+# A data-op is an InternalAction the *plan* composes as a step (not a runtime lever like _suspend_):
+# it reads a run-time collection Reason already resolved (from Activity.history via $from, a prior
+# binding via $bind, or a literal) and writes a named binding into Activity.bindings[out], which a
+# later step reads via {"$bind": "<name>"}. Registered in ActionRegistry's dedicated data-op bucket
+# (not _internal), so only these — never a runtime lever — are dispatchable from a plan step, and
+# so the collection-`filter` here never collides with FilterPerceptionsAction's perception-`filter`.
+# The pipeline is imperative (one op per step); a declarative $foreach/$select binding spec stays
+# rejected (ADR-0022 option (a)). Reason passes the resolved list as `collection` and the op's other
+# params as kwargs; the op is a pure transform except FilterAction's $decide escalation.
+_REF_DECIDE = "$decide"  # mirrors sora.strategies / ADR-0017's soft reference token
+
+
+def _pluck(element: Any, path: str | None) -> Any:
+    """The value at ``path`` of ``element`` (the shared dotted-path grammar), or ``None`` on a bad
+    path — a missing key is a non-match/absent value for a data-op, never a crash."""
+    if not path:
+        return element
+    try:
+        return walk_path(element, path)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _dedup_key(value: Any) -> str:
+    """A stable, hashable signature for a (possibly unhashable, e.g. dict) value, for _distinct_."""
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _matches(element: Any, where: Any) -> bool:
+    """Evaluate a mechanical ``filter`` predicate against one element: ``{"path", "op", "value"}``
+    with op in eq/ne/lt/le/gt/ge/between/in. A ``$decide`` predicate never reaches here (Filter-
+    Action escalates it). No predicate keeps everything."""
+    if not isinstance(where, dict):
+        return True
+    actual = _pluck(element, where.get("path", ""))
+    op = where.get("op", "eq")
+    value = where.get("value")
+    if op == "eq":
+        return bool(actual == value)
+    if op == "ne":
+        return bool(actual != value)
+    if op == "in":
+        return isinstance(value, (list, tuple)) and actual in value
+    if op == "between":
+        if not (isinstance(value, (list, tuple)) and len(value) == 2):
+            return False
+        lo, hi = value
+        if actual is None:
+            return False
+        try:
+            return bool(lo <= actual <= hi)
+        except TypeError:
+            return False  # incomparable types -> non-match, never a crash (like lt/le/gt/ge)
+    if actual is None:
+        return False  # ordered comparisons need a present value
+    try:
+        if op == "lt":
+            return bool(actual < value)
+        if op == "le":
+            return bool(actual <= value)
+        if op == "gt":
+            return bool(actual > value)
+        if op == "ge":
+            return bool(actual >= value)
+    except TypeError:
+        return False
+    log.warning("filter: unknown predicate op %r -> excluding element", op)
+    return False
+
+
+class FilterAction:  # predefined data-op: _filter_
+    name = "filter"
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        out = kwargs["out"]
+        collection = kwargs["collection"]
+        where = kwargs.get("where")
+        if isinstance(where, dict) and _REF_DECIDE in where:
+            # Soft predicate: escalate to one off-cycle model call over the whole collection, like
+            # _ground_ — park RUNNING, resolve into bindings[out] a later cycle (via Observe).
+            inf_id = uuid.uuid4().hex
+            activity.pending_inference = PendingInference(
+                id=inf_id, kind="select", requested_at=time.time(), out=out
+            )
+            activity.state = ActivityState.RUNNING
+            log.info("data-op: filter %r via the model (%d items)", out, len(collection))
+            _spawn_tracked(
+                self._tasks, self._call(cycle, activity, inf_id, collection, where[_REF_DECIDE])
+            )
+            return
+        activity.bindings[out] = [e for e in collection if _matches(e, where)]
+
+    async def _call(
+        self,
+        cycle: DecisionCycle,
+        activity: Activity,
+        inf_id: str,
+        collection: list[Any],
+        predicate: str,
+    ) -> None:
+        current_inference_id.set(
+            inf_id
+        )  # attribute this round-trip's cost to this call (see infer)
+        try:
+            kept = await cycle.procedural.select(activity, collection, predicate)
+        except Exception as exc:  # noqa: BLE001 — any model/parse/wire failure resolves as an error
+            log.exception("data-op: filter select failed for activity %s", activity.id)
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))
+            return
+        cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=kept))
+
+
+class DistinctAction:  # predefined data-op: _distinct_
+    name = "distinct"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        by = kwargs.get("by")
+        seen: set[str] = set()
+        result: list[Any] = []
+        for element in kwargs["collection"]:
+            signature = _dedup_key(_pluck(element, by) if by else element)
+            if signature not in seen:
+                seen.add(signature)
+                result.append(element)
+        activity.bindings[kwargs["out"]] = result
+
+
+class SortAction:  # predefined data-op: _sort_
+    name = "sort"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        by = kwargs.get("by")
+        collection = list(kwargs["collection"])
+
+        def key(element: Any) -> tuple[bool, Any]:
+            value = _pluck(element, by) if by else element
+            return (value is None, value)  # None sorts to one end without comparing None to a value
+
+        try:
+            result = sorted(collection, key=key, reverse=bool(kwargs.get("desc", False)))
+        except TypeError:
+            log.warning("sort: incomparable keys for by=%r -> leaving order unchanged", by)
+            result = collection
+        activity.bindings[kwargs["out"]] = result
+
+
+class TakeAction:  # predefined data-op: _take_
+    name = "take"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        collection = list(kwargs["collection"])
+        n = kwargs.get("n")
+        activity.bindings[kwargs["out"]] = collection if n is None else collection[: int(n)]
+
+
+class CollectAction:  # predefined data-op: _collect_ — the map-invoke's MapReduce gather
+    name = "collect"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        # Reason pre-gathers the per-element history results (by the `from` operation name) into
+        # `collection`; this just materializes them as one binding for a downstream op to consume.
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        activity.bindings[kwargs["out"]] = list(kwargs["collection"])
+
+
+class ReduceAction:  # predefined data-op: _reduce_
+    name = "reduce"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        collection = kwargs["collection"]
+        op = kwargs.get("op", "count")
+        out = kwargs["out"]
+        if op == "count":
+            activity.bindings[out] = len(collection)
+            return
+        by = kwargs.get("by")
+        values = [(_pluck(e, by) if by else e) for e in collection]
+        nums = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if op == "sum":
+            activity.bindings[out] = sum(nums) if nums else None  # None (not 0) on empty, like mean
+        elif op == "min":
+            activity.bindings[out] = min(nums) if nums else None
+        elif op == "max":
+            activity.bindings[out] = max(nums) if nums else None
+        elif op == "mean":
+            activity.bindings[out] = (sum(nums) / len(nums)) if nums else None
+        else:
+            log.warning("reduce: unknown op %r -> null result", op)
+            activity.bindings[out] = None
+
+
 def default_action_registry() -> ActionRegistry:
-    """The predefined action space, assembled once: the six external actions plus the eight internal
-    actions (six working-memory levers plus the two off-cycle model calls _infer_/_ground_).
-    bootstrap and test harnesses register everything through this rather than naming each action
-    inline."""
+    """The predefined action space, assembled once: the six external actions, the eight internal
+    working-memory levers/model calls, plus the six plan-composable data-ops (ADR-0023). bootstrap
+    and test harnesses register everything through this rather than naming each action inline."""
     registry = ActionRegistry()
     for external in (
         InvokeAction(),
@@ -479,4 +695,13 @@ def default_action_registry() -> ActionRegistry:
         GroundAction(),
     ):
         registry.register_internal(internal)
+    for data_op in (
+        FilterAction(),
+        DistinctAction(),
+        SortAction(),
+        TakeAction(),
+        CollectAction(),
+        ReduceAction(),
+    ):
+        registry.register_data_op(data_op)
     return registry

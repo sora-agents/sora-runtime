@@ -67,24 +67,31 @@ If the request instead named *several* people to reply to — "reply to everyone
 
 A multi-item task — the RentAFlat scenario asks to *save each qualifying apartment*, *remove the ones already saved*, and *email each relative* — cannot hard-code its counts at synthesis time, because the counts are unknown until a search returns. A flat plan collapses each "for each" to a single call. Sub-goals fix this in two modes.
 
-**Mechanical sub-goal** — a uniform map over a collection that a prior step produced. Reason resolves the collection, applies any per-item selection, and fans out `len(collection)` copies of a fixed template, one invocation per cycle. The count is `len(data)`, never a model guess:
+**Mechanical sub-goal** — a uniform map over a collection that a prior step produced. It fans out `len(collection)` copies of a fixed template, one invocation per cycle; the count is `len(data)`, never a model guess. *Narrowing* the collection to the qualifying items is not the sub-goal's job — a separate **`filter` data-op** step ([ADR-0023](docs/architecture/adrs/0023-structured-value-data-ops.md)) does it first, writing a named binding the sub-goal then iterates:
 
 ```python
-# The plan body reaches this after a search step whose result is on the activity's history.
+# The plan body reaches these after a search step whose result is on the activity's history.
+# 1) narrow the search result to the qualifying apartments -> a named binding.
+Step(next_action="filter",
+     params={
+         "in":    {"$from": "search_apartments", "path": "apartments"},  # collection from history ($from)
+         "out":   "qualifying",                                          # writes Activity.bindings["qualifying"]
+         "where": {"$decide": "violent-crime index in 5..10 and not already saved"},  # soft predicate -> model
+     })
+# 2) map save_apartment over that binding — the count comes from len(qualifying), not the model.
 Step(next_action="subgoal",
      params={
          "goal": "save each qualifying apartment",
          "mode": "mechanical",
-         "in":   {"$from": "search_apartments", "path": "apartments"},  # collection from history ($from)
+         "in":   {"$bind": "qualifying"},                               # the filter's output, not a fresh $from
          "as":   "apt",                                                 # element name (named-binding namespace)
-         "where": {"$decide": "violent-crime index in 5..10 and not already saved"},  # per-item selection
          "template": Step(next_action="invoke",
                           params={"tool_id": "RentAFlat", "operation_name": "save_apartment",
                                   "apartment_id": {"$bind": "apt", "path": "id"}}),  # element, not $from
      })
 ```
 
-Reason resolves `in` mechanically, filters by `where` (a mechanical comparison is free; a `$decide` predicate escalates *per element*, the only model spend, evaluated against real data), then splices one `save_apartment` per surviving element into the active frame. Five qualifying apartments ⇒ exactly `save_apartment` ×5 — the count that the oracle event graph checks, bound to the data rather than frozen at authoring time.
+The `filter` step runs first: a mechanical `{"path", "op", "value"}` predicate is free, while the `{"$decide": …}` shown here escalates to one off-cycle model call over the whole collection (`ProceduralMemory.select`, resolving into the binding a later cycle like a grounding escalation). The sub-goal then resolves `in` from that binding and splices one `save_apartment` per surviving element into the active frame. Five qualifying apartments ⇒ exactly `save_apartment` ×5 — the count the oracle event graph checks, bound to the data rather than frozen at authoring time. (This composes further: dedupe with `distinct`, gather a fan-out's per-item results with `collect`, then `filter`/`take`/`reduce` them — see ADR-0023.)
 
 **Deliberative sub-goal** — an open, heterogeneous continuation that is *not* a uniform map (a mix of removals and tailored emails, whose shape depends on what actually got saved). Reason fires `_infer_` mid-plan (`kind="subgoal"`), so the model synthesizes the sub-plan while *seeing* the real post-save state; the sub-plan is pushed as a frame, and the parent resumes when it completes:
 

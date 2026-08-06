@@ -62,6 +62,12 @@ class Activity:
     # against it (last_operation keeps only the newest, overwritten each step). Transient:
     # not persisted, and episodic learn() captures selectively, not a blind asdict(activity).
     history: list[CompletedOperation] = field(default_factory=list)
+    # Named bindings a data-op step writes and a later step reads via {"$bind": "<name>"} (ADR-0023)
+    # — the imperative pipeline's intermediate values (a filtered/deduped/sorted collection, a
+    # reduced scalar). Transient run state like `history`/`grounded_params` (not persisted); cleared
+    # on replan since the values are coupled to the plan that produced them. Distinct from the
+    # mechanical sub-goal's eager loop-element $bind, which is substituted at fan-out, never stored.
+    bindings: dict[str, Any] = field(default_factory=dict)
     # context is exclusively for strategy-author data — the runtime itself never writes into it,
     # which is what keeps pending_operation/last_operation as dedicated fields instead of context
     # keys with a naming convention: no shared namespace means no collision to avoid in the first
@@ -93,6 +99,9 @@ class Activity:
         # separate future method; there's no trigger for it yet (a failed sub-plan inference
         # currently terminates the activity rather than replanning the frame).
         self.parent_frames.clear()
+        # Drop the pipeline's intermediate bindings too: they were produced by (and are only
+        # meaningful within) the plan being discarded.
+        self.bindings.clear()
         self.discard_inference()
         if was_inferring:
             self.state = ActivityState.READY

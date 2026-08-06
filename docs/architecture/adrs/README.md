@@ -37,7 +37,8 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0020](0020-hard-interrupt-and-await-input.md) | Hard-interrupt path: process-scheduling preemption, await-input, and a push-time InterruptPolicy seam | proposed | Decision cycle |
 | [0021](0021-llm-calls-as-async-internal-actions.md) | LLM calls as off-cycle, deferred-result internal actions (supersedes ADR-0020's mid-flight abandonment) | proposed | Decision cycle |
 | [0022](0022-plan-representation-context-guard-and-subgoals.md) | Plan representation: retrieval-binding context guard + sub-goals (loosely AgentSpeak) | proposed | Decision cycle |
+| [0023](0023-structured-value-data-ops.md) | Structured-value data-ops: composable transforms as plan steps | proposed | Decision cycle |
 
 ## Planned
 
-None currently pending — 22 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
+None currently pending — 23 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
