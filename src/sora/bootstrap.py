@@ -9,6 +9,7 @@ A developer implementing an agent only ever writes ``agent.yaml`` plus, typicall
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +84,11 @@ class AgentConfig:
     transport: dict[str, Any] | None = None
     llm: dict[str, Any] | None = None
     procedural: dict[str, str] | None = None
+    # Override for the deliberative sub-goal recursion breaker's depth cap (DefaultReasonStrategy).
+    # A generic runtime safety limit, not domain config; raise it for a task with legitimately deep
+    # sub-goals. None (agent.yaml omits it) -> the strategy's own default owns the value, so the
+    # single source of truth is _DEFAULT_MAX_SUBGOAL_DEPTH there, never a second literal here.
+    max_subgoal_depth: int | None = None
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -138,6 +144,7 @@ def load_yaml(config_path: str | Path) -> AgentConfig:
             "mechanical default (planning needs a model). Name your ReasonStrategy there."
         )
     procedural = agent.get("procedural")
+    depth = agent.get("max_subgoal_depth")  # None -> the strategy's own default (no literal here)
     return AgentConfig(
         name=agent["name"],
         strategies=strategies,
@@ -146,6 +153,7 @@ def load_yaml(config_path: str | Path) -> AgentConfig:
         transport=agent.get("transport"),
         llm=agent.get("llm"),
         procedural=dict(procedural) if procedural else None,
+        max_subgoal_depth=int(depth) if depth is not None else None,
     )
 
 
@@ -292,6 +300,19 @@ def transport_for(config: AgentConfig, simulation: Any | None = None) -> Message
     return InProcessTransport()
 
 
+def reason_strategy_for(config: AgentConfig) -> Any:
+    """Construct the (required) Reason strategy named in ``strategies.reason``. Forwards
+    ``max_subgoal_depth`` only when agent.yaml set it *and* the strategy's constructor declares it
+    (the default does) — an omitted key falls through to the strategy's own default, so the numeric
+    default lives in exactly one place. A custom ReasonStrategy that doesn't take the kwarg still
+    constructs with no args, keeping the generic dotted-path wiring intact."""
+    cls = import_object(config.strategies["reason"])
+    override = config.max_subgoal_depth
+    if override is not None and "max_subgoal_depth" in inspect.signature(cls).parameters:
+        return cls(max_subgoal_depth=override)
+    return cls()
+
+
 def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
     """What ``sora run`` calls before handing off to TerminalSession. The one place all the wiring
     happens — a developer implementing an agent never writes this. Constructs the single shared
@@ -323,7 +344,7 @@ def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
         observe=import_object(config.strategies.get("observe", _DEFAULT_STRATEGIES["observe"]))(),
         reflect=import_object(config.strategies.get("reflect", _DEFAULT_STRATEGIES["reflect"]))(),
         situate=import_object(config.strategies.get("situate", _DEFAULT_STRATEGIES["situate"]))(),
-        reason=import_object(config.strategies["reason"])(),  # required — no default
+        reason=reason_strategy_for(config),  # required — no default
         act=import_object(config.strategies.get("act", _DEFAULT_STRATEGIES["act"]))(),
     )
 

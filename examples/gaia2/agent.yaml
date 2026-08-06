@@ -13,6 +13,13 @@
 # See examples/gaia2/run_benchmark.py for the driver and its flags.
 agent:
   name: gaia2-default
+  # Optional override for the deliberative sub-goal recursion breaker's depth cap
+  # (DefaultReasonStrategy): once the intention stack is this deep, a further deliberative sub-goal
+  # pauses to await user input instead of spending another plan-inference. Omitted here, so the
+  # strategy's own default applies; uncomment and raise it for a task with legitimately deep nested
+  # sub-goals. The overlap-based similarity guard catches most runaway recursion earlier; this is
+  # the outer backstop.
+  # max_subgoal_depth: 4
   strategies:
     # The model-backed default planner + default selection. No interrupt policy is wired here:
     # core's default is NeverInterruptPolicy, which is correct for the static capabilities

@@ -765,24 +765,30 @@ _SUBGOAL_HALTED = object()
 # pulled forward). Synthesis-as-selection has no termination guarantee an *authored* plan library
 # has: the model can satisfy "plan for goal G" by emitting a plan whose body is another deliberative
 # sub-goal for ~G, deferring instead of reducing, and recurse until a budget (or credit) runs out.
-# Two mechanical detectors, tripped before the _infer_ spend: a depth cap on the intention stack,
-# and goal-similarity against the ancestor sub-goals — a new sub-goal that closely repeats one still
-# on the stack is not reducing. Tripping pauses to await-input (ADR-0020) rather than terminating,
-# so a deep-but-legitimate task can be redirected, not killed. Both are coarse backstops; the real
-# fix is making the common map/filter/distinct shapes expressible without deliberation at all.
-_MAX_SUBGOAL_DEPTH = 8
-_SUBGOAL_GOAL_SIMILARITY = 0.7
+# Two mechanical detectors, tripped before the _infer_ spend: a depth cap on the intention stack
+# (configurable per DefaultReasonStrategy, wired from agent.yaml's `max_subgoal_depth`), and
+# token-overlap against the ancestor sub-goals — a new sub-goal whose tokens are largely contained
+# in one still on the stack is re-stating it, not reducing. Overlap (|A&B| / min), not Jaccard: the
+# observed regress *elaborates* the same goal (piling on qualifiers), which grows the union and
+# sinks Jaccard while the core token set stays contained, so containment is what catches the reword.
+# Tripping pauses to await-input (ADR-0020) rather than terminating, so a deep-but-legitimate task
+# can be redirected, not killed. Both are coarse backstops; the real fix is making the common
+# map/filter/distinct shapes expressible without deliberation at all.
+_DEFAULT_MAX_SUBGOAL_DEPTH = 4
+_SUBGOAL_GOAL_OVERLAP = 0.7
 
 
-def _goal_token_similarity(a: str, b: str) -> float:
-    """Order-independent token Jaccard over two goal strings — 1.0 identical, 0.0 disjoint. Cheap
-    and deterministic (no model call): enough to catch a sub-goal that re-states an ancestor's goal
-    in reworded form, which is how the non-reducing recursion manifests."""
+def _goal_token_overlap(a: str, b: str) -> float:
+    """Token overlap coefficient over two goal strings — ``|A&B| / min(|A|, |B|)``, 1.0 when the
+    smaller token set is contained in the larger, 0.0 disjoint. Cheap and deterministic (no model
+    call). Overlap, not Jaccard: the non-reducing recursion re-states an ancestor's goal with extra
+    qualifiers, growing the union (which sinks Jaccard) while the core stays contained — containment
+    is the signal that survives the reword."""
     ta = set(re.findall(r"[a-z0-9]+", a.lower()))
     tb = set(re.findall(r"[a-z0-9]+", b.lower()))
     if not ta or not tb:
         return 0.0
-    return len(ta & tb) / len(ta | tb)
+    return len(ta & tb) / min(len(ta), len(tb))
 
 
 def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
@@ -884,6 +890,11 @@ class DefaultReasonStrategy:
     and mechanically resolving its params — makes zero model calls and stays same-cycle; only the
     escalations park the activity in RUNNING and resolve a later cycle. No phase blocks on a model
     call, so there is nothing to race or abandon (ADR-0021)."""
+
+    def __init__(self, max_subgoal_depth: int = _DEFAULT_MAX_SUBGOAL_DEPTH) -> None:
+        # Depth cap for the deliberative sub-goal breaker; wired from agent.yaml's
+        # `max_subgoal_depth` so a legitimately deep task can raise it past the default.
+        self._max_subgoal_depth = max_subgoal_depth
 
     async def reason(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
@@ -990,13 +1001,16 @@ class DefaultReasonStrategy:
     def _deliberation_would_loop(self, activity: Activity, goal: str) -> str | None:
         """Whether firing a deliberative sub-goal for ``goal`` now would be runaway recursion rather
         than progress — the reason string if so (for the log and the await-input prompt), else
-        ``None``. Two mechanical checks: the intention stack is already ``_MAX_SUBGOAL_DEPTH`` deep,
-        or ``goal`` closely repeats a sub-goal still suspended above it (not reducing)."""
+        ``None``. Two mechanical checks: the intention stack is already ``max_subgoal_depth`` deep,
+        or ``goal``'s tokens are largely contained in a sub-goal still suspended above it (an
+        elaborated re-statement, not a reduction)."""
         depth = len(activity.parent_frames)
-        if depth >= _MAX_SUBGOAL_DEPTH:
-            return f"sub-goal recursion reached the depth cap ({depth} >= {_MAX_SUBGOAL_DEPTH})"
+        if depth >= self._max_subgoal_depth:
+            return (
+                f"sub-goal recursion reached the depth cap ({depth} >= {self._max_subgoal_depth})"
+            )
         for ancestor in _ancestor_subgoal_goals(activity):
-            if _goal_token_similarity(goal, ancestor) >= _SUBGOAL_GOAL_SIMILARITY:
+            if _goal_token_overlap(goal, ancestor) >= _SUBGOAL_GOAL_OVERLAP:
                 return "sub-goal goal repeats an ancestor's without reducing to concrete actions"
         return None
 

@@ -37,7 +37,7 @@ from sora.memory import (
 )
 from sora.perception import Message
 from sora.strategies import (
-    _MAX_SUBGOAL_DEPTH,
+    _DEFAULT_MAX_SUBGOAL_DEPTH,
     DefaultActStrategy,
     DefaultObserveStrategy,
     DefaultReasonStrategy,
@@ -403,8 +403,8 @@ async def test_deliberative_subgoal_halts_at_the_depth_cap(tmp_path: Path) -> No
     tool = FakeTool("realestate")
     cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
     await registry.join(_ORIGIN)
-    # A stack already _MAX_SUBGOAL_DEPTH deep, every ancestor goal distinct so the *depth* cap (not
-    # the similarity check) is what trips. _no_llm_procedural would raise if _infer_ ever fired.
+    # A stack already _DEFAULT_MAX_SUBGOAL_DEPTH deep, ancestor goals all distinct so the *depth*
+    # cap (not the overlap check) is what trips. _no_llm_procedural would raise if _infer_ fired.
     frames: list[tuple[Plan, int]] = [
         (
             Plan(
@@ -414,7 +414,7 @@ async def test_deliberative_subgoal_halts_at_the_depth_cap(tmp_path: Path) -> No
             ),
             0,
         )
-        for i in range(_MAX_SUBGOAL_DEPTH)
+        for i in range(_DEFAULT_MAX_SUBGOAL_DEPTH)
     ]
     active = Plan(
         id="active",
@@ -466,6 +466,84 @@ async def test_deliberative_subgoal_halts_when_goal_repeats_an_ancestor(tmp_path
     assert result.step is None
     state = activity.state
     assert state is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, InputWait)
+    assert activity.pending_inference is None
+
+
+async def test_deliberative_subgoal_halts_on_reworded_elaboration(tmp_path: Path) -> None:
+    tool = FakeTool("realestate")
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    # The verbatim goals from the RentAFlat run that ran away: the sub-goal restates its parent with
+    # extra qualifiers ("exactly once", "relative to the current call count", ...). Token Jaccard is
+    # ~0.51 (below the 0.70 threshold — the old metric let this recurse); the overlap coefficient is
+    # ~0.72 because the parent's tokens stay contained, so the breaker now trips at the 2nd call.
+    # Depth is only 1 here (< the cap), so it is the overlap check, not the depth cap, that fires.
+    ancestor_goal = (
+        "Using the apartments from list_all_apartments, collect every distinct zip_code and call "
+        "insim:are/City.get_crime_rate for each distinct zip_code. Identify the set of zip codes "
+        "whose violent_crime value is between 5 and 10 inclusive. Respect the City API call limit."
+    )
+    reworded_goal = (
+        "From the list_all_apartments result, compute the set of distinct zip_code values, "
+        "then for each distinct zip_code call insim:are/City.get_crime_rate exactly once "
+        "(never repeating a zip_code so as to respect the City API call limit relative to "
+        "the current call count), and collect the violent_crime value for each zip_code."
+    )
+    parent = Plan(
+        id="p", goal="p", steps=[Step(next_action="subgoal", params={"goal": ancestor_goal})]
+    )
+    active = Plan(
+        id="active",
+        goal="active",
+        steps=[Step(next_action="subgoal", params={"goal": reworded_goal, "mode": "deliberative"})],
+    )
+    activity = Activity(id="a", goal="root", context={}, plan=active, parent_frames=[(parent, 0)])
+    working.activities["a"] = activity
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None
+    state = activity.state
+    assert state is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, InputWait)
+    assert activity.pending_inference is None  # no _infer_ was spent
+
+
+async def test_deliberative_subgoal_depth_cap_is_configurable(tmp_path: Path) -> None:
+    tool = FakeTool("realestate")
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    # Two frames deep with distinct goals: the default cap (4) would let this infer, but a strategy
+    # built with max_subgoal_depth=2 trips the depth cap instead. Proves the agent.yaml knob reaches
+    # the guard. _no_llm_procedural would raise if _infer_ fired.
+    frames: list[tuple[Plan, int]] = [
+        (
+            Plan(
+                id=f"f{i}",
+                goal=f"g{i}",
+                steps=[Step(next_action="subgoal", params={"goal": f"ancestor task number {i}"})],
+            ),
+            0,
+        )
+        for i in range(2)
+    ]
+    active = Plan(
+        id="active",
+        goal="active",
+        steps=[
+            Step(
+                next_action="subgoal",
+                params={"goal": "some wholly unrelated final errand", "mode": "deliberative"},
+            )
+        ],
+    )
+    activity = Activity(id="a", goal="root", context={}, plan=active, parent_frames=frames)
+    working.activities["a"] = activity
+
+    strategy = DefaultReasonStrategy(max_subgoal_depth=2)
+    result = await strategy.reason(activity, working, cycle, TickResult())
+    assert result.step is None
+    assert activity.state is ActivityState.BLOCKED
     assert isinstance(activity.blocked_on, InputWait)
     assert activity.pending_inference is None
 
