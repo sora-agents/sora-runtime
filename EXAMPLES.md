@@ -37,6 +37,13 @@ Activity(id="schedule-sync",
 Plan(
     id="plan-schedule-from-email",
     goal="schedule meeting and reply to requester",
+    context_guard=[
+        # Evaluated once at plan entry (Reason), before the body advances. A retrieval from
+        # long-term memory, bound by name — not a prior step's output — so it can't be a $from.
+        # Applicable only if the value is known; body params read it via {"$bind": ...}.
+        {"bind": "default_duration_min",
+         "query": {"memory": "semantic", "key": "default_meeting_minutes"}},
+    ],
     steps=[
         Step(next_action="invoke",
              params={"tool_id": "EmailClientApp", "operation_name": "list_emails",
@@ -44,14 +51,52 @@ Plan(
         Step(next_action="invoke",
              params={"tool_id": "CalendarApp", "operation_name": "get_calendar_events_from_to"}),
         Step(next_action="invoke",
-             params={"tool_id": "CalendarApp", "operation_name": "add_calendar_event"}),
+             params={"tool_id": "CalendarApp", "operation_name": "add_calendar_event",
+                     "duration_min": {"$bind": "default_duration_min"}}),  # from the guard, not history
         Step(next_action="invoke",
              params={"tool_id": "EmailClientApp", "operation_name": "reply_to_email"}),
     ]
 )
 ```
 
-Each step executes in a separate decision cycle. Concrete parameters (target date, attendees, email ID) are bound from the most recent percepts in working memory each cycle: the `list_emails` result feeds the `email_id` for `reply_to_email`, and the `get_calendar_events_from_to` result determines which Monday slot is free. `add_calendar_event` is a write operation, so the ARE MCP server immediately sends `resource_updated` for `CalendarApp/state` — S-ORA delivers this as a signal `Percept` (appended to `wm.signals`) on the next `observe()`, which the `ReflectStrategy` uses to confirm the operation succeeded before advancing the plan.
+Each step executes in a separate decision cycle. Two binding mechanisms feed the params, split by origin: the **context guard** binds `default_duration_min` once at plan entry from semantic memory (read in the body via `{"$bind": ...}`), while **`$from`** resolves per-step from prior results in the activity's history — the `list_emails` result feeds the `email_id` for `reply_to_email`, and the `get_calendar_events_from_to` result determines which Monday slot is free. `add_calendar_event` is a write operation, so the ARE MCP server immediately sends `resource_updated` for `CalendarApp/state` — S-ORA delivers this as a signal `Percept` (appended to `wm.signals`) on the next `observe()`, which the `ReflectStrategy` uses to confirm the operation succeeded before advancing the plan.
+
+If the request instead named *several* people to reply to — "reply to everyone who asked" — the plan would not hard-code a reply count; it would emit a **sub-goal** step (`next_action="subgoal"`), which Reason expands into one `reply_to_email` per requester. That mechanism, mechanical and deliberative, is illustrated on the multi-item RentAFlat scenario below.
+
+### Sub-goals: multi-item work (RentAFlat)
+
+A multi-item task — the RentAFlat scenario asks to *save each qualifying apartment*, *remove the ones already saved*, and *email each relative* — cannot hard-code its counts at synthesis time, because the counts are unknown until a search returns. A flat plan collapses each "for each" to a single call. Sub-goals fix this in two modes.
+
+**Mechanical sub-goal** — a uniform map over a collection that a prior step produced. Reason resolves the collection, applies any per-item selection, and fans out `len(collection)` copies of a fixed template, one invocation per cycle. The count is `len(data)`, never a model guess:
+
+```python
+# The plan body reaches this after a search step whose result is on the activity's history.
+Step(next_action="subgoal",
+     params={
+         "goal": "save each qualifying apartment",
+         "mode": "mechanical",
+         "in":   {"$from": "search_apartments", "path": "apartments"},  # collection from history ($from)
+         "as":   "apt",                                                 # element name (named-binding namespace)
+         "where": {"$decide": "violent-crime index in 5..10 and not already saved"},  # per-item selection
+         "template": Step(next_action="invoke",
+                          params={"tool_id": "RentAFlat", "operation_name": "save_apartment",
+                                  "apartment_id": {"$bind": "apt", "path": "id"}}),  # element, not $from
+     })
+```
+
+Reason resolves `in` mechanically, filters by `where` (a mechanical comparison is free; a `$decide` predicate escalates *per element*, the only model spend, evaluated against real data), then splices one `save_apartment` per surviving element into the active frame. Five qualifying apartments ⇒ exactly `save_apartment` ×5 — the count that the oracle event graph checks, bound to the data rather than frozen at authoring time.
+
+**Deliberative sub-goal** — an open, heterogeneous continuation that is *not* a uniform map (a mix of removals and tailored emails, whose shape depends on what actually got saved). Reason fires `_infer_` mid-plan (`kind="subgoal"`), so the model synthesizes the sub-plan while *seeing* the real post-save state; the sub-plan is pushed as a frame, and the parent resumes when it completes:
+
+```python
+Step(next_action="subgoal",
+     params={
+         "goal": "reconcile the saved shortlist against the family's requests and notify each relative",
+         "mode": "deliberative",
+     })
+```
+
+Reaching it moves the activity to `RUNNING` with `pending_inference` (`kind="subgoal"`), exactly like the initial plan infer — but at `step_index > 0`. When it resolves, `(plan, step_index)` is pushed onto `parent_frames` and the synthesized sub-plan becomes the active frame: e.g. `remove_saved_apartment` for the two duplicates it now sees, then a `send_email` to each of the two relatives with a summary tailored to what was saved. This is where a uniform mechanical fan-out would be wrong — the removals and emails are heterogeneous and their contents depend on run-time state — so the count and shape come from the model reading real data, not from a template. (A cached sub-plan for this sub-goal can also be retrieved first, a sub-plan library keyed by the sub-goal's goal.)
 
 ## Connecting via the ARE MCP server
 

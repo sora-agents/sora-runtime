@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 import uuid
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.activity import Activity, ActivityState
@@ -364,15 +365,20 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         catalog: dict[str, Manual] = kwargs["tools"]  # id -> Manual, the planning catalog
         observed = kwargs.get("observed")
         messages = kwargs.get("messages")  # snapshot of recent user messages at fire time
+        # kind defaults to "plan" (top-level planning); a mid-plan sub-goal passes kind="subgoal"
+        # (it lands the same way, on Activity.plan — see PendingInference) and a `goal` override so
+        # the sub-plan is inferred for the sub-goal's goal, not the activity's top-level one (ADR-
+        # 0022). pending_inference still lives on the real activity, so Observe resolves it by id.
+        kind = kwargs.get("kind", "plan")
+        goal = kwargs.get("goal")
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind="plan", requested_at=time.time()
+            id=inf_id, kind=kind, requested_at=time.time()
         )
         activity.state = ActivityState.RUNNING  # off-cycle, like _invoke_ — immediate, never blocks
-        log.info("reason: inferring a plan for %r (%d tools)", activity.goal, len(catalog))
-        _spawn_tracked(
-            self._tasks, self._call(cycle, activity, inf_id, catalog, observed, messages)
-        )
+        target = activity if goal is None else replace(activity, goal=goal)
+        log.info("reason: inferring a plan for %r (%d tools)", target.goal, len(catalog))
+        _spawn_tracked(self._tasks, self._call(cycle, target, inf_id, catalog, observed, messages))
 
     async def _call(
         self,

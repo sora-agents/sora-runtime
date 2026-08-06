@@ -430,16 +430,32 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
 
     @dataclass(frozen=True)
     class Step:
-        next_action: str      # an ExternalAction.name ("invoke", "send", "focus", ...) or the WAIT sentinel
+        next_action: str      # an ExternalAction.name ("invoke", "send", "focus", ...) or a WAIT / SUBGOAL sentinel
         params: dict          # the action's own argument bag, passed through opaquely and destructured by
         #                       the action — shape is per-action (send -> {to, content}, focus -> {tool_id}).
         #                       `invoke` mixes routing (tool_id/operation_name, under the TOOL_ID/OPERATION_NAME
         #                       keys) with the operation's args; Act's bind splits them. Build one via invoke_step().
+        #                       next_action="subgoal" is a sentinel (like WAIT): params = {"goal": <str>, "mode":
+        #                       "mechanical"|"deliberative"}. "mechanical" also carries {"in": <collection ref>,
+        #                       "as": <element name>, "template": <Step>} — Reason fans out len(collection) copies
+        #                       of the template, each with the element bound in the named-binding namespace
+        #                       (read via {"$bind": <as>}, optional "path"), no model call — count = len(collection),
+        #                       not a model guess. "deliberative" re-fires _infer_ (or retrieve) mid-plan and runs the
+        #                       resulting sub-plan as a pushed frame. Not an external action. ADR-0022.
 
     @dataclass(frozen=True)
     class Plan:                # multi-step, goal-indexed, reusable — the thing ProceduralMemory stores
         id: str                  # stable identity for storage/reuse
         goal: str                  # matched against future activities' goals — the retrieval key
+        context_guard: list[dict] = []  # AgentSpeak-style guard clauses, evaluated once at plan entry (Reason), before
+        #                            the body advances. Each is {"bind": <name>, "query": {...}} (a memory retrieval
+        #                            binding <name> in the named-binding namespace; applicability = query non-empty),
+        #                            a bare predicate dict (a pure check, binds nothing), or {"$decide": "..."} (an
+        #                            escalation, only for genuine judgment). Retrieval, not unification. A body
+        #                            param reads a bound value via {"$bind": <name>} (optional "path") — the
+        #                            named-binding sibling of $from; that is how a param binds from long-term
+        #                            memory, while $from stays history-only. Naming an unbound guard name -> plan inapplicable
+        #                            (a mechanical unbindable flag, not a hallucinated literal). ADR-0022.
         steps: list[Step]
 
     @dataclass(frozen=True)
@@ -458,7 +474,8 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
     class PendingInference:   # tracks one in-flight infer()/ground() — lives on Activity, mutually exclusive
         id: str                 #   with pending_operation (a cycle emits one action). Correlates to what
         kind: str               #   _infer_/_ground_ pushed into inference_sink. kind: "plan" (infer ->
-        requested_at: float     #   Activity.plan) or "ground" (ground -> the pending step's params). An
+        requested_at: float     #   Activity.plan), "subgoal" (a mid-plan infer -> a sub-plan PUSHED as a frame,
+        #                         parent kept — ADR-0022), or "ground" (ground -> the pending step's params). An
         #                         interrupt handler that re-routes the activity clears/replaces this; a result
         #                         whose id no longer matches the live pending_inference is discarded on resolve
         #                         (the stale-inference guard, mirroring pending_operation's late-ack). ADR-0021.
@@ -682,8 +699,14 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
     class Activity:
         id: str; goal: str; context: dict
         state: ActivityState = ActivityState.READY
-        plan: Plan | None = None    # once set, Reason can just advance it instead of (re)planning
-        step_index: int = 0
+        plan: Plan | None = None    # the ACTIVE frame's plan — once set, Reason advances it instead of (re)planning
+        step_index: int = 0         # the active frame's cursor
+        parent_frames: list[tuple[Plan, int]] = []  # suspended parent frames — the intention stack (ADR-0022);
+        #                             empty for a flat plan. A deliberative subgoal pushes (plan, step_index) here
+        #                             and makes the sub-plan the active (plan, step_index); when the active frame
+        #                             is exhausted and this is non-empty, Reason pops the top back into
+        #                             (plan, step_index) and the parent resumes. Generalizes plan/step_index into a
+        #                             stack rather than adding an intention type (ADR-0002).
         pending_operation: PendingOperation | None = None  # set while RUNNING on an invoke; cleared on resolve
         pending_inference: PendingInference | None = None  # set while RUNNING on an off-cycle infer()/ground();
         #                                                    mutually exclusive with pending_operation; resolved
@@ -1008,11 +1031,15 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         #   render_properties / render_signals / render_history / render_messages are reusable pieces.
         #   messages are recent user instructions (a follow-up after a stop, a mid-task correction),
         #   ambient context distinct from the goal string; history lets a replan skip a done step.
-        #   The response contract ({"steps":[...]}) stays fixed — customize the *prompt*, not the
-        #   parse. PLAN_SYSTEM_PROMPT also tells the model to emit a *reference* —
+        #   The response contract ({"context_guard":[...], "steps":[...]}) stays fixed — customize the
+        #   *prompt*, not the parse. PLAN_SYSTEM_PROMPT also tells the model to emit a *reference* —
         #   {"$from": "<op>", "path": "<dotted path>"} or {"$decide": "..."} — for a param whose
         #   value depends on an earlier step's result, never a made-up literal, and to reuse an
-        #   already-observed property/signal value directly instead of re-discovering it.
+        #   already-observed property/signal value directly instead of re-discovering it. It further
+        #   tells the model to author `context_guard` clauses for values that come from long-term
+        #   memory (bound by name, read via {"$bind": name}, not $from), and to emit a "subgoal" step — mechanical for a uniform
+        #   map over a collection, deliberative for an open continuation — instead of guessing an
+        #   iteration count inline (ADR-0022).
 
     class GroundPrompt(Protocol):   # builds ground()'s (system, user) prompt — grounding's counterpart
         def __call__(self, activity: Activity, operation_name: str, manual: Manual | None,
@@ -1031,7 +1058,9 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
             similarity, backend-dependent. Returns the backend's top-ranked match (query() orders
             most-relevant-first — see MemoryBackend), so this stays one line regardless of backend.
-            The cheap path: skips infer() entirely when it hits."""
+            The cheap path: skips infer() entirely when it hits. A deliberative sub-goal calls this
+            first too, keyed by the sub-goal's goal — a sub-plan library, not just a top-level one
+            (ADR-0022)."""
         async def infer(self, activity: Activity, tools: dict[str, Manual],
                         observed: PerceptSnapshot | None = None,
                         messages: list[Message] | None = None) -> Plan:
@@ -1041,8 +1070,11 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             catalog, passed in by the caller that holds the live registry (a memory module never
             reaches into the environment); `observed` is the caller's current properties/signals
             snapshot (omittable — defaults to none observed), so planning isn't blind to already-
-            known world state. Converts the model's JSON answer into Plan/Step (the anti-corruption
-            boundary); malformed output raises ValueError. No llm -> raises."""
+            known world state. Converts the model's JSON answer into Plan/Step — including the
+            plan's `context_guard` clauses and any `subgoal` steps — (the anti-corruption boundary);
+            malformed output raises ValueError. No llm -> raises. Also fired mid-plan for a
+            deliberative sub-goal (the sub-goal's goal as the planning target); the resulting
+            sub-plan is pushed as a frame, not a replacement for the parent (ADR-0022)."""
         async def ground(self, activity: Activity, operation_name: str, manual: Manual | None,
                          partial_params: dict, observed: PerceptSnapshot | None = None) -> dict:
             """The Reason-phase grounding *escalation*: decide an operation's concrete params from the
@@ -1153,8 +1185,14 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             *grounds* the step: a param whose value depends on an earlier result is a reference the
             default resolves against activity.history, escalating via the _ground_ internal action (same
             off-cycle shape) only when it can't be resolved mechanically — deciding a value is reasoning,
-            so it lives here (ADR-0017/0021). May additionally fill in invocation, short-circuiting Act —
-            this is where the historical 'tool hallucination' risk lives if it does."""
+            so it lives here (ADR-0017/0021). On plan entry it evaluates the plan's `context_guard` —
+            mechanical retrievals bind for free into the named-binding namespace, a `$decide` clause
+            escalates — and a body param naming an unbound guard value makes the plan inapplicable. A
+            `subgoal` step it either expands mechanically (fan out len(collection) template copies, one
+            per cycle) or dispatches as a mid-plan _infer_/retrieve that pushes the sub-plan as a frame;
+            an exhausted active frame with suspended parent_frames pops back to the parent (ADR-0022).
+            May additionally fill in invocation, short-circuiting Act — this is where the historical
+            'tool hallucination' risk lives if it does."""
 
     class ActStrategy(Protocol):
         async def bind(self, step: Step, manual: Manual | None, cycle: DecisionCycle,
@@ -1245,13 +1283,17 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             async for inf_id, res in cycle.inference_sink.drain():
                 # Off-cycle infer()/ground() result: 1:1 match to the live pending_inference, never a Percept.
                 # Discarded if the activity was re-routed (id no longer matches the live one) — the same
-                # stale-guard as a late ack. On match: plan -> Activity.plan; ground -> grounded_params for
-                # the pending step (consumed by Reason's next pass). Then RUNNING -> READY.
+                # stale-guard as a late ack. On match: plan -> Activity.plan; subgoal -> push a frame;
+                # ground -> grounded_params for the pending step (consumed by Reason's next pass). Then
+                # RUNNING -> READY.
                 activity = next((a for a in cycle.working.activities.values()
                                   if a.pending_inference and a.pending_inference.id == inf_id), None)
                 if activity is not None and activity.state is ActivityState.RUNNING:
                     if activity.pending_inference.kind == "plan":
                         activity.plan = res.value; activity.step_index = 0
+                    elif activity.pending_inference.kind == "subgoal":
+                        activity.parent_frames.append((activity.plan, activity.step_index))
+                        activity.plan = res.value; activity.step_index = 0   # sub-plan runs as a frame (ADR-0022)
                     else:
                         activity.grounded_params = res.value
                     activity.pending_inference = None
@@ -1291,7 +1333,8 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         there is nothing to race or abandon (ADR-0021, superseding ADR-0020's mid-flight abandonment).
         Reuse is currently always a miss — the default Reflect no longer stores completed plans (verbatim
         replay is unsound), so every activity infers until reusable procedures are distilled from
-        episodes; an exhausted plan yields no step. Wired in by bootstrap as sora.reason.default."""
+        episodes; an exhausted active frame pops back to a suspended parent_frame (ADR-0022) or, with
+        none, yields no step. Wired in by bootstrap as sora.reason.default."""
         async def reason(self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle,
                          result: TickResult) -> TickResult: ...
 

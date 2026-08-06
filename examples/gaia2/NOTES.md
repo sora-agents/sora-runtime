@@ -269,13 +269,15 @@ model; it scores end-to-end. What remains before a *trustworthy, comparable*
 full submission is the following ordered list. Steps 1 and 3–4 are the substance;
 the HF upload itself (step 5) is a thin, optional publication step.
 
-1. **`$foreach` / iteration primitive (code — the one real blocker).** S-ORA's
+1. **Iteration / sub-goals (code — the one real blocker).** S-ORA's
    plan execution can't loop today, so a multi-item task ("for each of these
    emails…") collapses each iterated step to a *single* tool call and
-   **under-counts against the oracle event graph**. Until ADR-0022's iteration
-   primitive lands, a full sweep would produce artificially low, non-comparable
-   scores — so the full run is deliberately held on this. This is the only
-   remaining engineering blocker; everything else below is running or reporting.
+   **under-counts against the oracle event graph**. Until ADR-0022's sub-goal
+   iteration lands (mechanical `len(collection)` fan-out for uniform maps;
+   re-`infer()` for open continuations), a full sweep would produce artificially
+   low, non-comparable scores — so the full run is deliberately held on this. This
+   is the only remaining engineering blocker; everything else below is running or
+   reporting.
 
 2. **Meter the smoke run (recommended, cheap).** Instrument the `--limit 3`
    batch run to record per-scenario **LLM calls + input/output tokens** for both
@@ -374,7 +376,7 @@ remaining work:
 
 **Runtime gaps** (the leverage — in `src/sora/`):
 
-- [ ] **`$foreach` / iteration primitive (ADR-0022) — correctness gap.** Plan
+- [x] **Iteration / sub-goals (ADR-0022) — correctness gap.** Plan
   execution can't loop, so multi-item tasks collapse each iterated step to one
   call and under-count against the oracle graph. Numbers are *low/wrong* until
   fixed. The one confirmed blocker.
@@ -382,10 +384,10 @@ remaining work:
   gap.** The `await-input` / `blocked` machinery only *enables* asking; if
   `DefaultReasonStrategy` never decides to ask/wait/replan, the Ambiguity /
   Adaptability / Time columns sit at baseline. Numbers are *valid but flat* until
-  tuned. Co-equal with `$foreach` — one makes the score correct, this makes it
-  interesting.
+  tuned. Co-equal with iteration/sub-goals — one makes the score correct, this
+  makes it interesting.
 - [ ] **Enumerate the gap list (n=1 today).** Only one capability's gate has run
-  ($foreach was what it found). Run the **five single-scenario gates** (one per
+  (iteration was what it found). Run the **five single-scenario gates** (one per
   capability, via `scripts/fetch_scenario.py` + `run_benchmark.py`) to surface the
   rest *before* committing the ~$3–4k full sweep.
 

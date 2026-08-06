@@ -36,7 +36,8 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0019](0019-blocked-state-machinery-and-percept-storage.md) | Blocked-state machinery: mechanical Observe-hosted suspend/resume + split percept storage | proposed | Decision cycle |
 | [0020](0020-hard-interrupt-and-await-input.md) | Hard-interrupt path: process-scheduling preemption, await-input, and a push-time InterruptPolicy seam | proposed | Decision cycle |
 | [0021](0021-llm-calls-as-async-internal-actions.md) | LLM calls as off-cycle, deferred-result internal actions (supersedes ADR-0020's mid-flight abandonment) | proposed | Decision cycle |
+| [0022](0022-plan-representation-context-guard-and-subgoals.md) | Plan representation: retrieval-binding context guard + sub-goals (loosely AgentSpeak) | proposed | Decision cycle |
 
 ## Planned
 
-None currently pending — 21 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
+None currently pending — 22 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).

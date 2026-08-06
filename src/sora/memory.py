@@ -257,6 +257,8 @@ PLAN_SYSTEM_PROMPT = (
     '  {"action": "focus", "tool_id": "<id>"}\n'
     '  {"action": "unfocus", "tool_id": "<id>"}\n'
     '  {"action": "send", "to": "<recipient>", "content": { ... }}\n'
+    '  {"action": "subgoal", "goal": "<what to achieve>", "mode": "mechanical" | "deliberative", '
+    "...}\n"
     'A step with no "action" is treated as "invoke". Use only tool ids and operation names that '
     "appear in the provided tool list. Invoking an operation does not require focusing the tool "
     "first — focus a tool only to perceive its observable properties and signals, and unfocus once "
@@ -286,6 +288,22 @@ PLAN_SYSTEM_PROMPT = (
     "not at plan time.\n"
     "Prefer a narrowing step first (e.g. search for the specific item) so a $from reference points "
     "at an unambiguous result.\n"
+    "When a step must be repeated once PER ITEM of a collection you only learn at run time (save "
+    "each of the found apartments, email each relative), do NOT hard-code one step per item and do "
+    "NOT collapse it to a single step — you do not know how many items there will be. Emit ONE "
+    '`subgoal` step instead. For a uniform repeat over a collection, use "mode": "mechanical" '
+    "with:\n"
+    '  "in": {"$from": "<operation_name>", "path": "<path to the array in that result>"}  the '
+    "collection to iterate,\n"
+    '  "as": "<name>"  a name for the current element, and\n'
+    '  "template": { <a single step> }  the step to run once per element, referencing the current '
+    'element as {"$bind": "<name>", "path": "<path into the element>"} wherever the element\'s '
+    "value is needed. The runtime fans this out to exactly one concrete step per element (the "
+    "count comes from the data, not from you), so narrow the collection first (search/filter) to "
+    "exactly the items that should be acted on. For repeated work that needs fresh per-item "
+    'judgement rather than a uniform template, use "mode": "deliberative" with just the "goal" — '
+    "the runtime plans "
+    "that sub-goal separately when it is reached.\n"
     "You are also given the agent's currently observed properties (persistent state, e.g. a "
     "thermostat reading) and recently observed signals (transient events, e.g. a notification) as "
     "already-known facts about the current world. Use them to decide WHAT to do — which branch to "
@@ -577,21 +595,24 @@ def default_plan_prompt(
     return PLAN_SYSTEM_PROMPT, user
 
 
+def step_from_raw(raw: dict[str, Any]) -> Step:
+    """Convert one raw plan-step dict (the model's JSON step shape) into a ``Step``. An ``invoke`` —
+    the default when no ``action`` is given — routes through ``invoke_step`` so the tool_id and
+    operation_name land under the routing keys; every other action (including a ``subgoal``, whose
+    nested ``template`` dict is preserved verbatim for the fan-out to instantiate later) keeps its
+    remaining keys as ``params``. Shared by ``_parse_plan_steps`` and the mechanical fan-out so both
+    read the same step grammar."""
+    action = raw.get("action", InvokeAction.name)
+    if action == InvokeAction.name:
+        return invoke_step(raw["tool_id"], raw["operation_name"], **raw.get("params", {}))
+    params = {k: v for k, v in raw.items() if k != "action"}
+    return Step(next_action=action, params=params)
+
+
 def _parse_plan_steps(text: str) -> list[Step]:
     try:
         data = json.loads(_strip_code_fences(text))
-        raw_steps = data["steps"]
-        steps: list[Step] = []
-        for raw in raw_steps:
-            action = raw.get("action", InvokeAction.name)
-            if action == InvokeAction.name:
-                steps.append(
-                    invoke_step(raw["tool_id"], raw["operation_name"], **raw.get("params", {}))
-                )
-            else:
-                params = {k: v for k, v in raw.items() if k != "action"}
-                steps.append(Step(next_action=action, params=params))
-        return steps
+        return [step_from_raw(raw) for raw in data["steps"]]
     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         raise ValueError(f"could not parse a plan from model output: {exc!r}\n---\n{text}") from exc
 

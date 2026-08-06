@@ -74,7 +74,7 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     # pending_operation's late-ack guard. `kind` picks the landing zone: "plan" (infer ->
     # Activity.plan) or "ground" (ground -> Activity.grounded_params). See ADR-0021.
     id: str
-    kind: str  # "plan" | "ground"
+    kind: str  # "plan" | "subgoal" | "ground" — "subgoal" lands like "plan" (into Activity.plan)
     requested_at: float
 
 
@@ -140,6 +140,11 @@ class Plan:  # multi-step, goal-indexed, reusable — the thing ProceduralMemory
 # to mypy). Registered ExternalActions are addressed by their own `.name` (e.g. InvokeAction.name);
 # WAIT is the one pseudo-action the cycle special-cases (it dispatches no ExternalAction).
 WAIT = "wait"
+
+# The Step.next_action sentinel for a sub-goal — the plan's sole recursion primitive (ADR-0022).
+# Reason handles it internally (mechanical fan-out or a mid-plan _infer_) and never dispatches it as
+# an ExternalAction, so it too is a pseudo-action like WAIT, not a registered action name.
+SUBGOAL = "subgoal"
 
 # Keys under which an `invoke` Step carries its routing in Step.params (and in InvokeAction's
 # kwargs), before Act binds them into an OperationInvocation.

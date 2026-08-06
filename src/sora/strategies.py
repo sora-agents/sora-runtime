@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, replace
@@ -23,10 +24,11 @@ from sora.action import (
 )
 from sora.activity import ActivityState
 from sora.llm import log_llm_discarded
-from sora.memory import PerceptSnapshot
+from sora.memory import PerceptSnapshot, step_from_raw
 from sora.perception import Percept
 from sora.types import (
     OPERATION_NAME,
+    SUBGOAL,
     TOOL_ID,
     USER_STOP,
     CompletedOperation,
@@ -369,6 +371,17 @@ class DefaultObserveStrategy:
                         activity.step_index = 0
                         activity.state = ActivityState.READY
                         log.info("observe: resolved inferred plan for activity %s", activity.id)
+                    elif kind == "subgoal":
+                        # A mid-plan sub-goal's synthesized sub-plan: push the parent frame (its
+                        # plan + the sub-goal's step_index) and enter the sub-plan, so Reason
+                        # advances it and pops back to the parent when it exhausts (ADR-0022). It
+                        # lands like a top-level plan, only onto a stacked frame not the activity.
+                        frame = (activity.plan, activity.step_index)
+                        activity.parent_frames.append(frame)  # type: ignore[arg-type]  # plan set mid-plan
+                        activity.plan = res.value  # type: ignore[assignment]  # kind=="subgoal" => Plan
+                        activity.step_index = 0
+                        activity.state = ActivityState.READY
+                        log.info("observe: entered sub-plan for activity %s", activity.id)
                     else:
                         activity.grounded_params = res.value  # type: ignore[assignment]  # => dict
                         activity.state = ActivityState.READY
@@ -394,10 +407,14 @@ class DefaultObserveStrategy:
         resumed = False
         for activity in wm.activities.values():
             if isinstance(activity.blocked_on, InputWait):
-                activity.state = ActivityState.READY
                 activity.blocked_on = None
-                activity.plan = None  # force a replan so the follow-up instruction is seen
-                activity.step_index = 0
+                # Route the plan-drop through the single funnel (clears plan/step_index, the whole
+                # intention stack, and any parked/in-flight deliberation) so Reason re-infers with
+                # the follow-up instruction and executed history visible — a bare resume would keep
+                # advancing the stale plan and never see it. blocked_on and the unconditional READY
+                # stay here: resume-specific, not plan invalidation (cf. the _resume_ action).
+                activity.reset_for_replan()
+                activity.state = ActivityState.READY
                 resumed = True
         return resumed
 
@@ -511,7 +528,13 @@ class DefaultReflectStrategy:
             activity.state = ActivityState.TERMINATED  # synchronous — Situate sees it this cycle
             log.info("reflect: activity %s failed; storing episode", activity.id)
             self._dispatch(self._record_failure(cycle, activity))
-        elif activity.plan is not None and activity.step_index >= len(activity.plan.steps):
+        elif (
+            activity.plan is not None
+            and activity.step_index >= len(activity.plan.steps)
+            and not activity.parent_frames
+        ):
+            # Complete only when the *top-level* plan is exhausted: a just-exhausted sub-plan still
+            # has parent frames to pop (Reason does that next cycle), so it isn't done (ADR-0022).
             activity.state = ActivityState.TERMINATED
             log.info("reflect: activity %s completed; storing episode", activity.id)
             self._dispatch(self._record_success(cycle, activity))
@@ -664,6 +687,10 @@ class DefaultSituateStrategy:
 _REF_FROM = "$from"
 _REF_PATH = "path"
 _REF_DECIDE = "$decide"
+# The named-binding read token (ADR-0022). Distinct from $from (which reads Activity.history): $bind
+# reads a named binding — here, the current loop element of a mechanical sub-goal, substituted
+# eagerly at fan-out time. (Binding names from a plan's context guard are a later addition.)
+_REF_BIND = "$bind"
 _MISSING = object()  # sentinel: no matching history entry (distinct from a genuine None result)
 
 
@@ -723,6 +750,113 @@ def resolve_references(
     return resolved, unresolved
 
 
+# --- sub-goals: mechanical fan-out over a collection (ADR-0022) -----------------------------------
+# A `subgoal` Step with mode="mechanical" is expanded in Reason into one concrete step per element
+# of a run-time collection — the count is len(data), not a model guess (the RentAFlat "for each"
+# fix). _SUBGOAL_RUNNING / _SUBGOAL_SPLICED are the two outcomes _subgoal reports to reason():
+# a deliberative sub-goal fired _infer_ and is RUNNING (return, no step); a mechanical one spliced
+# its expansion into the plan in place (re-loop and read the first expanded step); a deliberative
+# one the loop-guard refused pauses the activity to await input (no step) -> _SUBGOAL_HALTED.
+_SUBGOAL_RUNNING = object()
+_SUBGOAL_SPLICED = object()
+_SUBGOAL_HALTED = object()
+
+# Circuit breaker for runaway deliberative sub-goal recursion (ADR-0022's deferred overflow valve,
+# pulled forward). Synthesis-as-selection has no termination guarantee an *authored* plan library
+# has: the model can satisfy "plan for goal G" by emitting a plan whose body is another deliberative
+# sub-goal for ~G, deferring instead of reducing, and recurse until a budget (or credit) runs out.
+# Two mechanical detectors, tripped before the _infer_ spend: a depth cap on the intention stack,
+# and goal-similarity against the ancestor sub-goals — a new sub-goal that closely repeats one still
+# on the stack is not reducing. Tripping pauses to await-input (ADR-0020) rather than terminating,
+# so a deep-but-legitimate task can be redirected, not killed. Both are coarse backstops; the real
+# fix is making the common map/filter/distinct shapes expressible without deliberation at all.
+_MAX_SUBGOAL_DEPTH = 8
+_SUBGOAL_GOAL_SIMILARITY = 0.7
+
+
+def _goal_token_similarity(a: str, b: str) -> float:
+    """Order-independent token Jaccard over two goal strings — 1.0 identical, 0.0 disjoint. Cheap
+    and deterministic (no model call): enough to catch a sub-goal that re-states an ancestor's goal
+    in reworded form, which is how the non-reducing recursion manifests."""
+    ta = set(re.findall(r"[a-z0-9]+", a.lower()))
+    tb = set(re.findall(r"[a-z0-9]+", b.lower()))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
+    """The goals of the deliberative sub-goals still suspended on the intention stack — each parent
+    frame's ``(plan, idx)`` points back at the ``subgoal`` step that pushed it. The root
+    ``activity.goal`` is deliberately excluded: the first decomposition legitimately shares its
+    vocabulary, so comparing against it would false-trip a single, valid refinement."""
+    goals: list[str] = []
+    for plan, idx in activity.parent_frames:
+        if 0 <= idx < len(plan.steps):
+            goal = plan.steps[idx].params.get("goal")
+            if isinstance(goal, str):
+                goals.append(goal)
+    return goals
+
+
+def _resolve_collection(ref: Any, history: list[CompletedOperation]) -> list[Any] | None:
+    """The list a mechanical sub-goal iterates: a ``$from`` reference resolved against history (the
+    common case — the collection is a prior step's result), or a literal list. ``None`` when it
+    can't be resolved to a list (missing step, bad path, or a non-list value) — the caller treats
+    that as an empty fan-out, mirroring ``resolve_references``' never-raise contract."""
+    if not _is_reference(ref):
+        return ref if isinstance(ref, list) else None
+    result = _latest_result(history, ref.get(_REF_FROM))
+    if result is _MISSING:
+        return None
+    try:
+        value = _walk_path(result, ref.get(_REF_PATH, ""))
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, list) else None
+
+
+def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
+    """Replace every ``{"$bind": name, "path": ...}`` in a template with the value at that path of
+    the current loop ``element``, recursively. Only the named binding is substituted;
+    ``$from``/``$decide`` references (and a ``$bind`` for a different name) pass through untouched,
+    to be grounded later by the ordinary Reason path. A path that doesn't resolve substitutes a
+    ``None`` — which the Act required-param guard skips, not a literal ``$bind`` dict reaching the
+    tool."""
+    if isinstance(obj, dict):
+        if obj.get(_REF_BIND) == name:
+            try:
+                return _walk_path(element, obj.get(_REF_PATH, ""))
+            except (KeyError, IndexError, TypeError, ValueError):
+                log.warning("subgoal: $bind path %r did not resolve against %r", obj, element)
+                return None
+        return {k: _substitute_bindings(v, name, element) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_substitute_bindings(v, name, element) for v in obj]
+    return obj
+
+
+def _expand_mechanical(step: Step, history: list[CompletedOperation]) -> list[Step]:
+    """Fan a mechanical sub-goal out to one concrete ``Step`` per element of its ``in`` collection,
+    the element substituted for ``{"$bind": "<as>"}`` in its ``template``. Empty (or an unresolvable
+    collection) -> no steps, so the sub-goal simply vanishes from the plan."""
+    ref = step.params.get("in")
+    elements = _resolve_collection(ref, history)
+    if elements is None:
+        # Unresolvable (vs. a genuinely empty list): the `in` reference points at an op that never
+        # ran or a value that isn't a list — most likely a plan bug (no narrowing search ran first),
+        # so surface it rather than silently doing nothing, as an empty list legitimately would.
+        log.warning("subgoal: collection %r did not resolve to a list; expanding to nothing", ref)
+        return []
+    if not elements:
+        return []
+    loop_var = step.params.get("as", "")
+    template = step.params.get("template", {})
+    return [
+        step_from_raw(_substitute_bindings(template, loop_var, element)) for element in elements
+    ]
+
+
 class DefaultReasonStrategy:
     """The runtime's Reason default. Reason is the one phase with no *mechanical* default —
     planning inherently needs a model — so this is deterministic orchestration around the single
@@ -777,16 +911,94 @@ class DefaultReasonStrategy:
             )
             activity.plan = plan
             activity.step_index = 0
-        if activity.step_index >= len(activity.plan.steps):
-            return result  # exhausted -> no step this cycle
-        step = activity.plan.steps[activity.step_index]
-        grounded = await self._ground(step, activity, wm, cycle)
-        if grounded is None:
-            return result  # escalated via _ground_ (RUNNING); the step lands a later cycle
-        # Advance only once a concrete step is emitted, so a step awaiting its grounding escalation
-        # isn't skipped — step_index stays put across the RUNNING cycles until _ground_ resolves.
-        activity.step_index += 1
-        return replace(result, activity=activity, step=grounded)
+        while True:
+            plan = activity.plan
+            assert plan is not None  # set above, and by every branch that continues this loop
+            if activity.step_index >= len(plan.steps):
+                if activity.parent_frames:
+                    # Sub-plan exhausted: pop the frame and resume the parent at the step *after*
+                    # its sub-goal, then loop to read it (or pop again if that frame is exhausted).
+                    parent_plan, parent_index = activity.parent_frames.pop()
+                    activity.plan = parent_plan
+                    activity.step_index = parent_index + 1
+                    continue
+                return result  # top-level plan exhausted -> no step this cycle
+            step = plan.steps[activity.step_index]
+            if step.next_action == SUBGOAL:
+                outcome = await self._subgoal(step, activity, wm, cycle)
+                if outcome is _SUBGOAL_SPLICED:
+                    continue  # mechanical: spliced the expansion in place -> read the first step
+                return result  # deliberative fired _infer_ (RUNNING), or the guard halted (BLOCKED)
+            grounded = await self._ground(step, activity, wm, cycle)
+            if grounded is None:
+                return result  # escalated via _ground_ (RUNNING); the step lands a later cycle
+            # Advance only once a concrete step is emitted, so a step awaiting its grounding
+            # escalation isn't skipped — step_index stays put across RUNNING cycles until it lands.
+            activity.step_index += 1
+            return replace(result, activity=activity, step=grounded)
+
+    async def _subgoal(
+        self, step: Step, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle
+    ) -> object:
+        """Handle a ``subgoal`` step (ADR-0022). **Deliberative** -> fire ``_infer_`` for the
+        sub-goal's own goal (activity goes RUNNING; the sub-plan lands a later cycle and Observe
+        enters it on a pushed frame), reporting ``_SUBGOAL_RUNNING``. **Mechanical** -> fan the
+        sub-goal out over its collection and splice the expansion into the plan *in place* — a
+        per-run copy via ``replace``, so the stored skeleton keeps its ``subgoal`` step — leaving
+        ``step_index`` on the first expanded step and reporting ``_SUBGOAL_SPLICED`` so ``reason``
+        re-reads it. An empty/unresolvable collection expands to nothing (the sub-goal vanishes)."""
+        mode = step.params.get("mode", "deliberative")
+        if mode == "deliberative":
+            goal = step.params["goal"]
+            halt = self._deliberation_would_loop(activity, goal)
+            if halt is not None:
+                # Refuse to recurse: pause to await the user's guidance instead of spending another
+                # (and another...) _infer_ on a sub-goal that isn't reducing. Set BLOCKED directly,
+                # as the interrupt handler does for its InputWait — no _suspend_ (that's for a
+                # manual-declared SignalWait), and no model call for the prompt (kept mechanical).
+                log.warning(
+                    "reason: halting sub-goal recursion for activity %s: %s", activity.id, halt
+                )
+                activity.state = ActivityState.BLOCKED
+                activity.blocked_on = InputWait(
+                    prompt=f"Stuck on {goal!r}: {halt}. How should I proceed?"
+                )
+                return _SUBGOAL_HALTED
+            catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
+            observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+            infer = cycle.actions.internal(InferAction.name)
+            await infer.execute(
+                cycle,
+                activity_id=activity.id,
+                tools=catalog,
+                observed=observed,
+                messages=list(wm.messages),
+                kind="subgoal",
+                goal=goal,
+            )
+            return _SUBGOAL_RUNNING
+        plan = activity.plan
+        assert plan is not None  # reason() only dispatches a step off a set plan
+        i = activity.step_index
+        expanded = _expand_mechanical(step, activity.history)
+        activity.plan = replace(plan, steps=plan.steps[:i] + expanded + plan.steps[i + 1 :])
+        log.info(
+            "reason: sub-goal %r fanned out to %d step(s)", step.params.get("goal"), len(expanded)
+        )
+        return _SUBGOAL_SPLICED
+
+    def _deliberation_would_loop(self, activity: Activity, goal: str) -> str | None:
+        """Whether firing a deliberative sub-goal for ``goal`` now would be runaway recursion rather
+        than progress — the reason string if so (for the log and the await-input prompt), else
+        ``None``. Two mechanical checks: the intention stack is already ``_MAX_SUBGOAL_DEPTH`` deep,
+        or ``goal`` closely repeats a sub-goal still suspended above it (not reducing)."""
+        depth = len(activity.parent_frames)
+        if depth >= _MAX_SUBGOAL_DEPTH:
+            return f"sub-goal recursion reached the depth cap ({depth} >= {_MAX_SUBGOAL_DEPTH})"
+        for ancestor in _ancestor_subgoal_goals(activity):
+            if _goal_token_similarity(goal, ancestor) >= _SUBGOAL_GOAL_SIMILARITY:
+                return "sub-goal goal repeats an ancestor's without reducing to concrete actions"
+        return None
 
     async def _ground(
         self,
