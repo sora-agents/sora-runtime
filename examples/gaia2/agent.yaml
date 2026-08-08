@@ -36,6 +36,10 @@ agent:
     # Hold this constant between the S-ORA run and the ReAct baseline for a fair same-model
     # comparison; the driver's --model flag can override it per run.
     model: claude-opus-4-8
+    # A multi-step plan behind adaptive thinking overruns the 8192 default (thinking can take ~95%
+    # of the budget, truncating the plan JSON mid-serialization). The client streams the completion,
+    # so a large cap doesn't trip the SDK's non-streaming 10-minute guard.
+    max_tokens: 32000
     instrument: true
   transport:
     # ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies via

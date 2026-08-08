@@ -54,13 +54,18 @@ class AnthropicLLMClient:
         self._instrument = instrument
 
     async def complete(self, *, system: str, prompt: str) -> str:
-        message = await self._client.messages.create(
+        # Stream rather than a single create(): the SDK refuses a non-streaming call whose
+        # worst-case duration (estimated from max_tokens) could exceed 10 minutes, which a large
+        # plan-inference budget behind adaptive thinking crosses. Streaming lifts that ceiling;
+        # get_final_message() consumes the whole stream and returns the same assembled Message.
+        async with self._client.messages.stream(
             model=self._model,
             max_tokens=self._max_tokens,
             system=system,
             thinking={"type": "adaptive"},
             messages=[{"role": "user", "content": prompt}],
-        )
+        ) as stream:
+            message = await stream.get_final_message()
         # Join the answer's text blocks (skip thinking blocks); getattr keeps this robust to the
         # content-block union under strict typing without depending on the SDK's block class names.
         parts: list[str] = []
