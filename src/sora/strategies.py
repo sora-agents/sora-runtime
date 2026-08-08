@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from sora.action import (
     CollectAction,
     CreateActivityAction,
+    FilterAction,
     FilterPerceptionsAction,
     GroundAction,
     InferAction,
@@ -22,6 +23,7 @@ from sora.action import (
     SendAction,
     SuspendAction,
     UnloadManualAction,
+    pluck,
 )
 from sora.activity import ActivityState
 from sora.llm import log_llm_discarded
@@ -861,25 +863,46 @@ def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
 
 
 def _as_collection(value: Any) -> list[Any] | None:
-    """Coerce a resolved value to the list a fan-out/pipeline iterates. A list is itself; an
-    ``{id -> record}`` **mapping** (ARE's ``list_all_apartments`` / ``search_apartments`` /
-    ``list_saved_apartments``, the common id-keyed shape) iterates its *values* — the id is carried
-    inside each record, so values-iteration is lossless. To qualify, a non-empty dict must have
-    *every* value a mapping; a dict that doesn't (a single record's fields, a ``{"results": [...]}``
-    envelope, an ``{id -> scalar}`` map) is NOT mechanically a collection -> ``None``, so the caller
-    warns rather than silently fanning out over field values. An empty dict is an empty collection;
-    a scalar is ``None``. (Richer shape recovery — envelope unwrap, model escalation — deferred.)"""
+    """Coerce a resolved value to the list a fan-out/pipeline iterates, in deterministic tiers so a
+    plan author never has to hand-shape a tool's return:
+
+    1. **list** -> itself.
+    2. **single-key envelope** (a lone key wrapping the payload, e.g. ``{"apartments": {id -> r}}``
+       or ``{"results": [...]}``): unwrap and recurse into the one value, *iff* that value is itself
+       a collection. A single-element ``{id -> record}`` map whose record has *any* scalar field
+       falls through here (the recursion refuses a mixed/scalar record) and tier 3 catches it. The
+       residual ambiguity is any single-element map ``{"a1": {record}}`` whose lone record's fields
+       are *all* mapping-valued: that record is itself indistinguishable from an ``{id -> record}``
+       map (a one-field record ``{"a1": {"photos": [...]}}`` and a many-field one
+       ``{"a1": {"loc": {...}, "meta": {...}}}`` both recurse to a collection), so it is unwrapped
+       into the record's field-*values* rather than kept as one record — a genuine
+       misclassification for such a shape. This is **undecidable** at this layer
+       (``{K: {k1: {...}, k2: {...}}}`` is structurally identical whether ``K`` is an id or a
+       wrapper name); the unwrap is chosen because ARE's records always carry scalar fields (so they
+       never reach it) and its real envelopes are plural ``{id -> record}`` maps that must unwrap.
+       The principled fix for a tool that returns all-mapping-field records is the deferred
+       model-escalated extraction below, not another shape heuristic — every mechanical tie-break
+       here only shifts *which* shape misfires.
+    3. **``{id -> record}`` mapping** (ARE's ``list_all_apartments`` / ``search_apartments`` /
+       ``list_saved_apartments``): every value a mapping -> iterate the *values*; the id is carried
+       inside each record, so values-iteration is lossless.
+    4. anything else -> ``None``: a single record's fields, an ``{id -> scalar}`` map, a scalar. NOT
+       mechanically a collection, so the caller logs the shape rather than fanning out over garbage.
+
+    An empty dict is an empty collection (``[]``), not "unresolvable". (Model-escalated extraction
+    for shapes these tiers still refuse is deferred.)"""
     if isinstance(value, list):
         return value
     if isinstance(value, dict):
         if not value:
             return []  # an empty {id -> record} map is an empty collection, not "unresolvable"
+        if len(value) == 1:
+            inner = _as_collection(next(iter(value.values())))
+            if inner is not None:
+                return inner  # single-key envelope: the lone value is the real collection
         if all(isinstance(v, dict) for v in value.values()):
             return list(value.values())
-        return (
-            None  # not an id->record map: refuse to guess (single record / envelope / id->scalar)
-        )
-    return None
+    return None  # single record / envelope-of-scalars / id->scalar / scalar: refuse to guess
 
 
 def _resolve_collection(
@@ -890,18 +913,91 @@ def _resolve_collection(
     output), or a literal list. A resolved mapping iterates its values (see ``_as_collection``).
     ``None`` when it can't be resolved to a collection (missing source, bad path, a non-collection
     value, or a soft ``$decide``) — the caller treats that as an empty fan-out/pipeline, mirroring
-    ``resolve_references``' never-raise contract."""
-    if not _is_reference(ref):
-        return _as_collection(ref)
-    if _REF_DECIDE in ref:
-        return None  # a $decide collection is soft — not mechanically resolvable
-    try:
-        value = _resolve_ref(ref, history, bindings or {})
-    except (KeyError, IndexError, TypeError, ValueError):
-        return None
-    if value is _MISSING:
-        return None
-    return _as_collection(value)
+    ``resolve_references``' never-raise contract. This is the single site that logs *why* a
+    resolution came up empty (unresolved reference vs. a resolved value of the wrong shape), so
+    callers need not re-warn — an unresolved reference is likely a plan bug (nothing narrowed the
+    collection first), a wrong shape is a tool whose return these tiers don't recognize."""
+    if _is_reference(ref):
+        if _REF_DECIDE in ref:
+            return None  # a $decide collection is soft — resolved off-cycle, not a failure to log
+        try:
+            value: Any = _resolve_ref(ref, history, bindings or {})
+        except (KeyError, IndexError, TypeError, ValueError):
+            value = _MISSING
+        if value is _MISSING:
+            log.warning("resolve: reference %r did not resolve against history/bindings", ref)
+            return None
+    else:
+        value = ref  # a literal (already a list, mapping, or a plan author's mistake)
+    collection = _as_collection(value)
+    if collection is None:
+        log.warning(
+            "resolve: %r is a %s, not a list or {id -> record} map the runtime can iterate",
+            ref,
+            type(value).__name__,
+        )
+    return collection
+
+
+def _enrich_with_params(result: Any, params: dict[str, Any]) -> Any:
+    """``collect`` carries each fanned-out call's input params alongside its result, so a downstream
+    ``filter``/membership can correlate a result back to the input that produced it — a crime rate
+    back to its ``zip_code`` when ``get_crime_rate`` doesn't echo the zip. A dict result is enriched
+    in place, the params filling in only the keys the result doesn't already carry (the
+    authoritative return wins on collision); a non-dict result is wrapped as
+    ``{**params, "result": <value>}`` so the key stays reachable. Empty params (or none) -> the
+    result untouched."""
+    if not params:
+        return result
+    if isinstance(result, dict):
+        return {**params, **result}
+    return {**params, "result": result}
+
+
+def _resolve_membership_predicate(
+    params: dict[str, Any], history: list[CompletedOperation], bindings: dict[str, Any]
+) -> dict[str, Any]:
+    """For a ``filter`` whose predicate tests membership (``in``/``not_in``) against *another
+    collection* named by a reference, resolve that reference to a concrete list of comparable keys
+    *before* the op runs — so ``_matches`` stays a pure literal comparison and the cross-collection
+    resolution lives here in Reason, next to the ``in``-collection resolution (ADR-0023 extension).
+    The referenced collection is projected by ``value_path`` (default: the elements themselves, for
+    a reference that already resolves to a list of scalars). A literal ``value``, or a non-
+    membership op, passes through untouched; an unresolvable reference becomes an empty set — ``in``
+    matches nothing, ``not_in`` keeps everything (the never-raise contract). A resolved-but-
+    unusable projection (a ``value_path`` that plucks to ``None`` or a non-scalar for every member)
+    is the silent-failure trap the warning below guards: it looks like an empty set and fails open
+    the same way, so it is surfaced rather than left to mis-filter invisibly."""
+    where = params.get("where")
+    if not (isinstance(where, dict) and where.get("op") in ("in", "not_in")):
+        return params
+    value = where.get("value")
+    if not _is_reference(value):
+        return params  # a literal membership list — nothing to resolve
+    members = _resolve_collection(value, history, bindings) or []
+    projected = [pluck(m, where.get("value_path", "")) for m in members]
+    # A membership set is compared element-by-element against a scalar key, so only scalar members
+    # can ever match. A non-scalar (dict/list) or ``None`` projection is dead weight: `in` silently
+    # drops it, `not_in` silently keeps it. The usual cause is a `value_path` that's missing (the
+    # referenced collection is records, not bare keys), wrong (names a field the records don't
+    # carry -> None), or points at a nested object — surface any such member rather than let the
+    # filter fail open invisibly (an all-None projection is exactly the duplicate-action trap:
+    # "not already saved" keeps everything). An empty set (nothing resolved) stays silent here —
+    # _resolve_collection already logged *why*, and a genuinely empty exclusion list is benign.
+    if members and any(p is None or isinstance(p, (dict, list)) for p in projected):
+        bad = sum(1 for p in projected if p is None or isinstance(p, (dict, list)))
+        log.warning(
+            "filter: membership set for %r has %d/%d member(s) that projected to a non-scalar or "
+            "None key (value_path=%r); those can never match — `in` drops them, `not_in` keeps "
+            "them — check `value_path`",
+            where.get("path"),
+            bad,
+            len(projected),
+            where.get("value_path"),
+        )
+    resolved_where = {k: v for k, v in where.items() if k != "value_path"}
+    resolved_where["value"] = projected
+    return {**params, "where": resolved_where}
 
 
 def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
@@ -931,14 +1027,9 @@ def _expand_mechanical(
     the element substituted for ``{"$bind": "<as>"}`` in its ``template``. The ``in`` collection may
     be a ``$from`` (history) or a ``$bind`` (a data-op output binding, e.g. a filtered shortlist).
     Empty (or an unresolvable collection) -> no steps, so the sub-goal simply vanishes."""
-    ref = step.params.get("in")
-    elements = _resolve_collection(ref, history, bindings)
-    if elements is None:
-        # Unresolvable (vs. a genuinely empty list): the `in` reference points at an op that never
-        # ran or a value that isn't a list — most likely a plan bug (no narrowing search ran first),
-        # so surface it rather than silently doing nothing, as an empty list legitimately would.
-        log.warning("subgoal: collection %r did not resolve to a list; expanding to nothing", ref)
-        return []
+    # None (unresolvable — likely a plan bug, no narrowing search ran first) and [] (a genuinely
+    # empty collection) both fan out to nothing; _resolve_collection has already logged why on None.
+    elements = _resolve_collection(step.params.get("in"), history, bindings)
     if not elements:
         return []
     loop_var = step.params.get("as", "")
@@ -1049,30 +1140,31 @@ class DefaultReasonStrategy:
         """Execute one data-op step (ADR-0023) and report whether it *parked* the activity on an
         off-cycle model call (only a ``$decide`` filter does). Resolves the op's input collection
         here — a ``collect`` gathers the per-element results of a fanned-out operation straight from
-        ``history`` (its ``from`` is an operation name, not an ``in`` reference); every other op
-        resolves ``in`` from history/bindings, an unresolvable input becoming an empty collection
+        ``history`` (its ``from`` is an operation name, not an ``in`` reference), each result
+        carrying its invoking params so a downstream op can correlate it to its input; every other
+        op resolves ``in`` from history/bindings, an unresolvable input becoming an empty collection
         (the fan-out's never-raise contract). Dispatches from the data-op bucket; the op writes its
         result into ``activity.bindings[out]`` (or, for the escalation, Observe does so later)."""
         if step.next_action == CollectAction.name:
             op_name = step.params.get("from")
             collection: list[Any] = [
-                completed.ack.result
+                _enrich_with_params(completed.ack.result, completed.invocation.params)
                 for completed in activity.history
                 if completed.invocation.operation_name == op_name
             ]
             passthrough = {k: v for k, v in step.params.items() if k != "from"}
         else:
+            # An unresolvable input becomes an empty collection (never-raise); _resolve_collection
+            # has already logged *why* on None, so the op simply transforms nothing this run.
             resolved = _resolve_collection(
                 step.params.get("in"), activity.history, activity.bindings
             )
-            if resolved is None:
-                log.warning(
-                    "data-op %s: input %r did not resolve to a list; using an empty collection",
-                    step.next_action,
-                    step.params.get("in"),
-                )
             collection = resolved if resolved is not None else []
             passthrough = {k: v for k, v in step.params.items() if k != "in"}
+            if step.next_action == FilterAction.name:
+                passthrough = _resolve_membership_predicate(
+                    passthrough, activity.history, activity.bindings
+                )
         op = cycle.actions.data_op(step.next_action)
         await op.execute(cycle, activity_id=activity.id, collection=collection, **passthrough)
         return activity.pending_inference is not None

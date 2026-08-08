@@ -483,9 +483,12 @@ class GroundAction:  # predefined internal action: _ground_ — the async param-
 _REF_DECIDE = "$decide"  # mirrors sora.strategies / ADR-0017's soft reference token
 
 
-def _pluck(element: Any, path: str | None) -> Any:
+def pluck(element: Any, path: str | None) -> Any:
     """The value at ``path`` of ``element`` (the shared dotted-path grammar), or ``None`` on a bad
-    path — a missing key is a non-match/absent value for a data-op, never a crash."""
+    path — a missing key is a non-match/absent value for a data-op, never a crash. Public because
+    it is the one path-projection helper shared across the data-op layer: mechanical ``filter``
+    evaluation (``_matches`` here) and cross-collection membership projection (Reason, in
+    ``strategies``) must read a field the same way."""
     if not path:
         return element
     try:
@@ -501,11 +504,15 @@ def _dedup_key(value: Any) -> str:
 
 def _matches(element: Any, where: Any) -> bool:
     """Evaluate a mechanical ``filter`` predicate against one element: ``{"path", "op", "value"}``
-    with op in eq/ne/lt/le/gt/ge/between/in. A ``$decide`` predicate never reaches here (Filter-
-    Action escalates it). No predicate keeps everything."""
+    with op in eq/ne/lt/le/gt/ge/between/in/not_in. ``in``/``not_in`` test membership of the
+    element's ``path`` value in ``value`` (a literal list, or — resolved upstream in Reason — the
+    projected keys of another collection named by a reference). A ``$decide`` predicate never gets
+    here (FilterAction escalates it). No predicate keeps everything. A membership set that isn't a
+    list is treated as empty: ``in`` matches nothing, ``not_in`` keeps everything (fails open, so a
+    malformed exclusion set never silently drops the whole collection)."""
     if not isinstance(where, dict):
         return True
-    actual = _pluck(element, where.get("path", ""))
+    actual = pluck(element, where.get("path", ""))
     op = where.get("op", "eq")
     value = where.get("value")
     if op == "eq":
@@ -514,6 +521,8 @@ def _matches(element: Any, where: Any) -> bool:
         return bool(actual != value)
     if op == "in":
         return isinstance(value, (list, tuple)) and actual in value
+    if op == "not_in":
+        return not (isinstance(value, (list, tuple)) and actual in value)
     if op == "between":
         if not (isinstance(value, (list, tuple)) and len(value) == 2):
             return False
@@ -596,7 +605,7 @@ class DistinctAction:  # predefined data-op: _distinct_
         seen: set[str] = set()
         result: list[Any] = []
         for element in kwargs["collection"]:
-            signature = _dedup_key(_pluck(element, by) if by else element)
+            signature = _dedup_key(pluck(element, by) if by else element)
             if signature not in seen:
                 seen.add(signature)
                 result.append(element)
@@ -612,7 +621,7 @@ class SortAction:  # predefined data-op: _sort_
         collection = list(kwargs["collection"])
 
         def key(element: Any) -> tuple[bool, Any]:
-            value = _pluck(element, by) if by else element
+            value = pluck(element, by) if by else element
             return (value is None, value)  # None sorts to one end without comparing None to a value
 
         try:
@@ -655,7 +664,7 @@ class ReduceAction:  # predefined data-op: _reduce_
             activity.bindings[out] = len(collection)
             return
         by = kwargs.get("by")
-        values = [(_pluck(e, by) if by else e) for e in collection]
+        values = [(pluck(e, by) if by else e) for e in collection]
         nums = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if op == "sum":
             activity.bindings[out] = sum(nums) if nums else None  # None (not 0) on empty, like mean

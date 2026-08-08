@@ -8,12 +8,16 @@
 [ADR-0022](0022-plan-representation-context-guard-and-subgoals.md) gave a plan its recursion
 primitive: a **mechanical sub-goal** maps a fixed template over a run-time collection, fanning out
 `len(collection)` invocations so the count comes from the data, not a model guess. That closed the
-"save *each* apartment" under-count. But it can only *map* a collection it is handed — it cannot
-**narrow or reshape** one first. The RentAFlat goalpost asks to "save each *qualifying* apartment";
-the `where` selection [EXAMPLES.md](../../../EXAMPLES.md) showed inline on the mechanical sub-goal
-was **documented but never wired** — `_expand_mechanical` fanned the collection out unfiltered. The
-broader failing shape (Gaia2, 2026-08): "distinct zips → `get_crime_rate` each → keep the ones
-scoring 5–10" — dedupe, map-invoke, gather the results, filter by a threshold, take.
+"act once *per element*" under-count. But it can only *map* a collection as handed — it cannot
+**narrow or reshape** one first. Goals rarely hand a plan exactly the collection to act on; they ask
+it to act on a *derived* one — the elements that *qualify* (filter), the *distinct* keys, the
+*top few* by some order (sort + take), or the values *gathered* from a prior per-element fan-out and
+then filtered by a computed threshold. The inline `where` selection
+[EXAMPLES.md](../../../EXAMPLES.md) once sketched on the mechanical sub-goal was **documented but
+never wired** (`_expand_mechanical` fanned the collection out unfiltered), and even a wired `where`
+would still not cover dedupe, sort, gather, or aggregate. The general failing shape is a short
+pipeline over a run-time collection: dedupe → map-invoke → gather results → filter by a threshold →
+take.
 
 So the question: how should a synthesized plan express structured-value data processing — filter,
 dedupe, sort, limit, gather, aggregate — over collections discovered at run time, **without**
@@ -92,9 +96,9 @@ memory module) and are cleared on replan, since they are coupled to the plan tha
 
 ### Positive Consequences
 
-* RentAFlat's "save each *qualifying* apartment" and the "distinct → crime-rate each → keep 5–10"
-  pipeline become expressible end-to-end, deterministically where possible and with a single model
-  call only where a predicate genuinely needs judgment.
+* The "act on each *qualifying* element" and "map a tool over distinct keys, gather, then keep
+  those past a threshold" shapes become expressible end-to-end, deterministically where possible and
+  with a single model call only where a predicate genuinely needs judgment.
 * The pipeline is legible as ordinary plan steps; procedural reuse keeps a reusable skeleton (the
   references, not this run's values).
 * Vocabulary is open: a domain that needs `group_by`/`join` adds them via `register_data_op` with no
@@ -133,6 +137,75 @@ memory module) and are cleared on replan, since they are coupled to the plan tha
   calls, Protocol extension) and adds no control-flow layer or memory module.
 * Bad, because it is more surface than (b) — six classes and a registry bucket — and a longer plan
   grammar for the planner to use well.
+
+## Extension (2026-08-07): deterministic collection-shape tiers and a single diagnostic site
+
+The first end-to-end runs surfaced a gap the core decision left implicit: **what counts as "the
+collection"** when a `$from`/`$bind` reference resolves to something that isn't already a bare list.
+ARE's collection operations (`list_all_apartments` / `search_apartments` / `list_saved_apartments`)
+return an `{id -> record}` mapping, and some tools wrap that payload under a lone key
+(`{"apartments": {…}}`) or an envelope (`{"results": […]}`). The tool's own schema often synthesizes
+to an opaque `{"type": "object"}`, so plan-time grounding guidance is blind to the shape — the
+runtime must coerce **mechanically**, and a wrong guess silently fans a sub-goal out over a record's
+*fields* (garbage) instead of its elements.
+
+`_as_collection` therefore coerces in **deterministic tiers**, and it is the *only* place that
+decides collection-hood (both the mechanical sub-goal and every data-op resolve through it):
+
+1. a **list** is itself;
+2. a **single-key envelope** (`{"apartments": {id -> rec}}`, `{"results": […]}`) is unwrapped and
+   recursed into, *iff* the lone value is itself a collection — a single-element `{id -> record}`
+   map whose record has *any* scalar field makes the recursion refuse, so it correctly falls
+   through to tier 3. The residual ambiguity is any single-element map `{"a1": {record}}` whose lone
+   record's fields are *all* mapping-valued — a one-field record (`{"a1": {"photos": […]}}`) **or** a
+   many-field one (`{"a1": {"loc": {…}, "meta": {…}}}`): both recurse to a collection, so the record
+   is unwrapped into its field-*values* instead of kept as one record. This is **undecidable** at
+   this layer — `{K: {k1: {…}, k2: {…}}}` is structurally identical whether `K` is an id or a wrapper
+   name — so no mechanical tie-break resolves it; any rule only shifts *which* shape misfires. The
+   unwrap is chosen because ARE's records always carry scalar fields (so they never reach it) and its
+   real envelopes are plural `{id -> record}` maps that must unwrap; the principled resolution for a
+   tool returning all-mapping-field records is the deferred model-escalated extraction, not a further
+   shape heuristic;
+3. an **`{id -> record}` mapping** (every value a mapping) iterates its *values* — lossless, since
+   each record carries its own id;
+4. anything else (a single record's fields, an `{id -> scalar}` map, a scalar) is **refused**
+   (`None`) rather than guessed at.
+
+An empty dict is an empty collection (`[]`), not a failure. Richer recovery for shapes tier 4 still
+refuses — model-escalated *extraction* of a collection from an unrecognized envelope — is deferred
+(the same escalation seam the `$decide` filter already uses).
+
+Observability is consolidated into a **single diagnostic site**, `_resolve_collection`: it is the
+one place that logs *why* a resolution came up empty, distinguishing an **unresolved reference** (the
+source op never ran / a bad path — usually a plan bug: nothing narrowed the collection first) from a
+**resolved value of a shape the tiers refuse** (naming the offending type). A genuinely empty
+collection stays silent (benign). Callers (`_expand_mechanical`, the data-op dispatch) no longer
+re-warn — they just treat `None`/`[]` alike as "fan out over nothing", per the never-raise contract.
+This keeps the diagnostic where the *reason* is known, instead of a generic "expanded to nothing" at
+each call site.
+
+**Cross-collection membership (reference-valued `in`/`not_in`).** A predicate often needs to test an
+element against *another* run-time collection — "keep apartments **not** already saved", "keep the
+zips we don't yet have a crime rate for". A `filter` predicate's `value` may therefore be a reference
+(`$from`/`$bind`) to a second collection, with a new `not_in` operator alongside `in`. The reference
+is resolved **once, in Reason** (`_resolve_membership_predicate`, beside the `in`-collection
+resolution in `_data_op`), projected by an optional `value_path` to a concrete list of keys, and
+substituted into the predicate before the op runs — so `_matches` stays a pure literal comparison and
+the batched/off-cycle machinery is untouched (membership is **mechanical, never a model call**). An
+unresolvable membership reference degrades to an empty set: `in` matches nothing, `not_in` keeps
+everything (fails open, so a missing exclusion list never silently drops the whole collection). This
+lets a plan split a formerly-bundled `$decide` ("in 5..10 **and** not already saved") into its
+mechanical half (`not_in` the saved list) and only the genuinely judgemental remainder.
+
+**`collect` carries the fan-out key.** A map-invoke leaves N results scattered in history;
+`collect` gathers them, and — because a tool's result often doesn't echo the input it was called
+for (`get_crime_rate` returns a rate, not the zip) — each gathered item is enriched with its
+invocation's params (the return wins on key collision; a non-dict result is wrapped as
+`{**params, "result": …}`). This preserves the result↔input correlation a downstream
+`filter`/membership needs, so the canonical `distinct zips → get_crime_rate each → keep 5–10`
+pipeline is fully mechanical: `collect` → `filter between 5 10` on the rate → membership `in` join
+on `zip_code`, with no `$decide`. Without it, correlating each rate back to its zip would force the
+judgement escalation — which, being blind to other ops' history, cannot see the rates anyway.
 
 ## Links
 
