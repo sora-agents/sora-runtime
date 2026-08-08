@@ -18,6 +18,11 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from sora.action import default_action_registry
+from sora.adapters.runtime_io import (
+    RUNTIME_IO_ADAPTER,
+    RUNTIME_IO_ADDRESS,
+    RuntimeIOAdapter,
+)
 from sora.cycle import Agent, DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
 from sora.manual import DirectoryManualSource
@@ -328,7 +333,14 @@ def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
     load_dotenv()  # convenience: pick up ANTHROPIC_API_KEY etc. from a local .env if present
     config = load_yaml(config_path)
 
+    communication = transport_for(config, simulation)
     adapters = dict(adapter_for(entry, simulation) for entry in config.workspaces)
+    # The runtime's own I/O channels (today: the user-reply tool) are always joined, wired to the
+    # same transport handed to the cycle — so replying to the user is a uniform tool invoke, not a
+    # special `send` action. Nothing to suppress under ARE: ARE already routes the user
+    # channel through its transport, which this tool delegates to.
+    rio_origin = WorkspaceOrigin(adapter=RUNTIME_IO_ADAPTER, address=RUNTIME_IO_ADDRESS)
+    adapters[rio_origin] = RuntimeIOAdapter(origin=rio_origin, transport=communication)
     registry = EnvironmentRegistry(adapters=adapters)  # the single shared instance...
     working = WorkingMemory(registry=registry)  # ...held here read-only as an EnvironmentView
     semantic = SemanticMemory(backend_for(config.memory["semantic"]))
@@ -338,7 +350,6 @@ def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
         **procedural_prompts_for(config),
     )
     episodic = EpisodicMemory(backend_for(config.memory["episodic"]))
-    communication = transport_for(config, simulation)
 
     strategies = Strategies(
         observe=import_object(config.strategies.get("observe", _DEFAULT_STRATEGIES["observe"]))(),

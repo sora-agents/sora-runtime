@@ -102,6 +102,17 @@ def test_build_agent_uses_in_process_transport_by_default(tmp_path: Path) -> Non
     assert isinstance(agent.communication, InProcessTransport)
 
 
+def test_build_agent_always_configures_the_runtime_io_workspace(tmp_path: Path) -> None:
+    # The user-reply channel ships as an always-joined runtime-IO tool, independent of
+    # what agent.yaml declares — so an agent can always report back even with no other workspace.
+    from sora.adapters.runtime_io import RUNTIME_IO_ADAPTER, RUNTIME_IO_ADDRESS
+
+    agent = build_agent(str(_write_config(tmp_path, with_llm=False)))
+    origins = agent.registry.configured_origins()
+    rio = [o for o in origins if o.adapter == RUNTIME_IO_ADAPTER]
+    assert len(rio) == 1 and rio[0].address == RUNTIME_IO_ADDRESS
+
+
 def _fake_plan_prompt(
     activity: object, tools: object, observed: object, messages: object
 ) -> tuple[str, str]:
