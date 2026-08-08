@@ -8,7 +8,7 @@ import logging
 import os
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -256,18 +256,22 @@ PLAN_SYSTEM_PROMPT = (
     '  {"action": "invoke", "tool_id": "<id>", "operation_name": "<op>", "params": { ... }}\n'
     '  {"action": "focus", "tool_id": "<id>"}\n'
     '  {"action": "unfocus", "tool_id": "<id>"}\n'
-    '  {"action": "send", "to": "<recipient>", "content": { ... }}\n'
     '  {"action": "subgoal", "goal": "<what to achieve>", "mode": "mechanical" | "deliberative", '
     "...}\n"
     'A step with no "action" is treated as "invoke". Use only tool ids and operation names that '
     "appear in the provided tool list. Invoking an operation does not require focusing the tool "
     "first — focus a tool only to perceive its observable properties and signals, and unfocus once "
     "you no longer need them. Respect any usage protocols & safety constraints listed for a tool "
-    "when choosing and ordering steps. If the goal came from the user, end the plan with a `send` "
-    'step addressed to "user" that reports the outcome — a plan that only invokes tools and never '
-    'reports back leaves the user without an answer. Put that report in content as {"text": "<a '
-    "short natural-language sentence>\"}, not a bare data value, since that's what gets displayed "
-    "to the user.\n"
+    "when choosing and ordering steps. If the goal came from the user, end the plan by invoking "
+    "the user-reply tool's `send_message_to_user` operation to report the outcome — a plan that "
+    "never reports back leaves the user without an answer. Put that report in its `text` param as "
+    "a short natural-language sentence (or a $decide phrased from the real result), not a bare "
+    "data value.\n"
+    "`send_message_to_user` is the agent's OWN reply channel — the recipient is always the user, "
+    "so it is NEVER how you message anyone else. When the goal asks to email/message/notify some "
+    "OTHER person, that is a domain tool's own operation (e.g. an email client's `send_email`), "
+    "filling recipient / subject / body from earlier results; when it must reach EACH of several "
+    "recipients (e.g. email each relative), fan that invoke out with a mechanical sub-goal.\n"
     "When a parameter's value depends on the RESULT of an earlier step (e.g. an id or address you "
     "only learn by first listing/searching), you do NOT know it yet — never invent a literal. "
     "Instead reference the earlier result:\n"
@@ -312,22 +316,50 @@ PLAN_SYSTEM_PROMPT = (
     '{"$bind": "<name>", "path": "..."} (the same $bind you use for a sub-goal element). The '
     "data-ops:\n"
     '  {"action": "filter", "in": ..., "out": "<name>", "where": ...}  keep matching items; '
-    '`where` is either {"path": "<field>", "op": "<eq|ne|lt|le|gt|ge|between|in>", "value": <v>} '
-    "(a mechanical comparison; `between` takes [lo, hi], `in` takes a list) or "
-    '{"$decide": "<predicate in words>"} when keeping an item needs judgement,\n'
+    '`where` is either {"path": "<field>", "op": "<eq|ne|lt|le|gt|ge|between|in|not_in>", '
+    '"value": <v>} (a mechanical comparison; `between` takes [lo, hi], '
+    "`in`/`not_in` take a list) or "
+    '{"$decide": "<predicate in words>"} when keeping an item needs judgement. For `in`/`not_in`, '
+    "`value` may itself be a reference to ANOTHER collection to test membership against — "
+    '{"path": "<field>", "op": "not_in", "value": {"$from": "<op>"} | {"$bind": "<name>"}, '
+    '"value_path": "<field to read from each item of that collection>"}: '
+    "this keeps (in) / excludes "
+    "(not_in) items whose `path` value is among that other collection's `value_path` values — e.g. "
+    "keep apartments NOT already saved. Omit `value_path` when the referenced "
+    "collection is already "
+    "a list of the bare keys,\n"
     '  {"action": "distinct", "in": ..., "out": "<name>", "by": "<field>"}  drop duplicates (omit '
     "`by` to dedupe whole items),\n"
     '  {"action": "sort", "in": ..., "out": "<name>", "by": "<field>", "desc": true|false},\n'
     '  {"action": "take", "in": ..., "out": "<name>", "n": <count>}  the first n items,\n'
     '  {"action": "collect", "from": "<operation_name>", "out": "<name>"}  gather the results of '
     "every run of that operation — use it after a mechanical sub-goal that invoked one operation "
-    "per item, to turn the scattered per-item results into one list,\n"
+    "per item, to turn the scattered per-item results into one list. Each collected item also "
+    "carries that call's INPUT arguments, so you can filter/join on them even when the result "
+    "doesn't echo them back — e.g. after get_crime_rate per zip, `collect` yields items with both "
+    "the returned rate AND the zip_code it was called for, so a mechanical `between` then an "
+    "`in`/`not_in` membership join on zip_code needs no $decide,\n"
     '  {"action": "reduce", "in": ..., "out": "<name>", "op": "<sum|min|max|count|mean>", '
     '"by": "<field>"}  aggregate to a single value.\n'
     "So the 'save each QUALIFYING apartment' shape is: search -> `filter` the results into a "
     '`qualifying` binding -> a mechanical sub-goal whose "in" is {"$bind": "qualifying"}. To act '
     "on values a tool produced per item (e.g. a crime rate per zip), map with a mechanical "
     "sub-goal, then `collect` its results before filtering or reducing them.\n"
+    "For a plain top-N selection, `sort` + `take` is the right tool — and it stays right even when "
+    "ties on the sort key are possible, AS LONG AS the goal does not dictate how to break them "
+    "(any of the tied items is an acceptable pick). Do NOT reach for a $decide just because a tie "
+    "could happen. ONLY when the goal SPECIFIES a tie-break or priority rule that the sort order "
+    "cannot encode — one that applies among items tied on the primary key, or that depends on how "
+    "many items qualify (e.g. 'the two cheapest; if their prices tie, prefer the ones with "
+    "laundry, ordered alphabetically; if fewer than two have laundry, take the ones with the most "
+    "amenities') — is `sort` + `take` wrong: taking first collapses the tie by the sort's "
+    "incidental order and DISCARDS the other tied candidates before the specified rule can weigh "
+    "them. For that case bring the candidates together with `sort` on the primary key, then apply "
+    "the WHOLE rule in ONE `$decide` filter over that sorted collection — "
+    '{"action": "filter", "in": {"$bind": "<sorted>"}, "out": "<name>", "where": {"$decide": '
+    '"<the entire selection rule: how many to keep and every tie-break clause>"}} — so the '
+    "judgement sees every tied candidate and returns exactly the chosen subset (do not `take` "
+    "before it).\n"
     "Keep deliberative sub-goals RARE and SMALL. A deliberative sub-goal re-plans with the model "
     "when it is reached, so its goal must REDUCE the problem to a concrete, hard-to-template slice "
     "— it must NOT restate the task, or a large part of it, as another sub-goal. If you are about "
@@ -336,8 +368,9 @@ PLAN_SYSTEM_PROMPT = (
     "call over a collection is a MECHANICAL sub-goal; keeping / deduping / sorting / limiting / "
     "gathering / aggregating a collection is DATA-OP steps; a value that needs judgement is "
     "$decide. Reserve a deliberative sub-goal for a small, genuinely heterogeneous continuation "
-    "whose SHAPE — not merely its values — is unknown until you see run-time state (e.g. reconcile "
-    "a saved shortlist, then send each relative a tailored email). Prefer a single flat plan that "
+    "whose SHAPE — not merely its values — is unknown until you see run-time state (e.g. triage an "
+    "ambiguous result set where the right next step depends on what was found). Prefer a single "
+    "flat plan that "
     "reduces to concrete steps: the runtime REFUSES a deliberative sub-goal that merely re-states "
     "an ancestor, so a plan that leans on them instead of reducing will stall and do nothing.\n"
     "You are also given the agent's currently observed properties (persistent state, e.g. a "
@@ -647,7 +680,7 @@ def step_from_raw(raw: dict[str, Any]) -> Step:
 
 def _parse_plan_steps(text: str) -> list[Step]:
     try:
-        data = json.loads(_strip_code_fences(text))
+        data = _load_json_object(text)
         return [step_from_raw(raw) for raw in data["steps"]]
     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         raise ValueError(f"could not parse a plan from model output: {exc!r}\n---\n{text}") from exc
@@ -664,14 +697,81 @@ def _strip_code_fences(text: str) -> str:
     return body.strip()
 
 
+def _iter_json_objects(text: str) -> Iterator[str]:
+    """Yield each balanced ``{...}`` substring, in order, tracking string literals/escapes so a
+    brace *inside* a string doesn't unbalance the count. Used to recover the JSON when a model wraps
+    its answer in prose despite the ask (adaptive thinking makes a stray lead-in sentence common).
+    More than one is yielded because a prose lead-in can itself contain a brace-group (``"use the
+    {tag} format: {...}"``) — the caller tries each until one parses, rather than betting the first
+    balanced group is the JSON answer."""
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        end: int | None = None
+        for j in range(i, n):
+            ch = text[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            return  # an unbalanced tail: no further complete object can start before it closes
+        yield text[i : end + 1]
+        i = end + 1  # resume past this object so the next top-level group is found, not re-nested
+
+
+def _load_json_object(text: str) -> Any:
+    """Parse a JSON value from model output, tolerating both a code-fence wrapper and surrounding
+    prose. Fast path: parse the fence-stripped text directly (the common clean case). Fallback: try
+    each balanced ``{...}`` in order and return the first that parses, so a prose-wrapped
+    ``{"keep": []}`` (or plan/params object) no longer dies on a bare ``json.loads`` — and a prose
+    lead-in that *itself* contains a brace-group (``"use the {tag} format: {...}"``) doesn't shadow
+    the real object the way betting on the first balanced group would. Re-raises the last
+    ``json.JSONDecodeError`` when nothing yields valid JSON — the callers' anti-corruption boundary
+    converts it to a ``ValueError`` as before."""
+    stripped = _strip_code_fences(text)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as first_err:
+        last_err: json.JSONDecodeError = first_err
+    # Fallback runs outside the except so the eventual re-raise isn't exception-chained onto the
+    # fast-path error (they're the same failure viewed twice, not a handler bug).
+    for span in _iter_json_objects(stripped):
+        try:
+            return json.loads(span)
+        except json.JSONDecodeError as exc:
+            last_err = exc
+    raise last_err
+
+
 # --- parameter grounding (the Reason-phase escalation, packaged here like infer) ------------------
 
 GROUND_SYSTEM_PROMPT = (
     "You are grounding the parameters of a SINGLE tool operation about to be invoked. You are "
     "given the goal, the operation and its parameter schema, a partial set of parameters (some "
     "values may still be references to earlier results), the agent's currently observed properties "
-    "and recently observed signals, and the results of the operations already executed. Produce "
-    "the final, concrete parameters: fill every value that depends on a prior result or an already-"
+    "and recently observed signals, the named data-op bindings (collections an earlier step "
+    "computed), and the results of the operations already executed. Produce the final, concrete "
+    "parameters: fill every value that depends on a prior result, a named binding, or an already-"
     "observed property/signal from the ACTUAL data given, and keep already-concrete values as "
     "given.\n"
     'Respond with ONLY a JSON object of the form {"params": { ... }} and nothing else — no prose, '
@@ -711,6 +811,22 @@ def render_history(history: list[CompletedOperation]) -> str:
     return "\n".join(lines)
 
 
+def render_bindings(bindings: dict[str, Any]) -> str:
+    """Render an activity's named data-op bindings for a grounding prompt. Public so a custom
+    ``GroundPrompt`` can reuse it. A ``$bind`` reference or a ``$decide`` instruction may name a
+    binding an earlier data-op step produced (a filtered/sorted/collected collection), so — like
+    history results — these are the grounder's ground truth for resolving a reference and share the
+    same generous per-value cap. Order is preserved, so a sorted binding's front (e.g. the cheapest
+    items) survives truncation of a long tail."""
+    if not bindings:
+        return "(none)"
+    lines = []
+    for name, value in bindings.items():
+        rendered = _truncate(json.dumps(value, default=str), _HISTORY_RESULT_LIMIT)
+        lines.append(f"- {name} = {rendered}")
+    return "\n".join(lines)
+
+
 def _render_operation_schema(manual: Manual | None, operation_name: str) -> str:
     """The single operation's name/description + parameter schema (reuses ``_render_params``)."""
     if manual is None:
@@ -731,9 +847,10 @@ def default_ground_prompt(
     observed: PerceptSnapshot | None = None,
 ) -> tuple[str, str]:
     """The built-in ``GroundPrompt``: goal + the operation schema + the partial params + the
-    agent's currently observed world state + the execution history (``observed`` is omittable —
-    an unrelated caller isn't forced to supply one). Reuse ``GROUND_SYSTEM_PROMPT`` /
-    ``render_history`` / ``render_properties`` / ``render_signals`` in a custom one."""
+    agent's currently observed world state + the named data-op bindings + the execution history
+    (``observed`` is omittable — an unrelated caller isn't forced to supply one). Reuse
+    ``GROUND_SYSTEM_PROMPT`` / ``render_history`` / ``render_bindings`` / ``render_properties`` /
+    ``render_signals`` in a custom one."""
     observed = observed or PerceptSnapshot()
     user = (
         f"Goal: {activity.goal}\n\n"
@@ -742,6 +859,8 @@ def default_ground_prompt(
         f"{json.dumps(partial_params, indent=2)}\n\n"
         f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
         f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
+        f"Named data-op bindings (a $bind reference or a $decide instruction may name one):\n"
+        f"{render_bindings(activity.bindings)}\n\n"
         f"Results of operations already executed:\n{render_history(activity.history)}"
     )
     return GROUND_SYSTEM_PROMPT, user
@@ -749,7 +868,7 @@ def default_ground_prompt(
 
 def _parse_params(text: str) -> dict[str, Any]:
     try:
-        data = json.loads(_strip_code_fences(text))
+        data = _load_json_object(text)
         params = data["params"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(
@@ -779,7 +898,7 @@ def _parse_keep(text: str, count: int) -> list[int]:
     never duplicates an item — a duplicate would double-act a downstream fan-out); a structurally
     malformed answer raises, the anti-corruption boundary that infer/ground share."""
     try:
-        data = json.loads(_strip_code_fences(text))
+        data = _load_json_object(text)
         keep = data["keep"]
     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         raise ValueError(

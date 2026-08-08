@@ -34,6 +34,7 @@ from sora.memory import (
     ProceduralMemory,
     default_ground_prompt,
     default_plan_prompt,
+    render_bindings,
     render_history,
     render_messages,
     render_properties,
@@ -272,6 +273,29 @@ async def test_infer_with_no_percepts_reports_none_observed(tmp_path: Path) -> N
 async def test_infer_tolerates_code_fences(tmp_path: Path) -> None:
     fenced = "```json\n" + plan_json({"action": "wait"}) + "\n```"
     mem = _llm_memory(tmp_path, FakeLLMClient(fenced))
+
+    plan = await mem.infer(_activity("g"), {})
+
+    assert plan.steps == [Step(next_action="wait", params={})]
+
+
+async def test_infer_tolerates_prose_wrapped_json(tmp_path: Path) -> None:
+    # Adaptive thinking sometimes emits a lead-in/trailing sentence around the JSON despite the ask;
+    # the first balanced {...} is still recovered. Shared _load_json_object, so ground/select too.
+    prose = "Sure, here is the plan:\n" + plan_json({"action": "wait"}) + "\nHope that helps!"
+    mem = _llm_memory(tmp_path, FakeLLMClient(prose))
+
+    plan = await mem.infer(_activity("g"), {})
+
+    assert plan.steps == [Step(next_action="wait", params={})]
+
+
+async def test_infer_tolerates_a_prose_lead_in_that_itself_contains_braces(tmp_path: Path) -> None:
+    # Sharper than the above: the prose lead-in ITSELF contains a balanced brace-group before the
+    # real JSON. Betting on the first balanced {...} would extract "{action}" and fail; the loader
+    # tries each object in order until one parses, so the real plan object still wins.
+    prose = "Use the {action} template, then: " + plan_json({"action": "wait"})
+    mem = _llm_memory(tmp_path, FakeLLMClient(prose))
 
     plan = await mem.infer(_activity("g"), {})
 
@@ -631,6 +655,22 @@ def test_plan_prompt_instructs_references_for_runtime_dependent_params() -> None
     assert "$from" in PLAN_SYSTEM_PROMPT and "$decide" in PLAN_SYSTEM_PROMPT
 
 
+def test_plan_prompt_steers_conditional_selection_to_a_decide_filter() -> None:
+    # A selection with a CONDITIONAL tie-break (only applies among items tied on the primary key,
+    # or count-dependent) must NOT be resolved by `sort` + `take` — taking first collapses the tie
+    # by incidental order and drops the candidates the rule needs. The planner is told to sort to
+    # gather the candidates, then apply the whole rule in one $decide filter over that collection.
+    lowered = PLAN_SYSTEM_PROMPT.lower()
+    assert "tie-break" in lowered
+    assert "sort" in lowered and "take" in lowered and "$decide" in lowered
+    # The specific trap named: don't `take` before the conditional rule sees the tied candidates.
+    assert "discards" in lowered or "before the rule" in lowered
+    # But it must NOT over-route: a plain top-N stays sort+take even when a tie is merely possible —
+    # only a goal-SPECIFIED tie-break rule escalates to $decide (guards against the $decide path
+    # swallowing ordinary top-N selections and paying a needless, nondeterministic model call).
+    assert "plain top-n" in lowered
+
+
 def test_plan_prompt_keeps_visible_identifiers_as_references() -> None:
     # An observed identifier (an email/event id currently visible in properties) must still be
     # referenced, not hardcoded — otherwise a goal-keyed cached plan bakes in one run's ids and
@@ -812,6 +852,49 @@ def test_default_ground_prompt_includes_percept_rendering() -> None:
     assert system == GROUND_SYSTEM_PROMPT
     assert render_properties(properties) in user
     assert render_signals(signals) in user
+
+
+def test_render_bindings_names_each_binding_and_its_value() -> None:
+    rendered = render_bindings({"newly_sorted": [{"name": "Mechelen Mansion", "price": 2000}]})
+    assert "newly_sorted" in rendered
+    assert "Mechelen Mansion" in rendered and "2000" in rendered
+
+
+def test_render_bindings_empty_is_a_placeholder_not_blank() -> None:
+    assert render_bindings({}) == "(none)"
+
+
+async def test_ground_prompt_carries_named_data_op_bindings(tmp_path: Path) -> None:
+    # A $decide that names a binding an earlier data-op step produced (a filtered/sorted collection)
+    # must see that binding's ACTUAL data — otherwise the grounder can only emit a placeholder. This
+    # is the RentAFlat email regression: content = "$decide: names+prices of the two cheapest from
+    # newly_sorted" grounded to boilerplate because the binding wasn't in the prompt.
+    llm = FakeLLMClient(_params_json(content="Mechelen Mansion ($2,000)"))
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm)
+    activity = _activity_with_history("email", "list_saved_apartments", {"saved": []})
+    activity.bindings["newly_sorted"] = [{"name": "Mechelen Mansion", "price": 2000}]
+
+    await mem.ground(
+        activity,
+        "send_email",
+        None,
+        {"content": {"$decide": "names and prices of the two cheapest from newly_sorted"}},
+    )
+
+    _system, prompt = llm.calls[0]
+    assert "newly_sorted" in prompt
+    assert "Mechelen Mansion" in prompt and "2000" in prompt
+
+
+async def test_select_tolerates_prose_wrapped_keep(tmp_path: Path) -> None:
+    # The regression seen in a run log: a prose-wrapped {"keep": [...]} used to die on a bare
+    # json.loads, failing the whole $decide filter. Now recovered via the shared extractor.
+    llm = FakeLLMClient('Looking at the items, I would keep: {"keep": [1]}')
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm)
+
+    kept = await mem.select(_activity_with_history("f", "s", {}), ["a", "b", "c"], "the middle one")
+
+    assert kept == ["b"]
 
 
 async def test_ground_rejects_non_json(tmp_path: Path) -> None:
