@@ -53,11 +53,18 @@ class LLMUsage:
     matter how much thinking happened. The reliable estimate instead subtracts the *answer* (whose
     text we do see — ``answer_chars``, converted to tokens) from ``output_tokens``: whatever output
     the answer doesn't explain is deliberation. Approximate, but it correctly separates a
-    thinking-bound call (a tiny answer behind a large output) from an answer-bound one."""
+    thinking-bound call (a tiny answer behind a large output) from an answer-bound one.
+
+    ``reasoning_tokens`` is the *exact* deliberation count when the provider reports one directly
+    (OpenAI ``completion_tokens_details.reasoning_tokens``, Gemini ``thoughts_token_count``). When
+    present it supersedes the estimate above; when ``None`` (Anthropic adaptive thinking, which does
+    not break thinking out) the estimate stands. Keeping both means one metric reads uniformly
+    across providers — exact where available, estimated where not."""
 
     input_tokens: int
     output_tokens: int
     answer_chars: int
+    reasoning_tokens: int | None = None
 
     @property
     def answer_tokens(self) -> int:
@@ -65,8 +72,11 @@ class LLMUsage:
 
     @property
     def thinking_tokens(self) -> int:
-        """Estimated deliberation tokens: the billed output the returned answer doesn't account for
-        (clamped at 0, since the answer-token estimate can slightly exceed a short output)."""
+        """Deliberation tokens: the provider's exact ``reasoning_tokens`` when it reports one, else
+        the estimate — the billed output the returned answer doesn't account for (clamped at 0,
+        since the answer-token estimate can slightly exceed a short output)."""
+        if self.reasoning_tokens is not None:
+            return self.reasoning_tokens
         return max(0, self.output_tokens - self.answer_tokens)
 
     @property
@@ -95,6 +105,8 @@ def log_llm_usage(usage: LLMUsage) -> None:
             "llm_input_tokens": usage.input_tokens,
             "llm_output_tokens": usage.output_tokens,
             "llm_answer_chars": usage.answer_chars,
+            # None on the estimate path (Anthropic); an exact count when the provider reports one.
+            "llm_reasoning_tokens": usage.reasoning_tokens,
             "llm_inference_id": inference_id,
         },
     )
@@ -192,6 +204,12 @@ class LLMMeter(logging.Handler):
         self.input_tokens = 0
         self.output_tokens = 0
         self.answer_chars = 0
+        # Summed per-call deliberation tokens: each call contributes its OWN figure — the provider's
+        # exact reasoning count when it reports one (OpenAI/Gemini), else that call's answer-
+        # subtraction estimate. Summing per call rather than pooling one estimate over the totals is
+        # what keeps a mixed-provider run correct: an exact-reporting model in one phase and an
+        # estimate-only one (Anthropic) in another both land, each measured its own way.
+        self.thinking_tokens = 0
         # The wasted subset of the grand totals above: an inference whose result was discarded
         # (interrupted/superseded) still ran to completion, so its cost is counted in the totals —
         # these break out how much of that cost did no useful work, so a run surface can show used
@@ -219,9 +237,18 @@ class LLMMeter(logging.Handler):
             self.usage_calls += 1
             input_tokens = getattr(record, "llm_input_tokens", 0)
             output_tokens = getattr(record, "llm_output_tokens", 0)
+            answer_chars = getattr(record, "llm_answer_chars", 0)
+            reasoning_tokens = getattr(record, "llm_reasoning_tokens", None)
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
-            self.answer_chars += getattr(record, "llm_answer_chars", 0)
+            self.answer_chars += answer_chars
+            # Add this call's own deliberation figure — exact when the provider reported one, else
+            # its estimate — reusing LLMUsage.thinking_tokens so the exact/estimate choice and the
+            # clamp are decided per call. A single exact-reporting call no longer discards the
+            # estimated thinking of every other call, which pooling one estimate would have done.
+            self.thinking_tokens += LLMUsage(
+                input_tokens, output_tokens, answer_chars, reasoning_tokens=reasoning_tokens
+            ).thinking_tokens
             if inference_id is not None:
                 self._tokens_by_id[inference_id] = (input_tokens, output_tokens)
         elif event == "discarded" and inference_id is not None:
@@ -235,15 +262,19 @@ class LLMMeter(logging.Handler):
                 self.wasted_output_tokens += tokens[1]
 
     def _pooled(self) -> LLMUsage:
-        """This run's usage as one ``LLMUsage`` over the pooled totals, so the answer/thinking
-        estimates are the per-call ones applied to the sums (0.0/0 when nothing was metered)."""
+        """This run's pooled input/output/answer totals as one ``LLMUsage`` (0/0 when nothing was
+        metered), used only for the answer-token display. Thinking is *not* read off this — see
+        ``thinking_share``, which sums each call's own figure so a mixed exact/estimated run stays
+        right (pooling one estimate here would drop the estimate for every call once one reported an
+        exact count)."""
         return LLMUsage(self.input_tokens, self.output_tokens, self.answer_chars)
 
     @property
     def thinking_share(self) -> float:
-        """Estimated deliberation share of total output tokens across every instrumented call — the
-        pooled counterpart to ``LLMUsage.thinking_share`` (0.0 when nothing was metered)."""
-        return self._pooled().thinking_share
+        """Deliberation share of total output across every instrumented call: the summed per-call
+        thinking (each call exact where its provider reported one, estimated where not) over pooled
+        output (0.0 when nothing was metered)."""
+        return self.thinking_tokens / self.output_tokens if self.output_tokens else 0.0
 
     def summary(self, wall_seconds: float | None = None) -> str:
         plural = "" if self.calls == 1 else "s"
@@ -260,7 +291,7 @@ class LLMMeter(logging.Handler):
             pooled = self._pooled()
             text += (
                 f"; {self.input_tokens} in / {self.output_tokens} out tokens "
-                f"(~{pooled.answer_tokens} answer, ~{pooled.thinking_share * 100:.0f}% thinking)"
+                f"(~{pooled.answer_tokens} answer, ~{self.thinking_share * 100:.0f}% thinking)"
             )
             if self.wasted_output_tokens:
                 text += f"; {self.wasted_output_tokens} out discarded"

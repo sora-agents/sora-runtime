@@ -2365,6 +2365,9 @@ llm = [
 mcp = [
     { name = "mcp" },
 ]
+openai = [
+    { name = "openai" },
+]
 
 [package.dev-dependencies]
 are = [
@@ -2376,6 +2379,7 @@ requires-dist = [
     { name = "anthropic", marker = "extra == 'llm'", specifier = ">=0.40" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.68" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
@@ -2383,7 +2387,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6" },
 ]
-provides-extras = ["mcp", "a2a", "wot", "llm", "dev"]
+provides-extras = ["mcp", "a2a", "wot", "llm", "openai", "dev"]
 
 [package.metadata.requires-dev]
 are = [{ name = "meta-agents-research-environments", specifier = ">=1.2" }]

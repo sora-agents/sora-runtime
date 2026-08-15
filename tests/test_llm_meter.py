@@ -150,6 +150,57 @@ def test_llm_usage_estimates_thinking_from_output_minus_answer() -> None:
     assert LLMUsage(10, 0, answer_chars=0).thinking_share == 0.0
 
 
+def test_llm_usage_prefers_an_exact_reasoning_count_over_the_estimate() -> None:
+    # A provider that reports thinking tokens directly (OpenAI reasoning_tokens, Gemini
+    # thoughts_token_count) wins: thinking is that exact number, not the output-minus-answer
+    # estimate. The answer-token display is unaffected — it still reflects the visible answer size.
+    usage = LLMUsage(1200, 800, answer_chars=40, reasoning_tokens=600)
+    assert usage.thinking_tokens == 600  # exact, not 790 the estimate would give
+    assert usage.thinking_share == 600 / 800
+    assert usage.answer_tokens == 10
+    # reasoning_tokens=None (the Anthropic path / default) leaves the estimate in force, unchanged.
+    assert LLMUsage(1200, 800, answer_chars=40).thinking_tokens == 790
+
+
+def test_llm_meter_pools_exact_reasoning_tokens_when_providers_report_them(
+    _llm_logging_enabled: None,
+) -> None:
+    # When usage records carry reasoning_tokens, the pooled thinking share is the summed exact
+    # counts over summed output — not the char estimate — so a multi-call run reports true thinking.
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        log_llm_usage(LLMUsage(1000, 900, answer_chars=40, reasoning_tokens=850))
+        log_llm_usage(LLMUsage(500, 200, answer_chars=600, reasoning_tokens=50))
+    finally:
+        logger.removeHandler(meter)
+
+    assert (meter.input_tokens, meter.output_tokens) == (1500, 1100)
+    assert meter.thinking_share == (850 + 50) / 1100  # exact, not the answer_chars estimate
+
+
+def test_llm_meter_mixes_exact_and_estimated_thinking_per_call(
+    _llm_logging_enabled: None,
+) -> None:
+    # A run that mixes providers — one call reports an exact reasoning count (OpenAI/Gemini), the
+    # other does not (Anthropic) — must sum EACH call's own figure: the exact count for the first
+    # plus the answer-subtraction estimate for the second. The regression this guards: a single
+    # exact-reporting call must not blank out the estimated thinking of the estimate-only calls.
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        log_llm_usage(LLMUsage(1000, 1000, answer_chars=40))  # Anthropic: estimate 1000 - 10 = 990
+        log_llm_usage(LLMUsage(500, 200, answer_chars=40, reasoning_tokens=50))  # OpenAI: exact 50
+    finally:
+        logger.removeHandler(meter)
+
+    # 990 (estimated) + 50 (exact) over 1200 pooled output — NOT 50/1200, which the old all-or-
+    # nothing flag produced once any call reported an exact count.
+    assert meter.thinking_share == (990 + 50) / 1200
+
+
 def test_log_llm_usage_emits_one_usage_record(_llm_logging_enabled: None) -> None:
     records: list[logging.LogRecord] = []
     handler = logging.Handler()

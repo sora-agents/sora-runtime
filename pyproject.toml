@@ -27,6 +27,12 @@ wot = []
 # Optional so the core stays dependency-free: the LLMClient Protocol lives in core, its concrete
 # provider client under sora/adapters, installed only when inference is actually wired.
 llm = ["anthropic>=0.40"]
+# OpenAICompatLLMClient — the OpenAI SDK pointed at any OpenAI-compatible endpoint via base_url:
+# OpenAI itself, Gemini's OpenAI-compat surface, and local runtimes (Ollama, LM Studio, vLLM,
+# llama.cpp). One SDK covers all of them, so there is no separate google-genai/local extra.
+# Floor is 1.68, not 1.0: the client sends `max_completion_tokens` (SDK 1.45+) and reads
+# `completion_tokens_details.reasoning_tokens` (SDK 1.47+); an older 1.x lacks both.
+openai = ["openai>=1.68"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
