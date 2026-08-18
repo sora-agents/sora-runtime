@@ -1,0 +1,67 @@
+# In-process ARE showcase (AreSimulation, dynamic Environment timeline) — run a dynamic ARE
+# scenario end to end. Same premise as examples/are/mcp/email_calendar, told via the other adapter.
+#
+#     uv sync --all-extras --group are         # installs the ARE package + the llm extra
+#     export ANTHROPIC_API_KEY=sk-ant-...       # or a .gitignored .env
+#     uv run sora run examples/are/sim/email_calendar/agent.yaml \
+#         --scenario examples.are.sim.email_calendar.scenario.EmailScheduleScenario --verbose
+#
+#     # headless + scored (no one watching, auto-exit once quiescent, ARE's own validate() printed):
+#     uv run sora run examples/are/sim/email_calendar/agent.yaml \
+#         --scenario examples.are.sim.email_calendar.scenario.EmailScheduleScenario \
+#         --report examples.are.sim.email_calendar.report.report --exit-when-idle 8
+#
+# This config is deliberately **generic**: it selects the in-process ARE workspace (`are-sim`) and the
+# ARE transport (user messages routed through the scenario's AgentUserInterface), but names **no
+# scenario** — a scenario is a per-run input, like a task, so it's a `sora run --scenario` CLI argument
+# that gets turned into the running simulation. The same config runs any ARE scenario.
+agent:
+  name: are-sim-email-calendar-dev-local
+  strategies:
+    # Dynamic-scenario reconsideration through the runtime's general context-adaptation mechanism
+    # (ADR-0024): the phase strategies stay the defaults (model-backed planning, default selection),
+    # and before committing a side-effecting step Reason re-validates the in-flight plan against new
+    # perception — a mid-run follow-up email moved the world, so the cheap change-gate goes hot and a
+    # single revalidation call decides "still valid?"; on "no" it re-plans against the current inbox. This is
+    # general and needs no domain authoring (no inbox-shape knowledge), so nothing here is scenario-
+    # specific. The static MCP showcase, which never emits signals, keeps the simpler
+    # ScheduleFromEmailStrategy and needs no reconsideration at all.
+    reason: sora.strategies.DefaultReasonStrategy  # required; the model-backed default does the (re-)planning
+    context_adaptation: before_writes  # re-validate before each write; none | before_writes | before_each_op
+    # Opt-in deterministic override (uncomment to use instead of / alongside context_adaptation): a
+    # hard-interrupt path that preempts on a genuinely new inbound email, diffing INBOX ids from the
+    # state_changed payload (no model call, ARE-email-shaped). It also covers the *post-completion*
+    # follow-up — a change that lands after the goal already finished — which the cooperative
+    # before-writes checkpoint structurally can't (a terminated activity has no checkpoint). See NOTES.md.
+    # interrupt_policy: examples.are.sim.email_calendar.strategies.MailDiffInterruptPolicy
+    # interrupt: examples.are.sim.email_calendar.strategies.ReconsiderInterruptHandler
+  memory:
+    semantic: file://./.sora/are/sim/email_calendar/semantic
+    procedural: file://./.sora/are/sim/email_calendar/procedural
+    episodic: file://./.sora/are/sim/email_calendar/episodic
+  procedural:
+    # In adition to the default prompt, tells the planner it may have already acted and must reconcile
+    # against current state (undo/modify) instead of assuming a blank slate. Separate from the
+    # memory.procedural URI above (that's the plan *store*; this overrides the plan *prompt*).
+    plan_prompt: examples.are.sim.email_calendar.strategies.reconciling_plan_prompt
+  llm:
+    # OpenAI-compatible client pointed at a local runtime — a config change, not a new adapter.
+    client: sora.adapters.openai_llm.OpenAICompatLLMClient
+    # Qwen3-30B-A3B (MoE, ~3B active): fast local iteration, reliable Plan/Step output, and a
+    # Gaia2-leaderboard model family. `ollama pull qwen3:30b` (~18 GB at Q4_K_M). Swap for any
+    # OpenAI-compatible local model — e.g. gpt-oss:20b (fastest) or qwen3:32b (dense, slower but
+    # slightly better plans). Qwen3 is a hybrid-thinking model; prepend `/no_think` in the strategy
+    # prompt for deterministic, cheaper dev runs.
+    model: qwen3:30b
+    base_url: http://localhost:11434/v1
+    instrument: true
+    # No api_key needed for a local runtime: the client supplies a placeholder when base_url is set
+    # and no key is in the environment. Set api_key (or OPENAI_API_KEY) only for an endpoint that
+    # actually authenticates (a hosted gateway).
+  transport:
+    # The ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies
+    # via send_message_to_user. Shares the running simulation with the are-sim workspace below.
+    kind: are
+  workspaces:
+    - origin: { adapter: are-sim, address: "insim:are" }
+      workspace_id: are

@@ -1,0 +1,47 @@
+# Local-model DEV agent for the Gaia2 benchmark. Same generic, scenario-agnostic scaffold as
+# agent.yaml — it only swaps the `llm:` block to a small open model served locally through an
+# OpenAI-compatible runtime (Ollama here), reached by the `OpenAICompatLLMClient`. Purpose:
+# exercise the decision cycle, plan execution, and the exact production client path — cheaply,
+# offline, and fast. The Gaia2 *score* is not the point of this config; a well-formed trajectory
+# is. For leaderboard-comparable numbers use a hosted frontier agent + hosted judge (agent.yaml).
+#
+#     # 1. Serve the model locally (one-time pull, then it stays resident):
+#     ollama pull qwen3:30b
+#     # Ollama's OpenAI-compatible endpoint is http://localhost:11434/v1 by default.
+#
+#     # 2. Fast, unscored smoke over a handful of scenarios — no judge, no cost:
+#     uv run python -m examples.gaia2.batch --capability mini --limit 5 \
+#         --config examples/gaia2/agent.dev.yaml
+#
+# See examples/gaia2/batch.py for the driver and its flags.
+agent:
+  name: gaia2-dev-local
+  strategies:
+    # Same model-backed default planner + default selection as the hosted config. No interrupt
+    # policy: core's NeverInterruptPolicy is correct for the static capabilities exercised here.
+    reason: sora.strategies.DefaultReasonStrategy
+  memory:
+    semantic: file://./.sora/gaia2/semantic
+    procedural: file://./.sora/gaia2/procedural
+    episodic: file://./.sora/gaia2/episodic
+  llm:
+    # OpenAI-compatible client pointed at a local runtime — a config change, not a new adapter.
+    client: sora.adapters.openai_llm.OpenAICompatLLMClient
+    # Qwen3-30B-A3B (MoE, ~3B active): fast local iteration, reliable Plan/Step output, and a
+    # Gaia2-leaderboard model family. `ollama pull qwen3:30b` (~18 GB at Q4_K_M). Swap for any
+    # OpenAI-compatible local model — e.g. gpt-oss:20b (fastest) or qwen3:32b (dense, slower but
+    # slightly better plans). Qwen3 is a hybrid-thinking model; prepend `/no_think` in the strategy
+    # prompt for deterministic, cheaper dev runs.
+    model: qwen3:30b
+    base_url: http://localhost:11434/v1
+    instrument: true
+    # No api_key needed for a local runtime: the client supplies a placeholder when base_url is set
+    # and no key is in the environment. Set api_key (or OPENAI_API_KEY) only for an endpoint that
+    # actually authenticates (a hosted gateway).
+  transport:
+    # ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies via
+    # send_message_to_user (the per-turn boundary Gaia2's online judge keys on).
+    kind: are
+  workspaces:
+    - origin: { adapter: are-sim, address: "insim:are" }
+      workspace_id: are
