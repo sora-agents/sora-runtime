@@ -5,6 +5,17 @@ team sync and reply to Alice; mid-run, a follow-up email arrives that changes th
 (Monday → Tuesday). The agent is made to reconsider through its own decision cycle rather than
 finishing the stale plan.
 
+**Primary reconsideration path: context-adaptation ([ADR-0024](../../../../docs/architecture/adrs/0024-plan-reconsideration-context-adaptation.md)).**
+The `agent.yaml` sets `context_adaptation: before_writes`, so before each side-effecting step Reason
+re-validates the in-flight plan against new perception: a cheap mechanical change-gate (did anything
+observable move since the plan was inferred?) fronts a single model *revalidation* call (given the goal and
+remaining steps, is the plan still valid?), and on "no" it re-plans against the current inbox. This
+is **general runtime machinery** — no inbox-shape knowledge, no example code — and it is what handles
+the mid-run follow-up. The `MailDiffInterruptPolicy` seam below is retained only as an **opt-in
+deterministic override** (see it in the "example-specific" catalogue). This substantially addresses
+old limitation 6 (blind commitment) at the *plan* level; intention-level commitment lifecycles remain
+future work.
+
 Getting this to work end-to-end took a fair amount of **prompt tuning** and a few example-only
 strategies. That effort is deliberate scaffolding around real, still-open runtime gaps — it is not
 meant to look production-clean. This note records what is example-specific, what is a genuine
@@ -22,17 +33,23 @@ plans), so each run infers fresh — there is no stale plan cache to clear betwe
 
 Everything here lives under `examples/are/sim/email_calendar/` and would not ship in the runtime:
 
-- **`MailDiffInterruptPolicy`** — an `InterruptPolicy` (screened at push time) that raises a hard
-  interrupt on a *genuinely new inbound email*. It diffs the set of **INBOX email ids** carried in
-  the `state_changed` signal payload against what it has already seen, which knows ARE's
-  `EmailClientApp` state shape (`folders → INBOX → emails[*].email_id`). ARE-email-shaped. Stateful,
-  so it also dedups — each new id fires once, the first non-empty inbox is the baseline, and the
-  agent's own reply (landing in SENT) never fires. See [ADR-0020](../../../../docs/architecture/adrs/0020-hard-interrupt-and-await-input.md).
-- **`ReconsiderInterruptHandler`** — the paired `InterruptHandler`. On that interrupt it clears the
-  in-flight activity's plan so the default Reason re-infers, or — if the email landed *after* the goal
-  already completed (no live activity) — spawns one fresh corrective activity (a hard-coded
-  `_CORRECTIVE_GOAL` string). A user stop is delegated to `DefaultInterruptHandler`. Reconsideration
-  thus lives in *one* seam, rather than being split across bespoke Reason/Situate strategies.
+- **`MailDiffInterruptPolicy`** *(opt-in override, not the default path)* — an `InterruptPolicy`
+  (screened at push time) that raises a hard interrupt on a *genuinely new inbound email*. It diffs
+  the set of **INBOX email ids** carried in the `state_changed` signal payload against what it has
+  already seen, which knows ARE's `EmailClientApp` state shape (`folders → INBOX → emails[*].email_id`).
+  ARE-email-shaped. Stateful, so it also dedups — each new id fires once, the first non-empty inbox is
+  the baseline, and the agent's own reply (landing in SENT) never fires. See [ADR-0020](../../../../docs/architecture/adrs/0020-hard-interrupt-and-await-input.md).
+  The default path is now the general context-adaptation mechanism (see the intro); this is wired only
+  when `agent.yaml` uncomments the `interrupt_policy`/`interrupt` lines. Two things keep it worth
+  retaining: it is **deterministic** (no model call) and **preemptive** (aborts the current phase),
+  and — unlike a before-writes checkpoint — it also fires **after the goal completed** (see the handler).
+- **`ReconsiderInterruptHandler`** *(opt-in override)* — the paired `InterruptHandler`. On that
+  interrupt it clears the in-flight activity's plan so the default Reason re-infers, or — if the email
+  landed *after* the goal already completed (no live activity) — spawns one fresh corrective activity
+  (a hard-coded `_CORRECTIVE_GOAL` string). A user stop is delegated to `DefaultInterruptHandler`. That
+  post-completion branch is the one thing context-adaptation structurally **can't** do: a terminated
+  activity has no before-writes checkpoint to fire, so covering a follow-up that arrives after the goal
+  is done still needs either this preemptive seam or a persistent monitoring intention (future work).
 - **`reconciling_plan_prompt` / `_RECONCILE_INSTRUCTION`** — a `PlanPrompt` appending
   dynamic-environment guidance to the default planning content, **split into fragments with
   different fates**:
@@ -120,10 +137,20 @@ These are the seams the example works around. Each is a real runtime gap, not a 
    common-case procedure is future work (see "episodic → procedural consolidation").
 
 3. **Self-caused state changes are indistinguishable from external ones.** The agent writes to the
-   very tool it observes; every write emits `state_changed`. A naive "a signal arrived → re-infer"
-   trigger therefore loops forever (reply → signal → re-plan → reply → …). The example sidesteps
-   this by keying on **INBOX ids** — the agent's reply lands in SENT, invisible to the trigger — but
-   that is ARE-email-shaped, not general.
+   very tool it observes; every write emits `state_changed`. The cost of this depends on the path:
+   - Under the **opt-in interrupt override** (`MailDiffInterruptPolicy`), a naive "a signal arrived →
+     re-infer" trigger would loop forever (reply → signal → re-plan → reply → …); the policy sidesteps
+     it by keying on **INBOX ids** — the agent's reply lands in SENT, invisible to the trigger.
+   - Under the **primary context-adaptation path** ([ADR-0024](../../../../docs/architecture/adrs/0024-plan-reconsideration-context-adaptation.md))
+     there is no loop: the self-write does trip the mechanical change-gate at the next checkpoint, but
+     the revalidation that fires returns *valid* (the agent's own SENT entry doesn't invalidate the plan),
+     so the plan commits and execution proceeds. The residual cost is degraded from an infinite loop to
+     **one wasted revalidation call per self-write**.
+
+   Either way the underlying gap is the same — the runtime can't tell a self-caused change from an
+   external one — and the INBOX-id trick that plugs it is ARE-email-shaped, not general. The
+   principled fix is efference / read-write tagging (see the foundational extensions below), which
+   would let the change-gate ignore self-writes directly and drop the wasted revalidation too.
 
 4. **Observation requires focus (mitigated, not resolved).** Observable properties are snapshotted
    only for *focused* tools. This *was* model-driven — the plan had to explicitly `focus` every tool
@@ -136,14 +163,39 @@ These are the seams the example works around. Each is a real runtime gap, not a 
    attends to only the tools that matter (and *holds* that focus across a replan) — is still future
    work; `_focus_`/`_unfocus_` remain the seam for it.
 
-5. **Observation-aware inference can bake run-specific literals.** A plan inferred while a tool is
-   focused may hard-code a visible id; mitigated by the core-prompt "keep identifiers as references"
-   change. This mattered most for cross-run reuse — now moot, since plans aren't cached — but it
-   remains good within-run hygiene.
+5. **Observation-aware inference can bake run-specific literals.** Because the mailbox `state_changed`
+   signal lands *before* the plan-inference call resolves, the planner sees the email contents in its
+   context and extracts parameter values at plan time. The prompt sanctions this for *stable,
+   meaningful* values (a title, a time, a name — memory.py's "fill parameters whose value is stable
+   and meaningful") but forbids it for *volatile identifiers* (email/event ids → keep as `$from`
+   references). Two consequences, both about what this leaves for grounding:
 
-6. **Blind commitment; no reconsideration policy.** The agent has no BDI-style commitment strategy.
-   "Re-infer on every new inbound email" is a blunt stand-in for intention reconsideration, with no
-   notion of an intention being blocked vs. impossible vs. superseded.
+   - **Baking suppresses grounding entirely.** Grounding (`_ground_`) is demand-driven — it fires
+     only for a `$decide` param or an unresolvable `$from`/`$bind`. A plan that bakes concrete
+     literals leaves nothing to ground, so a data-dependent value (the meeting's attendees) never
+     gets a focused, later extraction pass; it rides on whatever the one-shot planner produced.
+   - This is fragile on a weak planner. Observed concretely on **qwen3-30b (local)**: Run #1 baked
+     `attendees: ['Bob','Carol']` correctly and kept the email id as `$from search_emails` → PASS,
+     with **zero grounding calls** (correct *and* cheapest). Run #2's re-inferred plan (a) baked the
+     email id as a bare literal — a genuine violation of the "ids stay references" rule, harmless
+     only because the id was stable within the run — and (b) *dropped* the attendees, so the
+     calendar event scheduled with none → **FAIL**. Because those params were concrete-but-incomplete
+     rather than `$decide`, there was no grounding pass to recover the missing attendees.
+
+   The id-hardcoding half mattered most for cross-run reuse (now moot — plans aren't cached) and
+   remains within-run hygiene. The deeper half is a genuine tension: eager literal-baking trades
+   grounding's focused extraction for a cheaper single-shot plan — a win on a strong planner, a
+   detail-dropping risk on a weak one — and the runtime can't force deferral (it can't tell which
+   literals are data-dependent). The levers are prompt/config, and none is free; the real variable is
+   planner capability.
+
+6. **Commitment at the plan level, not yet the intention level (mostly addressed — [ADR-0024](../../../../docs/architecture/adrs/0024-plan-reconsideration-context-adaptation.md)).**
+   The default path is no longer "re-infer on every new inbound email." `context_adaptation` gives a
+   real BDI-flavoured commitment dial (`none | before_writes | before_each_op`): a mechanical
+   change-gate plus a model revalidation decides *when* a plan is worth re-validating and whether new
+   perception actually invalidates it. **What remains** is the intention lifecycle proper — an
+   intention being blocked vs. impossible vs. superseded, per-*activity* commitment (this dial is
+   per-agent), and a commitment posture that adapts to how fast the world is actually changing.
 
 ---
 
@@ -166,9 +218,12 @@ Each of these would replace a chunk of the scaffolding above with a principled m
 - **Efference / read-write tags.** Tag state changes the agent itself caused so *any* self-write is
   filtered from triggers regardless of tool, generalizing the INBOX-id trick. Retires limitation (3).
 
-- **BDI-style commitment & reconsideration policies** (single-minded / open-minded), with a real
-  intention lifecycle (blocked / impossible / superseded). Replaces "re-infer on every signal" with
-  a principled decision about *when* to reconsider a plan. Retires limitation (6).
+- **BDI-style commitment & reconsideration policies** — *plan-level shipped ([ADR-0024](../../../../docs/architecture/adrs/0024-plan-reconsideration-context-adaptation.md))*:
+  `context_adaptation` replaces "re-infer on every signal" with a principled, config-selected decision
+  about *when* to reconsider a plan and a revalidation of whether new perception invalidates it. What
+  remains is the **intention lifecycle** proper (blocked / impossible / superseded), a per-activity
+  (not just per-agent) commitment override, and a posture that adapts to the observed world-change
+  rate. Substantially retires limitation (6).
 
 - **Hard-interrupt preemption (shipped — [ADR-0020](../../../../docs/architecture/adrs/0020-hard-interrupt-and-await-input.md)).**
   `DecisionCycle.interrupt()` now preempts the current phase (phase-boundary checkpoints + true

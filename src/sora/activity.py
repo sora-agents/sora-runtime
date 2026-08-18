@@ -68,6 +68,16 @@ class Activity:
     # on replan since the values are coupled to the plan that produced them. Distinct from the
     # mechanical sub-goal's eager loop-element $bind, which is substituted at fan-out, never stored.
     bindings: dict[str, Any] = field(default_factory=dict)
+    # Context-adaptation reconsideration (ADR-0024). reconsider_baseline is a compact signature of
+    # the perception the current plan was inferred against (its assumptions) — captured at infer
+    # time and installed with the plan by Observe, so a change that landed *during* inference is
+    # caught at the first checkpoint; a reused plan (no fresh inference) falls back to an entry-time
+    # baseline. Reason's checkpoint compares it to the live signature and, when they differ, fires
+    # an off-cycle revalidation. reconsider_verdict parks that re-check's bool result for Reason's
+    # next pass (True -> proceed and re-baseline; False -> reset_for_replan). Both are transient run
+    # state, cleared on reset_for_replan.
+    reconsider_baseline: object | None = None
+    reconsider_verdict: bool | None = None
     # context is exclusively for strategy-author data — the runtime itself never writes into it,
     # which is what keeps pending_operation/last_operation as dedicated fields instead of context
     # keys with a naming convention: no shared namespace means no collision to avoid in the first
@@ -102,6 +112,10 @@ class Activity:
         # Drop the pipeline's intermediate bindings too: they were produced by (and are only
         # meaningful within) the plan being discarded.
         self.bindings.clear()
+        # Reconsideration baseline/verdict are coupled to the discarded plan (ADR-0024): drop them
+        # so the next plan re-baselines against its own starting world rather than a stale one.
+        self.reconsider_baseline = None
+        self.reconsider_verdict = None
         self.discard_inference()
         if was_inferring:
             self.state = ActivityState.READY

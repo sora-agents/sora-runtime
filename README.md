@@ -475,16 +475,24 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         id: str                 #   with pending_operation (a cycle emits one action). Correlates to what
         kind: str               #   _infer_/_ground_ pushed into inference_sink. kind: "plan" (infer ->
         requested_at: float     #   Activity.plan), "subgoal" (a mid-plan infer -> a sub-plan PUSHED as a frame,
-        #                         parent kept — ADR-0022), or "ground" (ground -> the pending step's params). An
+        #                         parent kept — ADR-0022), "ground" (ground -> the pending step's params), or
+        #                         "revalidate" (a plan-validity verdict -> reconsider_verdict, ADR-0024). An
         #                         interrupt handler that re-routes the activity clears/replaces this; a result
         #                         whose id no longer matches the live pending_inference is discarded on resolve
         #                         (the stale-inference guard, mirroring pending_operation's late-ack). ADR-0021.
+        out: str | None = None  # target binding for kind="select" ($decide filter — ADR-0023); None otherwise
+        baseline: object | None = None  # the fire-time perception signature (plan/subgoal: the infer-time
+        #                         world; revalidate: the world it was checked against), moved onto
+        #                         Activity.reconsider_baseline on resolve so the context-adaptation gate
+        #                         baselines against that fire-time world — a change landing mid-flight then
+        #                         earns its own reconsideration rather than being absorbed (ADR-0024)
 
     @dataclass(frozen=True)
     class InferenceResult:    # what infer()/ground() resolve to — arrives async via inference_sink, never a
         id: str                 #   Percept (deliberation output, not observed state — ADR-0019/0021).
-        value: Plan | dict      # correlates to PendingInference.id; a Plan (kind="plan") or grounded params
-        #                         (kind="ground"). DefaultObserveStrategy applies it on resolve.
+        value: Plan | dict | bool  # correlates to PendingInference.id; a Plan (kind="plan"), grounded params
+        #                         (kind="ground"), or a bool verdict (kind="revalidate" — ADR-0024).
+        #                         DefaultObserveStrategy applies it on resolve.
 
     @dataclass(frozen=True)
     class CompletedOperation:   # one resolved invocation + its ack — an entry in Activity.history
@@ -625,6 +633,10 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
                              #   counterpart to `parameters` — adapter-synthesized from a native return
                              #   type/description. Lets a planner author a resolvable `$from` path into
                              #   a prior result instead of guessing its shape; None if undeterminable
+        side_effecting: bool | None = None  # does invoking this MUTATE the world (vs a pure read)? Fills
+                             #   the before_writes reconsideration checkpoint (ADR-0024). Adapter-owned like
+                             #   `returns`: from MCP readOnlyHint / ARE write_operation / inference. None =
+                             #   UNKNOWN -> treated as a write (conservative: reconsider before it)
 
     @dataclass(frozen=True)
     class ObservablePropertySpecification:
@@ -714,6 +726,11 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         grounded_params: dict | None = None                # a resolved _ground_ escalation's concrete params,
         #                                                    consumed by Reason's next pass to emit the step
         last_operation: OperationAck | None = None          # most recently resolved result, for Reason to read
+        reconsider_baseline: object | None = None           # ADR-0024 context-adaptation: a compact perception
+        #                                                     signature captured when the plan started executing;
+        #                                                     the before_writes checkpoint diffs it vs the live world
+        reconsider_verdict: bool | None = None              # a resolved revalidation verdict parked for Reason's next
+        #                                                     pass (True -> proceed + re-baseline; False -> replan)
         blocked_on: SignalWait | InputWait | None = None    # set while BLOCKED; what's awaited before READY —
         #                                                     a SignalWait (tool completion signal; set by
         #                                                     _suspend_, cleared by _resume_ — see below) or an
@@ -919,6 +936,18 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
                                                    kw["partial_params"], kw.get("observed"))
             cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=params))
 
+    class RevalidateAction:                 # predefined internal action: _revalidate_ — async plan-validity re-check
+        name = "revalidate"            #   the context-adaptation reconsideration model call (ADR-0024)
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            activity = cycle.working.activities[kwargs["activity_id"]]
+            inf_id = new_id()
+            activity.pending_inference = PendingInference(id=inf_id, kind="revalidate", requested_at=now())
+            activity.state = ActivityState.RUNNING
+            asyncio.create_task(self._call(cycle, activity, inf_id, kwargs))
+        async def _call(self, cycle, activity, inf_id, kw) -> None:
+            valid = await cycle.procedural.revalidate(activity, kw.get("observed"), kw.get("messages"))
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=valid))
+
     # Data-ops (ADR-0023): the plan's composable data-processing layer. Each is an InternalAction in
     # ActionRegistry's dedicated data-op bucket (not _internal), so only these — never a runtime-only
     # lever — are dispatchable from a plan step, and the collection-`filter` never collides with the
@@ -1117,6 +1146,14 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             (anti-corruption); no llm -> raises. Packaged here (like infer) because procedural memory
             owns the model handle; grounding a step is really an Act-adjacent reasoning act — see
             ADR-0017. (The mechanical reference resolver lives in Reason, not here.)"""
+        async def revalidate(self, activity: Activity, observed: PerceptSnapshot | None = None,
+                        messages: list[Message] | None = None) -> bool:
+            """The context-adaptation relevance judgment (ADR-0024): is the activity's in-progress plan
+            still VALID given the current world? One LLMClient call over the goal + the plan's remaining
+            steps + observed properties/signals + recent messages; parses {"valid": bool} (fail-soft to
+            True). Same model seam as infer/ground; no llm -> raises. A False verdict tells Reason to
+            re-infer — general (no domain-authored predicate), so the agent's own writes don't spuriously
+            invalidate the plan."""
         async def store(self, plan: Plan) -> None:
             """Persists a Plan so future retrieve() calls for similar goals can reuse it. NOT called by
             the default ReflectStrategy: auto-caching a completed plan and replaying it verbatim is
@@ -1267,6 +1304,39 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         on a signal would risk a self-write loop; opting in is a deliberate, application-supplied policy."""
         def decide(self, source: str, signal: Signal, wm: WorkingMemory) -> InterruptRequest | None: ...
 
+    # strategies.context_adaptation — how eagerly Reason re-validates an in-progress plan against new
+    # perception before committing a side-effecting step (ADR-0024): a pluggable policy gating an
+    # off-cycle revalidation, per-agent, selected by a level name or a dotted path. Reconsideration stays
+    # cycle-owned (ADR-0022) — the policy only decides WHEN, not the act. Default before_writes.
+    class ReconsiderationPolicy(Protocol):   # decides whether to run the validity check before a step
+        def should_check(self, side_effecting: bool | None) -> bool: ...   # True write / False read / None unknown
+    class NoneReconsideration:   # none — never reconsider on ambient percepts (blind); should_check -> False
+        def should_check(self, side_effecting: bool | None) -> bool: ...
+    class BeforeWrites:          # before_writes (default) — check before a side-effecting step, skip known reads
+        def should_check(self, side_effecting: bool | None) -> bool: ...   # side_effecting is not False
+    class BeforeEachOp:          # before_each_op — check before EVERY external step; should_check -> True
+        def should_check(self, side_effecting: bool | None) -> bool: ...
+
+    # strategies.change_gate — the cheap mechanical test the reconsideration checkpoint runs BEFORE it
+    # spends a revalidation: has anything observable moved since the plan was baselined? Orthogonal to
+    # context_adaptation, which decides WHICH steps are checkpoints (WHEN); the gate decides WHETHER the
+    # world moved (a signature compared to Activity.reconsider_baseline; equal -> skip it, free
+    # when static). A domain gate that projects perception onto only its externally-meaningful part
+    # filters the agent's OWN writes here — the same efference trick a stateful InterruptPolicy uses,
+    # applied to the cooperative path. Per-agent, selected by a dotted path. Default: the domain-free
+    # PerceptionSignatureGate. The baseline is stored as `object` (PendingInference.baseline /
+    # Activity.reconsider_baseline), so a gate may return any comparable signature.
+    class ChangeGate(Protocol):     # produces a comparable signature of perception for the pre-revalidation gate
+        def signature(self, wm: WorkingMemory) -> object: ...
+    class PerceptionSignatureGate:  # the runtime default: domain-free (sorted property reprs + log lengths)
+        """No domain knowledge — the replace-by-key property snapshot (by repr) plus the signal/message
+        append-log lengths. Equal signatures mean nothing observable moved since the baseline. A self-
+        caused write still moves it (a new state_changed signal, a changed property), so under this
+        default the checkpoint spends one revalidation on the agent's own writes; a domain ChangeGate that
+        projects to only the external surface is how an application removes that (e.g. the ARE example's
+        INBOX-id gate, which self-writes to SENT / read-flags / calendar don't move). See ADR-0024."""
+        def signature(self, wm: WorkingMemory) -> object: ...
+
     class InterruptHandler(Protocol):  # decides an interrupted activity's follow-up — the "interrupt handler"
         async def handle(self, request: InterruptRequest, wm: WorkingMemory, cycle: DecisionCycle) -> bool:
             """Runs after tick() aborts on a pending interrupt (the process-scheduling 'interrupt handler').
@@ -1402,7 +1472,9 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
                      working: WorkingMemory, semantic: SemanticMemory,
                      procedural: ProceduralMemory, episodic: EpisodicMemory,
                      interrupt_handler: InterruptHandler | None = None,      # default DefaultInterruptHandler
-                     interrupt_policy: InterruptPolicy | None = None):       # default NeverInterruptPolicy
+                     interrupt_policy: InterruptPolicy | None = None,        # default NeverInterruptPolicy
+                     reconsideration: ReconsiderationPolicy | None = None,   # default None (bootstrap: before_writes)
+                     change_gate: ChangeGate | None = None):                 # default PerceptionSignatureGate
             self.registry = registry   # the shared, mutation-capable handle, passed to external
             #                            actions at dispatch; WorkingMemory holds the same instance
             #                            read-only (as EnvironmentView) for strategies to reason over.
@@ -1411,6 +1483,8 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
             # signals for ones that should preempt (default: none do — the cooperative path is unchanged).
             self.interrupt_handler = interrupt_handler or DefaultInterruptHandler()
             self.interrupt_policy = interrupt_policy or NeverInterruptPolicy()
+            self.reconsideration = reconsideration or NoneReconsideration()  # ADR-0024; bootstrap: before_writes
+            self.change_gate = change_gate or PerceptionSignatureGate()      # ADR-0024 pre-revalidation change-gate
             # These sinks live here rather than on WorkingMemory: they bridge asynchronous, off-cycle
             # events into this engine's tick()/interrupt() — not settled state. signal_sink specifically
             # has to be co-located with interrupt() below, since a pushed Signal can preempt the current

@@ -19,7 +19,9 @@ from pathlib import Path
 import pytest
 
 from sora.bootstrap import (
+    _DEFAULT_STRATEGIES,
     AgentConfig,
+    _reconsideration_for,
     adapter_for,
     backend_for,
     import_object,
@@ -31,7 +33,13 @@ from sora.bootstrap import (
 )
 from sora.environment import WorkspaceOrigin
 from sora.memory import FileMemoryBackend
-from sora.strategies import DefaultReasonStrategy
+from sora.strategies import (
+    BeforeEachOp,
+    BeforeWrites,
+    DefaultReasonStrategy,
+    NoneReconsideration,
+    PerceptionSignatureGate,
+)
 from sora.transport import InProcessTransport
 
 
@@ -105,6 +113,29 @@ def test_import_object_rejects_bare_name() -> None:
 def test_import_object_missing_attribute_raises() -> None:
     with pytest.raises(AttributeError):
         import_object("sora.strategies.NoSuchStrategy")
+
+
+# _reconsideration_for — context_adaptation level names + a dotted path (ADR-0024)
+
+
+def test_reconsideration_for_resolves_level_names() -> None:
+    assert isinstance(_reconsideration_for("none"), NoneReconsideration)
+    assert isinstance(_reconsideration_for("before_writes"), BeforeWrites)
+    assert isinstance(_reconsideration_for("before_each_op"), BeforeEachOp)
+
+
+def test_reconsideration_for_resolves_a_dotted_path() -> None:
+    # A value that is not a known level name is treated as a dotted path to a custom policy.
+    policy = _reconsideration_for("sora.strategies.BeforeWrites")
+    assert isinstance(policy, BeforeWrites)
+
+
+# change_gate default (ADR-0024): the domain-free signature gate, resolvable like any strategy path
+
+
+def test_default_change_gate_resolves_to_perception_signature_gate() -> None:
+    gate = import_object(_DEFAULT_STRATEGIES["change_gate"])()
+    assert isinstance(gate, PerceptionSignatureGate)
 
 
 # --------------------------------------------------------------------------------------------------

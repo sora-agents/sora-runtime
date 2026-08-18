@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 from sora.action import JoinAction
 from sora.activity import ActivityState
 from sora.perception import NotificationQueueSink
-from sora.strategies import DefaultInterruptHandler, NeverInterruptPolicy
+from sora.strategies import (
+    DefaultInterruptHandler,
+    NeverInterruptPolicy,
+    NoneReconsideration,
+    PerceptionSignatureGate,
+)
 from sora.types import TOOL_ID, WAIT, InterruptRequest
 
 log = logging.getLogger("sora.cycle")
@@ -20,7 +25,14 @@ if TYPE_CHECKING:
     from sora.activity import Activity
     from sora.environment import EnvironmentRegistry
     from sora.memory import EpisodicMemory, ProceduralMemory, SemanticMemory, WorkingMemory
-    from sora.strategies import InterruptHandler, InterruptPolicy, Strategies, TickResult
+    from sora.strategies import (
+        ChangeGate,
+        InterruptHandler,
+        InterruptPolicy,
+        ReconsiderationPolicy,
+        Strategies,
+        TickResult,
+    )
     from sora.transport import MessageTransport
     from sora.types import InferenceResult, OperationAck, Signal, Step
 
@@ -38,6 +50,8 @@ class DecisionCycle:
         episodic: EpisodicMemory,
         interrupt_handler: InterruptHandler | None = None,
         interrupt_policy: InterruptPolicy | None = None,
+        reconsideration: ReconsiderationPolicy | None = None,
+        change_gate: ChangeGate | None = None,
     ) -> None:
         self.strategies = strategies
         self.communication = communication
@@ -49,6 +63,15 @@ class DecisionCycle:
         # bootstraps that never set them) keep working.
         self.interrupt_handler: InterruptHandler = interrupt_handler or DefaultInterruptHandler()
         self.interrupt_policy: InterruptPolicy = interrupt_policy or NeverInterruptPolicy()
+        # How eagerly to re-validate an in-progress plan against new perception (ADR-0024). Default
+        # NoneReconsideration so a directly-constructed cycle keeps its behavior; bootstrap sets
+        # the agent-facing default (before_writes) from agent.yaml's strategies.context_adaptation.
+        self.reconsideration: ReconsiderationPolicy = reconsideration or NoneReconsideration()
+        # The pre-revalidation change-gate (ADR-0024): WHETHER the world moved, orthogonal to
+        # reconsideration's WHEN. Default the domain-free signature gate; a domain gate (bootstrap,
+        # from strategies.change_gate) projects perception to only its external surface so the
+        # agent's own writes don't trip the checkpoint.
+        self.change_gate: ChangeGate = change_gate or PerceptionSignatureGate()
         # The mutation-capable handle, passed to external actions at dispatch. WorkingMemory holds
         # this same shared instance read-only (as EnvironmentView) for strategies to reason over.
         self.registry = registry

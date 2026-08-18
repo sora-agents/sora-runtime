@@ -388,9 +388,13 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # 0022). pending_inference still lives on the real activity, so Observe resolves it by id.
         kind = kwargs.get("kind", "plan")
         goal = kwargs.get("goal")
+        # A signature of the world this plan is inferred against (ADR-0024), captured by Reason at
+        # fire time and carried through to plan install so the context-adaptation gate baselines
+        # against the assumptions the plan was formed in. Absent for grounding fires.
+        baseline = kwargs.get("baseline")
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind=kind, requested_at=time.time()
+            id=inf_id, kind=kind, requested_at=time.time(), baseline=baseline
         )
         activity.state = ActivityState.RUNNING  # off-cycle, like _invoke_ — immediate, never blocks
         target = activity if goal is None else replace(activity, goal=goal)
@@ -468,6 +472,51 @@ class GroundAction:  # predefined internal action: _ground_ — the async param-
             cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))
             return
         cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=params))
+
+
+class RevalidateAction:  # predefined internal action: _revalidate_ — the plan-validity re-check
+    name = "revalidate"
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        # The context-adaptation checkpoint (ADR-0024): fire the validity re-check off-cycle,
+        # exactly like _infer_/_ground_ — the activity goes RUNNING with
+        # pending_inference(kind="revalidate") and the bool verdict lands a later cycle via
+        # inference_sink (Observe parks it on reconsider_verdict). Never blocks the cycle.
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        observed = kwargs.get("observed")
+        messages = kwargs.get("messages")
+        # The perception signature captured when this re-check fires (ADR-0024). Carried through so
+        # Observe can advance reconsider_baseline to *this* moment on resolve: a change that lands
+        # during the re-check's flight then stays outside the new baseline and is reconsidered on
+        # its own, rather than being folded in silently by re-baselining to the verdict-time world.
+        baseline = kwargs.get("baseline")
+        inf_id = uuid.uuid4().hex
+        activity.pending_inference = PendingInference(
+            id=inf_id, kind="revalidate", requested_at=time.time(), baseline=baseline
+        )
+        activity.state = ActivityState.RUNNING  # off-cycle, like _infer_ — immediate, never blocks
+        log.info("reason: revalidating plan for %r", activity.goal)
+        _spawn_tracked(self._tasks, self._call(cycle, activity, inf_id, observed, messages))
+
+    async def _call(
+        self,
+        cycle: DecisionCycle,
+        activity: Activity,
+        inf_id: str,
+        observed: Any,
+        messages: Any,
+    ) -> None:
+        current_inference_id.set(inf_id)
+        try:
+            valid = await cycle.procedural.revalidate(activity, observed, messages)  # LLM call
+        except Exception as exc:  # noqa: BLE001 — any model/parse/wire failure resolves as an error
+            log.exception("reason: revalidate failed for activity %s", activity.id)
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))
+            return
+        cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=valid))
 
 
 # --- data-ops: composable structured-value transforms (ADR-0023) ---------------------------------
@@ -702,6 +751,7 @@ def default_action_registry() -> ActionRegistry:
         ResumeAction(),
         InferAction(),
         GroundAction(),
+        RevalidateAction(),
     ):
         registry.register_internal(internal)
     for data_op in (

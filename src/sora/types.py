@@ -84,12 +84,21 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     # pending_operation's late-ack guard. `kind` picks the landing zone: "plan" (infer ->
     # Activity.plan) or "ground" (ground -> Activity.grounded_params). See ADR-0021.
     id: str
-    # "plan" | "subgoal" | "ground" | "select". "subgoal" lands like "plan" (into Activity.plan);
-    # "select" is a $decide data-op filter (ADR-0023) whose surviving subset lands into
-    # Activity.bindings[out] — the one kind that carries `out`.
+    # "plan" | "subgoal" | "ground" | "select" | "revalidate". "subgoal" lands like "plan" (into
+    # Activity.plan); "select" is a $decide data-op filter (ADR-0023) whose surviving subset lands
+    # into Activity.bindings[out] — carries `out`; "revalidate" is the context-adaptation
+    # plan-validity re-check (ADR-0024), landing a bool onto Activity.reconsider_verdict.
     kind: str
     requested_at: float
     out: str | None = None  # target binding name for kind=="select"; None for the others
+    # A compact signature of the perception the pending deliberation was fired against, captured at
+    # fire time. For kind "plan"/"subgoal" it is the world the plan is being inferred against; for
+    # "revalidate" it is the world the validity check ran against. Observe moves it onto
+    # Activity.reconsider_baseline on resolve, so the context-adaptation gate (ADR-0024) measures
+    # change against that fire-time world — not a later, already-drifted one (a change that lands
+    # during the call's flight then earns its own reconsideration). None for "ground"/"select" and
+    # for a reused plan (no fresh inference), which falls back to an entry-time baseline.
+    baseline: object | None = None
 
 
 @dataclass(frozen=True)
@@ -102,9 +111,10 @@ class InferenceResult:  # what infer()/ground() resolve to — arrives async via
     # RUNNING forever — Observe terminates the activity on it. DefaultObserveStrategy applies it on
     # resolve.
     id: str
-    # Plan (kind "plan"/"subgoal"), grounded params dict (kind "ground"), or the surviving-subset
-    # list (kind "select" — a $decide data-op filter, ADR-0023).
-    value: Plan | dict[str, Any] | list[Any] | None = None
+    # Plan (kind "plan"/"subgoal"), grounded params dict (kind "ground"), the surviving-subset list
+    # (kind "select" — a $decide data-op filter, ADR-0023), or a bool verdict (kind "revalidate" —
+    # the context-adaptation plan-validity re-check, ADR-0024).
+    value: Plan | dict[str, Any] | list[Any] | bool | None = None
     error: str | None = None
 
 

@@ -38,6 +38,7 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0021](0021-llm-calls-as-async-internal-actions.md) | LLM calls as off-cycle, deferred-result internal actions (supersedes ADR-0020's mid-flight abandonment) | proposed | Decision cycle |
 | [0022](0022-plan-representation-context-guard-and-subgoals.md) | Plan representation: retrieval-binding context guard + sub-goals (loosely AgentSpeak) | proposed | Decision cycle |
 | [0023](0023-structured-value-data-ops.md) | Structured-value data-ops: composable transforms as plan steps | proposed | Decision cycle |
+| [0024](0024-plan-reconsideration-context-adaptation.md) | Plan reconsideration via context-adaptation checkpoints (commitment as config) | proposed | Decision cycle |
 
 ## Planned
 

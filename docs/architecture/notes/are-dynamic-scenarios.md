@@ -1,5 +1,13 @@
 # ARE dynamic scenarios via an in-process simulation bridge
 
+> **Note (reconsideration path):** the **primary** way the showcase reconsiders a plan mid-run is now
+> the general context-adaptation mechanism ([ADR-0024](../adrs/0024-plan-reconsideration-context-adaptation.md)),
+> configured as `context_adaptation: before_writes` — no interrupt, no domain authoring. The
+> `MailDiffInterruptPolicy` / `ReconsiderInterruptHandler` seam described below is retained as an
+> **opt-in deterministic override** (preemptive, and the only path that also covers a follow-up
+> arriving *after* the goal completed). This note documents the *bridge* — how a live `Environment`
+> surfaces `state_changed`/user-message events into the cycle — which is unchanged and feeds both paths.
+
 Design note behind the in-process ARE integration. Records how S-ORA runs a *dynamic* ARE (Meta
 Agents Research Environments) scenario — a live, ticking `Environment` whose event timeline actually
 fires — why that path is **in-process** rather than over MCP, and what validating it against the

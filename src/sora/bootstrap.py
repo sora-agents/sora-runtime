@@ -33,7 +33,7 @@ from sora.memory import (
     SemanticMemory,
     WorkingMemory,
 )
-from sora.strategies import Strategies
+from sora.strategies import ReconsiderationPolicy, Strategies
 from sora.transport import InProcessTransport
 
 if TYPE_CHECKING:
@@ -56,7 +56,28 @@ _DEFAULT_STRATEGIES = {
     # await input); interrupt_policy = which pushed signals preempt (default: none).
     "interrupt": "sora.strategies.DefaultInterruptHandler",
     "interrupt_policy": "sora.strategies.NeverInterruptPolicy",
+    # The pre-revalidation change-gate (ADR-0024): whether the world moved since the plan was
+    # baselined, orthogonal to context_adaptation's when. Default the domain-free signature gate; an
+    # app names a domain gate (e.g. an INBOX-id projection) to filter the agent's own writes out.
+    "change_gate": "sora.strategies.PerceptionSignatureGate",
 }
+
+# context_adaptation (ADR-0024): how eagerly to re-validate an in-progress plan against new
+# perception. Selected by a level name — none | before_writes | before_each_op — or a dotted
+# path to a custom ReconsiderationPolicy; the agent-facing default is before_writes.
+_RECONSIDERATION_LEVELS = {
+    "none": "sora.strategies.NoneReconsideration",
+    "before_writes": "sora.strategies.BeforeWrites",
+    "before_each_op": "sora.strategies.BeforeEachOp",
+}
+
+
+def _reconsideration_for(value: str) -> ReconsiderationPolicy:
+    """Resolve a ``context_adaptation`` value (a level name or dotted path) to a policy."""
+    policy: ReconsiderationPolicy = import_object(_RECONSIDERATION_LEVELS.get(value, value))()
+    return policy
+
+
 _DEFAULT_LLM_CLIENT = "sora.adapters.anthropic_llm.AnthropicLLMClient"
 
 # Built-in workspace-adapter / transport "kinds" — the config↔code contract. Each is the string a
@@ -373,6 +394,12 @@ def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
         )(),
         interrupt_policy=import_object(
             config.strategies.get("interrupt_policy", _DEFAULT_STRATEGIES["interrupt_policy"])
+        )(),
+        reconsideration=_reconsideration_for(
+            config.strategies.get("context_adaptation", "before_writes")
+        ),
+        change_gate=import_object(
+            config.strategies.get("change_gate", _DEFAULT_STRATEGIES["change_gate"])
         )(),
     )
     return Agent(

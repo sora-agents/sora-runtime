@@ -15,13 +15,18 @@ from sora.action import (
     CreateActivityAction,
     FilterAction,
     FilterPerceptionsAction,
+    FocusAction,
     GroundAction,
     InferAction,
     InvokeAction,
+    JoinAction,
+    LeaveAction,
     LoadManualAction,
     ResumeAction,
+    RevalidateAction,
     SendAction,
     SuspendAction,
+    UnfocusAction,
     UnloadManualAction,
     pluck,
 )
@@ -34,6 +39,7 @@ from sora.types import (
     SUBGOAL,
     TOOL_ID,
     USER_STOP,
+    WAIT,
     CompletedOperation,
     InputWait,
     OperationInvocation,
@@ -63,6 +69,107 @@ if TYPE_CHECKING:
     from sora.types import InterruptRequest, Signal
 
 log = logging.getLogger("sora.strategies")
+
+
+# ── Context-adaptation reconsideration (ADR-0024) ───────────────────────────────────────────────
+# How eagerly the cycle re-validates an in-progress plan against new perception, as a pluggable
+# policy gating an off-cycle revalidation. Per-agent (via agent.yaml strategies.context_adaptation);
+# the *act* of reconsidering stays cycle-owned (ADR-0022/0019) — the policy only decides WHEN.
+
+
+class ReconsiderationPolicy(Protocol):
+    def should_check(self, side_effecting: bool | None) -> bool:
+        """Given the side-effecting-ness of the step Reason is about to commit (True write, False
+        read, None unknown), decide whether to run the (gated) validity check before it."""
+        ...
+
+
+class NoneReconsideration:
+    """``context_adaptation: none`` — never reconsider on ambient percepts (blind commitment).
+    Failure-driven re-planning stays orthogonal and always on."""
+
+    def should_check(self, side_effecting: bool | None) -> bool:
+        return False
+
+
+class BeforeWrites:
+    """``context_adaptation: before_writes`` (the default) — check before a side-effecting step,
+    where acting on a stale plan does damage. Skips reads (side_effecting is False); an unknown
+    (None) is treated as a write, so it is checked (conservative)."""
+
+    def should_check(self, side_effecting: bool | None) -> bool:
+        return side_effecting is not False
+
+
+class BeforeEachOp:
+    """``context_adaptation: before_each_op`` — check before EVERY external step, read or write.
+    Maximum caution; still op-gated, so it skips planning/grounding/waiting cycles."""
+
+    def should_check(self, side_effecting: bool | None) -> bool:
+        return True
+
+
+# WM/attention actions and WAIT never mutate the world, so they are never "writes"; every other
+# non-invoke external action (e.g. send) is unknown -> treated as a write by before_writes.
+_NON_SIDE_EFFECTING_ACTIONS = frozenset(
+    {FocusAction.name, UnfocusAction.name, JoinAction.name, LeaveAction.name, WAIT}
+)
+
+
+def _step_side_effecting(step: Step, wm: WorkingMemory) -> bool | None:
+    """Whether committing ``step`` mutates the world: an invoke defers to the operation's
+    ``OperationSpecification.side_effecting`` (None = unknown); a WM/attention action or WAIT is a
+    definite read (False); any other external action is unknown (None)."""
+    if step.next_action == InvokeAction.name:
+        manual = _manual_for(wm, step.params.get(TOOL_ID))
+        op = manual.operation(step.params.get(OPERATION_NAME, "")) if manual is not None else None
+        return op.side_effecting if op is not None else None
+    if step.next_action in _NON_SIDE_EFFECTING_ACTIONS:
+        return False
+    return None
+
+
+def _perception_signature(wm: WorkingMemory) -> tuple[Any, ...]:
+    """A compact, comparable signature of current perception — the cheap mechanical change-gate
+    behind the reconsideration check (ADR-0024). No domain knowledge: the replace-by-key property
+    snapshot (each property by its *payload* repr) plus the append-log lengths. Equal signatures
+    mean nothing observable moved since the plan was baselined, so the re-check is skipped (free
+    when the world is static). Keyed on `percept.payload` (the ObservableProperty value), NOT whole
+    Percept — the envelope's `observed_at` is refreshed with `time.time()` on every re-observation
+    (`_snapshot_properties`), so hashing the whole Percept would make an unchanged property look
+    like it moved every cycle and revalidate on every write even in a static world."""
+    properties = tuple(
+        sorted(
+            (f"{source}\x1f{name}", repr(percept.payload))
+            for (source, name), percept in wm.properties.items()
+        )
+    )
+    return (properties, len(wm.signals), len(wm.messages))
+
+
+class ChangeGate(Protocol):
+    """The cheap mechanical test the reconsideration checkpoint runs *before* a revalidation:
+    produce a comparable signature of perception, so equal signatures across cycles mean nothing
+    observable moved since the plan was baselined (ADR-0024). Orthogonal to ReconsiderationPolicy,
+    which decides *which* steps are checkpoints (WHEN); the gate decides *whether* the world moved.
+    A domain gate that projects perception onto only its externally-meaningful part filters the
+    agent's *own* writes here — the same efference trick a stateful InterruptPolicy uses, applied to
+    the cooperative path. The signature is stored as ``object`` (PendingInference.baseline /
+    Activity.reconsider_baseline), so a gate may return any comparable value."""
+
+    def signature(self, wm: WorkingMemory) -> object: ...
+
+
+class PerceptionSignatureGate:
+    """The runtime default ChangeGate: domain-free. The replace-by-key property snapshot (by repr)
+    plus the signal/message append-log lengths. A self-caused write still moves it (a new
+    ``state_changed`` signal, a changed property), so under this default the checkpoint spends one
+    revalidation on the agent's own writes; a domain ChangeGate that projects to only the external
+    surface is how an application removes that (e.g. an INBOX-id gate that self-writes to SENT /
+    read-flags / calendar don't move)."""
+
+    def signature(self, wm: WorkingMemory) -> object:
+        return _perception_signature(wm)
 
 
 @dataclass(frozen=True)
@@ -365,6 +472,9 @@ class DefaultObserveStrategy:
                 ):
                     kind = activity.pending_inference.kind
                     out = activity.pending_inference.out  # set only for kind=="select"
+                    baseline = (
+                        activity.pending_inference.baseline
+                    )  # set for plan/subgoal (ADR-0024)
                     activity.pending_inference = None
                     if res.error is not None and kind == "select":
                         # A $decide filter is a transform, not control flow: a transient model or
@@ -379,6 +489,19 @@ class DefaultObserveStrategy:
                             res.error,
                             out,
                         )
+                    elif res.error is not None and kind == "revalidate":
+                        # A failed revalidation must not force a replan (would thrash): degrade to
+                        # "still valid" so Reason proceeds — mirrors select's fail-soft (ADR-0024).
+                        # Advance the baseline to the re-check's fire-time world (like a valid
+                        # verdict) so a static world doesn't re-fire on the next write.
+                        activity.reconsider_verdict = True
+                        activity.reconsider_baseline = baseline
+                        activity.state = ActivityState.READY
+                        log.warning(
+                            "observe: plan revalidation for %s failed (%s) -> assume valid",
+                            activity.id,
+                            res.error,
+                        )
                     elif res.error is not None:
                         activity.grounded_params = None
                         activity.state = ActivityState.TERMINATED
@@ -391,6 +514,10 @@ class DefaultObserveStrategy:
                     elif kind == "plan":
                         activity.plan = res.value  # type: ignore[assignment]  # kind=="plan" => Plan
                         activity.step_index = 0
+                        # Anchor the context-adaptation gate to the world this plan was inferred
+                        # against (ADR-0024), so a change that landed *during* inference is caught
+                        # at the first checkpoint rather than folded into a later baseline.
+                        activity.reconsider_baseline = baseline
                         activity.state = ActivityState.READY
                         log.info("observe: resolved inferred plan for activity %s", activity.id)
                     elif kind == "subgoal":
@@ -402,6 +529,8 @@ class DefaultObserveStrategy:
                         activity.parent_frames.append(frame)  # type: ignore[arg-type]  # plan set mid-plan
                         activity.plan = res.value  # type: ignore[assignment]  # kind=="subgoal" => Plan
                         activity.step_index = 0
+                        # Re-anchor the gate to the sub-plan's own infer-time world (ADR-0024).
+                        activity.reconsider_baseline = baseline
                         activity.state = ActivityState.READY
                         log.info("observe: entered sub-plan for activity %s", activity.id)
                     elif kind == "select":
@@ -416,6 +545,22 @@ class DefaultObserveStrategy:
                         log.info(
                             "observe: resolved $decide filter -> binding %r for activity %s",
                             out,
+                            activity.id,
+                        )
+                    elif kind == "revalidate":
+                        # The context-adaptation validity verdict (ADR-0024): park the bool for
+                        # Reason's next pass (proceed / reset_for_replan) — deliberation output,
+                        # like plan/ground/select. Advance the baseline to the world this re-check
+                        # was fired against (carried on pending_inference.baseline), so a "valid"
+                        # verdict re-baselines to re-check-fire, not verdict, time: a change that
+                        # arrived mid-flight stays outside the baseline and earns its own
+                        # reconsideration. A "False" verdict discards it in reset_for_replan.
+                        activity.reconsider_verdict = bool(res.value)
+                        activity.reconsider_baseline = baseline
+                        activity.state = ActivityState.READY
+                        log.info(
+                            "observe: plan-validity verdict %s for activity %s",
+                            activity.reconsider_verdict,
                             activity.id,
                         )
                     else:
@@ -1091,6 +1236,11 @@ class DefaultReasonStrategy:
                     tools=catalog,
                     observed=observed,
                     messages=list(wm.messages),  # recent user instructions, snapshot at fire time
+                    # The world the plan is being inferred against, so the context-adaptation gate
+                    # baselines against it once the plan installs (ADR-0024) — not a later cycle's
+                    # already-drifted perception. Via the pluggable ChangeGate so the baseline and
+                    # every later comparison share one signature space.
+                    baseline=cycle.change_gate.signature(wm),
                 )
                 return result  # RUNNING on the inference; plan lands a later cycle
             log.info(
@@ -1127,13 +1277,81 @@ class DefaultReasonStrategy:
                 if parked:
                     return result  # RUNNING on the select escalation; binding lands a later cycle
                 continue
+            # Ground first, *then* reconsider — the checkpoint guards the side-effecting commitment
+            # (the invoke), not the grounding before it (ADR-0024). Grounding is itself an
+            # off-cycle, side-effect-free model call, so checking before it would (a) spend a
+            # revalidation to maybe save a grounding — a model call to save a model call,
+            # net-negative when the plan still holds (the common case) — and (b) miss a change that
+            # lands *during* the grounding window (grounding read its world at dispatch), where a
+            # slow grounding call is most exposed. So each step is checked once, just before commit.
             grounded = await self._ground(step, activity, wm, cycle)
             if grounded is None:
-                return result  # escalated via _ground_ (RUNNING); the step lands a later cycle
-            # Advance only once a concrete step is emitted, so a step awaiting its grounding
-            # escalation isn't skipped — step_index stays put across RUNNING cycles until it lands.
+                return result  # escalated via _ground_ (RUNNING); checked on the invoke pass later
+            checkpoint = await self._reconsider(step, activity, wm, cycle, result)
+            if checkpoint is not None:
+                # Fired a revalidation (RUNNING), or the plan was invalidated (reset_for_replan) —
+                # either way no step commits this cycle. The grounded params stay parked (see
+                # _resolve) so the next cycle re-emits this step without a second _ground_ call.
+                return checkpoint
+            # Commit: consume the parked grounding now that the step dispatches. Advance only once a
+            # concrete step is emitted, so a step awaiting its grounding escalation isn't skipped —
+            # step_index stays put across RUNNING cycles until it lands.
+            activity.grounded_params = None
             activity.step_index += 1
             return replace(result, activity=activity, step=grounded)
+
+    async def _reconsider(
+        self,
+        step: Step,
+        activity: Activity,
+        wm: WorkingMemory,
+        cycle: DecisionCycle,
+        result: TickResult,
+    ) -> TickResult | None:
+        """Context-adaptation checkpoint (ADR-0024), run just before committing an external step.
+        Returns a ``TickResult`` to yield (a revalidation was fired -> RUNNING, or the plan was
+        invalidated -> re-infer) or ``None`` to proceed and emit the step. Two-tier: a resolved
+        verdict from a prior cycle's revalidation is consumed first; otherwise a cheap mechanical
+        gate (did perception move since the plan was baselined?) decides whether to spend one —
+        so a static world costs zero model calls."""
+        # 1) A prior cycle's revalidation resolved: act on its verdict.
+        if activity.reconsider_verdict is not None:
+            valid = activity.reconsider_verdict
+            activity.reconsider_verdict = None
+            if not valid:
+                log.info("reason: plan invalidated by context-adaptation for %r", activity.goal)
+                activity.reset_for_replan()  # -> re-infer next cycle against the current world
+                return result
+            # Valid: proceed. The baseline was already advanced by Observe to the world the re-check
+            # was fired against (not now) — so a change that landed during its flight stays outside
+            # the baseline and is reconsidered on the next write rather than folded in here.
+            return None
+        # 2) Anchor the baseline if unset. An inferred plan already carries its infer-time baseline
+        # (installed by Observe); this is the fallback for a *reused* plan, which has no fresh
+        # inference. Done before the policy gate so even a pre-write read prefix anchors the
+        # reference the first write compares against (entry-time, not first-write-time).
+        if activity.reconsider_baseline is None:
+            activity.reconsider_baseline = cycle.change_gate.signature(wm)
+        # 3) Does the policy want a check before this step?
+        if not cycle.reconsideration.should_check(_step_side_effecting(step, wm)):
+            return None
+        # 4) Cheap mechanical gate: has anything observable moved since the plan was baselined?
+        current = cycle.change_gate.signature(wm)
+        if current == activity.reconsider_baseline:
+            return None  # nothing moved -> proceed (free when the world is static)
+        # 5) Gate hot: fire the revalidation off-cycle (RUNNING); the verdict lands a later cycle.
+        # Carry the fire-time signature so Observe advances the baseline to *this* world on resolve:
+        # a change landing mid-flight then earns its own reconsideration rather than being absorbed.
+        observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+        revalidate = cycle.actions.internal(RevalidateAction.name)
+        await revalidate.execute(
+            cycle,
+            activity_id=activity.id,
+            observed=observed,
+            messages=list(wm.messages),
+            baseline=current,
+        )
+        return result
 
     @staticmethod
     async def _data_op(step: Step, activity: Activity, cycle: DecisionCycle) -> bool:
@@ -1207,6 +1425,9 @@ class DefaultReasonStrategy:
                 messages=list(wm.messages),
                 kind="subgoal",
                 goal=goal,
+                # A sub-plan has its own assumptions; baseline the gate against the world it is
+                # synthesized in, so entering a sub-goal re-anchors reconsideration (ADR-0024).
+                baseline=cycle.change_gate.signature(wm),
             )
             return _SUBGOAL_RUNNING
         plan = activity.plan
@@ -1249,7 +1470,7 @@ class DefaultReasonStrategy:
         references deterministically; escalate to one **off-cycle** model call (the ``_ground_``
         internal action) only for what can't be resolved mechanically. Returns the concrete Step
         when grounding is complete (no references, references resolved mechanically, or a prior
-        ``_ground_`` escalation's params consumed from ``activity.grounded_params``), or ``None``
+        ``_ground_`` escalation's params peeked from ``activity.grounded_params``), or ``None``
         when it just fired ``_ground_`` — the activity is now RUNNING and the step lands a later
         cycle. A step with no references is a pure no-op — the cheap path makes no model call. Only
         ``invoke`` (an operation's params) and ``send`` (its ``content``) carry a groundable bag
@@ -1289,13 +1510,14 @@ class DefaultReasonStrategy:
     ) -> dict[str, Any] | None:
         """Mechanically resolve ``params`` against history; if anything can't be, escalate to the
         off-cycle ``_ground_`` action and return ``None``. When a prior escalation already resolved
-        (``activity.grounded_params`` set by Observe), consume and return those instead — the 1:1
+        (``activity.grounded_params`` set by Observe), *peek* and return those instead — the 1:1
         counterpart to the plan landing on ``activity.plan``. step_index hasn't advanced across the
-        RUNNING cycles, so the parked params belong to exactly this step."""
+        RUNNING cycles, so the parked params belong to exactly this step. Peek, not consume: a
+        checkpoint (ADR-0024) can run between grounding and the invoke and defer the step a cycle,
+        so reason() clears the params at the commit site once the step dispatches — leaving them
+        parked here means a deferred re-entry re-emits the same step instead of re-escalating."""
         if activity.grounded_params is not None:
-            resolved = activity.grounded_params  # the escalation resolved; consume it
-            activity.grounded_params = None
-            return resolved
+            return activity.grounded_params  # the escalation resolved; peek (cleared at commit)
         resolved, unresolved = resolve_references(params, activity.history, activity.bindings)
         if not unresolved:
             return resolved  # cheap path — resolved mechanically, no model call

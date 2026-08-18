@@ -1,34 +1,41 @@
-"""Deterministic tests for the ARE *dynamic*-scenario interrupt seam — over fakes, no model.
+"""Deterministic tests for the ARE *dynamic*-scenario reconsideration paths — over fakes, no model.
 
 The dynamic scenario's follow-up (a mid-run Monday -> Tuesday change) reaches the agent as a **new
-inbound email**, and reconsideration is triggered by a hard interrupt rather than a phase strategy:
+inbound email**. Two reconsideration paths are covered:
 
-* ``MailDiffInterruptPolicy`` raises an interrupt on a genuinely new INBOX email id (read from the
-  ``state_changed`` signal payload) — and crucially NOT on the baseline inbox, NOT the agent's own
-  reply landing in SENT (the loop a bare signal-count trigger caused), and NOT a non-inbox signal.
-* ``ReconsiderInterruptHandler`` routes that interrupt: clear a live activity's plan (the default
-  Reason then re-infers) or spawn one corrective activity when the goal completed; a user stop
-  is delegated to the runtime default.
+* **Primary — context-adaptation (ADR-0024).** `agent.yaml` sets `context_adaptation:
+  before_writes`; the follow-up moves perception, so before the calendar write Reason's change-gate
+  goes hot and a revalidation (a fake, here) re-checks the plan — "invalid" re-plans, "valid" runs.
+  General runtime machinery, no example code (the last section below).
+* **Opt-in override — the MailDiff interrupt seam.** ``MailDiffInterruptPolicy`` raises a hard
+  interrupt on a genuinely new INBOX email id (from the ``state_changed`` payload) — NOT the
+  baseline inbox, NOT the agent's own reply landing in SENT, NOT a non-inbox signal — and
+  ``ReconsiderInterruptHandler`` routes it: clear a live activity's plan (Reason re-infers) or spawn
+  one corrective activity when the goal completed; a user stop is delegated to the runtime default.
 
 The real ARE Environment + real Claude version is the skip-gated ``test_are_sim_reproduction.py``.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 from examples.are.sim.email_calendar.strategies import (
     _CORRECTIVE_GOAL,
+    InboxChangeGate,
     MailDiffInterruptPolicy,
     ReconsiderInterruptHandler,
     reconciling_plan_prompt,
 )
 
-from sora.action import default_action_registry
+from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from sora.action import RevalidateAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
-from sora.environment import EnvironmentRegistry
+from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.manual import Manual, OperationSpecification
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -36,16 +43,28 @@ from sora.memory import (
     SemanticMemory,
     WorkingMemory,
 )
+from sora.perception import Percept
 from sora.strategies import (
+    BeforeWrites,
     DefaultActStrategy,
     DefaultObserveStrategy,
     DefaultReasonStrategy,
     DefaultReflectStrategy,
     DefaultSituateStrategy,
     Strategies,
+    TickResult,
+    _perception_signature,
 )
 from sora.transport import InProcessTransport
-from sora.types import InputWait, InterruptRequest, PendingInference, Plan, Signal, Step
+from sora.types import (
+    InputWait,
+    InterruptRequest,
+    ObservableProperty,
+    PendingInference,
+    Plan,
+    Signal,
+    Step,
+)
 
 _GOAL = "schedule the team sync Alice emailed about, then reply to her"
 
@@ -92,6 +111,49 @@ def _cycle(tmp_path: Path) -> tuple[DecisionCycle, WorkingMemory]:
         episodic=EpisodicMemory(FileMemoryBackend(tmp_path / "episodic")),
     )
     return cycle, working
+
+
+# --------------------------------------------------------------------------------------------------
+# InboxChangeGate: the cooperative-path efference filter — the change-gate signature tracks only the
+# INBOX id-set, so a SENT self-write / a non-email state never moves it, but a new inbound does
+# --------------------------------------------------------------------------------------------------
+
+
+def _state_property(wm: WorkingMemory, tool_id: str, state: Any) -> None:
+    wm.properties[(tool_id, "state")] = Percept(tool_id, ObservableProperty("state", state), 0.0)
+
+
+def test_inbox_change_gate_projects_to_inbox_ids() -> None:
+    wm = _wm()
+    _state_property(wm, "email", _email_state(inbox=["e1", "e2"]))
+    assert InboxChangeGate().signature(wm) == frozenset({"e1", "e2"})
+
+
+def test_inbox_change_gate_ignores_a_sent_self_write() -> None:
+    # The whole point: the agent's own reply lands in SENT and never grows the INBOX id-set, so the
+    # signature is unchanged and the before-writes checkpoint stays cold on a self-write.
+    gate = InboxChangeGate()
+    wm = _wm()
+    _state_property(wm, "email", _email_state(inbox=["e1"]))
+    before = gate.signature(wm)
+    _state_property(wm, "email", _email_state(inbox=["e1"], sent=["reply"]))
+    assert gate.signature(wm) == before
+
+
+def test_inbox_change_gate_moves_on_a_new_inbound() -> None:
+    gate = InboxChangeGate()
+    wm = _wm()
+    _state_property(wm, "email", _email_state(inbox=["e1"]))
+    before = gate.signature(wm)
+    _state_property(wm, "email", _email_state(inbox=["e1", "e2"]))  # a follow-up arrived
+    assert gate.signature(wm) != before
+
+
+def test_inbox_change_gate_ignores_non_email_state() -> None:
+    # A calendar tool's state has no INBOX -> projected away, so a self calendar write never fires.
+    wm = _wm()
+    _state_property(wm, "cal", {"events": [{"event_id": "ev1"}]})
+    assert InboxChangeGate().signature(wm) == frozenset()
 
 
 # --------------------------------------------------------------------------------------------------
@@ -240,3 +302,106 @@ def test_reconciling_prompt_no_longer_scaffolds_focus() -> None:
     assert "make your first steps a" not in lowered  # the retired focus-first directive
     assert "keep them focused until the task is done" not in lowered
     assert "duplicate" in lowered  # keeps the reconcile-don't-duplicate guidance
+
+
+# --------------------------------------------------------------------------------------------------
+# The primary reconsideration path: context-adaptation (ADR-0024). agent.yaml sets
+# `context_adaptation: before_writes`, so the mid-run Monday -> Tuesday follow-up trips the
+# checkpoint and the plan is re-inferred — general mechanism, no MailDiff interrupt, fake re-check.
+# --------------------------------------------------------------------------------------------------
+
+_CAL_MANUAL = Manual(
+    id="calendar",
+    metadata={},
+    description="",
+    observable_properties=[],
+    signals=[],
+    operations=[
+        OperationSpecification(
+            name="add_calendar_event", description="", parameters={}, side_effecting=True
+        )
+    ],
+)
+
+
+async def _reconsidering_cycle(
+    tmp_path: Path, *, verdict: str
+) -> tuple[DecisionCycle, WorkingMemory]:
+    """A cycle wired the way the example's agent.yaml wires it — before_writes context-adaptation —
+    with a fake revalidation for the model so the Monday -> Tuesday regression is deterministic."""
+    origin = WorkspaceOrigin(adapter="fake", address="fake://cal")
+    tool = FakeTool("calendar", manual=_CAL_MANUAL, invoke_results={"add_calendar_event": "ok"})
+    registry = EnvironmentRegistry(
+        adapters={origin: FakeAdapter("fake", FakeWorkspace("cal", origin, [tool]))}
+    )
+    await registry.join(origin)  # populate live tools so the manual (op.side_effecting) resolves
+    working = WorkingMemory(registry=registry)
+    cycle = DecisionCycle(
+        strategies=Strategies(
+            observe=DefaultObserveStrategy(),
+            reflect=DefaultReflectStrategy(),
+            situate=DefaultSituateStrategy(),
+            reason=DefaultReasonStrategy(),
+            act=DefaultActStrategy(),
+        ),
+        communication=InProcessTransport(),
+        actions=default_action_registry(),
+        registry=registry,
+        working=working,
+        semantic=SemanticMemory(FileMemoryBackend(tmp_path / "semantic")),
+        procedural=ProceduralMemory(
+            FileMemoryBackend(tmp_path / "procedural"), llm=FakeLLMClient(verdict)
+        ),
+        episodic=EpisodicMemory(FileMemoryBackend(tmp_path / "episodic")),
+        reconsideration=BeforeWrites(),
+    )
+    return cycle, working
+
+
+async def _resolve_revalidate(cycle: DecisionCycle) -> None:
+    await asyncio.gather(*list(cycle.actions.internal(RevalidateAction.name)._tasks))  # type: ignore[attr-defined]
+    await DefaultObserveStrategy().observe(cycle)
+
+
+async def test_context_adaptation_replans_on_the_mid_run_followup(tmp_path: Path) -> None:
+    # The Monday -> Tuesday regression, driven by the general mechanism rather than the interrupt.
+    cycle, working = await _reconsidering_cycle(tmp_path, verdict='{"valid": false}')
+    plan = Plan(id="p", goal=_GOAL, steps=[invoke_step("calendar", "add_calendar_event")])
+    activity = Activity(id="a", goal=_GOAL, context={}, plan=plan, step_index=0)
+    working.activities["a"] = activity
+    activity.reconsider_baseline = _perception_signature(working)  # baselined in the Monday world
+
+    # The follow-up lands mid-run: a new inbound email surfaces as a state change.
+    working.signals.append(
+        Percept("EmailClientApp", _state_changed(inbox=["orig", "followup"]), 0.0)
+    )
+
+    fired = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert (
+        fired.step is None
+    )  # the calendar write is NOT committed; the gate went hot -> revalidation
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "revalidate"
+
+    await _resolve_revalidate(cycle)  # verdict: invalid
+    replanned = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert replanned.step is None
+    assert activity.plan is None  # stale Monday plan dropped -> Reason re-infers against Tuesday
+
+
+async def test_context_adaptation_keeps_a_still_valid_plan(tmp_path: Path) -> None:
+    # Control: a "still valid" verdict commits the write — no spurious replan storm on self-writes.
+    cycle, working = await _reconsidering_cycle(tmp_path, verdict='{"valid": true}')
+    plan = Plan(id="p", goal=_GOAL, steps=[invoke_step("calendar", "add_calendar_event")])
+    activity = Activity(id="a", goal=_GOAL, context={}, plan=plan, step_index=0)
+    working.activities["a"] = activity
+    activity.reconsider_baseline = _perception_signature(working)
+    working.signals.append(Percept("EmailClientApp", _state_changed(inbox=["orig", "later"]), 0.0))
+
+    await DefaultReasonStrategy().reason(
+        activity, working, cycle, TickResult()
+    )  # fires the revalidation
+    await _resolve_revalidate(cycle)  # verdict: valid
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step == invoke_step("calendar", "add_calendar_event")  # still valid -> committed
+    assert activity.plan is not None

@@ -879,6 +879,30 @@ def _parse_params(text: str) -> dict[str, Any]:
     return params
 
 
+# --- revalidate: the context-adaptation plan-validity re-check — ADR-0024 ------------------------
+
+REVALIDATE_SYSTEM_PROMPT = (
+    "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. "
+    "You are given the goal, the plan's REMAINING steps, and the new observed state and messages. "
+    "The plan is INVALID if the new information changes what the remaining steps should do — a "
+    "follow-up that changes a detail the plan acted on, or a precondition that no longer holds. "
+    "It is VALID if the remaining steps still achieve the goal; the agent's OWN prior actions do "
+    "not by themselves invalidate it.\n"
+    'Respond with ONLY a JSON object {"valid": true} or {"valid": false} — no prose, no fences.'
+)
+
+
+def _parse_verdict(text: str) -> bool:
+    """Parse the revalidation's ``{"valid": bool}`` answer. A malformed/unparseable answer degrades
+    to ``True`` (still valid), so a flaky call can't trigger a replan storm — mirrors ``select``'s
+    fail-soft degrade (ADR-0024)."""
+    try:
+        obj = _load_json_object(text)
+        return bool(obj["valid"])
+    except (ValueError, KeyError, TypeError):
+        return True
+
+
 # --- select: the model-escalated data-op filter predicate ($decide) — ADR-0023 -------------------
 
 SELECT_SYSTEM_PROMPT = (
@@ -1037,6 +1061,53 @@ class ProceduralMemory:
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", SELECT_SYSTEM_PROMPT, user)
         text = await self._llm.complete(system=SELECT_SYSTEM_PROMPT, prompt=user)
         return [collection[index] for index in _parse_keep(text, len(collection))]
+
+    async def revalidate(
+        self,
+        activity: Activity,
+        observed: PerceptSnapshot | None = None,
+        messages: list[Message] | None = None,
+    ) -> bool:
+        """Re-check whether the activity's in-progress plan is still valid against the current world
+        — the context-adaptation relevance judgment (ADR-0024). One model call: the goal, the plan's
+        REMAINING steps, and the observed properties/signals plus recent messages, asking for
+        a ``{"valid": bool}`` verdict. Reuses the same ``LLMClient`` seam as ``infer``; no
+        LLM -> raises. A ``False`` verdict re-infers; best-effort, not a guarantee, and
+        deliberately general (no domain-authored predicate) — it reasons about relevance itself, so
+        the agent's own writes don't spuriously invalidate the plan."""
+        if self._llm is None:
+            raise RuntimeError(
+                "ProceduralMemory has no LLM configured; cannot revalidate a plan. Pass a client."
+            )
+        snapshot = observed or PerceptSnapshot()
+        # The full remaining tail across the sub-goal stack (ADR-0022), not just the active
+        # sub-plan: the current plan's steps from step_index, then each suspended parent's steps
+        # after its sub-goal (innermost frame resumes first — the top of parent_frames). Checking
+        # only the sub-plan would call it "still valid" while a now-stale parent step still waits.
+        remaining = (
+            list(activity.plan.steps[activity.step_index :]) if activity.plan is not None else []
+        )
+        for parent_plan, subgoal_index in reversed(activity.parent_frames):
+            remaining.extend(parent_plan.steps[subgoal_index + 1 :])
+        steps_text = (
+            "\n".join(
+                f"{index}: {step.next_action} {json.dumps(step.params, default=str)}"
+                for index, step in enumerate(remaining)
+            )
+            or "(none)"
+        )
+        user = (
+            f"Goal: {activity.goal}\n"
+            f"Remaining plan steps:\n{steps_text}\n"
+            f"Observed properties:\n{render_properties(snapshot.properties)}\n"
+            f"Observed signals:\n{render_signals(snapshot.signals)}\n"
+            f"Recent messages:\n{render_messages(messages or [])}"
+        )
+        log.debug(
+            "reason: revalidate system prompt\n%s\nUser prompt\n%s", REVALIDATE_SYSTEM_PROMPT, user
+        )
+        text = await self._llm.complete(system=REVALIDATE_SYSTEM_PROMPT, prompt=user)
+        return _parse_verdict(text)
 
     async def store(self, plan: Plan) -> None:
         """Persists a Plan that was actually followed to completion, so future retrieve() calls

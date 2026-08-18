@@ -3,7 +3,26 @@
 The static MCP demo (``examples/are/mcp/email_calendar``) runs one plan to completion. This dynamic
 scenario's timeline fires a mid-run follow-up email that *changes the answer* (Monday -> Tuesday).
 The agent reconsiders through its **own decision cycle** rather than blindly finishing the original
-plan — and the trigger for that reconsideration is a **hard interrupt**, not a phase strategy:
+plan.
+
+The **primary** reconsideration path is now the runtime's general context-adaptation mechanism
+(ADR-0024), configured in ``agent.yaml`` as ``context_adaptation: before_writes`` — before each
+side-effecting step Reason re-validates the plan against new perception, and a mid-run follow-up
+trips it before the calendar write. The mechanism itself is pure runtime; this file contributes only
+one optional, domain-shaped piece — ``InboxChangeGate``, wired as ``strategies.change_gate``. It is
+the *pre-revalidation* change-gate: the runtime default trips on any observable movement (including
+the agent's own reply/read-flags/calendar writes), so without it the checkpoint would spend a
+revalidation on the agent's own actions. ``InboxChangeGate`` projects perception to just the INBOX
+email ids, so a self-write leaves the signature unchanged (no revalidation) and only a genuine
+follow-up fires — the same
+efference filter ``MailDiffInterruptPolicy`` applies on the hard-interrupt path, sharing the one
+``_inbox_ids_from_state`` projection.
+
+What lives here is the **opt-in deterministic override** — a *preemptive*, no-model alternative that
+also covers the post-completion case (a follow-up after the goal already finished), which the
+cooperative before-writes checkpoint structurally can't. It is wired only when ``agent.yaml``
+uncomments the ``interrupt_policy``/``interrupt`` lines. It is a **hard interrupt**, not a phase
+strategy:
 
 * ``MailDiffInterruptPolicy`` — an ``InterruptPolicy`` screening the ``state_changed`` signals the
   ARE tools push. It diffs the INBOX email ids carried in the signal payload against what it has
@@ -72,20 +91,28 @@ _CORRECTIVE_GOAL = (
 _NEW_INBOUND = "new_inbound_email"  # the interrupt signal the policy raises and the handler routes
 
 
-def _inbox_ids_from_signal(signal: Signal) -> frozenset[str] | None:
-    """The INBOX email ids in a ``state_changed`` signal's payload, or None if it carries no inbox
-    (a non-email tool's state, or a malformed payload). ARE ``EmailClientApp`` state shape:
-    ``{"value": {"folders": {"INBOX": {"emails": [{"email_id": ...}]}}}}``. Scoping to INBOX is the
-    whole point — the agent's own outbound reply lands in SENT, so it never grows this set."""
-    value = signal.payload.get("value")
-    if not isinstance(value, dict):
+def _inbox_ids_from_state(state: object) -> frozenset[str] | None:
+    """The INBOX email ids in an ARE ``EmailClientApp`` state, or None if this state has no inbox
+    (a non-email tool's state, or a malformed value). State shape:
+    ``{"folders": {"INBOX": {"emails": [{"email_id": ...}]}}}``. Scoping to INBOX is the whole point
+    — the agent's own outbound reply lands in SENT, so it never grows this set. This is the shared
+    ``state -> id-set`` projection behind both the hard-interrupt policy (fed the signal payload's
+    ``value``) and the cooperative change-gate (fed an observable ``state`` property's value)."""
+    if not isinstance(state, dict):
         return None
-    folders = value.get("folders")
+    folders = state.get("folders")
     inbox = folders.get("INBOX") if isinstance(folders, dict) else None
     emails = inbox.get("emails") if isinstance(inbox, dict) else None
     if not isinstance(emails, list):
         return None
     return frozenset(str(e["email_id"]) for e in emails if isinstance(e, dict) and "email_id" in e)
+
+
+def _inbox_ids_from_signal(signal: Signal) -> frozenset[str] | None:
+    """The INBOX email ids carried in a ``state_changed`` signal payload (``{"value": state}``), or
+    None if it carries no inbox. A thin wrapper over the shared ``_inbox_ids_from_state`` projection
+    — the hard-interrupt path unwraps the fat signal's ``value``."""
+    return _inbox_ids_from_state(signal.payload.get("value"))
 
 
 class MailDiffInterruptPolicy:
@@ -110,6 +137,30 @@ class MailDiffInterruptPolicy:
             log.info("interrupt-policy: new inbound email %s -> preempt", sorted(new_inbound))
             return InterruptRequest(Signal(_NEW_INBOUND, {"email_ids": sorted(new_inbound)}))
         return None
+
+
+class InboxChangeGate:
+    """A domain ``ChangeGate`` for the cooperative context-adaptation path (ADR-0024), the
+    counterpart to ``MailDiffInterruptPolicy`` on the hard-interrupt path. The runtime default
+    ``PerceptionSignatureGate`` trips on *any* observable movement — including the agent's own
+    reply, read-flags, and calendar writes, each of which mutates a watched ``state`` property — so
+    the before-writes checkpoint would spend a revalidation on the agent's own actions. This gate
+    projects perception onto only its externally-meaningful part: the union of INBOX email ids
+    across every observable ``state`` property, via the same ``_inbox_ids_from_state`` projection
+    the interrupt policy uses. A self-write (reply -> SENT, a read-flag flip, a calendar add) leaves
+    the INBOX id-set unchanged, so the signature is equal and the revalidation is skipped; a genuine
+    follow-up grows the set and the checkpoint fires. Stateless — the baseline lives on the
+    activity, not here."""
+
+    def signature(self, wm: WorkingMemory) -> object:
+        ids: frozenset[str] = frozenset()
+        for (_source, name), percept in wm.properties.items():
+            if name != "state":
+                continue
+            inbox = _inbox_ids_from_state(getattr(percept.payload, "value", None))
+            if inbox is not None:
+                ids |= inbox
+        return ids
 
 
 class ReconsiderInterruptHandler:
