@@ -11,7 +11,10 @@ revalidation, no network, no model.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
+
+import pytest
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, ScriptedTransport
 from sora.action import (
@@ -314,6 +317,52 @@ async def test_hot_gate_fires_revalidation_then_invalid_reinfers(tmp_path: Path)
     assert replanned.step is None
     assert activity.plan is None  # invalidated -> Reason will re-infer next
     assert activity.reconsider_verdict is None  # consumed
+
+
+async def test_invalidated_then_re_inferred_plans_are_both_traced(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The trace of a replan is only useful if it shows *both* plans: the invalidated one (with the
+    step it had reached) and the replacement inferred against the moved world. Body text is DEBUG —
+    it belongs in the --log-file mirror, not the terminal's one-line-per-event view."""
+    cycle, working = await _cycle(
+        tmp_path, reconsideration=BeforeWrites(), verdict_response='{"valid": false}'
+    )
+    activity = _write_activity(working)
+    activity.reconsider_baseline = _perception_signature(working)
+    working.signals.append(Percept("t", Signal("follow_up", {}), 0.0))  # gate hot
+    # Taken inside a sub-plan: reset_for_replan drops the suspended parent too, so a dump of the
+    # active plan alone would understate the discard.
+    parent_steps = [invoke_step("t", "sub_op"), invoke_step("t", "tail_op")]
+    parent = Plan(id="p0", goal="g", steps=parent_steps)
+    activity.parent_frames.append((parent, 0))
+
+    with caplog.at_level(logging.DEBUG, logger="sora.strategies"):
+        await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+        await _resolve_revalidate(cycle)
+        await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())  # invalid
+        assert activity.plan is None
+
+        # The replacement inference lands the way Reason's re-infer would.
+        replacement = Plan(id="p2", goal="g", steps=[invoke_step("t", "read_op")])
+        activity.state = ActivityState.RUNNING
+        activity.pending_inference = PendingInference(
+            id="inf-2", kind="plan", requested_at=0.0, baseline=_perception_signature(working)
+        )
+        cycle.inference_sink.push("inf-2", InferenceResult(id="inf-2", value=replacement))
+        await DefaultObserveStrategy().observe(cycle)
+
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    discarded = [m for m in debug if m.startswith("reason: discarded plan")]
+    installed = [m for m in debug if m.startswith("observe: plan for activity")]
+    assert len(discarded) == 1
+    assert "was at step 0" in discarded[0]
+    assert "0: invoke" in discarded[0] and "write_op" in discarded[0]
+    assert "1 suspended parent(s)" in discarded[0]  # the whole stack, not just the active frame
+    assert "-- parent, suspended at step 0 --" in discarded[0]
+    assert "tail_op" in discarded[0]  # the parent's un-run tail, dropped with it
+    assert len(installed) == 1
+    assert "0: invoke" in installed[0] and "read_op" in installed[0]
 
 
 async def test_hot_gate_valid_verdict_proceeds_and_rebaselines(tmp_path: Path) -> None:

@@ -220,6 +220,26 @@ Ctrl-D (EOF) does the same. `--task "..."` (or `--task-file path`) submits an in
 startup, before you'd type anything yourself — useful for scripting a run non-interactively, e.g.
 `sora run agent.yaml --task-file task.txt`, without needing to type it in by hand.
 
+`--verbose` is a *display* setting, not a log level: it selects the one-line-per-event terminal view,
+while the runtime separately emits finer `DEBUG` detail — the prompt behind each model call, each
+operation's result, and the plan bodies themselves (as inferred, as reused from procedural memory, as
+entered for a sub-goal, as re-spliced when a mechanical sub-goal fans out, and as discarded when
+context-adaptation invalidates one, paired with the replacement inferred against the moved world).
+`--log-file PATH` mirrors that complete trace to a file, always at full detail and independent of
+what the terminal is showing:
+
+    [cycle 4] Reason   - plan invalidated by context-adaptation for 'book the cheapest flight'
+    [cycle 4] Reason   - discarded plan for activity trip (was at step 1)
+    0: invoke {"tool_id": "Flights", "operation_name": "search"}
+    1: invoke {"tool_id": "Flights", "operation_name": "book"}
+    [cycle 6] Observe  - plan for activity trip
+    0: invoke {"tool_id": "Flights", "operation_name": "search"}
+    1: invoke {"tool_id": "Hotels", "operation_name": "search"}
+
+There is no `--log-level` flag: `sora run` holds the `sora` logger at `DEBUG` and lets each handler
+decide what to show, so a run recorded with `--log-file` never has to be repeated at a higher
+verbosity to recover the detail.
+
 Three more optional flags, mainly for driving an ARE scenario without a bespoke runner script (see
 [Running the ARE examples](#running-the-are-examples)): `--scenario <ref>` injects a runtime
 `AreSimulation` for an `are-sim` workspace/`are` transport (mutually exclusive with `--task`/
@@ -381,7 +401,7 @@ Two runnable showcases drive S-ORA against Meta's [Agents Research Environments]
 
 Separately, the **MCP path** runs one seeded static scenario, `examples/are/mcp/email_calendar` (a 30-minute team sync from an inbox email); it is fixed by that example's `agent.yaml`/`task.txt` rather than selected with `--scenario`.
 
-The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the decision cycle until the activity terminates, prints the trajectory, and prints the runtime's own INFO trace via plain `logging.basicConfig`; raise or lower it with `LOGLEVEL` (e.g. `LOGLEVEL=WARNING`) — it exists primarily as the reference example for [driving an agent programmatically](#driving-an-agent-programmatically), without `TerminalSession`. The in-process dynamic path runs entirely through `sora run` (above), so its trace/trajectory/footer are the same colored `[cycle N] Phase - ...` output (or terse `[invoking ...]` cues) as any other `sora run` session, controlled by `--verbose`/`--color`/`--no-color`, not `LOGLEVEL`. For how the two adapter paths differ and why the dynamic path exists, see [EXAMPLES.md](EXAMPLES.md#running-dynamic-scenarios-in-process) and the [ARE dynamic scenarios design note](docs/architecture/notes/are-dynamic-scenarios.md).
+The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the decision cycle until the activity terminates, prints the trajectory, and prints the runtime's own INFO trace via plain `logging.basicConfig`; raise or lower it with `LOGLEVEL` (e.g. `LOGLEVEL=WARNING`) — it exists primarily as the reference example for [driving an agent programmatically](#driving-an-agent-programmatically), without `TerminalSession`. The in-process dynamic path runs entirely through `sora run` (above), so its trace/trajectory/footer are the same colored `[cycle N] Phase - ...` output (or terse `[invoking ...]` cues) as any other `sora run` session, controlled by `--verbose`/`--color`/`--no-color` (and `--log-file` for the full-detail file mirror), not `LOGLEVEL`. For how the two adapter paths differ and why the dynamic path exists, see [EXAMPLES.md](EXAMPLES.md#running-dynamic-scenarios-in-process) and the [ARE dynamic scenarios design note](docs/architecture/notes/are-dynamic-scenarios.md).
 
 ## API Sketch
 

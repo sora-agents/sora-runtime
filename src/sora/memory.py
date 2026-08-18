@@ -811,6 +811,22 @@ def render_history(history: list[CompletedOperation]) -> str:
     return "\n".join(lines)
 
 
+def render_steps(steps: list[Step]) -> str:
+    """Render plan steps one per line as ``index: action {params}``. Shared by the revalidation
+    prompt and the runtime's own plan-level DEBUG log so both read alike — the same rendering, not
+    the same text: an index is a position in whatever list the caller passes, and the prompt passes
+    only the remaining tail (flattened across the sub-goal stack, re-indexed from 0) while the log
+    passes a whole plan body. ``(none)`` for an empty list — an inferred plan can legitimately be
+    empty."""
+    return (
+        "\n".join(
+            f"{index}: {step.next_action} {json.dumps(step.params, default=str)}"
+            for index, step in enumerate(steps)
+        )
+        or "(none)"
+    )
+
+
 def render_bindings(bindings: dict[str, Any]) -> str:
     """Render an activity's named data-op bindings for a grounding prompt. Public so a custom
     ``GroundPrompt`` can reuse it. A ``$bind`` reference or a ``$decide`` instruction may name a
@@ -1089,13 +1105,7 @@ class ProceduralMemory:
         )
         for parent_plan, subgoal_index in reversed(activity.parent_frames):
             remaining.extend(parent_plan.steps[subgoal_index + 1 :])
-        steps_text = (
-            "\n".join(
-                f"{index}: {step.next_action} {json.dumps(step.params, default=str)}"
-                for index, step in enumerate(remaining)
-            )
-            or "(none)"
-        )
+        steps_text = render_steps(remaining)
         user = (
             f"Goal: {activity.goal}\n"
             f"Remaining plan steps:\n{steps_text}\n"

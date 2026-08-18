@@ -32,7 +32,7 @@ from sora.action import (
 )
 from sora.activity import ActivityState
 from sora.llm import log_llm_discarded
-from sora.memory import PerceptSnapshot, step_from_raw
+from sora.memory import PerceptSnapshot, render_steps, step_from_raw
 from sora.perception import Percept
 from sora.types import (
     OPERATION_NAME,
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     from sora.manual import Manual
     from sora.memory import WorkingMemory
     from sora.perception import Message
-    from sora.types import InterruptRequest, Signal
+    from sora.types import InterruptRequest, Plan, Signal
 
 log = logging.getLogger("sora.strategies")
 
@@ -512,7 +512,8 @@ class DefaultObserveStrategy:
                             res.error,
                         )
                     elif kind == "plan":
-                        activity.plan = res.value  # type: ignore[assignment]  # kind=="plan" => Plan
+                        inferred: Plan = res.value  # type: ignore[assignment]  # kind=="plan" => Plan
+                        activity.plan = inferred
                         activity.step_index = 0
                         # Anchor the context-adaptation gate to the world this plan was inferred
                         # against (ADR-0024), so a change that landed *during* inference is caught
@@ -520,6 +521,15 @@ class DefaultObserveStrategy:
                         activity.reconsider_baseline = baseline
                         activity.state = ActivityState.READY
                         log.info("observe: resolved inferred plan for activity %s", activity.id)
+                        # The plan body itself only at DEBUG: it belongs in the full --log-file
+                        # trace (next to the prompt that produced it), not in the terminal's
+                        # one-line-per-event view. Same rendering as the revalidation prompt, so a
+                        # re-inferred plan can be diffed against the one it replaced by eye.
+                        log.debug(
+                            "observe: plan for activity %s\n%s",
+                            activity.id,
+                            render_steps(inferred.steps),
+                        )
                     elif kind == "subgoal":
                         # A mid-plan sub-goal's synthesized sub-plan: push the parent frame (its
                         # plan + the sub-goal's step_index) and enter the sub-plan, so Reason
@@ -527,12 +537,19 @@ class DefaultObserveStrategy:
                         # lands like a top-level plan, only onto a stacked frame not the activity.
                         frame = (activity.plan, activity.step_index)
                         activity.parent_frames.append(frame)  # type: ignore[arg-type]  # plan set mid-plan
-                        activity.plan = res.value  # type: ignore[assignment]  # kind=="subgoal" => Plan
+                        sub_plan: Plan = res.value  # type: ignore[assignment]  # kind=="subgoal" => Plan
+                        activity.plan = sub_plan
                         activity.step_index = 0
                         # Re-anchor the gate to the sub-plan's own infer-time world (ADR-0024).
                         activity.reconsider_baseline = baseline
                         activity.state = ActivityState.READY
                         log.info("observe: entered sub-plan for activity %s", activity.id)
+                        log.debug(
+                            "observe: sub-plan for activity %s (nested under %d frame(s))\n%s",
+                            activity.id,
+                            len(activity.parent_frames),
+                            render_steps(sub_plan.steps),
+                        )
                     elif kind == "select":
                         # A $decide data-op filter (ADR-0023): the surviving subset lands into the
                         # named binding, exactly like a mechanical filter would have written it. Not
@@ -1246,6 +1263,9 @@ class DefaultReasonStrategy:
             log.info(
                 "reason: reusing cached plan (%d steps) for %r", len(plan.steps), activity.goal
             )
+            log.debug(
+                "reason: cached plan for activity %s\n%s", activity.id, render_steps(plan.steps)
+            )
             activity.plan = plan
             activity.step_index = 0
         while True:
@@ -1320,6 +1340,26 @@ class DefaultReasonStrategy:
             activity.reconsider_verdict = None
             if not valid:
                 log.info("reason: plan invalidated by context-adaptation for %r", activity.goal)
+                # Dump what is being dropped *before* reset_for_replan clears it, so the trace
+                # pairs it with the replacement the next inference logs. Suspended parents
+                # included: reset_for_replan drops the whole intention stack, so a discard taken
+                # inside a sub-plan throws away more than the frame in hand.
+                if activity.plan is not None:
+                    frames = activity.parent_frames
+                    body = render_steps(activity.plan.steps)
+                    for parent_plan, subgoal_index in reversed(frames):
+                        body += (
+                            f"\n-- parent, suspended at step {subgoal_index} --\n"
+                            f"{render_steps(parent_plan.steps)}"
+                        )
+                    also = f" and {len(frames)} suspended parent(s)" if frames else ""
+                    log.debug(
+                        "reason: discarded plan for activity %s (was at step %d)%s\n%s",
+                        activity.id,
+                        activity.step_index,
+                        also,
+                        body,
+                    )
                 activity.reset_for_replan()  # -> re-infer next cycle against the current world
                 return result
             # Valid: proceed. The baseline was already advanced by Observe to the world the re-check
@@ -1437,6 +1477,14 @@ class DefaultReasonStrategy:
         activity.plan = replace(plan, steps=plan.steps[:i] + expanded + plan.steps[i + 1 :])
         log.info(
             "reason: sub-goal %r fanned out to %d step(s)", step.params.get("goal"), len(expanded)
+        )
+        # The spliced body, not just its size: every later "act: invoke" and "was at step N"
+        # indexes into *this* plan, so without it the trace's last plan is the pre-splice one.
+        log.debug(
+            "reason: plan for activity %s after fan-out (at step %d)\n%s",
+            activity.id,
+            i,
+            render_steps(activity.plan.steps),
         )
         return _SUBGOAL_SPLICED
 

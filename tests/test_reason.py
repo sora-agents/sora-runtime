@@ -20,9 +20,12 @@ a ``FakeLLMClient``-backed real one (the end-to-end tick). No network, no model.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
 from sora.action import default_action_registry, invoke_step
@@ -103,6 +106,10 @@ class SpyProcedural(ProceduralMemory):
         if self._infer_plan is None:
             raise AssertionError("infer() was called but no infer plan was configured")
         return self._infer_plan
+
+
+def _debug(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
 
 
 def _registry_with(*tools: Tool) -> tuple[EnvironmentRegistry, WorkspaceOrigin]:
@@ -201,6 +208,41 @@ async def test_reason_reuses_retrieved_plan_without_inferring(tmp_path: Path) ->
     assert result.step == cached.steps[0]
     assert len(spy.retrieve_calls) == 1
     assert spy.infer_calls == []  # a cache hit skips the model entirely
+
+
+async def test_installed_plans_are_traced_at_debug(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Whichever path put a plan on the activity — a cache hit in Reason or an inference landing in
+    Observe — the plan body reaches the trace, so a run's --log-file shows what was decided and not
+    only that something was. DEBUG: the terminal keeps its one-line-per-event view."""
+    tool = FakeTool("t", invoke_results={"op1": "ok"})
+    registry, origin = _registry_with(tool)
+    await registry.join(origin)
+
+    cached = Plan(id="p", goal="g", steps=[invoke_step("t", "op1")])
+    cycle, working = _cycle(registry, tmp_path, procedural=SpyProcedural(retrieve=cached))
+    with caplog.at_level(logging.DEBUG, logger="sora.strategies"):
+        await DefaultReasonStrategy().reason(
+            Activity(id="a", goal="g", context={}), working, cycle, TickResult()
+        )
+    reused = [m for m in _debug(caplog) if m.startswith("reason: cached plan")]
+    assert len(reused) == 1
+    assert "0: invoke" in reused[0] and "op1" in reused[0]
+
+    caplog.clear()
+    inferred = Plan(id="p2", goal="g2", steps=[invoke_step("t", "op1"), invoke_step("t", "op2")])
+    spy = SpyProcedural(retrieve=None, infer=inferred)
+    cycle, working = _cycle(registry, tmp_path, procedural=spy)
+    activity = Activity(id="b", goal="g2", context={})
+    working.activities["b"] = activity
+    with caplog.at_level(logging.DEBUG, logger="sora.strategies"):
+        await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+        await asyncio.sleep(0)  # let the off-cycle _infer_ push its result
+        await DefaultObserveStrategy().observe(cycle)
+    installed = [m for m in _debug(caplog) if m.startswith("observe: plan for activity b")]
+    assert len(installed) == 1
+    assert "0: invoke" in installed[0] and "1: invoke" in installed[0]  # every step, not a count
 
 
 async def test_reason_infers_plan_on_cache_miss_with_joined_tool_catalog(tmp_path: Path) -> None:

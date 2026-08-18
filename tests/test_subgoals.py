@@ -18,8 +18,11 @@ See ADR-0022. Grounding of an expanded step's remaining references is the ordina
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+
+import pytest
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
 from sora.action import InferAction, default_action_registry
@@ -287,6 +290,70 @@ async def test_deliberative_subgoal_infers_against_the_subgoal_goal(tmp_path: Pa
     assert activity.step_index == 0
     state = activity.state
     assert state is ActivityState.READY
+
+
+async def test_entered_sub_plan_is_traced_at_debug(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sub-plan is a plan too: entering one logs its body and the depth it entered at, so a trace
+    of a decomposed run shows the sub-plan's steps and not just that a frame was pushed."""
+    subplan = plan_json({"action": "send", "to": "user", "content": {"text": "done"}})
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=FakeLLMClient(subplan))
+    cycle, working, registry = _cycle(tmp_path, procedural, FakeTool("realestate"))
+    await registry.join(_ORIGIN)
+    subgoal = Step(
+        next_action="subgoal", params={"goal": "notify each relative", "mode": "deliberative"}
+    )
+    parent = Plan(id="p", goal="reconcile the shortlist", steps=[subgoal])
+    activity = Activity(id="a", goal="reconcile the shortlist", context={}, plan=parent)
+    working.activities["a"] = activity
+
+    with caplog.at_level(logging.DEBUG, logger="sora.strategies"):
+        await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+        await asyncio.sleep(0)  # let the off-cycle _infer_ push its result
+        await DefaultObserveStrategy().observe(cycle)
+
+    entered = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and r.getMessage().startswith("observe: sub-plan")
+    ]
+    assert len(entered) == 1
+    assert "nested under 1 frame(s)" in entered[0]  # frames suspended below, not the recursion cap
+    assert "0: send" in entered[0]
+
+
+async def test_fanned_out_plan_body_is_traced_at_debug(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A mechanical fan-out rewrites the plan in place, so logging only the expansion's size would
+    leave the trace's last plan body the pre-splice one — and every step index printed afterwards
+    would refer to a plan the log never showed."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[_mechanical_subgoal()]),
+        step_index=0,
+        history=[_history("search_apartments", [{"id": "a1"}, {"id": "a2"}])],
+    )
+    working.activities["a"] = activity
+
+    with caplog.at_level(logging.DEBUG, logger="sora.strategies"):
+        await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    spliced = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and r.getMessage().startswith("reason: plan for activity a")
+    ]
+    assert len(spliced) == 1
+    assert "at step 0" in spliced[0]  # where the expansion starts, i.e. what runs next
+    assert "0: invoke" in spliced[0] and "1: invoke" in spliced[0]  # every expanded step
+    assert "a1" in spliced[0] and "a2" in spliced[0]  # each element's binding already substituted
 
 
 async def test_frame_pops_and_parent_resumes_after_the_subgoal(tmp_path: Path) -> None:
