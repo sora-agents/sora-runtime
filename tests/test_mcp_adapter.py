@@ -25,6 +25,7 @@ from sora.adapters.mcp import (  # noqa: E402
     McpSession,
     McpWorkspaceAdapter,
     ResourceUpdateCallback,
+    _side_effecting_from_mcp,  # noqa: E402
 )
 from sora.environment import (  # noqa: E402
     EnvironmentRegistry,
@@ -39,6 +40,26 @@ from sora.manual import (  # noqa: E402
 )
 from sora.perception import NotificationQueueSink  # noqa: E402
 from sora.types import Signal  # noqa: E402
+
+
+def test_side_effecting_from_mcp_maps_read_only_hint() -> None:
+    # readOnlyHint is the read/write discriminator behind OperationSpecification.side_effecting
+    # (ADR-0024): read-only -> False, a declared write -> True, no/None annotation -> None (unknown,
+    # the checkpoint then treats it as a write).
+    assert (
+        _side_effecting_from_mcp(SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=True)))
+        is False
+    )
+    assert (
+        _side_effecting_from_mcp(SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False)))
+        is True
+    )
+    assert (
+        _side_effecting_from_mcp(SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=None)))
+        is None
+    )
+    assert _side_effecting_from_mcp(SimpleNamespace(name="unannotated")) is None
+
 
 # ------------------------------------------------------------------------------------------------
 # Fake MCP session + adapter factory seam

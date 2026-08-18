@@ -48,6 +48,12 @@ class OperationSpecification:  # was Operation — renamed for symmetry with the
     # guessing the result's shape (a wrong guess silently escalates the reference to the model).
     # None when the adapter can't determine it (an unannotated op, a hand-authored manual).
     returns: dict[str, Any] | None = None
+    # Does invoking this operation MUTATE the world (a write) versus being a pure read? Fills the
+    # `before_writes` reconsideration checkpoint (ADR-0024): the cycle re-validates a plan before a
+    # side-effecting step, where acting on a stale plan does damage. Adapter-owned like `returns` —
+    # from MCP's readOnlyHint, ARE's AppTool.write_operation, or inference. None = UNKNOWN,
+    # treated as a write by the checkpoint (reconsider before anything possibly-writing).
+    side_effecting: bool | None = None
 
 
 @dataclass(frozen=True)

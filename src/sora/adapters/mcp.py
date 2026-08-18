@@ -51,6 +51,16 @@ if TYPE_CHECKING:
 ResourceUpdateCallback = Callable[[str], Awaitable[None]]
 
 
+def _side_effecting_from_mcp(tool: Any) -> bool | None:
+    """Map an MCP tool's ``readOnlyHint`` annotation onto ``OperationSpecification.side_effecting``:
+    read-only -> ``False``, a declared write -> ``True``, no annotation -> ``None`` (unknown,
+    the checkpoint treats it as a write). Keyed on ``readOnlyHint`` (the read/write discriminator);
+    ``destructiveHint`` only refines *how* a write behaves, not whether it is one."""
+    annotations = getattr(tool, "annotations", None)
+    read_only = getattr(annotations, "readOnlyHint", None) if annotations is not None else None
+    return (not read_only) if isinstance(read_only, bool) else None
+
+
 class McpSession(Protocol):
     """The subset of ``mcp.ClientSession`` this adapter uses. A Protocol so tests can inject a
     subprocess-free fake; the real ``ClientSession`` satisfies it structurally."""
@@ -202,6 +212,7 @@ class McpWorkspaceAdapter:
                             if getattr(t, "outputSchema", None)
                             else None
                         ),
+                        side_effecting=_side_effecting_from_mcp(t),
                     )
                 ],
             )

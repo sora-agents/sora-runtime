@@ -50,12 +50,13 @@ class FakeAppTool:
         args: list[FakeArg] | None = None,
         return_type: Any = None,
         return_description: str | None = None,
+        write_operation: bool = False,
     ) -> None:
         self.name = name
         self.function = fn
         self.function_description = f"{name} description"
         self.args = args or []
-        self.write_operation = False
+        self.write_operation = write_operation
         self.return_type = return_type
         self.return_description = return_description
 
@@ -83,7 +84,9 @@ class FakeEmailApp:
     def get_tools(self) -> list[FakeAppTool]:
         return [
             FakeAppTool("list_emails", self.list_emails),
-            FakeAppTool("add_email", self.add_email, args=[FakeArg("subject")]),
+            FakeAppTool(
+                "add_email", self.add_email, args=[FakeArg("subject")], write_operation=True
+            ),
         ]
 
 
@@ -187,6 +190,12 @@ async def test_discover_builds_one_tool_per_app_excluding_aui() -> None:
     assert [t.id for t in tools] == ["insim:are/EmailClientApp"]  # AUI is not a tool
     manual = tools[0].manual
     assert {op.name for op in manual.operations} == {"list_emails", "add_email"}
+    # ARE's AppTool.write_operation flows into OperationSpecification.side_effecting (ADR-0024):
+    # add_email is a write, list_emails a read — the before_writes checkpoint keys on it.
+    assert {op.name: op.side_effecting for op in manual.operations} == {
+        "list_emails": False,
+        "add_email": True,
+    }
     assert [p.name for p in manual.observable_properties] == ["state"]
     assert [s.name for s in manual.signals] == ["state_changed"]
 

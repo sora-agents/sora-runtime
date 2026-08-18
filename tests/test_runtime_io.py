@@ -72,6 +72,8 @@ def test_manual_bakes_the_recipient_into_the_operation_name() -> None:
     assert op is not None
     assert op.name.endswith("_to_user")
     assert "text" in op.parameters["properties"]
+    # Replying to the user is a write, so the before_writes checkpoint sees it (ADR-0024).
+    assert op.side_effecting is True
 
 
 if __name__ == "__main__":

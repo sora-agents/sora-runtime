@@ -389,6 +389,29 @@ def test_merge_keeps_authored_completion_signal_over_adapter() -> None:
     ]
 
 
+def test_operation_spec_side_effecting_defaults_to_none() -> None:
+    # Unknown until an adapter fills it (MCP readOnlyHint / ARE write_operation); the before_writes
+    # checkpoint treats None as a write (ADR-0024).
+    assert OperationSpecification(name="x", description="", parameters={}).side_effecting is None
+
+
+def test_merge_preserves_adapter_side_effecting() -> None:
+    # side_effecting is adapter-owned op metadata (like `returns`), so it survives the merge
+    # unchanged — the authored channel doesn't carry it here.
+    adapter = _adapter_manual(
+        operations=[
+            OperationSpecification(
+                name="open_valve", description="adapter", parameters={}, side_effecting=True
+            )
+        ]
+    )
+    authored = _authored_manual(
+        operations=[OperationSpecification(name="open_valve", description="", parameters={})]
+    )
+    merged = merge_manuals(adapter, authored)
+    assert [op.side_effecting for op in merged.operations] == [True]
+
+
 def test_merge_skips_required_check_when_adapter_schema_has_no_properties_key() -> None:
     # ARE's synthesized observable properties carry an empty {} schema — no "properties" key at
     # all — so required-key checking can't run, but the name still validates.

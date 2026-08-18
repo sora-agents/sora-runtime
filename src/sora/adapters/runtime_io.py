@@ -64,6 +64,7 @@ def user_channel_manual() -> Manual:
                     "required": ["text"],
                 },
                 returns=None,
+                side_effecting=True,  # sending a message to the user is an outward-facing write
             )
         ],
         raw_text=None,

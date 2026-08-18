@@ -399,6 +399,14 @@ def _returns_schema(app_tool: Any) -> dict[str, Any] | None:
     return {**schema, "description": description} if description else schema
 
 
+def _side_effecting(app_tool: Any) -> bool | None:
+    """ARE's ``AppTool.write_operation`` (a bool set by the ``@app_tool`` decorator) mapped onto
+    ``OperationSpecification.side_effecting`` — the native read/write signal, so no name heuristic.
+    Absent/non-bool -> ``None`` (unknown; the checkpoint treats it as a write)."""
+    write_operation = getattr(app_tool, "write_operation", None)
+    return write_operation if isinstance(write_operation, bool) else None
+
+
 def _operation_specs(app: Any) -> list[OperationSpecification]:
     return [
         OperationSpecification(
@@ -406,6 +414,7 @@ def _operation_specs(app: Any) -> list[OperationSpecification]:
             description=getattr(at, "function_description", None) or "",
             parameters=_params_schema(at),
             returns=_returns_schema(at),
+            side_effecting=_side_effecting(at),
         )
         for at in app.get_tools()
     ]

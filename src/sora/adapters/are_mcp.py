@@ -19,6 +19,7 @@ from typing import Any
 from sora.adapters.mcp import (
     McpWorkspaceAdapter,
     _ResourceBinding,
+    _side_effecting_from_mcp,
     _ToolBlueprint,
 )
 from sora.manual import OperationSpecification
@@ -47,6 +48,7 @@ class AreMcpWorkspaceAdapter(McpWorkspaceAdapter):
                         if getattr(mcp_tool, "outputSchema", None)
                         else None
                     ),
+                    side_effecting=_side_effecting_from_mcp(mcp_tool),
                 )
             )
         return [
