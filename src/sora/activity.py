@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from sora.types import SupersededPlan  # constructed at run time by reset_for_replan
+
 if TYPE_CHECKING:
     from sora.types import (
         CompletedOperation,
@@ -78,6 +80,11 @@ class Activity:
     # state, cleared on reset_for_replan.
     reconsider_baseline: object | None = None
     reconsider_verdict: bool | None = None
+    # The plan the last reset_for_replan() discarded, kept for exactly one inference: the planning
+    # prompt renders its un-run tail so the replacement is written against the intent it replaces
+    # rather than from nothing (ADR-0024). Cleared by Observe once that replacement installs, so it
+    # can never leak into a later, unrelated inference. Transient run state; never persisted.
+    superseded: SupersededPlan | None = None
     # context is exclusively for strategy-author data — the runtime itself never writes into it,
     # which is what keeps pending_operation/last_operation as dedicated fields instead of context
     # keys with a naming convention: no shared namespace means no collision to avoid in the first
@@ -100,14 +107,22 @@ class Activity:
         place every plan-invalidation site (interrupt handlers, signal-driven re-planners) routes
         through, so new deliberation state can't be forgotten at one call site."""
         was_inferring = self.pending_inference is not None
+        # Park what is being dropped for the *next* inference to read (ADR-0024): a blank-slate
+        # replan is correct but wasteful, and the planner reuses what still applies far better than
+        # the runtime could decide for it. Captured before the fields below are cleared, and only
+        # when there is a plan — a reset with nothing in flight leaves any earlier bundle alone.
+        if self.plan is not None:
+            self.superseded = SupersededPlan(
+                plan=self.plan, step_index=self.step_index, parent_frames=list(self.parent_frames)
+            )
         self.plan = None
         self.step_index = 0
-        # Clears the whole intention stack: right for a whole-activity redirect (the only callers,
-        # interrupt handlers and signal-driven re-planners, invalidate the suspended parents too).
-        # A frame-local sub-goal replan (keep the parents, re-infer only the active sub-plan for
-        # its own goal — recoverable from parent_frames[-1]'s (parent_plan, subgoal_index)) is a
-        # separate future method; there's no trigger for it yet (a failed sub-plan inference
-        # currently terminates the activity rather than replanning the frame).
+        # Clears the whole intention stack, deliberately: reconsideration is a whole-activity
+        # redirect, never frame-local. Popping only to the stale frame was considered and rejected
+        # (ADR-0024) — `bindings`/`history` are flat on the activity with no frame ownership, so a
+        # surviving parent step could read a binding produced by the sub-plan just discarded, and
+        # the frame's own goal string is authored by the parent's now-stale reasoning. The
+        # superseded bundle above is what recovers the lost work instead.
         self.parent_frames.clear()
         # Drop the pipeline's intermediate bindings too: they were produced by (and are only
         # meaningful within) the plan being discarded.

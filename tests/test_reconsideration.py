@@ -16,9 +16,17 @@ from pathlib import Path
 
 import pytest
 
-from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, ScriptedTransport
+from fakes import (
+    FakeAdapter,
+    FakeLLMClient,
+    FakeTool,
+    FakeWorkspace,
+    ScriptedTransport,
+    plan_json,
+)
 from sora.action import (
     FocusAction,
+    InferAction,
     RevalidateAction,
     SendAction,
     default_action_registry,
@@ -93,8 +101,9 @@ async def _cycle(
     tmp_path: Path,
     *,
     reconsideration: object,
-    verdict_response: str = '{"valid": true}',
+    verdict_response: str | list[str] = '{"valid": true}',
     change_gate: object | None = None,
+    llm: FakeLLMClient | None = None,
 ) -> tuple[DecisionCycle, WorkingMemory]:
     registry = await _joined_registry()
     working = WorkingMemory(registry=registry)
@@ -113,7 +122,7 @@ async def _cycle(
         working=working,
         semantic=SemanticMemory(FileMemoryBackend(tmp_path / "sem")),
         procedural=ProceduralMemory(
-            FileMemoryBackend(tmp_path / "proc"), llm=FakeLLMClient(verdict_response)
+            FileMemoryBackend(tmp_path / "proc"), llm=llm or FakeLLMClient(verdict_response)
         ),
         episodic=EpisodicMemory(FileMemoryBackend(tmp_path / "epi")),
         reconsideration=reconsideration,  # type: ignore[arg-type]
@@ -386,11 +395,96 @@ async def test_invalidated_then_re_inferred_plans_are_both_traced(
     assert len(discarded) == 1
     assert "was at step 0" in discarded[0]
     assert "0: invoke" in discarded[0] and "write_op" in discarded[0]
-    assert "1 suspended parent(s)" in discarded[0]  # the whole stack, not just the active frame
-    assert "-- parent, suspended at step 0 --" in discarded[0]
-    assert "tail_op" in discarded[0]  # the parent's un-run tail, dropped with it
+    # The whole stack, not just the active frame: the parent is dropped with it, so its body is
+    # traced too — and in full, unlike the un-run tail the replanning prompt is given.
+    assert "-- suspended parent, at sub-goal step 0 --" in discarded[0]
+    assert "tail_op" in discarded[0]
     assert len(installed) == 1
     assert "0: invoke" in installed[0] and "read_op" in installed[0]
+
+
+async def test_invalid_verdict_parks_the_whole_discarded_stack_for_the_replan(
+    tmp_path: Path,
+) -> None:
+    """Invalidation stays a whole-activity redirect — the intention stack is cleared, never popped
+    to the stale frame (ADR-0024). What that costs is recovered by parking the discard for the next
+    inference to read, rather than by making the reset frame-local."""
+    cycle, working = await _cycle(
+        tmp_path, reconsideration=BeforeWrites(), verdict_response='{"valid": false}'
+    )
+    activity = _write_activity(working)
+    activity.reconsider_baseline = _perception_signature(working)
+    working.signals.append(Percept("t", Signal("follow_up", {}), 0.0))  # gate hot
+    parent_steps = [invoke_step("t", "sub_op"), invoke_step("t", "tail_op")]
+    parent = Plan(id="p0", goal="g", steps=parent_steps)
+    activity.parent_frames.append((parent, 0))
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await _resolve_revalidate(cycle)
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())  # invalid
+
+    assert activity.plan is None and not activity.parent_frames  # blank slate, as before
+    assert activity.superseded is not None
+    assert activity.superseded.step_index == 0
+    assert activity.superseded.parent_frames == [(parent, 0)]  # the suspended parent, not just
+    assert activity.superseded.plan.steps == [invoke_step("t", "write_op")]  # the active frame
+
+
+async def test_superseded_plan_reaches_the_replanning_prompt(tmp_path: Path) -> None:
+    """End to end: the plan discarded inside a sub-goal is what the *replacement* inference is
+    written against. Without this the re-infer starts blank and re-derives a decomposition that
+    several model calls already paid for."""
+    llm = FakeLLMClient(['{"valid": false}', plan_json({"tool_id": "t", "op": "read_op"})])
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites(), llm=llm)
+    activity = _write_activity(working)
+    activity.reconsider_baseline = _perception_signature(working)
+    working.signals.append(Percept("t", Signal("follow_up", {}), 0.0))  # gate hot
+    parent_steps = [invoke_step("t", "sub_op"), invoke_step("t", "tail_op")]
+    parent = Plan(id="p0", goal="g", steps=parent_steps)
+    activity.parent_frames.append((parent, 0))
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await _resolve_revalidate(cycle)
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())  # invalid
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())  # fires _infer_
+    await asyncio.gather(*list(cycle.actions.internal(InferAction.name)._tasks))  # type: ignore[attr-defined]
+
+    _system, user = llm.calls[-1]
+    assert "previous plan for this goal was abandoned" in user
+    assert "write_op" in user  # the discarded active frame's un-run step
+    assert "tail_op" in user  # ...and the suspended parent's, which the reset dropped too
+
+
+async def test_superseded_plan_is_cleared_once_the_replacement_installs(tmp_path: Path) -> None:
+    # Parked for exactly one inference: a bundle that outlived its replan would leak into a later,
+    # unrelated one as a phantom "previous plan".
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    activity = _write_activity(working)
+    activity.reset_for_replan()
+    assert activity.superseded is not None
+
+    activity.state = ActivityState.RUNNING
+    activity.pending_inference = PendingInference(id="inf-1", kind="plan", requested_at=0.0)
+    replacement = Plan(id="p2", goal="g", steps=[invoke_step("t", "read_op")])
+    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=replacement))
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.plan == replacement
+    assert activity.superseded is None
+
+
+async def test_a_reset_with_no_plan_leaves_an_earlier_bundle_intact(tmp_path: Path) -> None:
+    # reset_for_replan runs on paths where there may be nothing in flight (a stop arriving while
+    # already replanning). Overwriting with an empty capture there would erase the real discard the
+    # pending inference is still waiting to read.
+    _unused, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    activity = _write_activity(working)
+    activity.reset_for_replan()
+    parked = activity.superseded
+
+    activity.reset_for_replan()  # nothing to discard this time
+
+    assert activity.superseded is parked
 
 
 async def test_hot_gate_valid_verdict_proceeds_and_rebaselines(tmp_path: Path) -> None:

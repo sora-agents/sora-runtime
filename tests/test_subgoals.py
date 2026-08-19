@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
-from sora.action import InferAction, default_action_registry
+from sora.action import InferAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
@@ -57,6 +57,7 @@ from sora.types import (
     OperationInvocation,
     Plan,
     Step,
+    SupersededPlan,
 )
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
@@ -290,6 +291,39 @@ async def test_deliberative_subgoal_infers_against_the_subgoal_goal(tmp_path: Pa
     assert activity.step_index == 0
     state = activity.state
     assert state is ActivityState.READY
+
+
+async def test_a_parked_superseded_plan_never_reaches_a_subgoal_prompt(tmp_path: Path) -> None:
+    # A superseded bundle is context for re-planning the *activity's* goal, and the prompt section
+    # introduces it as "a previous plan for this goal". A sub-goal was never planned, let alone
+    # abandoned, so rendering it there would describe a plan that does not exist (ADR-0024). The
+    # bundle can still be parked here because a cached-plan install consumes no inference.
+    subplan = plan_json({"action": "send", "to": "user", "content": {"text": "done"}})
+    llm = FakeLLMClient(subplan)
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, procedural, tool)
+    await registry.join(_ORIGIN)
+    subgoal = Step(
+        next_action="subgoal",
+        params={"goal": "notify each relative", "mode": "deliberative"},
+    )
+    parent = Plan(id="p", goal="reconcile the shortlist", steps=[subgoal])
+    activity = Activity(id="a", goal="reconcile the shortlist", context={}, plan=parent)
+    dropped = Plan(id="old", goal="reconcile the shortlist", steps=[invoke_step("t", "stale_op")])
+    activity.superseded = SupersededPlan(plan=dropped, step_index=0, parent_frames=[])
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)  # let the background _infer_ task run
+
+    _system, prompt = llm.calls[-1]
+    assert "notify each relative" in prompt  # it is the sub-goal's prompt
+    assert "previous plan for this goal was abandoned" not in prompt
+    assert "stale_op" not in prompt
+    # Still parked on the real activity: only the sub-goal's copy drops it, so the replacement
+    # top-level plan (if one is ever inferred) has not been robbed of its context.
+    assert activity.superseded is not None
 
 
 async def test_entered_sub_plan_is_traced_at_debug(

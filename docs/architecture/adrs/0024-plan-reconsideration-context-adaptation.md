@@ -145,6 +145,17 @@ At a checkpoint the cycle runs a two-tier check:
    re-plan, so in a mostly-stable world (most gate-hot checkpoints find nothing) it is the economical
    choice, and the expensive re-infer runs only on an actual invalidation.
 
+   That "cheaper" has to be *maintained*, not assumed. Both prompts render the activity's executed
+   history, which is append-only for the whole life of an activity — so an uncapped re-check drifts
+   toward the size of the plan prompt it is meant to undercut, and it fires per write rather than per
+   plan. Both are therefore windowed to their most recent N entries, the re-check's window
+   deliberately the tighter: it answers one yes/no question about the remaining tail, where the recent
+   results carry the signal and what is already done is implied by the tail's own contents. Grounding
+   is left unwindowed — a `$from`/`$decide` reference may name any past result, and hiding the entry
+   holding the referent fails the way truncating it mid-record does. Elision is marked with a count
+   rather than being silent, since "nothing happened earlier" is a different claim from "not shown",
+   and a planner told the former can legitimately decide to redo committed work.
+
 **No efference, no manual relevance.** The self-write problem dissolves at tier 2: the revalidation reasons
 "my own reply does not change the meeting day" and returns *still valid*, so a coarse gate no longer
 loops. An agent's own action that *does* legitimately invalidate the plan is caught the same way —
@@ -190,13 +201,68 @@ hints or inferred, **unknown → treated as a write** (conservative: reconsider 
 might have a side effect). This is a sibling of `completion_signal`, not the cross-cutting
 plan-knowledge the rejected option (a) demanded.
 
-The question the flag answers is **mutation of the environment the plan reasons about**, which is
-narrower than "outward-facing". Reporting to the principal on the agent's own channel (runtime-io's
-`send_message_to_user`) reaches outside the agent yet moves nothing in the environment, so it is
-`side_effecting=False` and is *not* a checkpoint. Two reasons beyond the definition: a revalidation
-there can only churn — the work being reported is already committed and no re-plan takes it back —
-and the report is typically a plan's *last* step, where `remaining` is thinnest and a verdict least
-well-founded.
+The question the flag answers is **would committing this step against a stale plan do damage**. Reporting
+to the principal on the agent's own channel (runtime-io's `send_message_to_user`) moves nothing in the
+environment and is nonetheless `side_effecting=True`, because delivery is irreversible and, for a plan whose
+deliverable *is* the message — answering a question, reporting a decision — a follow-up that landed mid-run
+makes the pending text wrong. That such a report is typically a plan's *last* step is the reason to check it
+rather than a reason to skip it: nothing checks it afterwards, so skipping leaves that plan with no
+checkpoint at all, which is the failure this ADR exists to prevent. The churn objection is real but
+bounded by tier 1: the change gate skips the re-check for free whenever nothing observable moved, so a
+status report in a static world still costs nothing. A spec cannot distinguish the trailing-status case
+from the answer-shaped one, so the conservative reading is the only safe one.
+
+### What an "invalidated" verdict discards: the whole activity, not the stale frame
+
+`reset_for_replan()` clears `plan`, `step_index` **and `parent_frames`** — the entire intention stack
+([ADR-0022](0022-plan-representation-context-guard-and-subgoals.md)) — then re-infers one plan against
+`Activity.goal`. A discard taken three frames deep therefore throws away every parent's decomposition,
+each of which cost its own `_infer_` call. That is deliberate, and the frame-local alternative
+(pop only to the frame the drift invalidated, keep the parents, re-infer that frame against its own
+sub-goal) is **rejected**:
+
+* **Staleness is not a contiguous suffix of the stack.** A single "stale from depth N" answer assumes
+  it is. Ambient drift more often invalidates *purpose* than *mechanics*: Alice moving the meeting
+  makes the root's "create the event Monday" stale while the leaf's "find a free slot" is still good
+  work. A root-stale/leaf-fine verdict collapses back to a full discard anyway, and
+  root-stale/mid-fine/leaf-stale cannot be expressed at all.
+* **Run state has no frame ownership.** `bindings` ([ADR-0023](0023-structured-value-data-ops.md)) and
+  `history` are flat on the `Activity`. Keeping a parent frame means a surviving parent step can read
+  a `{"$bind": ...}` value produced by the sub-plan just discarded, or ground against a history whose
+  sub-goal-produced tail no longer matches what the re-inferred frame will produce. Clearing them
+  instead breaks parent steps that legitimately depend on values bound before the sub-goal was
+  entered. Sound frame-local replanning needs frame-scoped ownership of both — a change to
+  [ADR-0023](0023-structured-value-data-ops.md), not a tweak here.
+* **The frame's goal is itself suspect.** A sub-plan is re-inferred against the goal string in the
+  parent's `subgoal` step — authored by pre-drift reasoning. "Find Alice's cheapest Monday option" is
+  a stale question after Alice moves, however good the new sub-plan answering it is.
+* **The index error is asymmetric.** Too shallow over-discards (harmless); too deep keeps a stale
+  parent and *acts on it* — the silent wrong side effect this ADR exists to prevent — and a model
+  biased toward minimal change errs that way. Blank-slate has no such failure mode.
+
+**What recovers the cost instead: the replan sees the plan it replaces.** `reset_for_replan()` parks
+the discard as a `SupersededPlan` (active frame + `step_index` + suspended parents) on
+`Activity.superseded`, and the planning prompt renders its **un-run tail**, flattened across the stack
+by the same `remaining_steps()` helper the revalidation uses. Framed as reusable material, not as a
+negative example — told the old plan was *wrong*, a planner discards the parts that were fine too. The
+planner then decides what still applies, which it does far better than a depth index could, and which
+needs no frame ownership, no fallible frame index, and no partially-trusted stack. Observe clears the
+bundle when the replacement installs, and a cached-plan reuse clears it too (it installs a plan without
+spending an inference to consume it), so it is read by at most one inference. A *sub-goal* inference
+never sees it at all — `_infer_` drops it from the sub-goal's activity copy, since the bundle describes
+a plan for the activity's goal and the prompt introduces it as such, which would be a false statement
+about a sub-goal that was never planned, let alone abandoned.
+
+This is the same principle as rendering `history` into the revalidation prompt above, applied to the
+other half of the loop: the re-check sees the work already done, and the re-infer that follows an
+invalid verdict sees the intent it is replacing. Only the un-run tail is rendered — what already ran
+reaches the same prompt as history, and repeating it as *intent* alongside its *results* is redundant
+weight.
+
+One asymmetry is left standing on purpose: entering a sub-goal re-anchors `reconsider_baseline` to the
+sub-plan's infer-time world, but *popping* back to a parent does not restore that parent's baseline —
+it resumes carrying the sub-goal's. That is conservative in the safe direction (drift during the
+sub-goal makes the parent's next write revalidate rather than skip), so it stands.
 
 ### Placement, seam, and the reliability escape hatch
 
@@ -247,6 +313,19 @@ thesis) at the centre rather than a bespoke signal handler.
   (`strategies.change_gate`, default `PerceptionSignatureGate`), an
   `OperationSpecification.side_effecting` flag, and a per-plan baseline snapshot on the
   `Activity`/`PendingInference` for the change-gate.
+* Invalidation is coarse: a drift affecting one sub-goal still re-plans the whole activity. The
+  superseded-plan context makes that cheap to recover from rather than free to avoid — the re-infer
+  is one call, but it is still a call, and the planner may legitimately choose a different
+  decomposition than the one it was shown.
+* `Activity.superseded` is one more piece of transient, prompt-facing run state whose lifetime spans a
+  reset (parked by `reset_for_replan()`, cleared by Observe on install) — a wider window than
+  `grounded_params` or `reconsider_verdict`, and one a new invalidation path could forget to close.
+* Making the user-reply channel a checkpoint costs a revalidation before the average plan's last step
+  whenever the world moved during the run, including the many cases where the report was fine. That is
+  paid to protect the answer-shaped plans, which an operation spec cannot tell apart from status ones.
+* The history windows are fixed constants, not adaptive to model context or result size: a long plan of
+  large results can still be heavy under the window, and a plan longer than the planning window loses
+  its oldest entries. Each is a one-constant change, but neither is tuned per deployment.
 
 ## Pros and Cons of the Options
 

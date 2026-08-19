@@ -491,6 +491,14 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         invoked_at: float
 
     @dataclass(frozen=True)
+    class SupersededPlan:      # the plan a reset_for_replan() discarded, parked for the replacement inference
+        plan: Plan               # the active frame at discard time
+        step_index: int          # how far it had got — its un-run tail is what a prompt renders
+        parent_frames: list[tuple[Plan, int]]  # the suspended parents, dropped with it: invalidation is a
+        #                            whole-activity redirect, never frame-local (ADR-0024). Kept so the
+        #                            re-infer is written against the intent it replaces instead of starting
+        #                            blank; Observe clears it once the replacement plan installs.
+
     class PendingInference:   # tracks one in-flight infer()/ground() — lives on Activity, mutually exclusive
         id: str                 #   with pending_operation (a cycle emits one action). Correlates to what
         kind: str               #   _infer_/_ground_ pushed into inference_sink. kind: "plan" (infer ->

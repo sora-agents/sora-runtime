@@ -64,6 +64,7 @@ from sora.types import (
     Plan,
     Signal,
     Step,
+    SupersededPlan,
 )
 
 _GOAL = "schedule the team sync Alice emailed about, then reply to her"
@@ -288,6 +289,21 @@ async def test_handler_delegates_a_user_stop_to_the_default(tmp_path: Path) -> N
 # --------------------------------------------------------------------------------------------------
 # reconciling_plan_prompt: no longer instructs focusing (the runtime auto-focuses joined tools now)
 # --------------------------------------------------------------------------------------------------
+
+
+def test_reconciling_prompt_inherits_the_superseded_plan_section() -> None:
+    # A custom PlanPrompt composes the default's *user* half rather than reimplementing it, so the
+    # replanning context arrives without the example being touched. This is what the bundle riding
+    # on the Activity buys over widening the PlanPrompt signature, which every implementor would
+    # have had to adopt by hand (ADR-0024).
+    activity = Activity(id="probe", goal=_GOAL, context={})
+    plan = Plan(id="p", goal=_GOAL, steps=[invoke_step("Cal", "book_monday")])
+    activity.superseded = SupersededPlan(plan=plan, step_index=0, parent_frames=[])
+
+    _system, user = reconciling_plan_prompt(activity, {})
+
+    assert "previous plan for this goal was abandoned" in user
+    assert "book_monday" in user
 
 
 def test_reconciling_prompt_no_longer_scaffolds_focus() -> None:

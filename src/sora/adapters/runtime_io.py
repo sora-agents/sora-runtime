@@ -64,14 +64,19 @@ def user_channel_manual() -> Manual:
                     "required": ["text"],
                 },
                 returns=None,
-                # Outward-facing, but it mutates nothing in the environment the plan reasons about
-                # — it reports to the principal on the agent's own channel (this tool has no
-                # observable properties and emits no signals; nothing in the world moves). So it is
-                # NOT a before_writes checkpoint (ADR-0024): a revalidation here can only churn, as
-                # the work being reported is already committed and no re-plan can take it back,
-                # while the report is typically a plan's last step — exactly where `remaining` is
-                # thinnest and a verdict least well-founded.
-                side_effecting=False,
+                # Outward-facing and irreversible, so it IS a before_writes checkpoint (ADR-0024).
+                # It mutates nothing in the environment the plan reasons about — no observable
+                # property, no signal — but that is the wrong test. What the flag gates is "would
+                # committing this against a stale plan do damage", and for a plan whose deliverable
+                # *is* the message (answering a question, reporting a decision), a follow-up that
+                # landed mid-run makes the pending text wrong and delivery cannot take it back.
+                # Being the plan's usual last step is precisely why it must be checked rather than
+                # why it need not: there is no later checkpoint to catch it. The earlier reading
+                # here — that a report is only ever about work already committed — holds for a
+                # trailing status line but not for the answer-shaped case, and the two are not
+                # distinguishable from the operation spec. Churn is bounded anyway: the change gate
+                # skips the re-check for free whenever nothing observable moved.
+                side_effecting=True,
             )
         ],
         raw_text=None,

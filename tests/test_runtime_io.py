@@ -72,10 +72,11 @@ def test_manual_bakes_the_recipient_into_the_operation_name() -> None:
     assert op is not None
     assert op.name.endswith("_to_user")
     assert "text" in op.parameters["properties"]
-    # Replying to the user reaches outside the agent but mutates nothing in the environment, so the
-    # before_writes checkpoint does NOT stop on it (ADR-0024) — a revalidation before reporting can
-    # only churn: the reported work is already committed.
-    assert op.side_effecting is False
+    # Delivery is outward-facing and cannot be taken back, so the before_writes checkpoint DOES
+    # stop on it (ADR-0024). It mutates nothing in the environment, but the flag gates damage from
+    # acting on a stale plan, and when the message *is* the deliverable a mid-run follow-up makes
+    # the pending text wrong. It is usually the plan's last step, so nothing checks it afterwards.
+    assert op.side_effecting is True
 
 
 if __name__ == "__main__":

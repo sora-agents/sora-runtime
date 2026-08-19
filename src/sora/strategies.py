@@ -504,6 +504,7 @@ class DefaultObserveStrategy:
                         )
                     elif res.error is not None:
                         activity.grounded_params = None
+                        activity.superseded = None  # no replacement is coming; don't keep it parked
                         activity.state = ActivityState.TERMINATED
                         log.error(
                             "observe: %s for activity %s failed (%s) -> terminated",
@@ -515,6 +516,10 @@ class DefaultObserveStrategy:
                         inferred: Plan = res.value  # type: ignore[assignment]  # kind=="plan" => Plan
                         activity.plan = inferred
                         activity.step_index = 0
+                        # The superseded bundle has now been consumed by the inference that
+                        # produced this plan (ADR-0024): drop it so it can never reach a later,
+                        # unrelated inference.
+                        activity.superseded = None
                         # Anchor the context-adaptation gate to the world this plan was inferred
                         # against (ADR-0024), so a change that landed *during* inference is caught
                         # at the first checkpoint rather than folded into a later baseline.
@@ -1268,6 +1273,9 @@ class DefaultReasonStrategy:
             )
             activity.plan = plan
             activity.step_index = 0
+            # A cached plan installs without an inference, so nothing consumed a parked superseded
+            # bundle (ADR-0024) — drop it here too, or it outlives the re-plan it was parked for.
+            activity.superseded = None
         while True:
             plan = activity.plan
             assert plan is not None  # set above, and by every branch that continues this loop
@@ -1340,27 +1348,26 @@ class DefaultReasonStrategy:
             activity.reconsider_verdict = None
             if not valid:
                 log.info("reason: plan invalidated by context-adaptation for %r", activity.goal)
-                # Dump what is being dropped *before* reset_for_replan clears it, so the trace
-                # pairs it with the replacement the next inference logs. Suspended parents
-                # included: reset_for_replan drops the whole intention stack, so a discard taken
-                # inside a sub-plan throws away more than the frame in hand.
-                if activity.plan is not None:
-                    frames = activity.parent_frames
-                    body = render_steps(activity.plan.steps)
-                    for parent_plan, subgoal_index in reversed(frames):
-                        body += (
-                            f"\n-- parent, suspended at step {subgoal_index} --\n"
-                            f"{render_steps(parent_plan.steps)}"
-                        )
-                    also = f" and {len(frames)} suspended parent(s)" if frames else ""
-                    log.debug(
-                        "reason: discarded plan for activity %s (was at step %d)%s\n%s",
-                        activity.id,
-                        activity.step_index,
-                        also,
-                        body,
-                    )
                 activity.reset_for_replan()  # -> re-infer next cycle against the current world
+                # Trace what was dropped, from the bundle the reset parked (ADR-0024). Every frame's
+                # *whole* body, not the un-run tail the replanning prompt gets: a prompt pays per
+                # token and separately receives what already ran as history, whereas this is read by
+                # a human diffing it against the replacement, which installs logged whole. Suspended
+                # parents included — the reset drops the entire intention stack, so a discard taken
+                # inside a sub-plan throws away more than the frame in hand.
+                if activity.superseded is not None:
+                    sup = activity.superseded
+                    bodies = [render_steps(sup.plan.steps)]
+                    bodies += [
+                        f"-- suspended parent, at sub-goal step {i} --\n{render_steps(p.steps)}"
+                        for p, i in reversed(sup.parent_frames)
+                    ]
+                    log.debug(
+                        "reason: discarded plan for activity %s (was at step %d)\n%s",
+                        activity.id,
+                        sup.step_index,
+                        "\n".join(bodies),
+                    )
                 return result
             # Valid: proceed. The baseline was already advanced by Observe to the world the re-check
             # was fired against (not now) — so a change that landed during its flight stays outside

@@ -161,6 +161,20 @@ class Plan:  # multi-step, goal-indexed, reusable — the thing ProceduralMemory
     steps: list[Step]
 
 
+@dataclass(frozen=True)
+class SupersededPlan:
+    """The plan a ``reset_for_replan()`` threw away, kept so the *replacement* inference can see the
+    intent it is replacing instead of starting blank (ADR-0024). Carries the whole intention stack,
+    since the reset drops it whole: ``plan``/``step_index`` are the active frame at discard time and
+    ``parent_frames`` the suspended parents, in the same (plan, subgoal_index) shape ``Activity``
+    holds them. Only the *un-run* tail is ever rendered into a prompt — what already ran is
+    ``Activity.history``, which the planning prompt renders separately."""
+
+    plan: Plan
+    step_index: int
+    parent_frames: list[tuple[Plan, int]]
+
+
 # Named constants for Step.next_action values and invoke routing keys — one source of truth instead
 # of bare string literals scattered across the cycle/actions/strategies (typos there are invisible
 # to mypy). Registered ExternalActions are addressed by their own `.name` (e.g. InvokeAction.name);

@@ -27,6 +27,8 @@ from sora.manual import (
     SignalSpecification,
 )
 from sora.memory import (
+    _HISTORY_RENDER_PLAN,
+    _HISTORY_RENDER_REVALIDATE,
     GROUND_SYSTEM_PROMPT,
     PLAN_SYSTEM_PROMPT,
     FileMemoryBackend,
@@ -34,6 +36,7 @@ from sora.memory import (
     ProceduralMemory,
     default_ground_prompt,
     default_plan_prompt,
+    remaining_steps,
     render_bindings,
     render_history,
     render_messages,
@@ -50,6 +53,7 @@ from sora.types import (
     Plan,
     Signal,
     Step,
+    SupersededPlan,
 )
 
 
@@ -420,6 +424,114 @@ def test_default_plan_prompt_renders_history_and_messages() -> None:
     _, user = default_plan_prompt(activity, tools, PerceptSnapshot(), messages)
     assert render_history(activity.history) in user
     assert render_messages(messages) in user
+
+
+def _completed(operation_name: str) -> CompletedOperation:
+    return CompletedOperation(
+        OperationInvocation(tool_id="t", operation_name=operation_name, params={}),
+        OperationAck(ok=True, result={"ok": True}),
+    )
+
+
+def test_render_history_keeps_the_most_recent_entries_and_marks_the_elision() -> None:
+    # A silent drop reads as "nothing happened earlier", which is a different claim from "not
+    # shown" — a planner told the former can legitimately decide to redo work already committed.
+    history = [_completed(f"op{i}") for i in range(25)]
+
+    rendered = render_history(history, 10)
+
+    assert "(… 15 earlier operation(s) not shown)" in rendered
+    assert "op24" in rendered and "op15" in rendered  # the recent tail is what survives
+    assert "op14" not in rendered and "op0(" not in rendered
+
+
+def test_render_history_is_unbounded_by_default() -> None:
+    # The default is the grounding caller's: a $from/$decide reference may name any past result, so
+    # hiding the entry that holds the referent fails the way truncating it mid-record does.
+    history = [_completed(f"op{i}") for i in range(25)]
+
+    rendered = render_history(history)
+
+    assert "not shown" not in rendered
+    assert "op0(" in rendered and "op24" in rendered
+
+
+def test_render_history_says_nothing_about_elision_when_it_fits() -> None:
+    assert "not shown" not in render_history([_completed("only_op")], 10)
+
+
+def test_revalidation_carries_a_tighter_history_window_than_planning() -> None:
+    # ADR-0024 justifies the re-check as much cheaper than the re-plan it guards, and it fires per
+    # write rather than per plan. Rendering the same history in both is what erodes that, so these
+    # two must actually differ — equal windows would leave the cost objection standing.
+    assert _HISTORY_RENDER_REVALIDATE < _HISTORY_RENDER_PLAN
+
+
+def test_default_plan_prompt_omits_superseded_section_when_none_parked() -> None:
+    # The common case is a first plan, not a replan: no bundle parked -> no section, no framing
+    # sentence telling the planner something was abandoned when nothing was.
+    _, user = default_plan_prompt(_activity("schedule the sync"), {})
+    assert "previous plan" not in user.lower()
+
+
+def test_default_plan_prompt_renders_superseded_tail_across_the_subgoal_stack() -> None:
+    # A discard taken inside a sub-plan drops the suspended parents too (ADR-0024), so the
+    # replacement inference must see their un-run steps as well — a view of the active frame alone
+    # would understate what it has to re-derive.
+    activity = _activity("schedule the sync")
+    sub = _plan("p1", "find a slot", [invoke_step("Cal", "read_slots"), invoke_step("Cal", "book")])
+    parent = _plan(
+        "p0", "schedule the sync", [invoke_step("Cal", "sub"), invoke_step("Cal", "tell")]
+    )
+    activity.superseded = SupersededPlan(plan=sub, step_index=1, parent_frames=[(parent, 0)])
+
+    _, user = default_plan_prompt(activity, {})
+
+    assert "previous plan for this goal was abandoned" in user
+    assert "already executed 1 step(s) of that plan, inside a sub-plan nested under 1" in user
+    assert "book" in user  # the active frame's un-run tail
+    assert "tell" in user  # the suspended parent's un-run tail, dropped with it
+
+
+def test_default_plan_prompt_superseded_section_omits_the_executed_prefix() -> None:
+    # What already ran is rendered as *history* by this same prompt; repeating those steps as
+    # *intent* would be redundant weight, so only the un-run tail is shown (ADR-0024).
+    activity = _activity("schedule the sync")
+    plan = _plan(
+        "p1",
+        "schedule the sync",
+        [invoke_step("Cal", "already_ran"), invoke_step("Cal", "not_yet")],
+    )
+    activity.superseded = SupersededPlan(plan=plan, step_index=1, parent_frames=[])
+
+    _, user = default_plan_prompt(activity, {})
+
+    assert "not_yet" in user
+    assert "already_ran" not in user
+
+
+def test_default_plan_prompt_frames_the_superseded_plan_as_reusable_not_wrong() -> None:
+    # Framing matters more than presence: told the old plan was *wrong*, a planner discards the
+    # parts that were fine too — which is the entire benefit of showing it. It is stale, not wrong.
+    activity = _activity("schedule the sync")
+    activity.superseded = SupersededPlan(plan=_plan("p1", "g"), step_index=0, parent_frames=[])
+
+    _, user = default_plan_prompt(activity, {})
+
+    assert "Reuse whatever still applies" in user
+    assert "stale, not wrong throughout" in user
+
+
+def test_remaining_steps_is_what_revalidation_and_the_superseded_rendering_share() -> None:
+    # One definition of "remaining" for both prompts: the active frame from step_index, then each
+    # suspended parent's steps after the sub-goal that pushed it, innermost frame first.
+    sub = _plan("p1", "sub", [invoke_step("t", "a"), invoke_step("t", "b")])
+    mid = _plan("p0a", "mid", [invoke_step("t", "m0"), invoke_step("t", "m1")])
+    root = _plan("p0", "root", [invoke_step("t", "r0"), invoke_step("t", "r1")])
+
+    tail = remaining_steps(sub, 1, [(root, 0), (mid, 0)])
+
+    assert [step.params["operation_name"] for step in tail] == ["b", "m1", "r1"]
 
 
 async def test_infer_forwards_messages_to_prompt(tmp_path: Path) -> None:

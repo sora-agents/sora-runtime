@@ -28,7 +28,7 @@ from sora.manual import (
     ToolRecord,
     WorkspaceRecord,
 )
-from sora.types import CompletedOperation, Plan, Step
+from sora.types import CompletedOperation, Plan, Step, SupersededPlan
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -658,9 +658,23 @@ def default_plan_prompt(
         f"Available tools and their operations:\n{render_tools(tools)}\n\n"
         f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
         f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
-        f"Results of operations already executed:\n{render_history(activity.history)}\n\n"
+        f"Results of operations already executed:\n"
+        f"{render_history(activity.history, _HISTORY_RENDER_PLAN)}\n\n"
         f"Recent instructions from the user:\n{render_messages(messages or [])}"
     )
+    if activity.superseded is not None:
+        # Framing lives in the section itself, not PLAN_SYSTEM_PROMPT: a custom PlanPrompt that
+        # omits the section then carries no dangling instruction about one that isn't there. Worded
+        # as reusable material rather than as a negative example — told "this was wrong", a planner
+        # avoids the parts that were fine too, which is the whole benefit lost.
+        user += (
+            "\n\nA previous plan for this goal was abandoned because the world moved; the "
+            "observations above supersede the assumptions it was written against. Reuse whatever "
+            "still applies and re-derive whatever does not — it is stale, not wrong throughout. "
+            "The intermediate values its earlier steps had bound were discarded with it, so a "
+            "remaining step that reads one must be re-derived rather than carried over as-is.\n"
+            f"{render_superseded_plan(activity.superseded)}"
+        )
     return PLAN_SYSTEM_PROMPT, user
 
 
@@ -794,16 +808,27 @@ class GroundPrompt(Protocol):
     ) -> tuple[str, str]: ...
 
 
-def render_history(history: list[CompletedOperation]) -> str:
+def render_history(history: list[CompletedOperation], limit: int | None = None) -> str:
     """Render an activity's executed operations + results for a grounding prompt. Public so a custom
     ``GroundPrompt`` can reuse it. Results are the grounder's ground truth for resolving a reference
     (the id a ``$from``/``$decide`` needs to pick), so they're rendered with a much larger cap than
     the observed-state renderers — a search returning several records must not have a later record's
-    id truncated off the end (the failure that made a second email invisible to grounding)."""
+    id truncated off the end (the failure that made a second email invisible to grounding).
+
+    ``limit`` keeps only the most recent N entries, with a counted marker in place of the rest so a
+    reader can tell elision from "nothing happened earlier". It defaults to *unbounded* because the
+    grounding caller must not have it: grounding resolves a reference against an arbitrary past
+    result, and dropping the entry holding the referent is the same class of failure as truncating
+    it mid-record. Callers that judge *what to do next* rather than resolve a reference pass a
+    window, since history is append-only for the life of an activity and would otherwise grow every
+    prompt without bound."""
     if not history:
         return "(nothing executed yet)"
+    shown = history if limit is None or len(history) <= limit else history[-limit:]
     lines = []
-    for completed in history:
+    if len(shown) < len(history):
+        lines.append(f"(… {len(history) - len(shown)} earlier operation(s) not shown)")
+    for completed in shown:
         outcome = completed.ack.result if completed.ack.ok else f"ERROR: {completed.ack.result}"
         args = json.dumps(completed.invocation.params)
         rendered = _truncate(outcome, _HISTORY_RESULT_LIMIT)
@@ -824,6 +849,40 @@ def render_steps(steps: list[Step]) -> str:
             for index, step in enumerate(steps)
         )
         or "(none)"
+    )
+
+
+def remaining_steps(
+    plan: Plan | None, step_index: int, parent_frames: list[tuple[Plan, int]]
+) -> list[Step]:
+    """The un-run tail of a plan, flattened across the sub-goal stack (ADR-0022): the active frame
+    from ``step_index``, then each suspended parent's steps after the sub-goal that pushed it —
+    innermost frame first, since that is the order they resume in. Shared by the revalidation prompt
+    (which asks *is all of this still valid*, and would call a sub-plan valid while a stale parent
+    step still waits) and the superseded-plan rendering, so both mean the same thing by "remaining".
+    Public so a custom prompt can reuse it."""
+    tail = list(plan.steps[step_index:]) if plan is not None else []
+    for parent_plan, subgoal_index in reversed(parent_frames):
+        tail.extend(parent_plan.steps[subgoal_index + 1 :])
+    return tail
+
+
+def render_superseded_plan(superseded: SupersededPlan) -> str:
+    """Render the discarded plan's un-run tail for the replanning prompt (ADR-0024). Only the tail:
+    what already ran is rendered separately as history by the same prompt, and repeating it as
+    *intent* alongside its *results* would be redundant weight. Flattened across the stack, so a
+    discard taken inside a sub-plan still shows the suspended parents' un-run steps — the part of
+    the loss a frame-local view would hide. Public so a custom ``PlanPrompt`` can reuse it."""
+    tail = remaining_steps(superseded.plan, superseded.step_index, superseded.parent_frames)
+    frames = len(superseded.parent_frames)
+    nested = f", inside a sub-plan nested under {frames} suspended frame(s)" if frames else ""
+    # Deliberately no absolute step number beside the listing: render_steps numbers whatever it is
+    # given from 0, so quoting the discarded plan's own index here would invite reading a *listed*
+    # step as one already executed. State how many ran, and where their results are, instead.
+    return (
+        f"It had already executed {superseded.step_index} step(s) of that plan{nested}; their "
+        f"results appear above under the executed operations and are not repeated here.\n"
+        f"Its remaining, unexecuted steps were (numbered afresh from 0):\n{render_steps(tail)}"
     )
 
 
@@ -877,6 +936,8 @@ def default_ground_prompt(
         f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
         f"Named data-op bindings (a $bind reference or a $decide instruction may name one):\n"
         f"{render_bindings(activity.bindings)}\n\n"
+        # Deliberately unwindowed: a $from/$decide reference may name any past result, and hiding
+        # the entry that holds the referent fails the same way truncating it mid-record does.
         f"Results of operations already executed:\n{render_history(activity.history)}"
     )
     return GROUND_SYSTEM_PROMPT, user
@@ -962,6 +1023,25 @@ def _parse_keep(text: str, count: int) -> list[int]:
 # Observed properties/signals are re-observed state that would grow every prompt, so they keep the
 # smaller default below — this is why the two aren't one shared limit.
 _HISTORY_RESULT_LIMIT = 4000
+
+# How many *entries* of an activity's history each prompt renders. History is append-only for the
+# whole life of an activity, so without a window every prompt grows with the activity — unbounded
+# in the long-lived, asynchronous setting this runtime is built for, not just in a long plan.
+#
+# Revalidation gets the tight window. It fires before every gate-hot write, and ADR-0024 justifies
+# it as much cheaper than the re-plan it guards; letting it carry the same history as a planning
+# prompt is what would erode that. It also needs the least: it answers one yes/no question about
+# the remaining tail, where the recent results carry the signal and "what is already done" is
+# implied by the tail's own contents. 10 matches _MESSAGE_RENDER, the existing recent-window
+# precedent for a prompt section whose storage is uncapped.
+_HISTORY_RENDER_REVALIDATE = 10
+
+# Planning gets the generous one: it runs once per plan rather than per write, and a re-plan must
+# not silently lose a fact the new plan depends on. 40 is _DEFAULT_MAX_SUBGOAL_DEPTH (4) frames of
+# roughly ten steps each — the deepest history a single plan tree can currently produce — so a
+# re-plan still sees the whole of its predecessor's work, and only an activity outliving many
+# plans is trimmed at all.
+_HISTORY_RENDER_PLAN = 40
 
 
 def _truncate(value: Any, limit: int = 400) -> str:
@@ -1103,19 +1183,15 @@ class ProceduralMemory:
                 "ProceduralMemory has no LLM configured; cannot revalidate a plan. Pass a client."
             )
         snapshot = observed or PerceptSnapshot()
-        # The full remaining tail across the sub-goal stack (ADR-0022), not just the active
-        # sub-plan: the current plan's steps from step_index, then each suspended parent's steps
-        # after its sub-goal (innermost frame resumes first — the top of parent_frames). Checking
-        # only the sub-plan would call it "still valid" while a now-stale parent step still waits.
-        remaining = (
-            list(activity.plan.steps[activity.step_index :]) if activity.plan is not None else []
+        # The full remaining tail across the sub-goal stack, not just the active sub-plan (ADR-0022)
+        # — checking only the sub-plan would call it "still valid" while a stale parent step waits.
+        steps_text = render_steps(
+            remaining_steps(activity.plan, activity.step_index, activity.parent_frames)
         )
-        for parent_plan, subgoal_index in reversed(activity.parent_frames):
-            remaining.extend(parent_plan.steps[subgoal_index + 1 :])
-        steps_text = render_steps(remaining)
         user = (
             f"Goal: {activity.goal}\n"
-            f"Results of operations already executed:\n{render_history(activity.history)}\n"
+            f"Results of operations already executed:\n"
+            f"{render_history(activity.history, _HISTORY_RENDER_REVALIDATE)}\n"
             f"Remaining plan steps:\n{steps_text}\n"
             f"Observed properties:\n{render_properties(snapshot.properties)}\n"
             f"Observed signals:\n{render_signals(snapshot.signals)}\n"

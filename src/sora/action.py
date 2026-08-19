@@ -397,7 +397,12 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
             id=inf_id, kind=kind, requested_at=time.time(), baseline=baseline
         )
         activity.state = ActivityState.RUNNING  # off-cycle, like _invoke_ — immediate, never blocks
-        target = activity if goal is None else replace(activity, goal=goal)
+        # `superseded` is dropped on the sub-goal copy (ADR-0024): the bundle is context for
+        # re-planning the *activity's* goal, and default_plan_prompt introduces it as "a previous
+        # plan for this goal" — true for the replacement, false for a sub-goal that was never
+        # planned, let alone abandoned. Cleared here rather than at each install site so no future
+        # path that leaves a bundle parked can leak it into a sub-plan's prompt.
+        target = activity if goal is None else replace(activity, goal=goal, superseded=None)
         log.info("reason: inferring a plan for %r (%d tools)", target.goal, len(catalog))
         _spawn_tracked(self._tasks, self._call(cycle, target, inf_id, catalog, observed, messages))
 

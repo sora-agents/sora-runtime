@@ -11,7 +11,11 @@ re-validates the in-flight plan against new perception: a cheap mechanical chang
 observable move since the plan was inferred?) fronts a single model *revalidation* call (given the goal and
 remaining steps, is the plan still valid?), and on "no" it re-plans against the current inbox. This
 is **general runtime machinery** — no inbox-shape knowledge, no example code — and it is what handles
-the mid-run follow-up. The `MailDiffInterruptPolicy` seam below is retained only as an **opt-in
+the mid-run follow-up. That re-plan is not blank: the invalidated plan's un-run steps are carried into
+the replanning prompt (whole-activity, since invalidation clears the sub-goal stack too), so the
+Tuesday plan is written against the Monday one it replaces rather than re-derived from nothing —
+`reconciling_plan_prompt` inherits the section without being changed, since it composes the default's
+user half. The `MailDiffInterruptPolicy` seam below is retained only as an **opt-in
 deterministic override** (see it in the "example-specific" catalogue). This substantially addresses
 old limitation 6 (blind commitment) at the *plan* level; intention-level commitment lifecycles remain
 future work.
