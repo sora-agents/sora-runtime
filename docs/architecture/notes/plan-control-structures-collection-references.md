@@ -14,7 +14,7 @@
 ## Context and Problem Statement
 
 A `Plan` is a flat `list[Step]`, inferred once (`_infer_`) before any tool has returned data, and
-walked linearly — **one `Step` → one external action → one invocation**. [ADR-0017](0017-parameter-grounding-in-reason.md)
+walked linearly — **one `Step` → one external action → one invocation**. [ADR-0017](../adrs/0017-parameter-grounding-in-reason.md)
 added *scalar* run-time values to that skeleton: `{"$from": ...}` resolves a scalar from a prior
 result mechanically, `{"$decide": ...}` escalates a scalar judgment to one model call. Neither
 expresses an operation over a **collection**: "save *each* qualifying property", "remove *each*
@@ -28,22 +28,22 @@ resolves it to a single value and `step_index` advances. **The iteration count w
 authoring time, when the count was unknowable.**
 
 How should a plan express operations over collections — reliably (count bound to data, not a model
-guess), while preserving one external action per cycle ([ADR-0009](0009-five-phase-decision-cycle.md))
+guess), while preserving one external action per cycle ([ADR-0009](../adrs/0009-five-phase-decision-cycle.md))
 and the reusable-skeleton property of plans?
 
 ## Decision Drivers
 
 * **Reliability = bind the iteration count to data, not prose.** A prose "repeat for each" is a model
   guess dressed as structure; the count must come from `len(collection)`, computed by code.
-* **One external action per cycle must hold** ([ADR-0009](0009-five-phase-decision-cycle.md)) — a
+* **One external action per cycle must hold** ([ADR-0009](../adrs/0009-five-phase-decision-cycle.md)) — a
   step may not dispatch N invocations at once (that re-serializes multi-activity concurrency and
   breaks the cycle invariant).
 * **Extend the existing reference family, don't add a foreign control-flow layer.** `$from`/`$decide`
-  ([ADR-0017](0017-parameter-grounding-in-reason.md)) already split *mechanical dataflow* from *model
+  ([ADR-0017](../adrs/0017-parameter-grounding-in-reason.md)) already split *mechanical dataflow* from *model
   judgment*; collection handling should slot into that split, not sit beside it as an interpreter.
 * **Plans stay reusable skeletons.** The stored plan keeps its references; expansion is per-run
   (grounds a copy), exactly as scalar grounding does today.
-* **Act stays mechanistic** ([ADR-0017](0017-parameter-grounding-in-reason.md)); deciding *what* to
+* **Act stays mechanistic** ([ADR-0017](../adrs/0017-parameter-grounding-in-reason.md)); deciding *what* to
   iterate over is a Reason act, so expansion lives on Reason's grounding path, not in Act.
 * **A bounded language, not a Turing tarpit.** Admit a primitive only if it **(a)** binds a decision
   to data more reliably than prose *and* **(b)** isn't already owned by the decision cycle.
@@ -111,10 +111,10 @@ sub-activity variant + join is a foreseen alternative, deferred.
 
 **The boundary that keeps this bounded.** Several "control structures" are deliberately **not** plan
 primitives, because the decision cycle already owns them (driver (b)): **waiting/"until"** is the
-`blocked_on`/`completion_signal` machinery ([ADR-0019](0019-blocked-state-machinery-and-percept-storage.md));
-**parallelism** is concurrent activities ([ADR-0009](0009-five-phase-decision-cycle.md),
-[ADR-0016](0016-pluggable-activity-selection.md)); **reconsideration on change** is the interrupt seam
-([ADR-0020](0020-hard-interrupt-and-await-input.md)). The admissible family is therefore narrow:
+`blocked_on`/`completion_signal` machinery ([ADR-0019](../adrs/0019-blocked-state-machinery-and-percept-storage.md));
+**parallelism** is concurrent activities ([ADR-0009](../adrs/0009-five-phase-decision-cycle.md),
+[ADR-0016](../adrs/0016-pluggable-activity-selection.md)); **reconsideration on change** is the interrupt seam
+([ADR-0020](../adrs/0020-hard-interrupt-and-await-input.md)). The admissible family is therefore narrow:
 map (`$foreach`), branch (`$if`), fold (`$select`/`$reduce`) — data-shaping, not process control.
 
 ### Positive Consequences
@@ -171,14 +171,14 @@ map (`$foreach`), branch (`$if`), fold (`$select`/`$reduce`) — data-shaping, n
 
 ## Links
 
-* Refines [ADR-0017](0017-parameter-grounding-in-reason.md) — extends the `$from`/`$decide` reference
+* Refines [ADR-0017](../adrs/0017-parameter-grounding-in-reason.md) — extends the `$from`/`$decide` reference
   family with collection-valued members, expanded on the same Reason grounding path.
-* Honors [ADR-0009](0009-five-phase-decision-cycle.md) (one external action per cycle) — expansion
+* Honors [ADR-0009](../adrs/0009-five-phase-decision-cycle.md) (one external action per cycle) — expansion
   produces steps, never a batch dispatch — and defers a sub-activity fan-out variant that would build
-  on [ADR-0016](0016-pluggable-activity-selection.md) plus a join.
-* Consistent with the "no redundant mechanism" ethos of [ADR-0011](0011-phase-fusion-via-threaded-result.md):
+  on [ADR-0016](../adrs/0016-pluggable-activity-selection.md) plus a join.
+* Consistent with the "no redundant mechanism" ethos of [ADR-0011](../adrs/0011-phase-fusion-via-threaded-result.md):
   waiting, parallelism, and reconsideration stay owned by the cycle
-  ([ADR-0019](0019-blocked-state-machinery-and-percept-storage.md),
-  [ADR-0020](0020-hard-interrupt-and-await-input.md)), not duplicated as plan keywords.
+  ([ADR-0019](../adrs/0019-blocked-state-machinery-and-percept-storage.md),
+  [ADR-0020](../adrs/0020-hard-interrupt-and-await-input.md)), not duplicated as plan keywords.
 * Deferred members: `$if` (branch), `$select`/`$reduce` (fold), sub-activity fan-out + join, and the
   re-planning complement (option (b)).

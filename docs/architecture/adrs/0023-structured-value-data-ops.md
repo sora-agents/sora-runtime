@@ -13,7 +13,7 @@ primitive: a **mechanical sub-goal** maps a fixed template over a run-time colle
 it to act on a *derived* one — the elements that *qualify* (filter), the *distinct* keys, the
 *top few* by some order (sort + take), or the values *gathered* from a prior per-element fan-out and
 then filtered by a computed threshold. The inline `where` selection
-[EXAMPLES.md](../../../EXAMPLES.md) once sketched on the mechanical sub-goal was **documented but
+[EXAMPLES.md](https://github.com/sora-agents/sora-runtime/blob/main/EXAMPLES.md) once sketched on the mechanical sub-goal was **documented but
 never wired** (`_expand_mechanical` fanned the collection out unfiltered), and even a wired `where`
 would still not cover dedupe, sort, gather, or aggregate. The general failing shape is a short
 pipeline over a run-time collection: dedupe → map-invoke → gather results → filter by a threshold →

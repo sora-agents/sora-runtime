@@ -1,7 +1,7 @@
 # AgentSpeak/Jason as an inspiration for S-ORA's plan representation
 
 * Date: 2026-08-04 (trimmed 2026-08-05)
-* Status: design analysis — conceptual companion to [ADR-0022](docs/architecture/adrs/0022-plan-representation-context-guard-and-subgoals.md), which realizes the plan representation; also informs [ADR-0002](docs/architecture/adrs/0002-activity-as-sole-first-class-construct.md) and touches [ADR-0017](docs/architecture/adrs/0017-parameter-grounding-in-reason.md). The concrete plan-representation spec moved into ADR-0022; what remains here is the BDI-lineage framing, the synthesis-not-planning reframe, and the preconditions→plan-validation seed — the parts the ADR deliberately does not carry.
+* Status: design analysis — conceptual companion to [ADR-0022](../adrs/0022-plan-representation-context-guard-and-subgoals.md), which realizes the plan representation; also informs [ADR-0002](../adrs/0002-activity-as-sole-first-class-construct.md) and touches [ADR-0017](../adrs/0017-parameter-grounding-in-reason.md). The concrete plan-representation spec moved into ADR-0022; what remains here is the BDI-lineage framing, the synthesis-not-planning reframe, and the preconditions→plan-validation seed — the parts the ADR deliberately does not carry.
 
 ## The question
 
@@ -22,7 +22,7 @@ borrow AgentSpeak's plan **schema** (trigger + context-guard + body) *loosely*, 
 S-ORA's own **substrate** (LLM-synthesized not developer-authored; structured-value binding not
 logic unification; activities not a belief/desire/intention triad). "Adopt Jason" is the wrong
 conclusion; "adopt its lineage, with a clear boundary" is the right one — and that boundary is
-[ADR-0002](docs/architecture/adrs/0002-activity-as-sole-first-class-construct.md).
+[ADR-0002](../adrs/0002-activity-as-sole-first-class-construct.md).
 
 ## What S-ORA already borrows (deliberately)
 
@@ -30,13 +30,13 @@ The BDI correspondence is not accidental — it was an inspiration source with a
 ADR-0002:
 
 * **Environment / artifact model (from JaCaMo/CArtAgO).** Workspaces/tools with the three-part
-  usage interface — observable properties, signals, operations ([ADR-0004](docs/architecture/adrs/0004-tool-usage-interface.md))
+  usage interface — observable properties, signals, operations ([ADR-0004](../adrs/0004-tool-usage-interface.md))
   — are CArtAgO artifacts; `invoke` is an artifact operation, invoked **asynchronously**. In
   JaCaMo, Jason actions invoke artifact operations asynchronously; that is part of the inspiration
-  for S-ORA's off-cycle async operations ([ADR-0021](docs/architecture/adrs/0021-llm-calls-as-async-internal-actions.md)),
+  for S-ORA's off-cycle async operations ([ADR-0021](../adrs/0021-llm-calls-as-async-internal-actions.md)),
   not a place S-ORA is "ahead of" Jason.
 * **Interleaved intentions ≈ activities.** Many concurrent activities, each advancing at most one
-  external action per cycle ([ADR-0009](docs/architecture/adrs/0009-five-phase-decision-cycle.md)),
+  external action per cycle ([ADR-0009](../adrs/0009-five-phase-decision-cycle.md)),
   mirrors BDI's interleaved intention execution — but modeled as `Activity`, the sole first-class
   unit, with no separate intention type (ADR-0002).
 
@@ -87,7 +87,7 @@ decision, not part of "loosely AgentSpeak."
   iteration is a **sub-goal**, not a functional-map primitive. Reaching a sub-goal re-fires
   `infer()`/`retrieve()`, which *is* S-ORA's selection mechanism — dissolving the "needs reactive
   selection over a belief base" objection to per-item plan firing. See
-  [ADR-0022](docs/architecture/adrs/0022-plan-representation-context-guard-and-subgoals.md) for the
+  [ADR-0022](../adrs/0022-plan-representation-context-guard-and-subgoals.md) for the
   realized form.
 
 ## The gap this surfaced, and where it landed
@@ -102,7 +102,7 @@ Both are resolved by the concrete representation this analysis pointed to — tr
 body, the two-mechanism binding split (guard-memory bound once at entry, `$from`-history bound per
 step), and iteration via sub-goals (mechanical `len(collection)` fan-out or deliberative
 re-`infer()`, run on a frame stack) — **specified in
-[ADR-0022](docs/architecture/adrs/0022-plan-representation-context-guard-and-subgoals.md), not
+[ADR-0022](../adrs/0022-plan-representation-context-guard-and-subgoals.md), not
 repeated here.** The two substantive additions it identified: the context guard binds from long-term
 memory (retrieval, not a widened `$from`), and sub-goals give the body recursive reach. The rest of
 this note keeps the framing the ADR does not carry — the BDI/JaCaMo lineage, the

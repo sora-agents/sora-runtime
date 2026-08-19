@@ -33,6 +33,7 @@ llm = ["anthropic>=0.40"]
 # Floor is 1.68, not 1.0: the client sends `max_completion_tokens` (SDK 1.45+) and reads
 # `completion_tokens_details.reasoning_tokens` (SDK 1.47+); an older 1.x lacks both.
 openai = ["openai>=1.68"]
+docs = ["mkdocs-material>=9.5"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -55,7 +56,7 @@ sora = "sora.cli:main"
 [project.urls]
 Homepage = "https://github.com/sora-agents/sora-runtime"
 Documentation = "https://github.com/sora-agents/sora-runtime/blob/main/README.md"
-"Architecture Decisions" = "https://github.com/sora-agents/sora-runtime/tree/main/docs/adrs"
+"Architecture Decisions" = "https://github.com/sora-agents/sora-runtime/tree/main/docs/architecture/adrs"
 
 [build-system]
 requires = ["hatchling"]

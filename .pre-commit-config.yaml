@@ -7,6 +7,14 @@ repos:
       - id: end-of-file-fixer
       - id: check-toml
       - id: check-yaml
+        exclude: ^mkdocs\.yml$
+      # mkdocs.yml uses PyYAML's !!python/name: tag (for pymdownx.superfences' custom fence
+      # formatter) that default check-yaml can't construct; --unsafe validates syntax only,
+      # without resolving tags to Python objects.
+      - id: check-yaml
+        name: check-yaml (mkdocs.yml, unsafe)
+        args: [--unsafe]
+        files: ^mkdocs\.yml$
       - id: check-added-large-files
       - id: check-merge-conflict
 

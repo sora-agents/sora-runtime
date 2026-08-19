@@ -1,0 +1,107 @@
+site_name: S-ORA
+site_description: A runtime for practical agents in dynamic and asynchronous environments.
+repo_url: https://github.com/sora-agents/sora-runtime
+repo_name: sora-agents/sora-runtime
+edit_uri: edit/main/docs/
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - footnotes
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Overview: getting-started/overview.md
+      - Quickstart: getting-started/quickstart.md
+      - Your First Agent: getting-started/first-agent.md
+      - Configuration: getting-started/configuration.md
+  - Concepts:
+      - Runtime Model: concepts/runtime-model.md
+      - Activities & Concurrency: concepts/activities-and-concurrency.md
+      - Decision Cycle: concepts/decision-cycle.md
+      - Environment Model: concepts/environment-model.md
+      - Memory & Planning: concepts/memory-and-planning.md
+      - Manuals: concepts/manuals.md
+      - Glossary: concepts/glossary.md
+  - Guides:
+      - CLI & Programmatic Runs: guides/cli-and-programmatic-runs.md
+      - Dynamic Environments: guides/dynamic-environments.md
+      - Custom Strategies: guides/custom-strategies.md
+      - Manual Authoring: guides/manual-authoring.md
+      - Workspace & Tool Integration: guides/workspace-and-tool-integration.md
+      - Observability & Troubleshooting: guides/observability-and-troubleshooting.md
+  - Tutorials:
+      - "ARE: Email & Calendar": tutorials/are-email-calendar.md
+      - "WoT: Two-Agent Lab": tutorials/wot-two-agent-lab.md
+  - Extensions:
+      - Adapters: extensions/adapters.md
+      - Strategies: extensions/strategies.md
+      - Memory Backends: extensions/memory-backends.md
+      - Transports: extensions/transports.md
+      - LLM Clients: extensions/llm-clients.md
+  - Reference:
+      - Configuration: reference/configuration.md
+      - CLI: reference/cli.md
+      - Manual Format: reference/manual-format.md
+      - Extension Protocols: reference/extension-protocols.md
+      - Python API: reference/python-api.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Principles & Non-Goals: architecture/principles-and-non-goals.md
+      - Decision Map: architecture/decision-map.md
+      - Status & Stability: architecture/status-and-stability.md
+      - Change-Safety Map: architecture/change-safety-map.md
+      - Decision Records: architecture/adrs/README.md
+      - Design Notes:
+          - ARE Dynamic Scenarios: architecture/notes/are-dynamic-scenarios.md
+          - Cross-Workspace Tool Sharing: architecture/notes/cross-workspace-tool-sharing.md
+          - Jason Plan Representation: architecture/notes/jason-plan-representation.md
+          - "Plan Control Structures: Collection References": architecture/notes/plan-control-structures-collection-references.md
+          - Reasoning Strategy Extension: architecture/notes/reasoning-strategy-extension.md
+          - Restore Drift Reconciliation: architecture/notes/restore-drift-reconciliation.md
+  - Research:
+      - Experimental Use: research/experimental-use.md
+      - Evaluation Scenarios: research/evaluation-scenarios.md
+      - Reproducibility: research/reproducibility.md
+      - Notes: research/notes/index.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Contributor Journey: development/contributor-journey.md
+      - Testing: development/testing.md
+      - Testing & Debugging: development/testing-and-debugging.md
+      - Agent Instructions: development/agent-instructions.md

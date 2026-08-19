@@ -48,3 +48,6 @@ scenario.json
 
 # Claude Code local session/config
 .claude/
+
+# Documentation
+site/

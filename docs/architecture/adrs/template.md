@@ -1,6 +1,6 @@
 # {short title, representative of the problem and the chosen solution}
 
-* Status: {proposed | accepted | rejected | deprecated | superseded by [ADR-NNNN](NNNN-title.md)}
+* Status: {proposed | accepted | rejected | deprecated | superseded by `[ADR-NNNN](NNNN-title.md)`}
 * Date: {YYYY-MM-DD when the decision was last updated}
 
 ## Context and Problem Statement
@@ -48,4 +48,4 @@ Chosen option: "{title of option}", because {justification — e.g., only option
 
 ## Links
 
-* {relation, e.g. "Depends on" / "Refines" / "Superseded by"} [ADR-NNNN](NNNN-title.md)
+* {relation, e.g. "Depends on" / "Refines" / "Superseded by"} `[ADR-NNNN](NNNN-title.md)`
