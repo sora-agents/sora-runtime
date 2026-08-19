@@ -134,7 +134,12 @@ At a checkpoint the cycle runs a two-tier check:
    pluggable* below — so an application can project perception onto only its externally-meaningful
    part rather than exclude properties one at a time.
 2. **Model relevance judgment (only when the gate is hot).** A single focused call: *given this plan
-   (goal + remaining steps) and these new percepts, is the plan still valid?* This is **revalidation-first,
+   (goal + the operations already executed + remaining steps) and these new percepts, is the plan still
+   valid?* The executed half is load-bearing, not context padding: a checkpoint late in a plan leaves
+   almost nothing in *remaining*, so a judgment made without history sees a goal whose work is nowhere
+   in evidence and invalidates a plan that is in fact nearly done — and it is what makes the
+   self-write reasoning below (*my own reply does not change the meeting day*) a judgment the model
+   can actually make instead of a guess. This is **revalidation-first,
    then maybe re-infer**: on "still valid" the cycle proceeds; on "invalidated" it calls
    `reset_for_replan()` and re-infers against the current world. The revalidation is cheaper than a full
    re-plan, so in a mostly-stable world (most gate-hot checkpoints find nothing) it is the economical
@@ -184,6 +189,14 @@ vs reads (`list`, `search`). Home: `OperationSpecification.side_effecting`, adap
 hints or inferred, **unknown → treated as a write** (conservative: reconsider before anything that
 might have a side effect). This is a sibling of `completion_signal`, not the cross-cutting
 plan-knowledge the rejected option (a) demanded.
+
+The question the flag answers is **mutation of the environment the plan reasons about**, which is
+narrower than "outward-facing". Reporting to the principal on the agent's own channel (runtime-io's
+`send_message_to_user`) reaches outside the agent yet moves nothing in the environment, so it is
+`side_effecting=False` and is *not* a checkpoint. Two reasons beyond the definition: a revalidation
+there can only churn — the work being reported is already committed and no re-plan takes it back —
+and the report is typically a plan's *last* step, where `remaining` is thinnest and a verdict least
+well-founded.
 
 ### Placement, seam, and the reliability escape hatch
 

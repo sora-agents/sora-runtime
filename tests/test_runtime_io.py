@@ -72,8 +72,10 @@ def test_manual_bakes_the_recipient_into_the_operation_name() -> None:
     assert op is not None
     assert op.name.endswith("_to_user")
     assert "text" in op.parameters["properties"]
-    # Replying to the user is a write, so the before_writes checkpoint sees it (ADR-0024).
-    assert op.side_effecting is True
+    # Replying to the user reaches outside the agent but mutates nothing in the environment, so the
+    # before_writes checkpoint does NOT stop on it (ADR-0024) — a revalidation before reporting can
+    # only churn: the reported work is already committed.
+    assert op.side_effecting is False
 
 
 if __name__ == "__main__":

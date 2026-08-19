@@ -28,6 +28,13 @@ agent:
     # ScheduleFromEmailStrategy and needs no reconsideration at all.
     reason: sora.strategies.DefaultReasonStrategy  # required; the model-backed default does the (re-)planning
     context_adaptation: before_writes  # re-validate before each write; none | before_writes | before_each_op
+    # The pre-revalidation change-gate (WHETHER the world moved, vs context_adaptation's WHEN). The
+    # runtime default (PerceptionSignatureGate) trips on ANY observable movement, so the agent's own
+    # reply / read-flags / calendar writes would each spend a revalidation. This domain gate projects
+    # perception to just the INBOX email ids, so a self-write leaves the signature unchanged (no
+    # revalidation) and only a genuine follow-up fires — the efference filter, ARE-email-shaped. Drop it
+    # to fall back to the domain-free default (correct, just one wasted revalidation per self-write).
+    change_gate: examples.are.sim.email_calendar.strategies.InboxChangeGate
     # Opt-in deterministic override (uncomment to use instead of / alongside context_adaptation): a
     # hard-interrupt path that preempts on a genuinely new inbound email, diffing INBOX ids from the
     # state_changed payload (no model call, ARE-email-shaped). It also covers the *post-completion*

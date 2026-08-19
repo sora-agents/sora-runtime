@@ -899,11 +899,13 @@ def _parse_params(text: str) -> dict[str, Any]:
 
 REVALIDATE_SYSTEM_PROMPT = (
     "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. "
-    "You are given the goal, the plan's REMAINING steps, and the new observed state and messages. "
+    "You are given the goal, what the agent has ALREADY DONE (the operations executed so far and "
+    "their results), the plan's REMAINING steps, and the new observed state and messages. "
     "The plan is INVALID if the new information changes what the remaining steps should do — a "
     "follow-up that changes a detail the plan acted on, or a precondition that no longer holds. "
-    "It is VALID if the remaining steps still achieve the goal; the agent's OWN prior actions do "
-    "not by themselves invalidate it.\n"
+    "It is VALID if the work already executed plus the remaining steps still achieve the goal; "
+    "the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps "
+    "only: work an executed operation already accomplished does not have to reappear in them.\n"
     'Respond with ONLY a JSON object {"valid": true} or {"valid": false} — no prose, no fences.'
 )
 
@@ -1085,9 +1087,14 @@ class ProceduralMemory:
         messages: list[Message] | None = None,
     ) -> bool:
         """Re-check whether the activity's in-progress plan is still valid against the current world
-        — the context-adaptation relevance judgment (ADR-0024). One model call: the goal, the plan's
-        REMAINING steps, and the observed properties/signals plus recent messages, asking for
-        a ``{"valid": bool}`` verdict. Reuses the same ``LLMClient`` seam as ``infer``; no
+        — the context-adaptation relevance judgment (ADR-0024). One model call: the goal, the
+        operations already executed, the plan's REMAINING steps, and the observed
+        properties/signals plus recent messages, asking for a ``{"valid": bool}`` verdict.
+        The executed half is not decoration: a checkpoint late in a plan leaves almost nothing in
+        ``remaining``, so without history the model sees a goal whose work is nowhere in evidence
+        and reasonably calls a nearly-finished plan invalid — it is also what makes "the agent's
+        own prior actions don't invalidate it" a judgment it can actually make rather than guess.
+        Reuses the same ``LLMClient`` seam as ``infer``; no
         LLM -> raises. A ``False`` verdict re-infers; best-effort, not a guarantee, and
         deliberately general (no domain-authored predicate) — it reasons about relevance itself, so
         the agent's own writes don't spuriously invalidate the plan."""
@@ -1108,6 +1115,7 @@ class ProceduralMemory:
         steps_text = render_steps(remaining)
         user = (
             f"Goal: {activity.goal}\n"
+            f"Results of operations already executed:\n{render_history(activity.history)}\n"
             f"Remaining plan steps:\n{steps_text}\n"
             f"Observed properties:\n{render_properties(snapshot.properties)}\n"
             f"Observed signals:\n{render_signals(snapshot.signals)}\n"

@@ -64,7 +64,14 @@ def user_channel_manual() -> Manual:
                     "required": ["text"],
                 },
                 returns=None,
-                side_effecting=True,  # sending a message to the user is an outward-facing write
+                # Outward-facing, but it mutates nothing in the environment the plan reasons about
+                # — it reports to the principal on the agent's own channel (this tool has no
+                # observable properties and emits no signals; nothing in the world moves). So it is
+                # NOT a before_writes checkpoint (ADR-0024): a revalidation here can only churn, as
+                # the work being reported is already committed and no re-plan can take it back,
+                # while the report is typically a plan's last step — exactly where `remaining` is
+                # thinnest and a verdict least well-founded.
+                side_effecting=False,
             )
         ],
         raw_text=None,

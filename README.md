@@ -653,10 +653,13 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
                              #   counterpart to `parameters` — adapter-synthesized from a native return
                              #   type/description. Lets a planner author a resolvable `$from` path into
                              #   a prior result instead of guessing its shape; None if undeterminable
-        side_effecting: bool | None = None  # does invoking this MUTATE the world (vs a pure read)? Fills
-                             #   the before_writes reconsideration checkpoint (ADR-0024). Adapter-owned like
-                             #   `returns`: from MCP readOnlyHint / ARE write_operation / inference. None =
-                             #   UNKNOWN -> treated as a write (conservative: reconsider before it)
+        side_effecting: bool | None = None  # does invoking this MUTATE THE ENVIRONMENT the plan reasons
+                             #   about (vs leaving it unchanged)? Outward-facing is a different question: a
+                             #   report to the principal on the agent's own channel (runtime-io's
+                             #   send_message_to_user) is False. Fills the before_writes reconsideration
+                             #   checkpoint (ADR-0024). Adapter-owned like `returns`: from MCP readOnlyHint /
+                             #   ARE write_operation / inference. None = UNKNOWN -> treated as a write
+                             #   (conservative: reconsider before it)
 
     @dataclass(frozen=True)
     class ObservablePropertySpecification:
@@ -1169,11 +1172,12 @@ The MCP path's standalone `examples/are/mcp/email_calendar/run.py` drives the de
         async def revalidate(self, activity: Activity, observed: PerceptSnapshot | None = None,
                         messages: list[Message] | None = None) -> bool:
             """The context-adaptation relevance judgment (ADR-0024): is the activity's in-progress plan
-            still VALID given the current world? One LLMClient call over the goal + the plan's remaining
-            steps + observed properties/signals + recent messages; parses {"valid": bool} (fail-soft to
-            True). Same model seam as infer/ground; no llm -> raises. A False verdict tells Reason to
-            re-infer — general (no domain-authored predicate), so the agent's own writes don't spuriously
-            invalidate the plan."""
+            still VALID given the current world? One LLMClient call over the goal + the operations already
+            executed + the plan's remaining steps + observed properties/signals + recent messages; parses
+            {"valid": bool} (fail-soft to True). Same model seam as infer/ground; no llm -> raises. A False
+            verdict tells Reason to re-infer — general (no domain-authored predicate), so the agent's own
+            writes don't spuriously invalidate the plan. History is what makes that last part decidable:
+            at a late checkpoint the remaining tail is one step and the goal's work is all behind it."""
         async def store(self, plan: Plan) -> None:
             """Persists a Plan so future retrieve() calls for similar goals can reuse it. NOT called by
             the default ReflectStrategy: auto-caching a completed plan and replaying it verbatim is

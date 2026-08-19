@@ -48,7 +48,10 @@ class OperationSpecification:  # was Operation — renamed for symmetry with the
     # guessing the result's shape (a wrong guess silently escalates the reference to the model).
     # None when the adapter can't determine it (an unannotated op, a hand-authored manual).
     returns: dict[str, Any] | None = None
-    # Does invoking this operation MUTATE the world (a write) versus being a pure read? Fills the
+    # Does invoking this operation MUTATE THE ENVIRONMENT the plan reasons about (a write) versus
+    # leaving it unchanged (a read)? Outward-facing is not the same question: a report on the
+    # agent's own channel to its principal (runtime-io's `send_message_to_user`) reaches outside
+    # the agent yet moves nothing in the environment, so it is False here. Fills the
     # `before_writes` reconsideration checkpoint (ADR-0024): the cycle re-validates a plan before a
     # side-effecting step, where acting on a stale plan does damage. Adapter-owned like `returns` —
     # from MCP's readOnlyHint, ARE's AppTool.write_operation, or inference. None = UNKNOWN,

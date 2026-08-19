@@ -53,8 +53,11 @@ from sora.strategies import (
     _step_side_effecting,
 )
 from sora.types import (
+    CompletedOperation,
     InferenceResult,
     ObservableProperty,
+    OperationAck,
+    OperationInvocation,
     PendingInference,
     Plan,
     Signal,
@@ -232,6 +235,31 @@ async def test_revalidate_parses_verdict_and_sees_goal_and_remaining_steps(tmp_p
     assert system == REVALIDATE_SYSTEM_PROMPT
     assert "schedule Monday sync" in user  # goal is in the prompt
     assert "write_op" in user  # the remaining step is in the prompt
+
+
+async def test_revalidate_sees_the_operations_already_executed(tmp_path: Path) -> None:
+    # The checkpoint fires late in a plan too, where `remaining` is a single step and everything
+    # the goal asked for lives in history. Without it the model judges a nearly-finished plan
+    # against a goal whose work is nowhere in evidence and reasonably answers "invalid" — the
+    # observed-state renderers can't stand in for it (they're truncated snapshots of the world,
+    # not a record of what this activity did).
+    llm = FakeLLMClient('{"valid": true}')
+    proc = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    plan = Plan(id="p", goal="schedule the sync and reply", steps=[invoke_step("t", "report_op")])
+    activity = Activity(id="a", goal="schedule the sync and reply", context={}, plan=plan)
+    activity.history.append(
+        CompletedOperation(
+            invocation=OperationInvocation(
+                tool_id="t", operation_name="add_calendar_event", params={"title": "Team sync"}
+            ),
+            ack=OperationAck(ok=True, result="event_created_42"),
+        )
+    )
+
+    assert await proc.revalidate(activity) is True
+    _system, user = llm.calls[-1]
+    assert "add_calendar_event" in user  # the executed operation is in the prompt
+    assert "event_created_42" in user  # ...with its result
 
 
 async def test_revalidate_fail_soft_treats_malformed_answer_as_valid(tmp_path: Path) -> None:
