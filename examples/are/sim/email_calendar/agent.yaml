@@ -36,8 +36,8 @@ agent:
     # to fall back to the domain-free default (correct, just one wasted revalidation per self-write).
     change_gate: examples.are.sim.email_calendar.strategies.InboxChangeGate
     # Opt-in deterministic override (uncomment to use instead of / alongside context_adaptation): a
-    # hard-interrupt path that preempts on a genuinely new inbound email, diffing INBOX ids from the
-    # state_changed payload (no model call, ARE-email-shaped). It also covers the *post-completion*
+    # hard-interrupt path that preempts on a genuinely new inbound email, diffing INBOX ids read off
+    # the tool on a state_changed event (no model call, ARE-email-shaped). It also covers the *post-completion*
     # follow-up — a change that lands after the goal already finished — which the cooperative
     # before-writes checkpoint structurally can't (a terminated activity has no checkpoint). See NOTES.md.
     # interrupt_policy: examples.are.sim.email_calendar.strategies.MailDiffInterruptPolicy

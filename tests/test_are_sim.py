@@ -405,10 +405,62 @@ async def test_observe_emits_signal_only_on_state_change() -> None:
     props = tool.observe()
     drained = [sig async for _src, sig in sink.drain()]
     assert len(drained) == 1 and drained[0].name == "state_changed"
+    # Thin: the event names which app moved, never a copy of the state (ADR-0004). The snapshot
+    # travels on the `state` observable property alone.
+    assert drained[0].payload == {"app": app.app_name()}
     assert len(props[0].value["emails"]) == 2  # property snapshot reflects the new email
 
     tool.observe()  # no further change -> no repeat signal
     assert [s async for s in sink.drain()] == []
+
+
+async def test_observe_is_reentrant_from_the_push_screen() -> None:
+    # Since the signal is thin, a push-time consumer (an InterruptPolicy) reads the state back off
+    # the tool — i.e. it calls observe() from inside push(). That must terminate: observe() records
+    # the new state BEFORE pushing, so the re-entrant call sees no diff and pushes nothing further.
+    app = FakeEmailApp()
+    sim = FakeSimulation([app])
+    tool = (await _adapter(sim).discover())[0].tools()[0]
+    sink: NotificationQueueSink[Any] = NotificationQueueSink()
+    await tool.focus(sink)
+
+    seen: list[Any] = []
+    sink.on_push = lambda _source, _signal: seen.append(tool.observe())
+
+    app.add_email("Follow-up: actually Tuesday")
+    tool.observe()
+
+    assert len(seen) == 1  # the screen ran once; its own observe() did not push again
+    assert len(seen[0][0].value["emails"]) == 2  # and it saw the POST-change state
+    assert len([sig async for _src, sig in sink.drain()]) == 1
+
+
+async def test_observe_returns_the_state_the_reentrant_screen_advanced_to() -> None:
+    # The push screen re-enters observe(). If ARE's thread mutates state in that window, the nested
+    # call advances the tool's recorded state past what the outer call read — and the outer call is
+    # what feeds the once-per-cycle property snapshot. It must return the newer state, not the
+    # value it happened to read first, or working memory carries the pre-change world for a tick.
+    app = FakeEmailApp()
+    sim = FakeSimulation([app])
+    tool = (await _adapter(sim).discover())[0].tools()[0]
+    sink: NotificationQueueSink[Any] = NotificationQueueSink()
+    await tool.focus(sink)
+
+    mutated = False
+
+    def screen(_source: Any, _signal: Any) -> None:
+        nonlocal mutated
+        if not mutated:  # mutate once, so the recursion terminates on the nested screen
+            mutated = True
+            app.add_email("Third, arriving mid-observe")  # the concurrent-mutation window
+        tool.observe()  # the ADR-0020 pattern: read the live tool at push time
+
+    sink.on_push = screen
+
+    app.add_email("Follow-up: actually Tuesday")
+    props = tool.observe()
+
+    assert len(props[0].value["emails"]) == 3  # not the 2 the outer _read_state() saw
 
 
 async def test_read_state_retries_past_a_transient_concurrent_modification() -> None:

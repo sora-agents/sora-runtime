@@ -115,6 +115,35 @@ self-write loop. Opting in is a deliberate, application-supplied policy — unti
 tagging exists, a policy can only tell an external event from the agent's own write by diffing observed
 state (e.g. a set of inbox ids), which is application-shaped.
 
+**A policy reads the tool, not `wm.properties`.** Screening at push time puts a policy *upstream of the
+only writer of the property snapshot*: `DefaultObserveStrategy._snapshot_properties` runs once per tick, at
+the top of Observe, and nothing else ever writes `wm.properties`. So at `decide()` time working memory
+still holds the pre-change world. For a genuinely asynchronous source the gap is up to a full tick (an MCP
+`resource_updated` can arrive mid-Reason, mid-Act, or during the idle wait); for a poll-on-observe source it
+is only the width of the `observe()` call the push happens inside — but stale either way. A policy that
+diffs the snapshot therefore finds nothing changed and, since the tool will not re-emit for a state it has
+already reported, **never fires again** — a silent failure, not an error.
+
+A policy needing current state must read it from the live tool (`wm.focused_tools[source]`), which is the
+artifact and so the authority at that instant; this is why `decide()` takes `wm` at all. Adapters must
+therefore refresh the tool's own view *before* pushing (see [ADR-0004](0004-tool-usage-interface.md)), which
+also makes a re-entrant `observe()` from inside the screen a no-op rather than a recursion.
+
+Syncing the snapshot instead was considered and rejected. Letting tools push property updates off-cycle
+would work for both source kinds, but makes `properties` mutable outside the cycle — the invariant that
+keeps a tick deterministic ([ADR-0011](0011-phase-fusion-via-threaded-result.md),
+[ADR-0019](0019-blocked-state-machinery-and-percept-storage.md): sinks carry *events*, and Observe is the
+single crossing point) — and would let the snapshot shift mid-phase, so one Reason call could read two
+different worlds. Screening at drain time instead would give every policy a current `wm`, but demotes the
+hard interrupt to the cycle-boundary reaction that
+[ADR-0024](0024-plan-reconsideration-context-adaptation.md) already provides, which is the one thing this
+seam exists not to be. The lag is not a defect: it is what a once-per-cycle snapshot means, and a push-time
+consumer is by definition outside that cycle.
+
+The constraint is specific to the *policy*. An `InterruptHandler` runs from `_preempted()` at a phase
+boundary — after Observe has completed — so it sees a fully refreshed snapshot and may read `wm.properties`
+freely. So may anything running inside a phase, such as a `ChangeGate` consulted in Reason.
+
 **Wiring.** `interrupt_handler` and `interrupt_policy` are new `DecisionCycle` constructor params
 (defaults `DefaultInterruptHandler` / `NeverInterruptPolicy`), selected via `agent.yaml`
 `strategies.interrupt` / `strategies.interrupt_policy` (mirroring the phase-strategy `import_object`
@@ -123,7 +152,7 @@ pattern — deliberately *not* folded into the five-field `Strategies` bundle, w
 **Example policy.** A concrete `InterruptPolicy` paired with a matching `InterruptHandler` exercises the seam
 end-to-end: the dynamic ARE showcase supplies one that treats a genuine new inbound event as a
 reconsideration trigger, centralizing reconsideration in this *one* seam rather than in bespoke
-Reason/Situate strategies. The worked walkthrough — the policy's payload keying, the Observe-cadence timing
+Reason/Situate strategies. The worked walkthrough — what the policy keys on, the Observe-cadence timing
 of that example's signal source, and how a reconsidering handler composes with off-cycle inference — lives
 with the example (`EXAMPLES.md`, and the ARE dynamic-scenarios note
 `docs/architecture/notes/are-dynamic-scenarios.md`); the requirement that such a handler invalidate an

@@ -279,8 +279,11 @@ async def test_resource_updated_pushes_signal_and_refreshes_property() -> None:
     source, signal = drained[0]
     assert source == email.id
     assert signal.name == "state_changed"
-    assert signal.payload["value"] == {"unread": 4}
-    # observe() reflects the refreshed snapshot.
+    # Thin: which resource changed, never a copy of what it now holds (ADR-0004) — the refreshed
+    # value travels on the observable property alone, which observe() below is the only source of.
+    assert signal.payload == {"uri": "app://EmailClientApp/state"}
+    # observe() reflects the refreshed snapshot — and it is refreshed *before* the push, so a
+    # push-time consumer reading the tool sees the new value.
     assert {p.name: p.value for p in email.observe()} == {"state": {"unread": 4}}
 
 

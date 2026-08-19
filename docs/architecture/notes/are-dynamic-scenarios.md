@@ -119,12 +119,26 @@ again, and so on. (Signals are also never consumed from `WorkingMemory` — an A
 signal can satisfy multiple waiters — so a count-based trigger can't drain them either.) The fix keys
 on the set of **INBOX email ids**: a follow-up grows the inbox, while the agent's reply lands in SENT,
 so a self-write is structurally invisible to the policy. This is example-level, ARE-email-shaped
-logic (`_inbox_ids_from_signal` knows the `folders/INBOX/emails` shape). It is also why the runtime
+logic (`_inbox_ids_from_state` knows the `folders/INBOX/emails` shape). It is also why the runtime
 default is `NeverInterruptPolicy` — with no general way yet to tell the agent's own writes from
 external events, preempting on a signal is opt-in. The general fix — efference / read-write tags so
 *any* self-caused change is filtered regardless of tool — is deferred alongside BDI-style commitment
 policies and an off-cycle ARE push (which would turn this Observe-cadence preemption into true
 mid-Reason abandonment).
+
+**Where the policy gets those ids.** Not from the signal: `state_changed` is a bare event naming the
+app that moved, with no state attached — a signal never duplicates an observable property it
+accompanies (ADR-0004), and here the whole `get_state()` tree is already published as the `state`
+property, so carrying it twice only reproduced a truncated copy of it in every prompt that renders
+`wm.signals`. Not from `wm.properties` either: a policy is screened *at push time*, upstream of the
+once-per-cycle property snapshot, so working memory still holds the pre-change world at that instant
+— a policy diffing it would find no new id, and since the tool won't re-emit for an unchanged state
+it would never fire again (a silent failure). The policy therefore reads the emitting tool's own
+`state` observable, and `_AreTool.observe` records the new state *before* pushing so the tool holds
+it by then (which also makes the policy's re-entrant `observe()` a no-op rather than a recursion).
+See ADR-0020. The cooperative `InboxChangeGate` has no such constraint — it runs inside Reason, well
+after the snapshot — which is why it reads `wm.properties` directly even though both share the one
+`_inbox_ids_from_state` projection.
 
 **Precondition: the plan must focus the tools it reconciles against** — the inbox *and* every tool
 whose state it changes (here the calendar). Observable properties are only snapshotted for a

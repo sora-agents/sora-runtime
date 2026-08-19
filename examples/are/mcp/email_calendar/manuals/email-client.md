@@ -29,11 +29,13 @@ schema field, unlike MCP tools), so it's spelled out here instead:
 - name: state_changed
 ```
 `state_changed` fires whenever the mailbox changes — a new email arrives, one is sent, replied to,
-forwarded, moved, or deleted. Same schema gap as `state` above (no native schema anywhere), so again
-spelled out here. The payload is an object with:
+forwarded, moved, or deleted. It reports *that* the mailbox moved, not what it now holds: the
+payload is an object with a single key,
 - `uri` (string): the resource that changed, always `app://EmailClientApp/state`.
-- `value` (object): the refreshed `state` snapshot at the moment of the change — same shape as the
-  `state` observable property described above (`user_email`, `view_limit`, `folders`).
+
+To see what changed, read the `state` observable property above, which is refreshed before this
+signal fires. The signal deliberately carries no copy of it — a signal never duplicates an
+observable property it accompanies.
 
 # Operations
 ```yaml

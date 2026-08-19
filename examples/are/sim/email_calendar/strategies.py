@@ -25,10 +25,10 @@ uncomments the ``interrupt_policy``/``interrupt`` lines. It is a **hard interrup
 strategy:
 
 * ``MailDiffInterruptPolicy`` — an ``InterruptPolicy`` screening the ``state_changed`` signals the
-  ARE tools push. It diffs the INBOX email ids carried in the signal payload against what it has
-  already seen; a genuinely new inbound email raises a hard interrupt (``DecisionCycle.interrupt``),
-  preempting the current phase. This is the whole reason the reconsideration is *preemptive* rather
-  than only at a cycle boundary.
+  ARE tools push. It reads the emitting tool's current INBOX email ids and diffs them against what
+  it has already seen; a genuinely new inbound email raises a hard interrupt
+  (``DecisionCycle.interrupt``), preempting the current phase. This is the whole reason the
+  reconsideration is *preemptive* rather than only at a cycle boundary.
 * ``ReconsiderInterruptHandler`` — the paired ``InterruptHandler``. On that interrupt it clears the
   in-flight activity's plan so the (default, model-backed) Reason re-infers a fresh plan against the
   now-updated observations; if the change landed *after* the goal already completed (no live
@@ -41,8 +41,17 @@ Why *inbound-email ids* and not "a signal arrived": the agent writes to the very
 trigger fires on the agent's *own* actions, forever (reply -> signal -> re-plan -> reply -> ...).
 Diffing the **INBOX** ids sidesteps that: a follow-up grows the inbox, while the agent's
 reply lands in SENT, so a self-write never changes the set and never fires. This is example-level,
-ARE-email-shaped logic (``_inbox_ids_from_signal`` knows the ``folders/INBOX/emails`` state shape);
+ARE-email-shaped logic (``_inbox_ids_from_state`` knows the ``folders/INBOX/emails`` state shape);
 the general fix — efference / read-write tags so *any* self-caused change is filtered — is deferred.
+
+Where those ids come from: the ``state_changed`` signal is a bare event carrying no state (ADR-0004
+— a signal never duplicates an observable property it accompanies), so the policy reads the emitting
+tool's own ``state`` observable. Not ``wm.properties``: a policy is screened at push time, upstream
+of the once-per-cycle property snapshot, so working memory still holds the *pre-change* world at
+that instant — diffing it would find nothing, and since the tool won't re-emit, the policy would
+never fire again (see ``_inbox_ids_from_tool`` and ADR-0020). The *handler* has no such constraint:
+it runs at the Observe->Reflect checkpoint, after the snapshot. Nor does the cooperative
+``InboxChangeGate``, which runs inside Reason — which is why it reads properties directly.
 
 Timing caveat: today the ARE bridge emits ``state_changed`` from ``tool.observe()``, i.e. *during*
 the Observe phase (Observe-cadence, for determinism), not off a background thread. So the interrupt
@@ -75,6 +84,7 @@ from sora.types import InterruptRequest, Signal
 if TYPE_CHECKING:
     from sora.activity import Activity
     from sora.cycle import DecisionCycle
+    from sora.environment import Tool
     from sora.manual import Manual
     from sora.memory import PerceptSnapshot, WorkingMemory
     from sora.perception import Message
@@ -96,8 +106,9 @@ def _inbox_ids_from_state(state: object) -> frozenset[str] | None:
     (a non-email tool's state, or a malformed value). State shape:
     ``{"folders": {"INBOX": {"emails": [{"email_id": ...}]}}}``. Scoping to INBOX is the whole point
     — the agent's own outbound reply lands in SENT, so it never grows this set. This is the shared
-    ``state -> id-set`` projection behind both the hard-interrupt policy (fed the signal payload's
-    ``value``) and the cooperative change-gate (fed an observable ``state`` property's value)."""
+    ``state -> id-set`` projection behind both the hard-interrupt policy (fed the emitting tool's
+    own ``state`` observable) and the cooperative change-gate (fed an observable ``state``
+    property's value out of working memory)."""
     if not isinstance(state, dict):
         return None
     folders = state.get("folders")
@@ -108,28 +119,43 @@ def _inbox_ids_from_state(state: object) -> frozenset[str] | None:
     return frozenset(str(e["email_id"]) for e in emails if isinstance(e, dict) and "email_id" in e)
 
 
-def _inbox_ids_from_signal(signal: Signal) -> frozenset[str] | None:
-    """The INBOX email ids carried in a ``state_changed`` signal payload (``{"value": state}``), or
-    None if it carries no inbox. A thin wrapper over the shared ``_inbox_ids_from_state`` projection
-    — the hard-interrupt path unwraps the fat signal's ``value``."""
-    return _inbox_ids_from_state(signal.payload.get("value"))
+def _inbox_ids_from_tool(tool: Tool | None) -> frozenset[str] | None:
+    """The INBOX email ids in a tool's own ``state`` observable, or None if it has no inbox (a
+    non-email tool, or a tool that is no longer focused). Reads the **artifact**, not
+    ``wm.properties``: an ``InterruptPolicy`` is consulted at push time, upstream of the
+    once-per-cycle property snapshot (``DefaultObserveStrategy._snapshot_properties``), so the copy
+    in working memory is still the pre-change world — diffing it would find nothing and, since the
+    tool won't re-emit, the policy would never fire again. The tool holds the current value at that
+    instant. A thin wrapper over the shared ``_inbox_ids_from_state`` projection."""
+    if tool is None:
+        return None
+    for prop in tool.observe():
+        if prop.name == "state":
+            return _inbox_ids_from_state(prop.value)
+    return None
 
 
 class MailDiffInterruptPolicy:
-    """An ``InterruptPolicy`` that preempts on a genuinely new inbound email. Reads INBOX ids
-    from the ``state_changed`` signal payload and diffs them against what it has already seen, so a
-    follow-up that grows the inbox raises a hard interrupt while the agent's own reply (landing in
-    SENT, leaving the INBOX unchanged) never does — the structural self-write filter. The first
-    non-empty observation is the *baseline*, not a follow-up: only mail on top of
-    it fires. Stateful, so it also dedups — each new id fires exactly once."""
+    """An ``InterruptPolicy`` that preempts on a genuinely new inbound email. On a ``state_changed``
+    signal it reads the emitting tool's current INBOX ids and diffs them against what it has already
+    seen, so a follow-up that grows the inbox raises a hard interrupt while the agent's own reply
+    (landing in SENT, leaving the INBOX unchanged) never does — the structural self-write filter.
+    The first non-empty observation is the *baseline*, not a follow-up: only mail on top of
+    it fires. Stateful, so it also dedups — each new id fires exactly once.
+
+    The signal itself is a bare event (ADR-0004: it never carries a snapshot of the ``state``
+    property it accompanies), so the state comes from the tool — see ``_inbox_ids_from_tool`` for
+    why not from ``wm.properties``."""
 
     def __init__(self) -> None:
         self._seen: frozenset[str] = frozenset()
 
     def decide(self, source: str, signal: Signal, wm: WorkingMemory) -> InterruptRequest | None:
-        current = _inbox_ids_from_signal(signal)
+        if signal.name != "state_changed":
+            return None  # a thin signal isn't self-describing: match on the name, not the payload
+        current = _inbox_ids_from_tool(wm.focused_tools.get(source))
         if current is None:
-            return None  # not an inbox-bearing state_changed signal
+            return None  # not an inbox-bearing tool (e.g. the calendar)
         new_inbound = current - self._seen
         had_baseline = bool(self._seen)  # first non-empty inbox is the baseline, not a follow-up
         self._seen = self._seen | current

@@ -472,13 +472,24 @@ class _AreTool:
         self._state = None
 
     def observe(self) -> list[ObservableProperty]:
+        # The new state is recorded *before* the push, not after. A pushed signal is screened
+        # synchronously by the InterruptPolicy, which runs upstream of the once-per-cycle property
+        # snapshot — so a push-time consumer has to read the current value off this tool, and this
+        # tool must therefore already hold it. Assigning first also makes a re-entrant observe()
+        # from inside that screen a no-op (state == self._state -> no second push) rather than a
+        # recursion.
         state = self._read_state()
-        if self._sink is not None and state != self._state:
-            self._sink.push(
-                self.id, Signal("state_changed", {"app": self._app.app_name(), "value": state})
-            )
+        changed = state != self._state
         self._state = state
-        return [ObservableProperty(name="state", value=state)]
+        if self._sink is not None and changed:
+            # Thin: the event, not the state. The snapshot is published as the `state` observable
+            # property below; duplicating it into the signal would only reproduce it in every
+            # prompt that renders wm.signals.
+            self._sink.push(self.id, Signal("state_changed", {"app": self._app.app_name()}))
+        # `self._state`, not the local: the push screen re-enters observe(), and if ARE's thread
+        # mutated state in between, that nested call already advanced `self._state` past the local.
+        # Returning the local would snapshot the pre-change world into working memory for one tick.
+        return [ObservableProperty(name="state", value=self._state)]
 
     def _read_state(self) -> Any:
         # ARE's event-loop thread can mutate app state mid-read (no shared lock), so a get_state()

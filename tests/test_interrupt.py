@@ -114,6 +114,14 @@ class _FiresOnPolicy:
         return None
 
 
+class _RaisingPolicy:
+    """An InterruptPolicy whose decide() fails — the realistic shape once a policy reads the live
+    tool at push time (ADR-0020): that is real I/O against a concurrently-mutating artifact."""
+
+    def decide(self, source: str, signal: Signal, wm: WorkingMemory) -> InterruptRequest | None:
+        raise RuntimeError("dictionary changed size during iteration")
+
+
 def _cycle(
     tmp_path: Path,
     *,
@@ -495,6 +503,19 @@ async def test_policy_promotes_a_signal_to_an_interrupt(tmp_path: Path) -> None:
     assert cycle._interrupt is not None
     assert cycle._interrupt.signal.name == "preempt"
     assert cycle._wake.is_set()
+
+
+async def test_a_failing_policy_degrades_to_no_interrupt(tmp_path: Path) -> None:
+    # decide() runs on the *pusher's* stack — an adapter callback, not a tick — so an exception
+    # would unwind through the adapter and out of Agent.run's loop, killing the agent. A failed
+    # screen must degrade to "no interrupt"; the signal still reaches the cooperative drain.
+    cycle, working, _ = _cycle(tmp_path, interrupt_policy=_RaisingPolicy())
+
+    cycle.signal_sink.push("inbox", Signal("state_changed", {}))  # must not raise
+
+    assert cycle._interrupt is None
+    assert not cycle._wake.is_set()
+    assert [sig.name async for _src, sig in cycle.signal_sink.drain()] == ["state_changed"]
 
 
 async def test_default_policy_never_preempts(tmp_path: Path) -> None:

@@ -38,9 +38,11 @@ plans), so each run infers fresh — there is no stale plan cache to clear betwe
 Everything here lives under `examples/are/sim/email_calendar/` and would not ship in the runtime:
 
 - **`MailDiffInterruptPolicy`** *(opt-in override, not the default path)* — an `InterruptPolicy`
-  (screened at push time) that raises a hard interrupt on a *genuinely new inbound email*. It diffs
-  the set of **INBOX email ids** carried in the `state_changed` signal payload against what it has
-  already seen, which knows ARE's `EmailClientApp` state shape (`folders → INBOX → emails[*].email_id`).
+  (screened at push time) that raises a hard interrupt on a *genuinely new inbound email*. On a
+  `state_changed` event it diffs the set of **INBOX email ids** read off the emitting tool's own
+  `state` observable against what it has already seen, which knows ARE's `EmailClientApp` state
+  shape (`folders → INBOX → emails[*].email_id`). It reads the *tool*, not the signal (which is a
+  bare event — ADR-0004) and not `wm.properties` (still a snapshot behind at push time — ADR-0020).
   ARE-email-shaped. Stateful, so it also dedups — each new id fires once, the first non-empty inbox is
   the baseline, and the agent's own reply (landing in SENT) never fires. See [ADR-0020](../../../../docs/architecture/adrs/0020-hard-interrupt-and-await-input.md).
   The default path is now the general context-adaptation mechanism (see the intro); this is wired only
@@ -167,9 +169,10 @@ These are the seams the example works around. Each is a real runtime gap, not a 
    attends to only the tools that matter (and *holds* that focus across a replan) — is still future
    work; `_focus_`/`_unfocus_` remain the seam for it.
 
-5. **Observation-aware inference can bake run-specific literals.** Because the mailbox `state_changed`
-   signal lands *before* the plan-inference call resolves, the planner sees the email contents in its
-   context and extracts parameter values at plan time. The prompt sanctions this for *stable,
+5. **Observation-aware inference can bake run-specific literals.** Because the mailbox's `state`
+   observable property is snapshotted into working memory in the same Observe that drains the thin
+   `state_changed` signal — and that lands *before* the plan-inference call resolves — the planner
+   sees the email contents in its context and extracts parameter values at plan time. The prompt sanctions this for *stable,
    meaningful* values (a title, a time, a name — memory.py's "fill parameters whose value is stable
    and meaningful") but forbids it for *volatile identifiers* (email/event ids → keep as `$from`
    references). Two consequences, both about what this leaves for grounding:

@@ -8,8 +8,10 @@ inbound email**. Two reconsideration paths are covered:
   goes hot and a revalidation (a fake, here) re-checks the plan — "invalid" re-plans, "valid" runs.
   General runtime machinery, no example code (the last section below).
 * **Opt-in override — the MailDiff interrupt seam.** ``MailDiffInterruptPolicy`` raises a hard
-  interrupt on a genuinely new INBOX email id (from the ``state_changed`` payload) — NOT the
-  baseline inbox, NOT the agent's own reply landing in SENT, NOT a non-inbox signal — and
+  interrupt on a genuinely new INBOX email id (read off the emitting tool, since the
+  ``state_changed`` signal is a bare event and ``wm.properties`` is still a snapshot behind at push
+  time) — NOT the baseline inbox, NOT the agent's own reply landing in SENT, NOT a non-inbox tool —
+  and
   ``ReconsiderInterruptHandler`` routes it: clear a live activity's plan (Reason re-infers) or spawn
   one corrective activity when the goal completed; a user stop is delegated to the runtime default.
 
@@ -80,12 +82,18 @@ def _email_state(*, inbox: list[str], sent: list[str] | None = None) -> dict[str
     }
 
 
-def _state_changed(*, inbox: list[str], sent: list[str] | None = None) -> Signal:
-    """The ``state_changed`` signal the ARE email tool pushes on a state diff."""
-    return Signal(
-        "state_changed",
-        {"app": "EmailClientApp", "value": _email_state(inbox=inbox, sent=sent)},
-    )
+def _state_changed(app: str = "EmailClientApp") -> Signal:
+    """The ``state_changed`` event the ARE tools push on a state diff — identity only, no state
+    (ADR-0004: a signal never duplicates the observable property it accompanies)."""
+    return Signal("state_changed", {"app": app})
+
+
+def _focus(wm: WorkingMemory, tool_id: str, state: Any) -> None:
+    """Put a focused tool holding `state` in its `state` observable into working memory. Calling it
+    again replaces the tool with one holding the new state — which is what the real adapter does
+    (``_AreTool.observe`` records the new state *before* pushing). The policy reads the tool, so
+    this, not ``wm.properties``, is where a follow-up has to land for it to be seen."""
+    wm.focused_tools[tool_id] = FakeTool(tool_id, properties=[ObservableProperty("state", state)])
 
 
 def _wm() -> WorkingMemory:
@@ -168,16 +176,36 @@ def test_policy_baseline_does_not_fire_but_a_new_inbound_does() -> None:
     wm = _wm()
 
     # First observation is the baseline (the original task) — not a follow-up.
-    assert policy.decide("EmailClientApp", _state_changed(inbox=["orig"]), wm) is None
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig"]))
+    assert policy.decide("EmailClientApp", _state_changed(), wm) is None
 
     # A follow-up grows the inbox -> a hard interrupt carrying the new id.
-    request = policy.decide("EmailClientApp", _state_changed(inbox=["orig", "followup"]), wm)
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig", "followup"]))
+    request = policy.decide("EmailClientApp", _state_changed(), wm)
     assert isinstance(request, InterruptRequest)
     assert request.signal.name == "new_inbound_email"
     assert request.signal.payload["email_ids"] == ["followup"]
 
     # Dedup: the same inbox state does not fire again.
-    assert policy.decide("EmailClientApp", _state_changed(inbox=["orig", "followup"]), wm) is None
+    assert policy.decide("EmailClientApp", _state_changed(), wm) is None
+
+
+def test_policy_reads_the_tool_not_the_property_snapshot() -> None:
+    # The regression this whole seam turns on. An InterruptPolicy is screened at push time, upstream
+    # of DefaultObserveStrategy._snapshot_properties, so wm.properties still holds the PRE-change
+    # world — here, the inbox before the follow-up. A policy that diffed the snapshot would find no
+    # new id, and since the tool won't re-emit for an unchanged state it would never fire again:
+    # silent death, not an error. Reading the tool is what makes the follow-up visible.
+    policy = MailDiffInterruptPolicy()
+    wm = _wm()
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig"]))
+    assert policy.decide("EmailClientApp", _state_changed(), wm) is None  # baseline
+
+    _state_property(wm, "EmailClientApp", _email_state(inbox=["orig"]))  # stale snapshot
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig", "followup"]))  # tool is current
+    request = policy.decide("EmailClientApp", _state_changed(), wm)
+    assert request is not None
+    assert request.signal.payload["email_ids"] == ["followup"]
 
 
 def test_policy_ignores_the_agents_own_reply_landing_in_sent() -> None:
@@ -185,22 +213,38 @@ def test_policy_ignores_the_agents_own_reply_landing_in_sent() -> None:
     # here; the INBOX-id diff must ignore it (INBOX unchanged -> no new id).
     policy = MailDiffInterruptPolicy()
     wm = _wm()
-    assert policy.decide("EmailClientApp", _state_changed(inbox=["orig"]), wm) is None
-    fired = policy.decide("EmailClientApp", _state_changed(inbox=["orig"], sent=["myreply"]), wm)
-    assert fired is None
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig"]))
+    assert policy.decide("EmailClientApp", _state_changed(), wm) is None
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig"], sent=["myreply"]))
+    assert policy.decide("EmailClientApp", _state_changed(), wm) is None
 
 
-def test_policy_ignores_a_non_inbox_signal() -> None:
-    # A calendar (or any non-email) state_changed carries no INBOX and must not fire or disturb the
-    # baseline of the inbox diff.
+def test_policy_ignores_a_non_inbox_tool() -> None:
+    # A calendar (or any non-email) state_changed comes from a tool whose state has no INBOX, and
+    # must not fire or disturb the baseline of the inbox diff.
     policy = MailDiffInterruptPolicy()
     wm = _wm()
-    assert (
-        policy.decide("CalendarApp", Signal("state_changed", {"value": {"events": []}}), wm) is None
-    )
-    assert policy.decide("EmailClientApp", _state_changed(inbox=["orig"]), wm) is None  # baseline
-    request = policy.decide("EmailClientApp", _state_changed(inbox=["orig", "new"]), wm)
-    assert request is not None  # still fires normally afterwards
+    _focus(wm, "CalendarApp", {"events": []})
+    assert policy.decide("CalendarApp", _state_changed("CalendarApp"), wm) is None
+
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig"]))
+    assert policy.decide("EmailClientApp", _state_changed(), wm) is None  # baseline
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig", "new"]))
+    assert policy.decide("EmailClientApp", _state_changed(), wm) is not None  # still fires after
+
+
+def test_policy_ignores_an_unknown_signal_and_an_unfocused_source() -> None:
+    # The payload no longer identifies the signal, so the name is the discriminator; and a signal
+    # whose source isn't focused has no readable state (an unfocus racing a push) -> no fire, and
+    # neither case may disturb the baseline.
+    policy = MailDiffInterruptPolicy()
+    wm = _wm()
+    _focus(wm, "EmailClientApp", _email_state(inbox=["orig", "followup"]))
+    assert policy.decide("EmailClientApp", Signal("user_stop", {}), wm) is None
+    assert policy.decide("UnfocusedApp", _state_changed("UnfocusedApp"), wm) is None
+
+    # Baseline intact: the first inbox read is still the baseline, so it doesn't fire either.
+    assert policy.decide("EmailClientApp", _state_changed(), wm) is None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -387,10 +431,9 @@ async def test_context_adaptation_replans_on_the_mid_run_followup(tmp_path: Path
     working.activities["a"] = activity
     activity.reconsider_baseline = _perception_signature(working)  # baselined in the Monday world
 
-    # The follow-up lands mid-run: a new inbound email surfaces as a state change.
-    working.signals.append(
-        Percept("EmailClientApp", _state_changed(inbox=["orig", "followup"]), 0.0)
-    )
+    # The follow-up lands mid-run: a new inbound email surfaces as a state change. The default gate
+    # tracks signal arrival, not signal content, so the thin event is all it takes to go hot.
+    working.signals.append(Percept("EmailClientApp", _state_changed(), 0.0))
 
     fired = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
     assert (
@@ -412,7 +455,7 @@ async def test_context_adaptation_keeps_a_still_valid_plan(tmp_path: Path) -> No
     activity = Activity(id="a", goal=_GOAL, context={}, plan=plan, step_index=0)
     working.activities["a"] = activity
     activity.reconsider_baseline = _perception_signature(working)
-    working.signals.append(Percept("EmailClientApp", _state_changed(inbox=["orig", "later"]), 0.0))
+    working.signals.append(Percept("EmailClientApp", _state_changed(), 0.0))
 
     await DefaultReasonStrategy().reason(
         activity, working, cycle, TickResult()

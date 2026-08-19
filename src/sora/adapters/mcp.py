@@ -412,12 +412,13 @@ class _McpTool:
 
     def _make_handler(self, binding: _ResourceBinding) -> Callable[[], Awaitable[None]]:
         async def handler() -> None:
+            # Refresh the cache *before* pushing: the signal is thin (which resource changed, not
+            # what it now holds — ADR-0004), so a push-time consumer such as an InterruptPolicy
+            # reads the new value off observe(), and wm.properties is still a cycle behind here.
             value = await self._read(binding.uri)
             self._cache[binding.property_name] = value
             if self._sink is not None:
-                self._sink.push(
-                    self.id, Signal(binding.signal_name, {"uri": binding.uri, "value": value})
-                )
+                self._sink.push(self.id, Signal(binding.signal_name, {"uri": binding.uri}))
 
         return handler
 

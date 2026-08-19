@@ -166,8 +166,17 @@ class DecisionCycle:
     def _screen_signal(self, source: str, signal: Signal) -> None:
         """signal_sink.on_push: consulted synchronously as each signal is pushed, before the
         cooperative Observe drain. If the InterruptPolicy elects to preempt, record the request and
-        wake the cycle; otherwise the signal just flows to the drain as before."""
-        request = self.interrupt_policy.decide(source, signal, self.working)
+        wake the cycle; otherwise the signal just flows to the drain as before.
+
+        The policy is guarded: it runs on the *pusher's* stack (an adapter callback, not a tick), so
+        an exception here would unwind through the adapter and out of the agent loop. A policy that
+        reads the live tool (ADR-0020's pattern) does real I/O and can genuinely fail, and a failed
+        screen must degrade to "no interrupt" — the signal still reaches the Observe drain."""
+        try:
+            request = self.interrupt_policy.decide(source, signal, self.working)
+        except Exception:
+            log.exception("interrupt policy failed screening %s from %s", signal.name, source)
+            return
         if request is not None:
             self._interrupt = request
             self._wake.set()
