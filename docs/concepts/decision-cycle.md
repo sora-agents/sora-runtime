@@ -1,9 +1,26 @@
 # Decision Cycle
 
-!!! note "Not yet written"
-    This page is scaffolding for the documentation restructuring. Until it is written, see:
+The S-ORA decision cycle manages concurrent activities by selecting one activity to progress and executing at most one external action per cycle.
 
-    - [README.md — The S-ORA Decision Cycle](https://github.com/sora-agents/sora-runtime/blob/main/README.md#the-s-ora-decision-cycle)
-    - [ADR-0009 — Five-phase decision cycle](../architecture/adrs/0009-five-phase-decision-cycle.md)
-    - [ADR-0010 — Pluggable phase strategies](../architecture/adrs/0010-pluggable-phase-strategies.md)
-    - [ADR-0011 — Phase fusion via threaded result](../architecture/adrs/0011-phase-fusion-via-threaded-result.md)
+Observe => Reflect (optional) => Situate => Reason => Act
+
+The decision cycle follows 5 steps:
+
+- Observe: the agent receives perceptual input and messages asynchronously, which are reflected in the agent's working memory
+- Reflect: for each activity, decides whether it has completed successfully or failed — and if so, executes an internal action to summarize and store the experience in episodic memory; "optional" means this decision itself is cheap by default and made fresh every cycle, not that the cycle is externally told when to check; the judgment is synchronous — it must land before Situate selects, so a just-completed activity is never re-selected the same cycle — while summarizing and storing run asynchronously and never block the cycle; several activities may terminate in the same cycle
+- Situate: the agent selects an activity and adjusts its working memory for that activity — for example, by loading required manuals, unloading obsolete ones, and filtering the perceptual input; if an unhandled message in working memory doesn't correspond to any existing activity, Situate creates one via the internal _create_activity_ action before selecting; which ready activity to select — the agent's scheduler — is its own pluggable sub-strategy, defaulting to fair round-robin rotation over the ready set (anti-starvation, still no model call) so richer policies (priority, aging, deadlines, an LLM-based scheduler) can replace just the pick without re-authoring the rest of Situate
+- Reason: the agent infers a plan for the current activity (or retrieves a stored one, once procedure reuse is enabled — auto-caching is currently disabled, so each activity infers fresh) — a multi-step artifact, advanced across cycles rather than regenerated every cycle — and selects the next step to advance it; if the activity already has a valid plan, this is as cheap as reading its next step, no replanning involved; the Situate phase may suggest prerequisite external actions for situated reasoning, such as to retrieve tool manuals from an external repository, focus on or unfocus from tools; these prerequisite actions should take priority unless a more urgent action is needed — for example, to respond to a critical signal; if no prerequisite or urgent actions are required, the agent selects the next external action that advances the plan, which is either to send a message to another agent or invoke a tool operation
+- Act: binds the step to a concrete invocation and executes the external action — mechanically, with no manual interpretation of its own. The suspend/resume that layers a signal-wait on top of a long-running operation is *not* done here: once the operation resolves, the Observe phase mechanically suspends the activity if the operation's manual declares a completion signal, and resumes it once that signal is observed (see [Activities & Concurrency](activities-and-concurrency.md))
+
+The five phases are a ceiling, not a quota: every cycle runs the pipeline, but a given cycle may conclude with one external action, with internal work only (e.g., storing experiences), or with nothing to do — at most one external action per cycle, never a mandatory one.
+
+How many model calls a cycle costs is a configuration choice, not a property of the runtime. Observe and Reflect are deterministic by default: Observe mechanically ingests percepts and messages (an LLM-backed Observe is possible where perception itself needs interpretation — e.g., describing a camera snapshot — which runs off-cycle as an async internal action whose result lands as a percept a later cycle, not a fusion entry point), and Reflect's completion judgment may be deterministic or model-backed, with summarizing and storing dispatched asynchronously so they never block the cycle. Situate → Reason → Act form the decision chain proper — select an activity, advance its plan, bind a concrete invocation. The model calls this can need — infer a plan, ground a param — run off-cycle as internal actions: the activity waits in RUNNING and the result lands a later cycle, so no phase ever blocks the cycle. Fusing selection and planning into a single model call is a narrow synchronous-mode option, not the default, since it re-serializes that concurrency (ADR-0021). In the common case — an already-inferred plan being advanced, mechanical defaults — a cycle costs zero model calls. A hard interrupt can preempt the current phase for high-priority signals, independent of where the cycle is mid-flight — the 10ms reactiveness target, met by phase-boundary checkpoints; because model calls run off-cycle, no phase blocks on one, so there is no in-flight model call to cut short.
+
+Every phase has a pluggable strategy. A strategy may short-circuit later phases by producing their answer directly — e.g., Situate deciding the step and the concrete invocation in the same call that selects the activity — so that a single underlying computation can serve multiple phases. The shared decision value lives only for the duration of one cycle.
+
+## See also
+
+- [ADR-0009 — Five-phase decision cycle](../architecture/adrs/0009-five-phase-decision-cycle.md)
+- [ADR-0010 — Pluggable phase strategies](../architecture/adrs/0010-pluggable-phase-strategies.md)
+- [ADR-0011 — Phase fusion via threaded result](../architecture/adrs/0011-phase-fusion-via-threaded-result.md)
+- [ADR-0021 — LLM calls as async internal actions](../architecture/adrs/0021-llm-calls-as-async-internal-actions.md)
