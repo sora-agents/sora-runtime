@@ -20,7 +20,7 @@ uv run pytest tests/test_smoke.py::test_package_importable  # single test
 uv run pre-commit install         # one-time: run the same checks locally on commit
 ```
 
-CI (`.github/workflows/ci.yml`) runs all six checks above (ruff lint, ruff format, mypy, pytest, readme-sync, manuals-sync) on Python 3.12 and 3.13 for every push/PR — treat a failure in any one of them as a real failure, not noise. Run the full set locally before committing/pushing (or `uv run pre-commit run --all-files`). The two `check_*_sync.py` scripts are the easiest to forget: they only run on commit if `pre-commit install` has been done, so run them explicitly when you add or rename a class in `src/sora/*.py` (readme-sync) or edit a manual in EXAMPLES.md / `tests/fixtures/manuals/` (manuals-sync) without a local pre-commit.
+CI (`.github/workflows/ci.yml`) runs all six checks above (ruff lint, ruff format, mypy, pytest, readme-sync, manuals-sync) on Python 3.12 and 3.13 for every push/PR, plus a separate `docs` job that runs `mkdocs build --strict` once on Python 3.12 — `mkdocs.yml`'s `validation:` block turns a broken internal link, a bad `#anchor`, or a nav entry pointing at a missing file into a build failure there — treat a failure in any of them as a real failure, not noise. Run the full set locally before committing/pushing (or `uv run pre-commit run --all-files`). The two `check_*_sync.py` scripts are the easiest to forget: they only run on commit if `pre-commit install` has been done, so run them explicitly when you add or rename a class in `src/sora/*.py` (readme-sync) or edit a manual in EXAMPLES.md / `tests/fixtures/manuals/` (manuals-sync) without a local pre-commit.
 
 ## Architecture
 

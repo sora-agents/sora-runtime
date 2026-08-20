@@ -5,6 +5,17 @@ repo_name: sora-agents/sora-runtime
 edit_uri: edit/main/docs/
 docs_dir: docs
 
+validation:
+  nav:
+    # omitted_files stays at its default (info): ADRs and research notes are intentionally
+    # reachable only via their section's index page, not listed individually in nav.
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
 theme:
   name: material
   palette:
