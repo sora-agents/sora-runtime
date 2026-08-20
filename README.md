@@ -16,108 +16,7 @@ Key features of the S-ORA runtime:
 
 ## Main concepts
 
-S-ORA is aligned with the [CoALA conceptual framework](https://arxiv.org/abs/2309.02427) for cognitive language agents, and draws further insight from classical agent architectures, specifically the Belief-Desire-Intention (BDI) model and practical implementations such as [Jason](https://github.com/jason-lang/jason).
-
-Main concepts: [activities](#activities), [tool model and use](#tool-model-and-use), [tool manuals](#tool-manuals), [memory modules](#memory), the [action space](#action-space), and the [S-ORA decision cycle](#the-s-ora-decision-cycle).
-
-### Activities
-
-An activity is the central unit of work for a S-ORA agent: it is a means to achieve a goal and has a context that represents a filtered view of the environment relevant to the activity. An agent can pursue multiple activities concurrently, but only one activity is executed in each decision cycle. It can also drop an activity if it is no
-longer desirable or achievable, or it can suspend the activity while waiting for external events and conditions.
-
-An activity can be in one of four states:
-
-- running: the activity has an invoked operation in flight — invoked but not yet resolved; the agent won't reselect it until the operation resolves, though other activities may still be picked and progressed meanwhile;
-- blocked: the agent is waiting for external events (e.g., signals from tools) to proceed with the activity;
-- ready: the agent can pick and pursue the activity;
-- terminated: the activity was completed or dropped.
-
-An activity is eligible for selection only when ready; running and blocked activities are skipped until something transitions them back. Invoking an operation always, implicitly, moves an activity to running until that operation's own result comes back — this is unconditional, independent of anything the tool's manual says, and resolving it back to ready is an unambiguous one-to-one match the runtime does automatically, with no strategy code involved. A manual can additionally require blocking on a specific signal before the next step, layered on top of (not instead of) that implicit wait — the two are orthogonal: the operation resolves to ready first, and a *separate* step then blocks the activity until the signal arrives. That block is likewise mechanical: an operation declares its completion signal in its manual (`OperationSpecification.completion_signal`), so entering `blocked` (the `_suspend_` action) and leaving it once the signal is observed (the `_resume_` action — the matched signal itself is left in `wm.signals`, not evicted, so it can also satisfy another activity waiting on the same signal, or a strategy reading it directly; only a fixed retention cap ever removes it) are both name-equality matches the Observe phase performs deterministically — no model call, no judgment. (A completion driven by an observable property reaching a state, rather than a signal, is a foreseen second form — deferred.)
-
-### Tool Model and Use
-
-S-ORA is inspired by the Agents and Artifacts (A&A) meta-model, which has its roots in activity theory: the agents' activities are mediated via tools. A tool is a domain object with its own control flow and internal state, with which agents can interact through a usage interface. Tools exist and evolve independently of any given agent and can be shared by multiple agents.
-
-A tool's _usage interface_ is defined by:
-
-- _observable properties_, which expose a persistent observable state; if an agent is observing the tool, the state is reflected in the agent's working memory
-- _signals_, which represent transient events that occur within the tool and carry information that may be relevant to agents
-- _operations_, which represent external actions provided by a tool
-
-The usage interface is inherently asynchronous: when an agent invokes a tool operation, the agent's decision cycle does not block until the operation completes.
-
-This distinction — an agent's action versus a tool's operation — mirrors the action/operation split in agent meta-models built on Agents & Artifacts, such as JaCaMo (Jason combined with the CArtAgO artifact-based environment). Concretely, invoking an operation produces two acknowledgments, not one: an immediate `ActionAck` confirming the action itself was dispatched — the same generic outcome every external action returns — and a separate `OperationAck` carrying the tool's own eventual result, made available later on the activity itself (see Activities) once the operation actually completes.
-
-S-ORA does not define its own tool-authoring framework. Tools are expected to be defined elsewhere (e.g., via MCP, OpenAPI, or plain function signatures) and adapted into this usage interface; since most existing ecosystems expose only operations, adapters may need to approximate observable properties and signals (e.g., via polling) where no richer model is available. Adapters should only import primitives that are model-controlled — e.g., MCP Tools, not MCP Resources, which are application-controlled and belong outside the agent's own focus/observe reasoning. Resource subscriptions (e.g., MCP's `resources/subscribe`) are one valid mechanism for the approximation above, on the same footing as polling — but only when the adapter author documents the resulting event as a specific Signal in the tool's manual. MCP Resources carry no structural guarantee, at the protocol level, of corresponding to any coherent tool's actual state or events — that guarantee comes from the adapter author's own curation, not from the mechanism used to implement it. A raw, undocumented pass-through of whatever a resource happens to contain is excluded, whether read once or subscribed to.
-
-Tools that share a connection or session — e.g., multiple operations exposed by one MCP server — are grouped into a workspace: a shared lifecycle boundary whose tools remain individually focusable, but whose underlying connection is established and torn down once, not per tool. A workspace's adapter fixes the tool-use protocol for everything inside it (e.g., all-MCP, all-WoT), but individual tools may still have their own connection address distinct from the workspace's — e.g., a hypermedia workspace for a lab could group virtual tools hosted on the workspace's own server alongside physical devices reachable at their own addresses in the same room.
-
-How finely a server's primitives map to tools is the adapter's call. A plain MCP adapter maps each MCP tool to one S-ORA tool with a single operation and no observable properties or signals (its resources being application-controlled, per the preceding paragraph); a _curating_ adapter can lift a richer abstraction on top — e.g., the ARE adapter groups a server's `<App>__<operation>` tools into one tool per app and surfaces that app's state resource as a curated observable/signal. The `<App>__` convention is that adapter's own curation, not canonical MCP.
-
-A tool's `address` is a _locator_ and may be absent — e.g., tools multiplexed over one MCP stdio connection have none — whereas its `id` is the stable _handle_ the agent uses to focus and invoke it, and is **globally unique**: because a tool is a shared object, two agents focusing the same tool, or messaging about it, must name it identically. The per-protocol adapter guarantees this by deriving the id from the tool's global identity — its URI where the protocol provides one, or a value synthesized from the workspace's global origin/address otherwise — deterministically, so a later `restore()` reproduces the same id. A single registry can only enforce the ids it sees (it rejects a collision within its own joined set rather than letting one workspace's tool shadow another's); global uniqueness itself rests on the adapter. See [ADR-0014](docs/architecture/adrs/0014-tool-identity-globally-unique.md).
-
-Joining and leaving a workspace are deliberate, agent-driven actions (_join_/_leave_), not the result of an eager, upfront scan of every configured target. Today, join targets are limited to workspaces declared in the agent's own configuration; open, dynamic discovery of previously-unknown workspaces (e.g., for open environments where not every tool is known in advance) is foreseen but deliberately deferred.
-
-We break down the process of using a tool into five phases:
-
-- Discovery: the agent discovers the tool at run time — for example, through MCP or another tool calling protocol that supports tool discovery
-- Learning: the agent retrieves the tool's manual and loads it into its context; thus, the agent learns how to use the tool by reading its manual
-- Focus: the agent decides whether to subscribe to the tool's observable properties and signals to perceive relevant state changes and domain events
-- Operation: the agent invokes operations that return an immediate acknowledgment (but not necessarily the final result or outcome)
-- Suspension and Resumption: if a tool's manual declares that a long-running operation's completion is marked by a specific signal (or, as a deferred second form, an observable property update), the runtime suspends the activity after invoking that operation and resumes it once the signal is observed — a mechanical match, not a per-operation decision
-
-### Tool Manuals
-
-Tools can be described by manuals. Any manual format can be used. S-ORA currently uses Markdown, though more structured formats (e.g., XML) may prove better suited for parsing and validation. Regardless of format, a manual is structured into six parts:
-
-1. Tool Metadata: includes general metadata about the tool, such as category information (e.g., "Critical Infrastructure / Fluid Dynamics"), to facilitate dynamic loading into the agent's context window;
-2. Functional Description: a short natural language description of the tool as a domain object and its intended purpose;
-3. Observable Properties: definitions of observable properties that may populate the agent's working memory, such as the current state of an air conditioner (AC);
-4. Signals: definitions of domain events that may be emitted by the tool, such as the AC reaching a target temperature;
-5. Operations: definitions of commands to interact with the tool, including the commands' intended purposes, preconditions, and effects;
-6. Usage Protocols & Safety: operating instructions, including safety constraints (if any) or conditions under which an activity must be suspended (e.g., to wait for specific signals).
-
-In the Markdown rendering, Observable Properties, Signals, and Operations are `-` bullet lists. An operation bullet may additionally carry optional labeled sub-bullets — `Preconditions:`, `Effects:`, and `Behavior:` (whether the operation completes synchronously or is long-running, and which signal, if any, indicates completion) — expressing the operation semantics part 5 calls for. These are folded into the operation's single `description`: fully available to a reasoning strategy as text, but not lifted into discrete model fields until a strategy actually consumes them — the labels are the seams where that structure would later attach. The one such field a consumer now needs, the completion signal, is the exception: an author may declare it explicitly as `completes_on:` in the optional operations interface block (see The clean Markdown format / ADR-0018), which the parser lifts into `OperationSpecification.completion_signal` for the blocked-state machinery to match against — the mechanical wait the Activities section describes.
-
-Property, signal, and operation entries carry their data shapes as JSON Schema in the spec types' `schema`/`parameters` fields (see the API Sketch). A manual describes a tool *type* and stays protocol-agnostic: JSON Schema is data shape, not a protocol binding, so it is filled either by an adapter from a native description (an MCP tool schema, a WoT TD affordance schema) or, for a hand-authored manual, lifted from the light `(type, range)` hints above — with an optional inline JSON Schema where full fidelity is needed. The protocol binding — how to actually reach one instance — lives on the live `Tool`, never in the manual. See [ADR-0015](docs/architecture/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md).
-
-#### The clean Markdown format
-
-`MarkdownManualParser` (the default `ManualParser`) parses this format; malformed input raises `ManualParseError`. The document is a flat sequence of `# `-level sections whose headings are the six parts above (`# Tool Metadata`, `# Functional Description`, `# Observable Properties`, `# Signals`, `# Operations`, `# Usage Protocols & Safety`). `# Tool Metadata` is `key: value` lines — `id:` is **required** (it becomes `Manual.id`; a manual with no `id` is rejected), every other key lands in `metadata`; the remaining sections are free prose, with the observable-property / signal / operation lists written as `-` bullets (or the literal `(none)` when empty).
-
-The parser yields a `Manual` **envelope**: it fills `id`, `metadata`, `description` (from Functional Description), and the verbatim `raw_text`, and leaves the structured `observable_properties` / `signals` / `operations` fields empty — those are the *adapter* channel's to fill from a native description's schemas (see [ADR-0015](docs/architecture/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md)). Hand-authored prose is not lifted into typed fields (that extraction was brittle and unread); a consumer that wants one section — the operations for a binding, usage & safety for a suspend judgment — reads `manual.section(ManualSection.OPERATIONS)` (the six canonical section titles are the `ManualSection` StrEnum — one source of truth, no literals to mistype), a lazy slice of `raw_text` on its `#` headings, and the whole manual is just `raw_text`. When a consumer eventually needs machine-readable schemas *from* hand-authored manuals, that content moves to a structured header (front-matter) rather than being regex-lifted from prose.
-
-### Memory
-
-The [CoALA framework](https://arxiv.org/abs/2309.02427) distinguishes between short and long-term memory.
-
-Short-term memory, or **working memory**, maintains the agent's ongoing activities, perceptual input, and other contextual knowledge relevant to the current decision cycle. It is transient and optimized for speed (in-process).
-
-Long-term memory modules are optional, persistent, and pluggable (e.g., a file-backed implementation to start, with database or vector-store backends as drop-in alternatives). They have their well-defined place in the S-ORA decision cycle:
-
-- semantic memory: captures the agent's long-term knowledge about the world and itself, including tool manuals and discovered tool/workspace records — new kinds of durable "world knowledge" belong here, not in a new memory module
-- procedural memory: captures the procedural knowledge the agent can query to derive or revise a plan for its current activity; this includes implicit knowledge encoded in LLM weights, and explicit knowledge captured as skills or plans — a plan is a multi-step, goal-indexed artifact, deliberately reusable across activities with similar goals, not something regenerated every cycle
-- episodic memory: stores relevant experiences, such as successful activity completions, which may be retrieved for guidance in future activities
-
-### Action space
-
-Two types of actions: **internal actions**, for interacting with memory modules; and **external actions**, for interacting with the external world. The action space is extensible — agents and downstream frameworks can register additional internal or external actions beyond the predefined set below.
-
-Predefined internal actions:
-
-- **semantic memory**: _retrieve_ and _store_ tool manuals
-- **working memory**: _load_ and _unload_ tool manuals from semantic memory; _filter_ perceptual input relevant to the current activity; _create_ a new activity from an unhandled message; _suspend_ and _resume_ an activity
-- **procedural memory**: _retrieve_ a plan of action for the current activity, _infer_ one if a suitable one is not already known, or _store_ one that was actually followed to a successful completion (auto-store/reuse is currently disabled — the default cycle infers a fresh plan each activity, since replaying a stored plan verbatim is unsound; the operations remain for distilling reusable procedures from episodes)
-- **episodic memory**: _learn_ from experience by saving a summary of an activity completion, or _consult_ previous
-experiences
-
-Predefined external actions:
-
-- _invoke_ a tool operation
-- _join_ a configured workspace (connects and registers its tools) and _leave_ one (closes the connection)
-- _retrieve_ manuals from external repositories
-- _focus_ on and _unfocus_ from tools to perceive observable properties and signals
-- _send_ messages to other agents, via a pluggable protocol (e.g., A2A, plain HTTP)
+See the [Concepts](docs/concepts/runtime-model.md) documentation for S-ORA's conceptual foundations: the CoALA/BDI/Jason lineage, activities, the tool model and use, tool manuals, and memory modules. The decision cycle that ties them together is described next.
 
 ### The S-ORA Decision Cycle
 
@@ -131,7 +30,7 @@ The decision cycle follows 5 steps:
 - Reflect: for each activity, decides whether it has completed successfully or failed — and if so, executes an internal action to summarize and store the experience in episodic memory; "optional" means this decision itself is cheap by default and made fresh every cycle, not that the cycle is externally told when to check; the judgment is synchronous — it must land before Situate selects, so a just-completed activity is never re-selected the same cycle — while summarizing and storing run asynchronously and never block the cycle; several activities may terminate in the same cycle
 - Situate: the agent selects an activity and adjusts its working memory for that activity — for example, by loading required manuals, unloading obsolete ones, and filtering the perceptual input; if an unhandled message in working memory doesn't correspond to any existing activity, Situate creates one via the internal _create_activity_ action before selecting; which ready activity to select — the agent's scheduler — is its own pluggable sub-strategy, defaulting to fair round-robin rotation over the ready set (anti-starvation, still no model call) so richer policies (priority, aging, deadlines, an LLM-based scheduler) can replace just the pick without re-authoring the rest of Situate
 - Reason: the agent infers a plan for the current activity (or retrieves a stored one, once procedure reuse is enabled — auto-caching is currently disabled, so each activity infers fresh) — a multi-step artifact, advanced across cycles rather than regenerated every cycle — and selects the next step to advance it; if the activity already has a valid plan, this is as cheap as reading its next step, no replanning involved; the Situate phase may suggest prerequisite external actions for situated reasoning, such as to retrieve tool manuals from an external repository, focus on or unfocus from tools; these prerequisite actions should take priority unless a more urgent action is needed — for example, to respond to a critical signal; if no prerequisite or urgent actions are required, the agent selects the next external action that advances the plan, which is either to send a message to another agent or invoke a tool operation
-- Act: binds the step to a concrete invocation and executes the external action — mechanically, with no manual interpretation of its own. The suspend/resume that layers a signal-wait on top of a long-running operation is *not* done here: once the operation resolves, the Observe phase mechanically suspends the activity if the operation's manual declares a completion signal, and resumes it once that signal is observed (see Activities)
+- Act: binds the step to a concrete invocation and executes the external action — mechanically, with no manual interpretation of its own. The suspend/resume that layers a signal-wait on top of a long-running operation is *not* done here: once the operation resolves, the Observe phase mechanically suspends the activity if the operation's manual declares a completion signal, and resumes it once that signal is observed (see [Activities](docs/concepts/activities-and-concurrency.md))
 
 The five phases are a ceiling, not a quota: every cycle runs the pipeline, but a given cycle may conclude with one external action, with internal work only (e.g., storing experiences), or with nothing to do — at most one external action per cycle, never a mandatory one.
 

@@ -1,6 +1,31 @@
 # Environment Model
 
-!!! note "Not yet written"
-    This page is scaffolding for the documentation restructuring. Until it is written, see:
+S-ORA is inspired by the Agents and Artifacts (A&A) meta-model, which has its roots in activity theory: the agents' activities are mediated via tools. A tool is a domain object with its own control flow and internal state, with which agents can interact through a usage interface. Tools exist and evolve independently of any given agent and can be shared by multiple agents.
 
-    - [README.md — Tool Model and Use](https://github.com/sora-agents/sora-runtime/blob/main/README.md#tool-model-and-use)
+A tool's _usage interface_ is defined by:
+
+- _observable properties_, which expose a persistent observable state; if an agent is observing the tool, the state is reflected in the agent's working memory
+- _signals_, which represent transient events that occur within the tool and carry information that may be relevant to agents
+- _operations_, which represent external actions provided by a tool
+
+The usage interface is inherently asynchronous: when an agent invokes a tool operation, the agent's decision cycle does not block until the operation completes.
+
+This distinction — an agent's action versus a tool's operation — mirrors the action/operation split in agent meta-models built on Agents & Artifacts, such as JaCaMo (Jason combined with the CArtAgO artifact-based environment). Concretely, invoking an operation produces two acknowledgments, not one: an immediate `ActionAck` confirming the action itself was dispatched — the same generic outcome every external action returns — and a separate `OperationAck` carrying the tool's own eventual result, made available later on the activity itself (see [Activities](activities-and-concurrency.md)) once the operation actually completes.
+
+S-ORA does not define its own tool-authoring framework. Tools are expected to be defined elsewhere (e.g., via MCP, OpenAPI, or plain function signatures) and adapted into this usage interface; since most existing ecosystems expose only operations, adapters may need to approximate observable properties and signals (e.g., via polling) where no richer model is available. Adapters should only import primitives that are model-controlled — e.g., MCP Tools, not MCP Resources, which are application-controlled and belong outside the agent's own focus/observe reasoning. Resource subscriptions (e.g., MCP's `resources/subscribe`) are one valid mechanism for the approximation above, on the same footing as polling — but only when the adapter author documents the resulting event as a specific Signal in the tool's manual. MCP Resources carry no structural guarantee, at the protocol level, of corresponding to any coherent tool's actual state or events — that guarantee comes from the adapter author's own curation, not from the mechanism used to implement it. A raw, undocumented pass-through of whatever a resource happens to contain is excluded, whether read once or subscribed to.
+
+Tools that share a connection or session — e.g., multiple operations exposed by one MCP server — are grouped into a workspace: a shared lifecycle boundary whose tools remain individually focusable, but whose underlying connection is established and torn down once, not per tool. A workspace's adapter fixes the tool-use protocol for everything inside it (e.g., all-MCP, all-WoT), but individual tools may still have their own connection address distinct from the workspace's — e.g., a hypermedia workspace for a lab could group virtual tools hosted on the workspace's own server alongside physical devices reachable at their own addresses in the same room.
+
+How finely a server's primitives map to tools is the adapter's call. A plain MCP adapter maps each MCP tool to one S-ORA tool with a single operation and no observable properties or signals (its resources being application-controlled, per the preceding paragraph); a _curating_ adapter can lift a richer abstraction on top — e.g., the ARE adapter groups a server's `<App>__<operation>` tools into one tool per app and surfaces that app's state resource as a curated observable/signal. The `<App>__` convention is that adapter's own curation, not canonical MCP.
+
+A tool's `address` is a _locator_ and may be absent — e.g., tools multiplexed over one MCP stdio connection have none — whereas its `id` is the stable _handle_ the agent uses to focus and invoke it, and is **globally unique**: because a tool is a shared object, two agents focusing the same tool, or messaging about it, must name it identically. The per-protocol adapter guarantees this by deriving the id from the tool's global identity — its URI where the protocol provides one, or a value synthesized from the workspace's global origin/address otherwise — deterministically, so a later `restore()` reproduces the same id. A single registry can only enforce the ids it sees (it rejects a collision within its own joined set rather than letting one workspace's tool shadow another's); global uniqueness itself rests on the adapter. See [ADR-0014](../architecture/adrs/0014-tool-identity-globally-unique.md).
+
+Joining and leaving a workspace are deliberate, agent-driven actions (_join_/_leave_), not the result of an eager, upfront scan of every configured target. Today, join targets are limited to workspaces declared in the agent's own configuration; open, dynamic discovery of previously-unknown workspaces (e.g., for open environments where not every tool is known in advance) is foreseen but deliberately deferred.
+
+We break down the process of using a tool into five phases:
+
+- Discovery: the agent discovers the tool at run time — for example, through MCP or another tool calling protocol that supports tool discovery
+- Learning: the agent retrieves the tool's manual and loads it into its context; thus, the agent learns how to use the tool by reading its manual
+- Focus: the agent decides whether to subscribe to the tool's observable properties and signals to perceive relevant state changes and domain events
+- Operation: the agent invokes operations that return an immediate acknowledgment (but not necessarily the final result or outcome)
+- Suspension and Resumption: if a tool's manual declares that a long-running operation's completion is marked by a specific signal (or, as a deferred second form, an observable property update), the runtime suspends the activity after invoking that operation and resumes it once the signal is observed — a mechanical match, not a per-operation decision

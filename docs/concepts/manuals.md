@@ -1,7 +1,22 @@
 # Manuals
 
-!!! note "Not yet written"
-    This page is scaffolding for the documentation restructuring. Until it is written, see:
+## Tool Manuals
 
-    - [README.md — Tool Manuals](https://github.com/sora-agents/sora-runtime/blob/main/README.md#tool-manuals)
-    - [README.md — The clean Markdown format](https://github.com/sora-agents/sora-runtime/blob/main/README.md#the-clean-markdown-format)
+Tools can be described by manuals. Any manual format can be used. S-ORA currently uses Markdown, though more structured formats (e.g., XML) may prove better suited for parsing and validation. Regardless of format, a manual is structured into six parts:
+
+1. Tool Metadata: includes general metadata about the tool, such as category information (e.g., "Critical Infrastructure / Fluid Dynamics"), to facilitate dynamic loading into the agent's context window;
+2. Functional Description: a short natural language description of the tool as a domain object and its intended purpose;
+3. Observable Properties: definitions of observable properties that may populate the agent's working memory, such as the current state of an air conditioner (AC);
+4. Signals: definitions of domain events that may be emitted by the tool, such as the AC reaching a target temperature;
+5. Operations: definitions of commands to interact with the tool, including the commands' intended purposes, preconditions, and effects;
+6. Usage Protocols & Safety: operating instructions, including safety constraints (if any) or conditions under which an activity must be suspended (e.g., to wait for specific signals).
+
+In the Markdown rendering, Observable Properties, Signals, and Operations are `-` bullet lists. An operation bullet may additionally carry optional labeled sub-bullets — `Preconditions:`, `Effects:`, and `Behavior:` (whether the operation completes synchronously or is long-running, and which signal, if any, indicates completion) — expressing the operation semantics part 5 calls for. These are folded into the operation's single `description`: fully available to a reasoning strategy as text, but not lifted into discrete model fields until a strategy actually consumes them — the labels are the seams where that structure would later attach. The one such field a consumer now needs, the completion signal, is the exception: an author may declare it explicitly as `completes_on:` in the optional operations interface block (see The clean Markdown format / ADR-0018), which the parser lifts into `OperationSpecification.completion_signal` for the blocked-state machinery to match against — the mechanical wait the [Activities](activities-and-concurrency.md) section describes.
+
+Property, signal, and operation entries carry their data shapes as JSON Schema in the spec types' `schema`/`parameters` fields (see the API Sketch). A manual describes a tool *type* and stays protocol-agnostic: JSON Schema is data shape, not a protocol binding, so it is filled either by an adapter from a native description (an MCP tool schema, a WoT TD affordance schema) or, for a hand-authored manual, lifted from the light `(type, range)` hints above — with an optional inline JSON Schema where full fidelity is needed. The protocol binding — how to actually reach one instance — lives on the live `Tool`, never in the manual. See [ADR-0015](../architecture/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md).
+
+## The clean Markdown format
+
+`MarkdownManualParser` (the default `ManualParser`) parses this format; malformed input raises `ManualParseError`. The document is a flat sequence of `# `-level sections whose headings are the six parts above (`# Tool Metadata`, `# Functional Description`, `# Observable Properties`, `# Signals`, `# Operations`, `# Usage Protocols & Safety`). `# Tool Metadata` is `key: value` lines — `id:` is **required** (it becomes `Manual.id`; a manual with no `id` is rejected), every other key lands in `metadata`; the remaining sections are free prose, with the observable-property / signal / operation lists written as `-` bullets (or the literal `(none)` when empty).
+
+The parser yields a `Manual` **envelope**: it fills `id`, `metadata`, `description` (from Functional Description), and the verbatim `raw_text`, and leaves the structured `observable_properties` / `signals` / `operations` fields empty — those are the *adapter* channel's to fill from a native description's schemas (see [ADR-0015](../architecture/adrs/0015-manuals-protocol-agnostic-adapter-boundary.md)). Hand-authored prose is not lifted into typed fields (that extraction was brittle and unread); a consumer that wants one section — the operations for a binding, usage & safety for a suspend judgment — reads `manual.section(ManualSection.OPERATIONS)` (the six canonical section titles are the `ManualSection` StrEnum — one source of truth, no literals to mistype), a lazy slice of `raw_text` on its `#` headings, and the whole manual is just `raw_text`. When a consumer eventually needs machine-readable schemas *from* hand-authored manuals, that content moves to a structured header (front-matter) rather than being regex-lifted from prose.
