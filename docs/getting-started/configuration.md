@@ -27,7 +27,7 @@
 - **Zero manual wiring for the common case**: implementing an agent means writing `agent.yaml` and,
   typically, one `ReasonStrategy` — never constructing `Agent`/`DecisionCycle`/memory modules by hand.
   All wiring is centralized in `sora/bootstrap.py` (see the
-  [API Sketch](https://github.com/sora-agents/sora-runtime/blob/main/README.md#api-sketch)).
+  [Python API Reference](../reference/python-api.md#sora.bootstrap)).
 
 ## Configuring the LLM and its API key
 

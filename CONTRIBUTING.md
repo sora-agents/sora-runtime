@@ -1,6 +1,6 @@
 # Contributing to S-ORA
 
-Thanks for your interest in the S-ORA runtime. This project is currently in **README-driven design** — see [README.md](README.md) for the conceptual model and API sketch, [EXAMPLES.md](EXAMPLES.md) for worked scenarios, and [docs/architecture/adrs/](docs/architecture/adrs/) for why specific decisions were made before implementation started. [ROADMAP.md](ROADMAP.md) tracks where implementation currently stands.
+Thanks for your interest in the S-ORA runtime. This project is currently in **README-driven design** — see [README.md](README.md) for the conceptual model, [docs/reference/python-api.md](docs/reference/python-api.md) for the exact type/signature reference, [EXAMPLES.md](EXAMPLES.md) for worked scenarios, and [docs/architecture/adrs/](docs/architecture/adrs/) for why specific decisions were made before implementation started. [ROADMAP.md](ROADMAP.md) tracks where implementation currently stands.
 
 ## Getting set up
 

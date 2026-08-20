@@ -39,4 +39,4 @@ This gate is sound only because, for Reason and Act, the field is the phase's *e
 
 * Depends on [ADR-0010](0010-pluggable-phase-strategies.md)
 * Related: [ADR-0021](0021-llm-calls-as-async-internal-actions.md) records why a single call is not built to span multiple phases (fusion); this mechanism stands on its own as the field-gating / short-circuit seam (cached plan skips infer, resolved step skips Reason, present invocation skips Act's bind)
-* `Step` (README.md's API Sketch) is exactly what threads through Reason and Act via this mechanism
+* `Step` ([Python API Reference](../../reference/python-api.md#sora.types)) is exactly what threads through Reason and Act via this mechanism

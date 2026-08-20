@@ -1,6 +1,6 @@
 # S-ORA Examples
 
-Two worked scenarios against the API sketched in [README.md](README.md). The ARE (Meta) scenario below is the primary implementation target (see [ROADMAP.md](ROADMAP.md)); the two-agent lab afterward is an additional example that exercises the hypermedia (WoT) tool/workspace model and cross-agent messaging.
+Two worked scenarios against the S-ORA API (see [docs/reference/python-api.md](docs/reference/python-api.md) for the exact types). The ARE (Meta) scenario below is the primary implementation target (see [ROADMAP.md](ROADMAP.md)); the two-agent lab afterward is an additional example that exercises the hypermedia (WoT) tool/workspace model and cross-agent messaging.
 
 # Example: Evaluating a S-ORA Agent on ARE (Meta)
 
@@ -224,7 +224,7 @@ The scenario is a **per-run input**, not config: `agent.yaml` names the `are-sim
 
 # Example: A Two-Agent Lab (additional example)
 
-This walks through a complete, two-agent scenario against the API sketched in [README.md](README.md), exercising every concept end to end: workspaces, manuals, focus/observe, invoke/suspend/resume on a signal, and cross-agent messaging kept distinct from perception.
+This walks through a complete, two-agent scenario against the S-ORA API (see [docs/reference/python-api.md](docs/reference/python-api.md) for the exact types), exercising every concept end to end: workspaces, manuals, focus/observe, invoke/suspend/resume on a signal, and cross-agent messaging kept distinct from perception.
 
 ## Scenario
 
@@ -241,7 +241,7 @@ Two agents share this one workspace, each focusing a different subset of its too
 
 Because neither agent has everything it needs on its own, `arm-agent` asks `room-agent` what it sees — via a **message** — before it can plan where to move.
 
-This example uses `ObservableProperty`, `Signal`, `ActionAck`, `OperationAck`, `Step`, `Plan`, `OperationInvocation`, `TickResult`, and `SendAction` as defined in the README's [API Sketch](README.md#api-sketch) — no redefinitions needed here.
+This example uses `ObservableProperty`, `Signal`, `ActionAck`, `OperationAck`, `Step`, `Plan`, `OperationInvocation`, `TickResult`, and `SendAction` as defined in the [Python API Reference](docs/reference/python-api.md#sora.types) — no redefinitions needed here.
 
 ## The `lab` workspace
 
@@ -438,7 +438,7 @@ agent:
 
 `room-agent/agent.yaml` is identical except `name: room-agent`, `transport.self: http://localhost:8767`, `peers.arm-agent: http://localhost:8766`, and its own `strategies.reason`.
 
-Note: this supersedes the flat `tools: [mcp://localhost:6000]` form shown in the main README's [Running S-ORA](README.md#running-s-ora) section, which predates `_join_`/workspaces — `workspaces:` (a list of `WorkspaceOrigin`s) is the current shape.
+Note: this supersedes the flat `tools: [mcp://localhost:6000]` form used before `_join_`/workspaces existed — `workspaces:` (a list of `WorkspaceOrigin`s) is the current shape.
 
 ## Startup: joining the workspace
 

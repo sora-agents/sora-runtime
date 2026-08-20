@@ -109,6 +109,7 @@ nav:
       - Manual Format: reference/manual-format.md
       - Extension Protocols: reference/extension-protocols.md
       - Python API: reference/python-api.md
+      - "API Sketch (Archived)": reference/api-sketch-notes.md
   - Architecture:
       - Overview: architecture/overview.md
       - Principles & Non-Goals: architecture/principles-and-non-goals.md

@@ -44,12 +44,6 @@ repos:
         types: [python]
         pass_filenames: false
         require_serial: true
-      - id: readme-sync
-        name: README.md class-name sync check
-        entry: uv run python3 scripts/check_readme_sync.py
-        language: system
-        pass_filenames: false
-        files: ^(src/sora/.*\.py|README\.md)$
       - id: manuals-sync
         name: EXAMPLES.md / manual-fixtures sync check
         entry: uv run python3 scripts/check_manuals_sync.py
