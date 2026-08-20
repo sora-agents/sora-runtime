@@ -33,7 +33,7 @@ llm = ["anthropic>=0.40"]
 # Floor is 1.68, not 1.0: the client sends `max_completion_tokens` (SDK 1.45+) and reads
 # `completion_tokens_details.reasoning_tokens` (SDK 1.47+); an older 1.x lacks both.
 openai = ["openai>=1.68"]
-docs = ["mkdocs-material>=9.5"]
+docs = ["mkdocs-material>=9.5", "mkdocstrings[python]>=0.26"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
