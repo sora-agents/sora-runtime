@@ -22,6 +22,7 @@ from sora.types import (
     PendingInference,
     PendingOperation,
     Step,
+    UnresolvableGrounding,
     walk_path,
 )
 
@@ -402,7 +403,21 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # plan for this goal" — true for the replacement, false for a sub-goal that was never
         # planned, let alone abandoned. Cleared here rather than at each install site so no future
         # path that leaves a bundle parked can leak it into a sub-plan's prompt.
-        target = activity if goal is None else replace(activity, goal=goal, superseded=None)
+        # The copy also carries the frame Observe *will* push when it installs the sub-plan
+        # (strategies.py's kind=="subgoal" branch), so the copy models the stack position the plan
+        # is being written for rather than the parent's. That is what lets a PlanPrompt tell a
+        # sub-goal from a top-level goal — `parent_frames` is unambiguous here because the only
+        # other infer fires when `plan is None`, and a reset clears the whole stack with the plan.
+        # Seeding it (rather than adding a flag) keeps the PlanPrompt Protocol unchanged, so an
+        # existing custom prompt keeps working and gains the ancestor chain for free.
+        frames = list(activity.parent_frames)
+        if goal is not None and activity.plan is not None:
+            frames.append((activity.plan, activity.step_index))
+        target = (
+            activity
+            if goal is None
+            else replace(activity, goal=goal, superseded=None, parent_frames=frames)
+        )
         log.info("reason: inferring a plan for %r (%d tools)", target.goal, len(catalog))
         _spawn_tracked(self._tasks, self._call(cycle, target, inf_id, catalog, observed, messages))
 
@@ -472,6 +487,20 @@ class GroundAction:  # predefined internal action: _ground_ — the async param-
             params = await cycle.procedural.ground(
                 activity, operation_name, manual, partial_params, observed
             )
+        except UnresolvableGrounding as exc:
+            # Not a failure of the call — the model followed the contract and reported a gap in the
+            # data instead of inventing a value. Kept off the `error` path so Observe can replan
+            # rather than terminate.
+            log.warning(
+                "reason: grounding %s for activity %s found no data (%s)",
+                operation_name,
+                activity.id,
+                exc,
+            )
+            cycle.inference_sink.push(
+                inf_id, InferenceResult(id=inf_id, unresolvable=str(exc) or "unspecified")
+            )
+            return
         except Exception as exc:  # noqa: BLE001 — any model/parse/wire failure resolves as an error
             log.exception("reason: ground failed for activity %s", activity.id)
             cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))

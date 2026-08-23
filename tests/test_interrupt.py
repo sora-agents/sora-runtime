@@ -357,23 +357,32 @@ async def test_stale_inference_is_discarded_after_reinference(tmp_path: Path) ->
     assert activity.state is ActivityState.RUNNING
 
 
-async def test_failed_inference_terminates_instead_of_stranding(tmp_path: Path) -> None:
+async def test_failed_inference_replans_instead_of_stranding(tmp_path: Path) -> None:
     # A model call that raised (malformed output, no LLM, a network error) resolves with an error
-    # InferenceResult rather than dying silently and leaving the activity RUNNING forever. Observe
-    # terminates the activity so the failure surfaces (like a failed op), never a permanent hang.
+    # InferenceResult rather than dying silently and leaving the activity RUNNING forever. The
+    # failure surfaces cycle-synchronized (like a failed op), never a permanent hang — and it
+    # degrades to a replan rather than terminating: nothing was attempted, so the activity has
+    # nothing wrong with it beyond one unusable model response.
     cycle, working, _ = _cycle(tmp_path)
     activity = _inferring("a1", inf_id="inf-1", kind="plan")
     working.activities["a1"] = activity
+    # The shape InferAction actually reports: repr(exc), whose message quotes the offending output.
     cycle.inference_sink.push(
-        "inf-1", InferenceResult(id="inf-1", error="ValueError: bad plan JSON")
+        "inf-1", InferenceResult(id="inf-1", error="ValueError('bad plan JSON: {\"steps\":')")
     )
 
     await DefaultObserveStrategy().observe(cycle)
 
     state = activity.state
-    assert state is ActivityState.TERMINATED  # surfaced, not stranded RUNNING
+    assert state is ActivityState.READY  # surfaced and retryable, not stranded RUNNING
     assert activity.pending_inference is None
-    assert activity.plan is None
+    assert activity.plan is None  # Reason will infer again on the next pass
+    # The attempt is on the record so the breaker can see a second one repeat — and the trail entry
+    # is normalized to the cause, since the quoted output differs every attempt and a raw entry
+    # would never compare equal to the next one.
+    assert activity.replan_trail == [
+        "the plan inference did not return a usable result (ValueError)"
+    ]
 
 
 async def test_discarded_inference_emits_a_meter_cue(tmp_path: Path) -> None:

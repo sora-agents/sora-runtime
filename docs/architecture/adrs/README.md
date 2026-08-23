@@ -39,7 +39,8 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0022](0022-plan-representation-context-guard-and-subgoals.md) | Plan representation: retrieval-binding context guard, sub-goals, and signal-triggered pending conditions (AgentSpeak-inspired) | proposed | Decision cycle |
 | [0023](0023-structured-value-data-ops.md) | Structured-value data-ops: composable transforms as plan steps | proposed | Decision cycle |
 | [0024](0024-plan-reconsideration-context-adaptation.md) | Plan reconsideration via context-adaptation checkpoints (commitment as config) | proposed | Decision cycle |
+| [0025](0025-deliberation-breakers.md) | Deliberation breakers: bounding replanning, recursion, and acting on a dead plan | proposed | Decision cycle |
 
 ## Planned
 
-None currently pending — 23 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
+None currently pending — 25 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).

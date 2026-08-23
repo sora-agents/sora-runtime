@@ -790,6 +790,101 @@ async def test_an_empty_list_going_in_is_not_a_floor_to_trip_over(tmp_path: Path
     assert got == {"attendees": [], "title": "Solo day"}
 
 
+async def test_unresolvable_grounding_replans_rather_than_terminating(tmp_path: Path) -> None:
+    """The headline behaviour: a reported gap is a defect in the PLAN (it assumed a step would yield
+    something it didn't), so the activity re-plans with the executed history — which now shows the
+    empty result — instead of dying with the user un-answered."""
+    tool = FakeTool("email", invoke_results={"send_email": {"id": "e1"}})
+    spy = ScriptedProcedural(ground_unresolvable="recipients: search_contacts returned []")
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    plan = Plan(
+        id="p",
+        goal="email the friend",
+        steps=[invoke_step("email", "send_email", recipients={"$decide": "the friend's address"})],
+    )
+    activity = Activity(
+        id="a",
+        goal="email the friend",
+        context={},
+        plan=plan,
+        step_index=0,
+        history=[_history("search_contacts", [])],
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    state = activity.state
+    assert state is ActivityState.RUNNING  # escalated off-cycle
+
+    await asyncio.sleep(0)  # let the _ground_ task run and push its resolution
+    await DefaultObserveStrategy().observe(cycle)
+
+    state = activity.state
+    assert state is ActivityState.READY  # NOT terminated — the activity gets another go
+    assert activity.plan is None  # dropped, so Reason re-infers next cycle
+    assert activity.step_index == 0
+    assert activity.grounded_params is None  # nothing fabricated reached the step
+    # The discarded plan is parked for the replanning prompt like any other invalidation, so the
+    # next inference can reuse what still applied.
+    superseded = activity.superseded
+    assert superseded is not None
+    assert superseded.plan is plan
+    assert tool.invocations == []  # and above all: nothing was sent to anyone
+
+
+async def test_a_real_grounding_failure_replans_under_its_own_defect(tmp_path: Path) -> None:
+    """The escape hatch must not soften genuine breakage — but the two are still distinguishable
+    where it counts. Both replan (nothing ran, so the activity is intact either way); what differs
+    is the defect the next planner is handed. A *reported* gap carries the model's own account of
+    what was missing, so the next plan can narrow differently. A model/wire/parse failure has no
+    such account, so it carries only its cause — and that is the entry the runaway-replan breaker
+    compares, which is what stops a permanently broken call from being paid for indefinitely."""
+    tool = FakeTool("email", invoke_results={"send_email": {"id": "e1"}})
+    spy = ScriptedProcedural(ground_error="connection reset")
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="email the friend",
+        context={},
+        plan=Plan(
+            id="p",
+            goal="email the friend",
+            steps=[invoke_step("email", "send_email", recipients={"$decide": "the address"})],
+        ),
+        step_index=0,
+        history=[],
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+    await DefaultObserveStrategy().observe(cycle)
+
+    state = activity.state
+    assert state is ActivityState.READY
+    assert activity.plan is None  # dropped for re-inference, not carried forward
+    assert activity.replan_trail == [
+        "the ground inference did not return a usable result (RuntimeError)"
+    ]
+    # The superseded bundle carries the *defect*, so the replanning brief says why rather than
+    # inviting the planner to reuse a plan whose grounding just blew up.
+    superseded = activity.superseded
+    assert superseded is not None
+    assert superseded.defect == activity.replan_trail[0]
+    assert tool.invocations == []  # nothing was sent on a plan that could not be grounded
+
+
+# -- the replanning brief has to match the reason -------------------------------------------------
+#
+# A replan driven by an unresolvable grounding and a replan driven by reconsideration are opposite
+# situations, and for a while both got the reconsideration brief: "the world moved... it is stale,
+# not wrong throughout... reuse whatever still applies". A real run took that advice literally and
+# re-emitted the doomed step verbatim — 203s of model time to learn nothing — because the plan was
+# not stale at all: search_contacts("Film Producer") returned [] and would return [] forever.
+
+
 def _superseded_activity(defect: str | None) -> Activity:
     activity = Activity(
         id="a",
@@ -830,6 +925,45 @@ def test_a_stale_plan_keeps_the_reconsideration_brief() -> None:
     assert "the world moved" in user
     assert "stale, not wrong throughout" in user
     assert "will fail in the same place" not in user
+
+
+async def test_an_unresolvable_grounding_tags_the_bundle_with_its_defect(tmp_path: Path) -> None:
+    """End to end: the reason the grounder gave is what the replanning prompt will be built from."""
+    tool = FakeTool("email", invoke_results={"send_email": {"id": "e1"}})
+    gap = 'attendees: search_contacts("Film Producer") -> []'
+    spy = ScriptedProcedural(ground_unresolvable=gap)
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="email the friend",
+        context={},
+        plan=Plan(
+            id="p",
+            goal="email the friend",
+            steps=[invoke_step("email", "send_email", recipients={"$decide": "the address"})],
+        ),
+        step_index=0,
+        history=[_history("search_contacts", [])],
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+    await DefaultObserveStrategy().observe(cycle)
+
+    superseded = activity.superseded
+    assert superseded is not None
+    assert superseded.defect == gap
+
+
+# -- a param the operation does not take ----------------------------------------------------------
+#
+# A real run planned get_contacts({"offset": 0, "limit": 100}). The manual declares only `offset`;
+# `limit` was picked up from the operation's own prose ("There is a view limit"). The runtime passed
+# it through, the tool raised "unexpected keyword argument 'limit'", and a failed op terminates the
+# activity — so a plan that was otherwise exactly right (get_contacts, then filter on job) died on a
+# name. The schema was there the whole time; nothing checked against it.
 
 
 def _contacts_manual() -> Manual:

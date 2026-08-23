@@ -110,6 +110,22 @@ A named callable fully replaces the built-in default — it does not patch piece
 applies — this key exists to raise it for a task with legitimately deep sub-goals, not to configure
 routine behavior.
 
+## `agent.max_replan_attempts`
+
+`int | None`, optional. Overrides the coarse arm of the runaway-replanning breaker on
+`DefaultReasonStrategy`: how many plans an activity may abandon *with a defect*, and without a
+single operation having run, before the agent stops re-planning and blocks on an `InputWait` to ask
+the user. Omitted means the strategy's own built-in default. The breaker's precise arm — the
+replacement plan abandoned for the *same* defect as the plan it replaced — trips at two regardless
+and is deliberately not configurable.
+
+Only defect-bearing entries in `Activity.replan_trail` count toward this. A plan discarded because
+the world moved under it ([ADR-0024](../architecture/adrs/0024-plan-reconsideration-context-adaptation.md))
+is an honest attempt against a changed world rather than a repeat, so a fast-moving environment
+never trips this cap — that pile-up is logged instead. Raise it for a domain where several
+structurally different plans legitimately fail before one lands; lowering it mostly buys a faster
+question to the user.
+
 ---
 
 !!! info "Hand-authored framing pending"

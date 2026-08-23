@@ -1036,6 +1036,83 @@ def _iter_json_objects(text: str) -> Iterator[str]:
         i = end + 1  # resume past this object so the next top-level group is found, not re-nested
 
 
+REPARSE_FEEDBACK = (
+    "\n\nYour previous answer could not be parsed as JSON and was discarded. The parser reported:\n"
+    "{error}\n\nHere is exactly what you returned:\n{output}\n\n"
+    "Return the SAME answer with the syntax fixed — a single well-formed JSON object and nothing "
+    "else, no prose and no markdown fences. Do not change what the answer says; only make it parse."
+)
+
+
+async def _complete_and_parse[T](
+    llm: LLMClient,
+    system: str,
+    user: str,
+    parse: Callable[[str], T],
+    *,
+    what: str,
+) -> T:
+    """One model call through the anti-corruption boundary, with a single retry that shows the model
+    its own parse error.
+
+    The last resort, and deliberately the *third* thing tried: a clean parse costs nothing, the
+    structural repair in ``_load_json_object`` costs nothing, and only a defect neither of those can
+    touch is worth a second round trip — which on a local reasoning model is minutes, not
+    milliseconds. One retry, not a loop: a model that cannot produce well-formed JSON twice is not
+    going to on the fifth attempt, and each attempt is charged to the same inference id (the
+    contextvar the caller set), so a retried inference reports its true cost rather than hiding half
+    of it. A retry that also fails raises, exactly as a single failed parse did before."""
+    text = await llm.complete(system=system, prompt=user)
+    try:
+        return parse(text)
+    except ValueError as exc:
+        failure = str(exc)
+        log.warning("reason: %s did not parse (%s) — retrying once with the error", what, failure)
+    retry = user + REPARSE_FEEDBACK.format(error=failure, output=text)
+    return parse(await llm.complete(system=system, prompt=retry))
+
+
+def _drop_surplus_closers(text: str) -> str | None:
+    """``text`` with every structurally impossible ``}``/``]`` removed, or None if there were none.
+
+    Narrow on purpose. A closer that appears where nothing is open, or that closes the wrong kind of
+    bracket, has *no* valid reading — deleting it cannot change which document was meant, because
+    there was no document while it was there. That makes this a repair rather than a guess, and it
+    is the only repair taken: an *unclosed* tail is left alone, because completing it would turn a
+    truncated response into a shorter-but-plausible one, and a plan silently missing its last steps
+    is far more dangerous than a plan that failed to parse.
+
+    The motivating case is a 2712-character plan that died on one stray brace at the tail of its
+    `pending` block — eight valid steps and a well-formed condition discarded, and the activity
+    terminated, over a character with no meaning. Every repaired result is still handed to
+    ``json.loads``, so nothing is trusted merely because it was repaired."""
+    stack: list[str] = []
+    kept: list[str] = []
+    dropped = False
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack and stack[-1] == ("{" if ch == "}" else "["):
+                stack.pop()
+            else:
+                dropped = True  # nothing open, or the wrong kind — this character cannot be meant
+                continue
+        kept.append(ch)
+    return "".join(kept) if dropped else None
+
+
 def _load_json_object(text: str) -> Any:
     """Parse a JSON value from model output, tolerating both a code-fence wrapper and surrounding
     prose. Fast path: parse the fence-stripped text directly (the common clean case). Fallback: try
@@ -1055,6 +1132,12 @@ def _load_json_object(text: str) -> Any:
     for span in _iter_json_objects(stripped):
         try:
             return json.loads(span)
+        except json.JSONDecodeError as exc:
+            last_err = exc
+    repaired = _drop_surplus_closers(stripped)
+    if repaired is not None:
+        try:
+            return json.loads(repaired)
         except json.JSONDecodeError as exc:
             last_err = exc
     raise last_err
@@ -1602,8 +1685,7 @@ class ProceduralMemory:
                 pending=_parse_plan_pending(text),
             )
 
-        text = await self._llm.complete(system=system, prompt=user)
-        return _to_plan(text)
+        return await _complete_and_parse(self._llm, system, user, _to_plan, what="plan inference")
 
     async def ground(
         self,

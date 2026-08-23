@@ -479,6 +479,55 @@ class DefaultInterruptHandler:
         return not pending
 
 
+# Inference kinds whose outright failure is recoverable by planning again: nothing was attempted, so
+# the world is untouched and a fresh attempt is free to differ. `select`/`condition`/`revalidate`
+# are absent because they already degrade in place (an empty shortlist, nothing fired, assume
+# valid) — cheaper still, since they keep the plan.
+_REPLANNABLE_INFERENCE = frozenset({"plan", "subgoal", "ground"})
+
+
+def _inference_defect(kind: str, error: str) -> str:
+    """The replan defect for an inference that failed outright, normalized to its *cause*.
+
+    Normalization is what makes the runaway-replan breaker able to see a repeat. Trail entries are
+    compared for equality (`_replanning_would_loop`), and `InferAction` reports `repr(exc)`, whose
+    message quotes the model output that defeated the parse — different every attempt. Carrying it
+    verbatim would mean two hopeless calls never compared equal, so the precise "abandoned for the
+    same reason twice" check could never fire and even a permanent failure would be paid for
+    `max_replan_attempts` times. The full message is not lost: it is logged at the failure site.
+    """
+    cause = error.split("(", 1)[0].strip() or error
+    return f"the {kind} inference did not return a usable result ({cause})"
+
+
+async def _report_to_user(cycle: DecisionCycle, text: str) -> None:
+    """Say something to the user on the agent's own channel, from the runtime rather than a plan.
+
+    The same transport call `runtime-io`'s `send_message_to_user` makes — used directly because
+    there is no plan left to route through at the points that need it (an activity being abandoned,
+    or parked on a question). Failures are logged, never raised: this runs on paths that are already
+    reporting bad news, and a dead transport must not replace one failure with another.
+    """
+    try:
+        await cycle.communication.send("user", {"text": text})
+    except Exception:  # noqa: BLE001 — a transport failure must not mask what we were reporting
+        log.exception("could not deliver a runtime message to the user: %s", text)
+
+
+async def _await_input(cycle: DecisionCycle, activity: Activity, prompt: str) -> None:
+    """Park an activity on the user's next instruction *and actually ask the question*.
+
+    A breaker that sets `blocked_on` without delivering `prompt` stops the agent on a question no
+    one can hear: `_resume_on_input` waits for a Message that the user has no reason to send. The
+    two halves belong together, so every breaker goes through here rather than setting the fields
+    itself. Deliberately not used for the hard-interrupt pause — the user caused that one and does
+    not need to be told they did it.
+    """
+    activity.state = ActivityState.BLOCKED
+    activity.blocked_on = InputWait(prompt=prompt)
+    await _report_to_user(cycle, prompt)
+
+
 class DefaultObserveStrategy:
     """The runtime's built-in default — purely mechanical, no LLM."""
 
@@ -550,8 +599,10 @@ class DefaultObserveStrategy:
         (deliberation output, not observed state — ADR-0019/0021), so it never touches the
         perception path. `kind == "plan"` lands the Plan and resets step_index; `"ground"` parks
         the resolved params on grounded_params for Reason's next pass to consume. A result carrying
-        an `error` (the model call raised) terminates the activity instead of stranding it RUNNING
-        forever — the failure surfaces, cycle-synchronized, the way a failed op does. Stale results
+        an `error` (the model call raised) never strands the activity RUNNING: the failure surfaces
+        cycle-synchronized, the way a failed op does, and every kind degrades rather than dying —
+        in place for select/condition/revalidate, into a replan carrying the defect for
+        plan/subgoal/ground, with the runaway-replan breaker bounding the retries. Stale results
         are discarded by the same guard the external-op late-ack uses: a result whose id no longer
         matches the live pending_inference (an interrupt handler re-routed or re-inferred the
         activity), or whose activity is no longer RUNNING, is dropped — the background call ran to
@@ -631,7 +682,43 @@ class DefaultObserveStrategy:
                             activity.id,
                             res.error,
                         )
+                    elif res.error is not None and kind in _REPLANNABLE_INFERENCE:
+                        # A plan/sub-plan/grounding call that raised is a *deliberation* failure,
+                        # not evidence that the goal cannot be reached: nothing was attempted, the
+                        # world is untouched, and a fresh attempt is free to differ. So it degrades
+                        # the same way an unresolvable grounding does — replan carrying the defect
+                        # — rather than terminating. Terminating here was the destructive default:
+                        # for `subgoal` it destroyed an activity whose parent frames were intact,
+                        # and for `plan` it threw away a whole activity over one malformed model
+                        # response. The retry budget is NOT open-ended and needs no counter of its
+                        # own: `_replanning_would_loop` already refuses a further attempt once two
+                        # plans in a row were abandoned for the *same* defect (or after
+                        # max_replan_attempts distinct ones) and blocks on an InputWait instead —
+                        # which is exactly the right disposition for a failure that keeps
+                        # repeating, including a permanent one like "no LLM is configured". That is
+                        # why `_inference_defect` normalizes the error to its cause rather than
+                        # carrying the raw message: two parse failures quote different model output
+                        # and would never compare equal, so the precise check would never fire and
+                        # a hopeless call would be paid for five times instead of twice.
+                        activity.grounded_params = None
+                        activity.reset_for_replan(defect=_inference_defect(kind, res.error))
+                        activity.state = ActivityState.READY
+                        log.warning(
+                            "observe: %s for activity %s failed (%s) -> replan",
+                            kind,
+                            activity.id,
+                            res.error,
+                        )
                     elif res.error is not None:
+                        # Residual net for an inference kind with no degradation of its own (every
+                        # kind the runtime ships routes above). Terminating is right when there is
+                        # no defined way to continue — but it must not be *silent*, which is what
+                        # this branch used to be: no episode, so the failure never reached memory
+                        # and Reflect's "TERMINATED was already recorded" was untrue for this path,
+                        # and no word to the user, so an activity born from an instruction ended
+                        # without an answer. Both are repaired here, and awaited rather than
+                        # dispatched: this is the activity's last cycle, so there is no later pass
+                        # to finish the work on.
                         activity.grounded_params = None
                         activity.superseded = None  # no replacement is coming; don't keep it parked
                         activity.state = ActivityState.TERMINATED
@@ -640,6 +727,16 @@ class DefaultObserveStrategy:
                             kind,
                             activity.id,
                             res.error,
+                        )
+                        await cycle.episodic.learn(
+                            activity,
+                            f"failed: {activity.goal} ({kind} inference failed: {res.error})",
+                            succeeded=False,
+                        )
+                        await _report_to_user(
+                            cycle,
+                            f"I could not carry on with {activity.goal!r}: the {kind} step of my "
+                            f"own reasoning failed ({res.error}). Nothing was changed.",
                         )
                     elif kind == "plan":
                         inferred: Plan = res.value  # type: ignore[assignment]  # kind=="plan" => Plan
@@ -761,6 +858,12 @@ class DefaultObserveStrategy:
                 # advancing the stale plan and never see it. blocked_on and the unconditional READY
                 # stay here: resume-specific, not plan invalidation (cf. the _resume_ action).
                 activity.reset_for_replan()
+                # The instruction just received is the new direction, so the attempts that led here
+                # no longer bear on the next plan. Without this the breaker re-trips on the resumed
+                # activity's first Reason pass and the halt becomes permanent instead of a question
+                # — including for the reset_for_replan immediately above, which appends to the very
+                # trail being read. Cleared after it, so the resume's own entry goes too.
+                activity.clear_replan_trail()
                 activity.state = ActivityState.READY
                 resumed = True
         return resumed
@@ -1542,6 +1645,35 @@ _SUBGOAL_DEFECT = object()
 _DEFAULT_MAX_SUBGOAL_DEPTH = 4
 _SUBGOAL_GOAL_OVERLAP = 0.7
 
+# Circuit breaker for runaway *replanning* — the same failure mode one level out. A plan is dropped
+# (a defect found in it, or reconsideration invalidating it), the replacement is dropped too, and
+# nothing ever executes; each turn of that loop costs a full planning inference, which on a local
+# model was minutes apiece in an observed run. Counted against `Activity.replan_trail`, which holds
+# only replans with no operation between them, so this never limits an agent adapting to a world
+# that keeps moving — the design center — and limits only one that is getting nowhere. Two
+# mechanical detectors, tripped before the _infer_ spend, mirroring the sub-goal breaker above:
+# a repeated *defect* (the planner was told what was wrong and wrote it again — no third attempt
+# will differ, so this trips at two), and a plain count as the coarse backstop for the case where
+# every attempt fails differently. Tripping pauses to await-input (ADR-0020) rather than
+# terminating, so the run can be redirected rather than killed.
+_DEFAULT_MAX_REPLAN_ATTEMPTS = 5
+
+
+def _replan_halt_prompt(activity: Activity, halt: str) -> str:
+    """The await-input text for a tripped replan breaker: the goal, why it stopped, and what each
+    abandoned plan ran into, oldest first. Rendered mechanically — no model call, matching the
+    sub-goal breaker. Summarizing why the model keeps failing is the last place to spend another
+    inference, and the trail is already the specific, quotable evidence a person needs to answer."""
+    attempts = "\n".join(
+        f"  {i}. {reason if reason is not None else 'the world changed under the plan'}"
+        for i, reason in enumerate(activity.replan_trail, start=1)
+    )
+    return (
+        f"Stuck on {activity.goal!r}: {halt}.\n"
+        f"What each abandoned plan ran into:\n{attempts}\n"
+        "How should I proceed?"
+    )
+
 
 def _goal_token_overlap(a: str, b: str) -> float:
     """Token overlap coefficient over two goal strings — ``|A&B| / min(|A|, |B|)``, 1.0 when the
@@ -1952,10 +2084,16 @@ class DefaultReasonStrategy:
     escalations park the activity in RUNNING and resolve a later cycle. No phase blocks on a model
     call, so there is nothing to race or abandon (ADR-0021)."""
 
-    def __init__(self, max_subgoal_depth: int = _DEFAULT_MAX_SUBGOAL_DEPTH) -> None:
+    def __init__(
+        self,
+        max_subgoal_depth: int = _DEFAULT_MAX_SUBGOAL_DEPTH,
+        max_replan_attempts: int = _DEFAULT_MAX_REPLAN_ATTEMPTS,
+    ) -> None:
         # Depth cap for the deliberative sub-goal breaker; wired from agent.yaml's
         # `max_subgoal_depth` so a legitimately deep task can raise it past the default.
         self._max_subgoal_depth = max_subgoal_depth
+        # Backstop count for the replanning breaker, from agent.yaml's `max_replan_attempts`.
+        self._max_replan_attempts = max_replan_attempts
 
     async def reason(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
@@ -1976,6 +2114,17 @@ class DefaultReasonStrategy:
             if fired is not None:
                 return fired
         if activity.plan is None:
+            halt = self._replanning_would_loop(activity)
+            if halt is not None:
+                # Refuse to plan again: pause for guidance rather than spend another planning
+                # inference (and another...) on an activity that is not getting anywhere. Gated
+                # ahead of the procedural retrieve as well as the inference — a cached plan is
+                # exactly as stuck as a synthesized one when it is the plan that just failed. Set
+                # BLOCKED directly, as the sub-goal breaker and the interrupt handler do, and with
+                # a mechanically rendered prompt for the same reason they use one.
+                log.warning("reason: halting replanning for activity %s: %s", activity.id, halt)
+                await _await_input(cycle, activity, _replan_halt_prompt(activity, halt))
+                return result
             plan = await cycle.procedural.retrieve(activity)  # reuse across runs (cheap)
             if plan is None:
                 # Miss -> fire _infer_ off-cycle: it moves the activity to RUNNING and returns at
@@ -2102,6 +2251,18 @@ class DefaultReasonStrategy:
             if not valid:
                 log.info("reason: plan invalidated by context-adaptation for %r", activity.goal)
                 activity.reset_for_replan()  # -> re-infer next cycle against the current world
+                # A moving world no longer counts toward the replan breaker (see
+                # _replanning_would_loop), so this is the only place the pile-up shows: the agent is
+                # re-planning honestly each time and still never reaching its first write.
+                churn = sum(1 for d in activity.replan_trail if d is None)
+                if churn >= self._max_replan_attempts:
+                    log.warning(
+                        "reason: %d consecutive plans for activity %s invalidated by a moving "
+                        "world with no operation run — the world may be changing faster than the "
+                        "agent can commit to it",
+                        churn,
+                        activity.id,
+                    )
                 # Trace what was dropped, from the bundle the reset parked (ADR-0024). Every frame's
                 # *whole* body, not the un-run tail the replanning prompt gets: a prompt pays per
                 # token and separately receives what already ran as history, whereas this is read by
@@ -2318,9 +2479,8 @@ class DefaultReasonStrategy:
                 log.warning(
                     "reason: halting sub-goal recursion for activity %s: %s", activity.id, halt
                 )
-                activity.state = ActivityState.BLOCKED
-                activity.blocked_on = InputWait(
-                    prompt=f"Stuck on {goal!r}: {halt}. How should I proceed?"
+                await _await_input(
+                    cycle, activity, f"Stuck on {goal!r}: {halt}. How should I proceed?"
                 )
                 return _SUBGOAL_HALTED
             catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
@@ -2368,6 +2528,41 @@ class DefaultReasonStrategy:
             render_steps(activity.plan.steps),
         )
         return _SUBGOAL_SPLICED
+
+    def _replanning_would_loop(self, activity: Activity) -> str | None:
+        """Whether inferring another plan for this activity now would be a loop rather than an
+        attempt — the reason string if so (for the log and the await-input prompt), else ``None``.
+        Read off ``Activity.replan_trail``, which accumulates only across replans that executed no
+        operation, so adapting to a world that keeps moving is never what trips this.
+
+        Both checks read only the *defect-bearing* entries. A defect-free entry is a
+        reconsideration (ADR-0024): the plan was fine and the world moved under it, so the next plan
+        is inferred against a genuinely different world and is an attempt, not a repeat. Counting
+        those meant a plan whose first checkpointed step is a write — nothing has run yet, so
+        nothing forgives the trail — halted the agent on an unanswerable question after five honest
+        adaptations, in exactly the moving world this runtime exists for. A world that will not hold
+        still long enough to commit a write is a livelock bounded by the operator's wall clock, not
+        evidence of a stuck planner, so it is logged (see ``_reconsider``) rather than blocked on.
+
+        Two mechanical checks. The precise one first: the replacement plan was abandoned for the
+        *same* defect as the plan it replaced, meaning the planner was handed that defect in its
+        brief and wrote past it anyway — a third attempt is not going to differ, so this trips at
+        two. A reconsideration landing between the two does not excuse it: a structural complaint
+        (a reference to nothing, a param the operation does not take) is wrong about the plan, not
+        about the world, so a moved world makes repeating it no more forgivable. Then the coarse
+        count, for floundering where each attempt at least fails differently."""
+        defects = [d for d in activity.replan_trail if d is not None]
+        if len(defects) >= 2 and defects[-1] == defects[-2]:
+            return (
+                "the replacement plan was abandoned for the same reason as the plan it "
+                f"replaced ({defects[-1]})"
+            )
+        if len(defects) >= self._max_replan_attempts:
+            return (
+                f"{len(defects)} plans in a row were abandoned with a defect and without a single "
+                f"operation running (>= {self._max_replan_attempts})"
+            )
+        return None
 
     def _deliberation_would_loop(self, activity: Activity, goal: str) -> str | None:
         """Whether firing a deliberative sub-goal for ``goal`` now would be runaway recursion rather
