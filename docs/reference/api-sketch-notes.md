@@ -782,7 +782,10 @@
         `done`/`usage` cue is tagged with `current_inference_id` (a ContextVar the _infer_/_ground_
         action sets, task-local per background call) so the meter can attribute a round-trip to the
         off-cycle inference that drove it."""
-        def __init__(self, inner: LLMClient) -> None: ...
+        def __init__(self, inner: LLMClient, *, model: str | None = None) -> None: ...
+        model: str | None    # the id from config, falling back to the client's own (a config that
+        #   omits `model:` still runs the client's default) — descriptive only, for a run surface
+        #   to record which model produced a trace.
         async def complete(self, *, system: str, prompt: str) -> str: ...
 
     @dataclass(frozen=True)
@@ -912,6 +915,9 @@
                      ground_prompt: GroundPrompt = default_ground_prompt): ...
         #   llm is the model behind infer()/ground(); None keeps store/retrieve usable with no LLM.
         #   prompt / ground_prompt are the knobs for planning / grounding *content*.
+        @property
+        def model(self) -> str | None: ...   # name of the model behind infer()/ground(), for a run
+        #   surface to report; None when no model — or an unnamed one — is configured.
         async def retrieve(self, activity: Activity) -> Plan | None:
             """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
             similarity, backend-dependent. Returns the backend's top-ranked match (query() orders
@@ -1264,7 +1270,13 @@
         catalog) — which moves the activity to RUNNING and returns no step this cycle; the plan lands a
         later cycle via inference_sink, and Reason then advances it. A param that can't be resolved
         mechanically fires _ground_ the same way (RUNNING, no step; the resolved params land as
-        activity.grounded_params, consumed next pass to emit the concrete step). While an activity is
+        activity.grounded_params, consumed next pass to emit the concrete step). Before any
+        side-effecting step it also checks that the plan can still finish: a later step that reads a
+        value out of a binding an earlier step produced EMPTY makes the plan unfinishable, so it is
+        dropped with that defect rather than committing a write that cannot be undone (a collection
+        position — a data-op `in`, a membership `where` — is exempt, since empty there is an answer).
+        Ahead of grounding and outside `cycle.reconsideration`: it reads only settled state, and
+        refusing to act on a plan that provably cannot work is not tunable. While an activity is
         RUNNING on an inference Reason simply yields no step for it — no model call blocks the cycle, so
         there is nothing to race or abandon (ADR-0021, superseding ADR-0020's mid-flight abandonment).
         Reuse is currently always a miss — the default Reflect no longer stores completed plans (verbatim

@@ -22,9 +22,12 @@ fired), then calls ``validate()`` once — so a multi-turn scenario is scored fu
 (``--max-wall-seconds``) is the safety valve; ``--exit-when-idle`` opts back into the old
 single-turn quiet-window heuristic.
 
-Only ``validate()`` contacts the judge model; without ``--judge-model`` the run is unscored (the
-judge no-op), useful for a quick trajectory check. Scenario iteration, ``--num-runs``, and HF trace
-export (the full batch harness) build on this same file.
+Without ``--judge-model`` the run is unscored (the judge no-op), useful for a quick trajectory
+check — but on a *multi-turn* scenario it also silently stops after turn 1, because the later turns'
+events hang off ``OracleEvent``s that an agent-mode environment ignores. ``--init-turns`` wires
+those turns up without a judge, so every turn is delivered unconditionally and an unscored run still
+exercises the later-turn behaviour. Scenario iteration, ``--num-runs``, and HF trace export (the
+full batch harness) build on this same file.
 """
 
 from __future__ import annotations
@@ -72,6 +75,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Custom endpoint URL for --judge-model. Optional.",
     )
     parser.add_argument(
+        "--init-turns",
+        action="store_true",
+        help=(
+            "Deliver every turn of a multi-turn scenario without attaching a judge: the run stays "
+            "unscored, but the later turns fire unconditionally instead of being gated on a judge "
+            "verdict about the earlier ones. Without this (and without --judge-model) a multi-turn "
+            "scenario silently stops after turn 1. Mutually exclusive with --judge-model."
+        ),
+    )
+    parser.add_argument(
         "--max-wall-seconds",
         type=float,
         default=1200.0,
@@ -100,6 +113,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    if args.judge_model and args.init_turns:
+        # Both route through preprocess_scenario and only the first takes effect (ARE's
+        # initialize_turns is idempotent), so the combination cannot mean what it looks like: the
+        # judge would still be the gate. Refuse rather than silently ignore --init-turns.
+        raise SystemExit("--init-turns and --judge-model are mutually exclusive")
 
     # A console-script/`python -m` entry point does not put the invocation dir on sys.path, but the
     # agent.yaml's dotted refs (and a dotted --scenario) resolve project-local code from cwd — match
@@ -109,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Lazy: ARE and the LLM client are optional dependency groups, only needed for an actual run.
     from examples.gaia2._runner import run_scenario
-    from sora.adapters.are_sim import attach_judge, load_scenario
+    from sora.adapters.are_sim import attach_judge, initialize_turns, load_scenario
 
     print(f"loading scenario {args.scenario!r} ...", flush=True)
     scenario: Any = load_scenario(args.scenario)
@@ -123,6 +141,10 @@ def main(argv: list[str] | None = None) -> None:
             provider=args.judge_provider,
             endpoint=args.judge_endpoint,
         )
+    elif args.init_turns:
+        # Same turn wiring, no judge and no gate: every turn is released regardless of how the
+        # earlier ones went, which is what exercising a later turn's behaviour needs.
+        initialize_turns(scenario)
 
     # run_scenario owns the turn-aware done condition (ride through the idle gaps between a
     # scenario's turns; stop once the timeline has completed and the agent is idle; a wall-clock cap
@@ -156,6 +178,10 @@ def _print_score(result: Any, *, scored: bool) -> None:
         print(f"\nGaia2 validation: {'✅ PASS' if outcome.success else '❌ FAIL'}")
     if getattr(outcome, "rationale", None):
         print(f"    {outcome.rationale}")
+    # A run that stopped to ask something looks identical to a run that merely did badly, unless
+    # the question is printed. It is the most actionable line in the output when it appears.
+    for prompt in getattr(result, "awaiting_input", []):
+        print(f"\nAgent stopped to ask:\n{prompt}")
 
 
 if __name__ == "__main__":

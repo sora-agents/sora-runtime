@@ -1,0 +1,28 @@
+# Long-context qwen3:30b — the local model examples/gaia2/agent.dev.yaml points at.
+#
+#     ollama create qwen3:30b-64k -f examples/gaia2/qwen3-30b-64k.Modelfile
+#
+# Instant and cheap: a derived model shares the base model's blobs, so this writes a manifest, not
+# another 18 GB. `ollama rm qwen3:30b-64k` undoes it.
+#
+# Why it exists. A plan prompt carries the whole tool catalog plus the activity's operation history;
+# two measured plan calls came to 16958 and 18233 input tokens. An over-long prompt is silently
+# truncated rather than refused, so the planner can lose the very system-prompt rules it is being
+# asked to follow — the $from/$decide reference vocabulary among them — and then emits malformed
+# references. The failure reads as a model-capability problem, which is what makes it expensive to
+# diagnose.
+#
+# Why a *derived model* rather than a per-request option. Ollama's OpenAI-compatible surface
+# (/v1/chat/completions — what OpenAICompatLLMClient speaks) silently ignores `num_ctx`: sending
+# `options: {"num_ctx": 8192}` in that body leaves the context at the auto-sized default, while the
+# identical body against the native /api/chat endpoint honours it exactly. The OpenAI SDK's
+# `extra_body` does not help — it produces that same ignored shape. So the parameter can only reach
+# a /v1 request by being baked into the model. The alternative, OLLAMA_CONTEXT_LENGTH, is a global
+# on the server process: it applies to every model and every caller, and it cannot be version-
+# controlled alongside the config that depends on it.
+#
+# 65536 costs ~25 GB resident vs ~21 GB at 32768 — lower it here if that is too much VRAM. Ollama
+# auto-sizes to the model's trained 32768 when nothing is specified, which is a workable floor. The
+# runtime bounds its own prompt growth separately (_HISTORY_CHAR_BUDGET in sora/memory.py).
+FROM qwen3:30b
+PARAMETER num_ctx 65536

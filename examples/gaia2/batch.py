@@ -90,6 +90,7 @@ def _jsonl_record(
     rationale: str | None,
     exception: BaseException | None,
     trace_id: str | None,
+    awaiting_input: list[str] | None = None,
 ) -> dict[str, Any]:
     """One ``output.jsonl`` line, matching ARE's ``_export_benchmark_result_jsonl`` exactly:
     ``task_id``/``trace_id``/``score`` at top level, and a ``metadata`` dict with all-None values
@@ -103,6 +104,11 @@ def _jsonl_record(
         "exception_type": type(exception).__name__ if exception is not None else None,
         "exception_message": str(exception) if exception is not None else None,
         "rationale": rationale,
+        # Why the run stopped short, when it stopped on a question (a replan or sub-goal breaker
+        # tripping) rather than on the timeline. A distinct failure mode from scoring badly, and
+        # invisible otherwise. None when there was none, so the strip below keeps every ordinary
+        # run's record byte-identical to ARE's own shape.
+        "awaiting_input": awaiting_input or None,
     }
     metadata = {k: v for k, v in metadata.items() if v is not None}
     return {"task_id": scenario_id, "trace_id": trace_id, "score": score, "metadata": metadata}
@@ -235,7 +241,7 @@ def _run_one_scenario(
     from are.simulation.scenarios.scenario import ScenarioStatus
 
     from examples.gaia2._runner import run_scenario
-    from sora.adapters.are_sim import attach_judge
+    from sora.adapters.are_sim import attach_judge, initialize_turns
 
     try:
         if args.judge_model:
@@ -245,6 +251,8 @@ def _run_one_scenario(
                 provider=args.judge_provider,
                 endpoint=args.judge_endpoint,
             )
+        elif args.init_turns:
+            initialize_turns(scenario)
         result = run_scenario(
             scenario,
             config=args.config,
@@ -287,6 +295,7 @@ def _run_one_scenario(
         rationale=result.outcome.rationale,
         exception=result.exception,
         trace_id=trace_id,
+        awaiting_input=result.awaiting_input,
     )
 
 
@@ -343,6 +352,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--judge-endpoint", metavar="URL", help="Custom endpoint for the judge.")
     parser.add_argument(
+        "--init-turns",
+        action="store_true",
+        help=(
+            "Deliver every turn of a multi-turn scenario without a judge (runs stay unscored). "
+            "Without it, an unscored multi-turn scenario stops after turn 1. Excludes "
+            "--judge-model."
+        ),
+    )
+    parser.add_argument(
         "--max-wall-seconds",
         type=float,
         default=1200.0,
@@ -362,6 +380,11 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.capability:
         raise SystemExit("--capability is required unless --report-only is given")
+
+    if args.judge_model and args.init_turns:
+        # Only the first of the two takes effect (ARE's initialize_turns is idempotent), leaving the
+        # judge as the turn gate — the opposite of what --init-turns asks for. Refuse, don't ignore.
+        raise SystemExit("--init-turns and --judge-model are mutually exclusive")
 
     # Absolutize the artifact root before anything writes under it: the HF trace path ARE returns
     # (and stores as each record's `trace_id`) is `os.path.join(output_dir, "hf", <file>)`, and the

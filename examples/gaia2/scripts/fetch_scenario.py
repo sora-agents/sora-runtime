@@ -11,17 +11,17 @@ Needs the ``are`` dependency group (``uv sync --all-extras --group are``) and, f
 dataset, an ``HF_TOKEN``.
 
     # list the scenario ids for one capability + split
-    python -m examples.gaia2.scripts.fetch_scenario --config execution --list
+    python -m examples.gaia2.scripts.fetch_scenario --capability execution --list
 
     # fetch the first execution/validation scenario to ./execution-validation-0.scenario.json
-    python -m examples.gaia2.scripts.fetch_scenario --config execution
+    python -m examples.gaia2.scripts.fetch_scenario --capability execution
 
     # a specific one, to a chosen path
-    python -m examples.gaia2.scripts.fetch_scenario --config ambiguity --index 2 --out amb.json
+    python -m examples.gaia2.scripts.fetch_scenario --capability ambiguity --index 2 --out amb.json
 
     # one per core capability (shell loop)
     for c in execution search adaptability time ambiguity; do
-        python -m examples.gaia2.scripts.fetch_scenario --config "$c"
+        python -m examples.gaia2.scripts.fetch_scenario --capability "$c"
     done
 """
 
@@ -40,10 +40,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Fetch one Gaia2 scenario JSON from HuggingFace (dev/inspection convenience).",
     )
     parser.add_argument(
-        "--config",
+        "--capability",
         required=True,
         metavar="CAPABILITY",
-        help="Dataset config / capability, e.g. execution, search, adaptability, time, ambiguity.",
+        help="Dataset config to fetch from, e.g. execution, search, adaptability, time, ambiguity.",
     )
     parser.add_argument(
         "--split",
@@ -67,12 +67,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--out",
         metavar="PATH",
-        help="Where to write the JSON (default: <config>-<split>-<index>.scenario.json).",
+        help="Where to write the JSON (default: <capability>-<split>-<index>.scenario.json).",
     )
     parser.add_argument(
         "--list",
         action="store_true",
-        help="Print the scenario ids for --config/--split and exit (no fetch).",
+        help="Print the scenario ids for --capability/--split and exit (no fetch).",
     )
     return parser.parse_args(argv)
 
@@ -87,10 +87,10 @@ def main(argv: list[str] | None = None) -> int:
         list_huggingface_scenarios,
     )
 
-    ids = list_huggingface_scenarios(args.dataset, args.config, args.split)
+    ids = list_huggingface_scenarios(args.dataset, args.capability, args.split)
     if not ids:
         print(
-            f"no scenarios for {args.dataset} config={args.config!r} split={args.split!r} "
+            f"no scenarios for {args.dataset} capability={args.capability!r} split={args.split!r} "
             "(check the capability/split names, and HF_TOKEN for a gated dataset)",
             file=sys.stderr,
         )
@@ -110,12 +110,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     sid = ids[args.index]
-    data = get_scenario_from_huggingface(args.dataset, args.config, args.split, sid)
+    data = get_scenario_from_huggingface(args.dataset, args.capability, args.split, sid)
     if data is None:
         print(f"failed to fetch scenario {sid!r}", file=sys.stderr)
         return 1
 
-    out = args.out or f"{args.config}-{args.split}-{args.index}.scenario.json"
+    out = args.out or f"{args.capability}-{args.split}-{args.index}.scenario.json"
     Path(out).write_text(data, encoding="utf-8")
     print(f"wrote {out}  (scenario {sid!r}, {len(data)} bytes)")
     return 0

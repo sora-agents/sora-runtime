@@ -7,9 +7,14 @@
 #
 #     # 1. Serve the model locally (one-time pull, then it stays resident):
 #     ollama pull qwen3:30b
+#
+#     # 2. Derive the long-context variant this config points at. Instant — a derived model shares
+#     #    the base model's blobs, so nothing is re-downloaded:
+#     ollama create qwen3:30b-64k -f examples/gaia2/qwen3-30b-64k.Modelfile
+#
 #     # Ollama's OpenAI-compatible endpoint is http://localhost:11434/v1 by default.
 #
-#     # 2. Fast, unscored smoke over a handful of scenarios — no judge, no cost:
+#     # 3. Fast, unscored smoke over a handful of scenarios — no judge, no cost:
 #     uv run python -m examples.gaia2.batch --capability mini --limit 5 \
 #         --config examples/gaia2/agent.dev.yaml
 #
@@ -32,7 +37,14 @@ agent:
     # OpenAI-compatible local model — e.g. gpt-oss:20b (fastest) or qwen3:32b (dense, slower but
     # slightly better plans). Qwen3 is a hybrid-thinking model; prepend `/no_think` in the strategy
     # prompt for deterministic, cheaper dev runs.
-    model: qwen3:30b
+    #
+    # The `-64k` suffix is the derived long-context model built in step 2 above, NOT a separate
+    # download. A plan prompt (tool catalog + operation history) overruns Ollama's default window
+    # and is then silently truncated, costing the planner the reference vocabulary it is being
+    # asked to use; `/v1` has no per-request context knob, so the window has to be baked into the
+    # model. Full reasoning in qwen3-30b-64k.Modelfile. Point this back at plain `qwen3:30b` to
+    # trade the context for ~4 GB of VRAM.
+    model: qwen3:30b-64k
     base_url: http://localhost:11434/v1
     instrument: true
     # No api_key needed for a local runtime: the client supplies a placeholder when base_url is set

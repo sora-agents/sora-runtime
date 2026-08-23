@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -155,3 +156,61 @@ async def test_invoke_is_logged_as_are_agent_event() -> None:
         assert after[-1].action.function_name == "list_emails"
     finally:
         await workspace.close()
+
+
+# -- the simulated clock ---------------------------------------------------------------------------
+#
+# `Environment.run` copies `duration` and `time_increment_in_seconds` off the scenario but NOT
+# `start_time`: that is read from the config alone, and `EnvironmentConfig` defaults it to None,
+# which the Environment reads as 0. Left unset, every scenario ran with its clock at the Unix epoch
+# — counting real seconds up from 1970-01-01 — while its data and its oracle sat in the scenario's
+# own year. A goal like "cancel my appointments this upcoming Saturday" was then computed against
+# 1970: a silent wrong answer, not an error, and one that looks like a model failure in a trace.
+
+# `start_time` is a dataclass FIELD on ARE's `Scenario`, defaulted by a `time.time()` factory, so it
+# has to be passed to the constructor — a class attribute on a subclass never reaches the instance.
+_SCENARIO_EPOCH = 1728975600.0  # 2024-10-15 07:00:00 UTC, a Tuesday — a real Gaia2 start_time
+
+
+def test_simulated_clock_starts_at_the_scenario_start_time() -> None:
+    sim = AreSimulation(_DynamicScenario(start_time=_SCENARIO_EPOCH))
+    sim.start()
+    try:
+        now = sim.environment().time_manager.time()
+        # the scenario's own clock — not seconds counted up from the Unix epoch
+        assert _SCENARIO_EPOCH <= now < _SCENARIO_EPOCH + 600
+        moment = datetime.fromtimestamp(now, tz=UTC)
+        assert moment.strftime("%Y-%m-%d") == "2024-10-15"
+        assert moment.strftime("%A") == "Tuesday"
+    finally:
+        sim.stop()
+
+
+def test_explicit_config_start_time_wins_over_the_scenario() -> None:
+    """A caller who pinned the clock keeps it, and their config object is not mutated behind
+    them."""
+    from are.simulation.environment import EnvironmentConfig
+
+    pinned = _SCENARIO_EPOCH + 86_400
+    config = EnvironmentConfig(start_time=pinned)
+    sim = AreSimulation(_DynamicScenario(start_time=_SCENARIO_EPOCH), config=config)
+    sim.start()
+    try:
+        assert sim.environment().time_manager.time() >= pinned
+        assert config.start_time == pinned  # copied, not mutated
+    finally:
+        sim.stop()
+
+
+def test_undated_scenario_starts_now_rather_than_at_the_epoch() -> None:
+    """An in-code scenario that names no date gets ARE's own default — the current wall-clock time,
+    from the `Scenario.start_time` field factory — and that is what reaches the clock. This is the
+    same rule ARE's ScenarioRunner applies (`if scenario.start_time and > 0`), and it is still a
+    real date rather than 1970."""
+    before = time.time()
+    sim = AreSimulation(_DynamicScenario())
+    sim.start()
+    try:
+        assert sim.environment().time_manager.time() >= before
+    finally:
+        sim.stop()

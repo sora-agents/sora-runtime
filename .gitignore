@@ -30,9 +30,13 @@ my-agent/
 logs/
 
 # Gaia2 scenario JSON fetched from HuggingFace (examples/gaia2/scripts/fetch_scenario.py) —
-# Meta's dataset content, gated by the HF dataset terms; fetch on demand, don't redistribute
+# Meta's dataset content, gated by the HF dataset terms; fetch on demand, don't redistribute.
+# The directory is ignored wholesale, not just the *.scenario.json naming: a scenario keeps its
+# own upstream filename (scenario_universe_21_5e0gvz.json) when fetched by id, which no suffix
+# pattern catches, and 12 MB of it was already sitting untracked in a working tree.
 scenario.json
 *.scenario.json
+examples/gaia2/scenarios/
 
 # Environment
 .env

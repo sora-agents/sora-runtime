@@ -182,7 +182,22 @@ class AreSimulation:
 
         if not getattr(self._scenario, "_initialized", False):
             self._scenario.initialize()
-        self._env = Environment(config=self._config or EnvironmentConfig())
+        # `Environment.run` copies `duration` and `time_increment_in_seconds` off the scenario,
+        # but NOT `start_time` — that is read from the config alone
+        # (`time_manager.reset(start_time=self.start_time)`), and `EnvironmentConfig` defaults it to
+        # None, which the Environment reads as 0. A scenario therefore runs with its simulated clock
+        # at the Unix epoch, counting real seconds up from 1970-01-01, while its data and its oracle
+        # sit in the scenario's own year: `get_current_time` told an agent it was Thursday
+        # 1 Jan 1970 for a scenario starting Tuesday 2024-10-15, so every date the agent derived
+        # ("this upcoming Saturday") was computed against the wrong epoch — a silent wrong answer,
+        # not an error. ARE's own ScenarioRunner sets it from the scenario; mirror that.
+        # An explicit start_time on a caller-supplied config wins, and the config is copied rather
+        # than mutated because it belongs to the caller.
+        config = self._config or EnvironmentConfig()
+        start_time = getattr(self._scenario, "start_time", None)
+        if start_time and config.start_time is None:
+            config = dataclasses.replace(config, start_time=start_time)
+        self._env = Environment(config=config)
         # wait_for_end=False: registers apps, schedules the timeline, starts the event-loop thread,
         # and returns — the agent then drives its cycle against the live, ticking world.
         self._env.run(self._scenario, wait_for_end=False)
@@ -276,8 +291,12 @@ def attach_judge(
     oracle mode to populate ``oracle_run_event_log`` and then sets ``scenario.judge`` /
     ``scenario.validate``. Call *after* ``load_scenario`` and *before* ``AreSimulation.start()``.
     Only meaningful for scenarios that carry ``OracleEvent``s (Gaia2 JSON does). ``model=None`` uses
-    ARE's default judge model. The judge model is contacted at ``validate()`` time, not here — so
-    this call is offline; oracle-mode replay of the OracleEvents is deterministic and modelless."""
+    ARE's default judge model. This call is itself offline — oracle-mode replay of the OracleEvents
+    is deterministic and modelless — but the judge model is *not* contacted only at ``validate()``:
+    under online validation (``offline_validation=False``, the default) ARE installs
+    ``judge.trigger_condition`` as each turn's release gate, so the judge is also called mid-run at
+    every turn boundary, and a verdict of "turn failed" stops the environment and withholds the
+    remaining turns. Use ``initialize_turns`` when the later turns are wanted without that gate."""
     from are.simulation.agents.are_simulation_agent_config import LLMEngineConfig
     from are.simulation.scenarios.scenario_imported_from_json.utils import preprocess_scenario
     from are.simulation.validation.configs import GraphPerEventJudgeConfig, create_judge_engine
@@ -292,6 +311,32 @@ def attach_judge(
         judge_config=GraphPerEventJudgeConfig(engine=create_judge_engine(engine_config)),
         offline_validation=offline_validation,
     )
+
+
+def initialize_turns(scenario: Any) -> None:
+    """Wire a multi-turn benchmark scenario's turn triggers *without* attaching a judge, so every
+    turn is delivered unconditionally. The run stays unscored (``scenario.judge`` is never set, so
+    ``AreSimulation.validate()`` keeps returning the ``success=None`` no-op) — this buys the later
+    turns, not a verdict.
+
+    Why this exists as its own entry point: a Gaia2 scenario's later turns do not fire on their own.
+    Their environment events hang off ``OracleEvent``s, which an agent-mode environment ignores
+    without releasing successors, so a scenario run straight from ``load_scenario`` silently stops
+    after turn 1. ARE re-anchors those events onto a per-turn ``ConditionCheckEvent`` only inside
+    ``preprocess_scenario`` — which ``attach_judge`` reaches, but only by also making the judge the
+    gate that decides whether each turn is released at all (see ``attach_judge``). Passing no judge
+    takes ARE's own dummy trigger instead: it always releases the next turn, so the later turns
+    arrive whether or not the agent got the earlier ones right.
+
+    That is what development wants. Exercising behaviour that only a *later* turn provokes — the
+    agent revising a plan when new information contradicts it — otherwise requires paying for a
+    judge good enough that its verdict on turn 1 can be trusted not to end the run first, which
+    couples the behaviour under test to judge quality for no benefit. Call *after* ``load_scenario``
+    and *before* ``AreSimulation.start()``, and not together with ``attach_judge`` (either one
+    initializes the turns; the second call is a no-op and the judge would still be the gate)."""
+    from are.simulation.scenarios.scenario_imported_from_json.utils import preprocess_scenario
+
+    preprocess_scenario(scenario, judge_config=None)
 
 
 # -- app -> S-ORA usage-interface extraction ------------------------------------------------------
