@@ -8,7 +8,7 @@ import logging
 import os
 import tempfile
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -808,12 +808,68 @@ class GroundPrompt(Protocol):
     ) -> tuple[str, str]: ...
 
 
-def render_history(history: list[CompletedOperation], limit: int | None = None) -> str:
+# A rendered result is either whole or explicitly absent — never a prefix. These bound the *total*
+# characters a history/bindings section contributes to a prompt; an entry that does not fit is
+# replaced by a counted placeholder rather than cut, because a half-rendered record is worse than a
+# missing one: it reads as complete, and grounding will happily resolve a reference against a
+# record whose tail (an id, an address, a `total:` that says "there are 115 more") was silently
+# removed. Bounding the prompt is a legitimate job for an arbitrary number; deciding how much of a
+# tool result is true is not.
+#
+# 60k chars is *tighter* than what the previous per-entry cap allowed (40 entries x 4000 = 160k) —
+# the old cap paid a correctness price for a bound it did not actually deliver.
+_HISTORY_CHAR_BUDGET = 60_000
+
+# Bindings are rendered alongside history in the grounding prompt, so they get their own smaller
+# budget rather than sharing one: a data-op binding is a narrowed collection (already the product of
+# a filter/take), so it is expected to be small, and letting it compete with history for one pooled
+# budget would let a single wide binding evict the operation results grounding resolves against.
+_BINDINGS_CHAR_BUDGET = 20_000
+
+
+def _one_line(value: Any) -> str:
+    """Whitespace-collapsed rendering of a result. Length is handled by the budget walk, not here —
+    this only flattens, it never elides."""
+    return " ".join(str(value).split())
+
+
+def _fit_to_budget(entries: Sequence[tuple[str, str | None, str]], budget: int) -> list[str]:
+    """Render ``(name, args, body)`` entries newest-last within a total character ``budget``.
+
+    All-or-nothing per entry: one that does not fit becomes a counted placeholder naming its size,
+    so the reader can tell "elided, re-invoke" from "never happened". The walk runs newest-first
+    because the newest entry is what a ``$from``/``$decide`` resolves against in the common case,
+    and **the newest entry is always rendered in full** even when it alone exceeds the budget — a
+    budget able to elide it would reintroduce the silent-loss bug in a new costume. Output order is
+    the caller's original order, so reading order is unchanged.
+    """
+    rendered: list[str] = []
+    spent = 0
+    for position, (name, args, body) in enumerate(reversed(entries)):
+        line = f"- {name}({args}) -> {body}" if args is not None else f"- {name} = {body}"
+        if position == 0 or spent + len(line) <= budget:
+            spent += len(line)
+            rendered.append(line)
+            continue
+        noun = "result" if args is not None else "value"
+        head = f"- {name}({_truncate(args, 120)}) -> " if args is not None else f"- {name} = "
+        rendered.append(f"{head}({noun} elided: {len(body)} chars — re-invoke to view)")
+    return rendered[::-1]
+
+
+def render_history(
+    history: list[CompletedOperation],
+    limit: int | None = None,
+    *,
+    budget: int = _HISTORY_CHAR_BUDGET,
+) -> str:
     """Render an activity's executed operations + results for a grounding prompt. Public so a custom
     ``GroundPrompt`` can reuse it. Results are the grounder's ground truth for resolving a reference
-    (the id a ``$from``/``$decide`` needs to pick), so they're rendered with a much larger cap than
-    the observed-state renderers — a search returning several records must not have a later record's
-    id truncated off the end (the failure that made a second email invisible to grounding).
+    (the id a ``$from``/``$decide`` needs to pick), so an individual result is **never** cut: it is
+    rendered whole or replaced by a counted placeholder, under a total ``budget`` (see
+    ``_fit_to_budget``). A partially rendered record is the worst outcome here — a contact record
+    cut mid-field yields a truncated email address that still looks like an email address, and the
+    paging metadata saying how many records were withheld lives in the tail a cut removes.
 
     ``limit`` keeps only the most recent N entries, with a counted marker in place of the rest so a
     reader can tell elision from "nothing happened earlier". It defaults to *unbounded* because the
@@ -828,11 +884,13 @@ def render_history(history: list[CompletedOperation], limit: int | None = None) 
     lines = []
     if len(shown) < len(history):
         lines.append(f"(… {len(history) - len(shown)} earlier operation(s) not shown)")
+
+    entries = []
     for completed in shown:
         outcome = completed.ack.result if completed.ack.ok else f"ERROR: {completed.ack.result}"
         args = json.dumps(completed.invocation.params)
-        rendered = _truncate(outcome, _HISTORY_RESULT_LIMIT)
-        lines.append(f"- {completed.invocation.operation_name}({args}) -> {rendered}")
+        entries.append((completed.invocation.operation_name, args, _one_line(outcome)))
+    lines.extend(_fit_to_budget(entries, budget))
     return "\n".join(lines)
 
 
@@ -886,20 +944,20 @@ def render_superseded_plan(superseded: SupersededPlan) -> str:
     )
 
 
-def render_bindings(bindings: dict[str, Any]) -> str:
+def render_bindings(bindings: dict[str, Any], *, budget: int = _BINDINGS_CHAR_BUDGET) -> str:
     """Render an activity's named data-op bindings for a grounding prompt. Public so a custom
     ``GroundPrompt`` can reuse it. A ``$bind`` reference or a ``$decide`` instruction may name a
     binding an earlier data-op step produced (a filtered/sorted/collected collection), so — like
-    history results — these are the grounder's ground truth for resolving a reference and share the
-    same generous per-value cap. Order is preserved, so a sorted binding's front (e.g. the cheapest
-    items) survives truncation of a long tail."""
+    history results — these are the grounder's ground truth for resolving a reference and get the
+    same all-or-nothing treatment under a total ``budget``: a binding renders whole or becomes a
+    counted placeholder, never a prefix. Insertion order is preserved in the output, but the budget
+    walk runs in reverse, so the most recently produced binding is the one guaranteed to survive."""
     if not bindings:
         return "(none)"
-    lines = []
-    for name, value in bindings.items():
-        rendered = _truncate(json.dumps(value, default=str), _HISTORY_RESULT_LIMIT)
-        lines.append(f"- {name} = {rendered}")
-    return "\n".join(lines)
+    entries = [
+        (name, None, _one_line(json.dumps(value, default=str))) for name, value in bindings.items()
+    ]
+    return "\n".join(_fit_to_budget(entries, budget))
 
 
 def _render_operation_schema(manual: Manual | None, operation_name: str) -> str:

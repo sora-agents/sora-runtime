@@ -1021,3 +1021,85 @@ async def test_ground_rejects_output_without_params_key(tmp_path: Path) -> None:
     mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=FakeLLMClient(json.dumps({"x": 1})))
     with pytest.raises(ValueError, match="could not parse grounded params"):
         await mem.ground(_activity_with_history("g", "s", {}), "op", None, {})
+
+
+# -- history/bindings rendering is all-or-nothing under a total budget ----------------------------
+#
+# The bug these pin: a paged tool result (ARE's `get_contacts` -> 10 records + a
+# `metadata: {range, total: 125}` envelope, ~7.6k chars) was rendered through a 4000-char per-value
+# cap, so the model saw ~6.5 records and *no* sign that 115 more existed. The paging affordance
+# lives in the tail, which is exactly what a prefix cut removes — and a record cut mid-field
+# yields a truncated email address that still looks like one. Whole-or-absent is the invariant; the
+# budget bounds the prompt instead.
+
+
+def _completed_with(operation_name: str, result: object) -> CompletedOperation:
+    return CompletedOperation(
+        OperationInvocation(tool_id="t", operation_name=operation_name, params={}),
+        OperationAck(ok=True, result=result),
+    )
+
+
+def test_render_history_keeps_a_large_result_whole() -> None:
+    # The regression: 7637 chars is the measured size of a real get_contacts page, comfortably over
+    # the 4000-char cap this replaces. The envelope at the very end must survive.
+    body = "x" * 7600 + "metadata:{'total':125}"
+    rendered = render_history([_completed_with("get_contacts", body)])
+    assert "metadata:{'total':125}" in rendered
+    assert "…" not in rendered
+
+
+def test_render_history_elides_a_whole_entry_rather_than_cutting_it() -> None:
+    big, small = "A" * 5000, "B" * 10
+    rendered = render_history(
+        [_completed_with("big_op", big), _completed_with("small_op", small)], budget=1000
+    )
+    # the over-budget entry is named and counted, but no prefix of its result leaks through
+    assert "big_op" in rendered
+    assert "elided" in rendered and "5000 chars" in rendered
+    assert "A" * 20 not in rendered
+    assert small in rendered  # the newest entry is still whole
+
+
+def test_render_history_never_emits_a_prefix_of_a_result() -> None:
+    # The invariant, stated directly: every result is present in full or not at all. Each body is
+    # given a unique head *and* tail so "a prefix of this result leaked" is actually detectable —
+    # bodies sharing a long common prefix would make the check vacuous.
+    results = [f"head{i}-" + "R" * 900 + f"-tail{i}" for i in range(6)]
+    rendered = render_history(
+        [_completed_with(f"op{i}", r) for i, r in enumerate(results)], budget=2000
+    )
+    for r in results:
+        assert (r in rendered) or (r[:50] not in rendered)
+
+
+def test_render_history_always_renders_the_newest_entry_in_full() -> None:
+    # A $from/$decide resolves against the newest result in the common case, so a budget that could
+    # elide it would reintroduce the same silent loss under a new name.
+    body = "Z" * 9000
+    rendered = render_history([_completed_with("only_op", body)], budget=100)
+    assert body in rendered
+
+
+def test_render_history_preserves_oldest_to_newest_order_after_budget_selection() -> None:
+    entries = [_completed_with(f"op{i}", "q" * 400) for i in range(6)]
+    rendered = render_history(entries, budget=1200)
+    positions = [rendered.index(f"op{i}") for i in range(6)]
+    assert positions == sorted(positions)
+
+
+def test_render_history_budget_composes_with_the_entry_window() -> None:
+    history = [_completed_with(f"op{i}", "w" * 800) for i in range(20)]
+    rendered = render_history(history, 5, budget=1000)
+    assert "15 earlier operation(s) not shown" in rendered  # window marker still there
+    assert "elided" in rendered  # and the budget still trims within the window
+    assert "op19" in rendered
+
+
+def test_render_bindings_is_all_or_nothing_and_keeps_the_last_binding() -> None:
+    rendered = render_bindings(
+        {"wide": [{"pad": "p" * 4000}], "cheapest": [{"name": "Mechelen Mansion"}]}, budget=500
+    )
+    assert "Mechelen Mansion" in rendered  # newest binding survives whole
+    assert "elided" in rendered and "p" * 20 not in rendered
+    assert rendered.index("wide") < rendered.index("cheapest")  # insertion order preserved
