@@ -1103,3 +1103,28 @@ def test_render_bindings_is_all_or_nothing_and_keeps_the_last_binding() -> None:
     assert "Mechelen Mansion" in rendered  # newest binding survives whole
     assert "elided" in rendered and "p" * 20 not in rendered
     assert rendered.index("wide") < rendered.index("cheapest")  # insertion order preserved
+
+
+# -- goal provenance: only the plan carrying the user's goal reports back --------------------------
+#
+# PLAN_SYSTEM_PROMPT says to end with `send_message_to_user` "if the goal came from the user", but a
+# sub-goal is inferred against its own goal string with the parent nowhere in the prompt, so the
+# model could not evaluate the condition and every plan in the tree read as the user's. One turn
+# then produced one report per plan — observed as three messages to the user in a single Gaia2 turn,
+# where the benchmark's turn gate counts exactly one.
+
+
+def test_plan_prompt_tells_a_subgoal_plan_not_to_report_to_the_user() -> None:
+    activity = _activity("notify each relative")
+    activity.parent_frames = [(Plan(id="p", goal="reconcile the shortlist", steps=[]), 0)]
+    _, user = default_plan_prompt(activity, {}, PerceptSnapshot(), [])
+    assert "NOT a request from the user" in user
+    assert "do NOT end this plan by invoking `send_message_to_user`" in user
+
+
+def test_plan_prompt_says_nothing_about_provenance_for_a_top_level_goal() -> None:
+    # The empty stack is the top-level case, which must read exactly as before: the system prompt's
+    # own condition applies, unqualified.
+    _, user = default_plan_prompt(_activity("reconcile the shortlist"), {}, PerceptSnapshot(), [])
+    assert "NOT a request from the user" not in user
+    assert "send_message_to_user" not in user

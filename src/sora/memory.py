@@ -637,6 +637,33 @@ class PlanPrompt(Protocol):
     ) -> tuple[str, str]: ...
 
 
+def _render_goal_provenance(activity: Activity) -> str:
+    """Say where this plan's goal came from, when the answer changes what the plan should contain.
+
+    For the **plan** prompt only. ``InferAction`` renders a sub-plan against a *copy* of the
+    activity whose ``goal`` is the sub-goal string, so the notice below and the goal it qualifies
+    agree. The live activity's ``goal`` is never rewritten when Observe enters a sub-plan, so any
+    other caller would print the user's actual request and then assert it is not a request from the
+    user.
+
+    ``PLAN_SYSTEM_PROMPT`` tells the planner to end with ``send_message_to_user`` *if the goal came
+    from the user* — a condition the model cannot evaluate, because a sub-goal is inferred against
+    its own goal string with the parent nowhere in the prompt. Every plan therefore read as the
+    user's and ended with a report, so one user turn produced a report per plan in the tree instead
+    of one for the turn. A non-empty intention stack is the mechanical answer (see
+    ``InferAction.execute``): it means this plan is a sub-plan, and the reply belongs to whatever
+    plan the user's goal is on. Empty stack renders nothing, leaving the system prompt's condition
+    to apply as before."""
+    if not activity.parent_frames:
+        return ""
+    return (
+        "This goal is one step of a larger plan — it is NOT a request from the user, and the user "
+        "is not waiting on its result. The plan that owns the user's goal reports back when the "
+        "whole task is done, so do NOT end this plan by invoking `send_message_to_user`: a report "
+        "here reaches the user as a second, partial answer to a question they asked once."
+    )
+
+
 def default_plan_prompt(
     activity: Activity,
     tools: dict[str, Manual],
@@ -654,7 +681,8 @@ def default_plan_prompt(
     ``render_history`` / ``render_messages`` when writing a custom one."""
     observed = observed or PerceptSnapshot()
     user = (
-        f"Goal: {activity.goal}\n\n"
+        f"Goal: {activity.goal}\n"
+        f"{_render_goal_provenance(activity)}\n"
         f"Available tools and their operations:\n{render_tools(tools)}\n\n"
         f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
         f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
