@@ -356,15 +356,19 @@ def _params_schema(app_tool: Any) -> dict[str, Any]:
     return schema
 
 
-# How deep to expand a returned record's nested records into a JSON-Schema shape. A list of records
-# whose fields include another list of records (ARE's ReturnedEmails -> list[Email]) is the deepest
-# real shape; today no ARE app record even reaches this cap (the deepest is record-in-record, and
-# none are self- or mutually-referential). The cap is defensive: a foreign/future annotation that
-# *is* self-referential (`children: list[Node]`, resolved back to the live class by
-# ``get_type_hints``) would otherwise recurse into a ``RecursionError``. When the cap actually
-# elides a nested shape, ``_type_to_schema`` emits a DEBUG log — silent in normal runs, and a lead
-# when a planner ``$from`` path won't resolve because the shape below the cap was dropped.
-_MAX_RETURN_DEPTH = 3
+# How deep to expand a returned record's nested records into a JSON-Schema shape. The deepest real
+# ARE shape is four levels: an envelope whose payload is a list of records, one of whose own fields
+# is a list (CalendarEventsResult -> events: list[CalendarEvent] -> attendees: list[str]; likewise
+# ReturnedEmails -> emails: list[Email] -> recipients: list[str]). The cap was 3, which clipped the
+# innermost list's element type on exactly those ops — and `attendees` is precisely the field a plan
+# needs to path into, so the elision was not cosmetic. 4 expands every real shape and still bounds
+# the walk: the cap is defensive against a foreign/future annotation that is *self*-referential
+# (`children: list[Node]`, resolved back to the live class by ``get_type_hints``), which would
+# otherwise recurse into a ``RecursionError`` — one more level costs nothing there. Raise this only
+# on the same evidence: a real returned shape that a plan must path into and cannot. When the cap
+# does elide a nested shape, ``_type_to_schema`` emits a DEBUG log — a lead when a planner ``$from``
+# path won't resolve because the shape below the cap was dropped.
+_MAX_RETURN_DEPTH = 4
 
 _PRIMITIVE_JSON = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
@@ -382,14 +386,41 @@ def _log_depth_cap(tp: Any) -> None:
     )
 
 
+def _record_fields(tp: Any) -> dict[str, Any] | None:
+    """``{field name: annotation}`` when ``tp`` is a *record* — a dataclass or a ``TypedDict`` —
+    else ``None``. Both spellings carry the same thing for a planner's purposes (named fields to
+    path a ``$from`` into) and differ only in how the field list is reached, so they share one
+    branch in ``_type_to_schema``. ARE uses both, and the split is not incidental: plain records are
+    dataclasses (``Email``, ``CalendarEvent``) while every *paginated envelope* is a TypedDict
+    (``CalendarEventsResult``, ``ProductListResult``). Recognizing only dataclasses therefore left
+    exactly the windowed list reads — the ops whose payload a planner most needs to path into —
+    declaring a bare ``string``. Annotations are resolved where possible, since ARE's app modules
+    use ``from __future__ import annotations``; a dataclass falls back to its raw (string) field
+    annotation, which the string mapper still reads."""
+    if not isinstance(tp, type):
+        return None
+    is_record = dataclasses.is_dataclass(tp) or typing.is_typeddict(tp)
+    if not is_record:
+        return None
+    try:
+        hints = typing.get_type_hints(tp)
+    except Exception:
+        hints = {}
+    if dataclasses.is_dataclass(tp):
+        return {f.name: hints.get(f.name, f.type) for f in dataclasses.fields(tp)}
+    # A TypedDict's own ``__annotations__`` omits inherited keys; ``get_type_hints`` flattens the
+    # bases, so it is the primary and the raw dict only the fallback.
+    return hints or dict(getattr(tp, "__annotations__", {}))
+
+
 def _type_to_schema(tp: Any, depth: int = 0) -> dict[str, Any]:
     """Best-effort JSON-Schema fragment for a Python return annotation — deep enough that a planner
     can author a ``$from`` path into it (list nesting + a record's field names), no deeper. Handles
-    ``list[X]`` (and tuple/set), ``X | None`` unions, dataclasses (one level of fields), and the
-    JSON primitives; anything else (or past the depth cap) degrades to a bare ``string`` rather than
-    raising. A *string* annotation (an unresolved ``from __future__ import annotations`` hint)
-    reuses the union-aware arg-type string mapper (so ``'int | None'`` maps to integer, not the
-    ``string`` a single-atom mapper would give)."""
+    ``list[X]`` (and tuple/set), ``X | None`` unions, records (dataclass or ``TypedDict``, one level
+    of fields — see ``_record_fields``), and the JSON primitives; anything else (or past the depth
+    cap) degrades to a bare ``string`` rather than raising. A *string* annotation (an unresolved
+    ``from __future__ import annotations`` hint) reuses the union-aware arg-type string mapper (so
+    ``'int | None'`` maps to integer, not the ``string`` a single-atom mapper would give)."""
     if isinstance(tp, str):
         return _json_type(tp)
     origin = typing.get_origin(tp)
@@ -416,17 +447,13 @@ def _type_to_schema(tp: Any, depth: int = 0) -> dict[str, Any]:
         return schema
     if origin is tuple or tp is tuple:
         return {"type": "array"}
-    if isinstance(tp, type) and dataclasses.is_dataclass(tp):
+    fields = _record_fields(tp)
+    if fields is not None:
         if depth >= _MAX_RETURN_DEPTH:
             _log_depth_cap(tp)
             return {"type": "string"}
-        try:
-            hints = typing.get_type_hints(tp)
-        except Exception:
-            hints = {f.name: f.type for f in dataclasses.fields(tp)}
         properties = {
-            f.name: _type_to_schema(hints.get(f.name, Any), depth + 1)
-            for f in dataclasses.fields(tp)
+            name: _type_to_schema(annotation, depth + 1) for name, annotation in fields.items()
         }
         return {"type": "object", "properties": properties}
     if tp in _PRIMITIVE_JSON:

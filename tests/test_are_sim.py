@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 
@@ -20,6 +20,7 @@ from sora.adapters.are_sim import (
     AreTransport,
     ValidationOutcome,
     _params_schema,
+    _record_fields,
     _returns_schema,
     _type_to_schema,
 )
@@ -261,6 +262,34 @@ class _Node:
     children: list[_Node]
 
 
+# Mirrors of ARE's *TypedDict* envelopes. ARE spells its plain records as dataclasses but every
+# paginated envelope as a TypedDict, so this is the shape that used to fall through to a bare
+# `string` — see `_record_fields`. `_CalendarEventsResult` is the four-level shape that sets the
+# depth cap: envelope -> list of records -> a record's own list of scalars.
+@dataclass
+class _CalendarEvent:
+    event_id: str
+    title: str
+    attendees: list[str]
+
+
+class _CalendarEventsResult(TypedDict):
+    events: list[_CalendarEvent]
+    range: tuple[int, int]
+    total: int
+
+
+class _ProductMetadata(TypedDict):
+    range: tuple[int, int]
+    total: int
+
+
+class _ProductListResult(TypedDict):
+    # A TypedDict whose own field is another TypedDict — recognizing the outer one is not enough.
+    products: dict[str, str]
+    metadata: _ProductMetadata
+
+
 def test_type_to_schema_expands_a_list_of_records_to_field_names() -> None:
     # The bug's core: search_emails returns a *bare* list[Email], so a resolvable $from path is
     # `0.email_id` — the schema must surface the record's field names, not a fictional wrapper.
@@ -278,6 +307,58 @@ def test_type_to_schema_expands_a_wrapped_record_of_records() -> None:
     emails = schema["properties"]["emails"]
     assert emails["type"] == "array"
     assert set(emails["items"]["properties"]) == {"sender", "email_id", "is_read"}
+
+
+def test_type_to_schema_expands_a_typed_dict_envelope() -> None:
+    # The gap this closes: ARE spells `get_calendar_events_from_to -> CalendarEventsResult` as a
+    # TypedDict, and a dataclass-only record branch let it fall through to a bare `string`. A
+    # planner reading that manual is told the op returns a scalar, so there is no `$from` path to
+    # author into `events` at all — the very ops whose payload most needs indexing were the ones
+    # declaring the least. The whole point is the *named fields*, so assert them, not just the type.
+    schema = _type_to_schema(_CalendarEventsResult)
+    assert schema["type"] == "object"
+    assert set(schema["properties"]) == {"events", "range", "total"}
+    assert schema["properties"]["total"] == {"type": "integer"}
+    events = schema["properties"]["events"]
+    assert events["type"] == "array"
+    assert set(events["items"]["properties"]) == {"event_id", "title", "attendees"}
+
+
+def test_type_to_schema_expands_a_typed_dict_nested_in_a_typed_dict() -> None:
+    # ARE's ProductListResult carries a ProductMetadata: recognizing only the outer envelope would
+    # leave the inner one a `string` leaf. A `dict[str, str]` field stays a bare `object` — its keys
+    # are data (product names), so there are no field names to declare.
+    schema = _type_to_schema(_ProductListResult)
+    assert schema["properties"]["products"] == {"type": "object"}
+    metadata = schema["properties"]["metadata"]
+    assert metadata["type"] == "object"
+    assert set(metadata["properties"]) == {"range", "total"}
+
+
+def test_the_depth_cap_admits_the_deepest_real_are_shape(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # envelope -> list of records -> a record's own list of scalars is four levels, and it is the
+    # deepest shape ARE actually returns. The cap must not clip it: `attendees` losing its element
+    # type is exactly the elision that matters, since attendees is what a plan paths into. No cap
+    # log either — a DEBUG line here would be a false lead on a shape that resolved fine.
+    with caplog.at_level(logging.DEBUG, logger="sora.adapters.are_sim"):
+        schema = _type_to_schema(_CalendarEventsResult)
+
+    attendees = schema["properties"]["events"]["items"]["properties"]["attendees"]
+    assert attendees == {"type": "array", "items": {"type": "string"}}
+    assert [r for r in caplog.records if "depth cap" in r.getMessage()] == []
+
+
+def test_record_fields_reads_both_record_spellings_and_nothing_else() -> None:
+    assert _record_fields(_ProductMetadata) is not None
+    assert set(_record_fields(_ProductMetadata) or {}) == {"range", "total"}
+    assert set(_record_fields(_Email) or {}) == {"sender", "email_id", "is_read"}
+    # Not records: a plain dict (arbitrary keys, no field names), a primitive, a parameterized
+    # generic. Each must fall through to its own branch rather than being read as an empty record.
+    assert _record_fields(dict) is None
+    assert _record_fields(str) is None
+    assert _record_fields(list[_Email]) is None
 
 
 def test_type_to_schema_handles_leaf_and_optional_types() -> None:
@@ -301,9 +382,19 @@ def test_type_to_schema_bounds_a_self_referential_record_and_logs_at_the_cap(
     with caplog.at_level(logging.DEBUG, logger="sora.adapters.are_sim"):
         schema = _type_to_schema(_Node)
 
-    # Bounded: the deepest reached `children` is a bare array with no `items` (shape below elided).
-    deepest = schema["properties"]["children"]["items"]["properties"]["children"]
-    assert deepest == {"type": "array"}
+    # Bounded: descend `children` -> `items` as far as the schema goes and assert it *ends* — in a
+    # leaf or an `items`-less array — rather than pinning the exact number of levels, which is the
+    # tunable `_MAX_RETURN_DEPTH` and not what this test is about.
+    node: dict[str, Any] = schema
+    levels = 0
+    while "properties" in node:
+        children = node["properties"]["children"]
+        assert children["type"] == "array"
+        if "items" not in children:
+            break  # clipped: shape below the cap elided
+        node = children["items"]
+        levels += 1
+    assert 0 < levels < 10  # terminated, and not by exhausting the recursion limit
     cap_logs = [r for r in caplog.records if "depth cap" in r.getMessage()]
     assert len(cap_logs) == 1
     assert cap_logs[0].levelno == logging.DEBUG
