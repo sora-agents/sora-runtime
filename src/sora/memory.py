@@ -28,7 +28,16 @@ from sora.manual import (
     ToolRecord,
     WorkspaceRecord,
 )
-from sora.types import CompletedOperation, Plan, Step, SupersededPlan
+from sora.types import (
+    Change,
+    CompletedOperation,
+    ConditionVerdict,
+    PendingCondition,
+    Plan,
+    SignalWait,
+    Step,
+    SupersededPlan,
+)
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -132,6 +141,16 @@ class WorkingMemory:  # transient, in-process, fast
     # directly) — the only eviction is the retention cap bounding orphan growth.
     properties: dict[tuple[str, str], Percept] = field(default_factory=dict)
     signals: list[Percept] = field(default_factory=list)
+    # Monotonic count of signals EVER appended — never decremented by the retention cap, so the
+    # sequence number of signals[i] is `signals_appended - len(signals) + i`. A waiter that must not
+    # re-evaluate a signal it has already seen keeps its own high-water mark against this; it cannot
+    # be a list index, because the cap front-evicts and would silently shift every stored index.
+    # Deliberately NOT a shared consumed-cursor like messages_cursor: that shape is correct there
+    # (a message must drive activity-creation at most once) and wrong here, where signals are a
+    # broadcast log with many independent readers — the first reader to advance a shared cursor
+    # would blind all the others. Adding it here rather than to Percept keeps a sequence number off
+    # the property half of the store, where it would be meaningless.
+    signals_appended: int = 0
     # inbound agent-to-agent communication — kept distinct
     messages: list[Message] = field(default_factory=list)
     # Count of messages already routed (turned into an activity goal by Situate, or claimed as
@@ -382,7 +401,40 @@ PLAN_SYSTEM_PROMPT = (
     "as a literal: such an id is specific to this run's data, so a plan that hardcodes it is not "
     "reusable and breaks the next time the same goal runs against different data. For an id, still "
     "emit a $from reference to the operation that yields it (adding the narrowing search/list step "
-    "if the plan lacks one), exactly as you would if it were not currently visible."
+    "if the plan lacks one), exactly as you would if it were not currently visible.\n"
+    # Pending conditions. This is the one part of the contract the planner most reliably gets wrong
+    # by OMISSION rather than by malformation: a run that stated three conditional clauses in its
+    # own prose encoded none of them as structure, terminated on a confirmation, and had nothing
+    # alive when the awaited reply arrived. Hence the explicit instruction to re-read the goal for
+    # conditional language, and the worked example showing prose -> structure for that shape.
+    'A plan MAY also carry {"pending": [ ... ]} alongside "steps". A pending condition says what '
+    "would make this goal relevant AGAIN after the steps are done — so the activity waits instead "
+    "of finishing. Re-read the goal for conditional language ('if', 'in case', 'should X happen', "
+    "'let me know when', 'once they reply') and turn EACH such clause into one entry. Do not leave "
+    "a condition in prose: a clause you mention but do not encode here is silently lost the moment "
+    "the last step completes. Each entry is:\n"
+    '  {"watch": {"signal": "<signal name>", "source": "<tool id>", "path": "<dotted path>"}, '
+    '"when": "<what must have happened>", "then": "<what to do about it>", '
+    '"until": "<when to stop waiting>"}\n'
+    '"watch" is REQUIRED and is a cheap mechanical filter, not the judgement: name the signal and '
+    "the tool that would carry the news, and use `path` to point at the part of that tool's "
+    "observable state that would move — it is what stops every unrelated event from waking this "
+    "goal, INCLUDING the agent's own writes, which usually land somewhere different from what it "
+    "is waiting on. `when` is the actual judgement, in plain language. `then` is a goal, phrased "
+    "like the original goal — the runtime plans it fresh when the moment comes, so do not write "
+    "steps here. `until` bounds the wait.\n"
+    'Example — goal: "Book the Rembrandt restoration slot for the 14th and tell the conservator; '
+    "if she can't make it, rebook for whatever day she suggests.\" The second clause is a pending "
+    "condition, not a step:\n"
+    '  {"steps": [ ... book the slot, message the conservator, report to the user ... ],\n'
+    '   "pending": [{"watch": {"signal": "state_changed", "source": "<messaging tool id>", '
+    '"path": "folders.INBOX.messages"},\n'
+    '     "when": "the conservator replies that the 14th does not work, or proposes another day",\n'
+    '     "then": "Rebook the Rembrandt restoration slot for the day she proposes, clearing '
+    'whatever is already booked then",\n'
+    '     "until": "the restoration slot has taken place"}]}\n'
+    "Emit no `pending` at all when the goal is unconditional — most goals are. A condition you "
+    "cannot name a watch for does not belong here."
 )
 
 
@@ -728,6 +780,58 @@ def _parse_plan_steps(text: str) -> list[Step]:
         raise ValueError(f"could not parse a plan from model output: {exc!r}\n---\n{text}") from exc
 
 
+def pending_from_raw(raw: dict[str, Any]) -> PendingCondition | None:
+    """Convert one raw ``pending`` entry into a ``PendingCondition``, or None if it is unusable.
+
+    A malformed condition is **dropped, not raised**: the body is the part that does the work, and
+    failing a whole plan because the model mis-shaped an optional forward-looking clause would trade
+    a partial success for a total one. Dropping is also the honest degradation — it lands the run
+    back on the pre-conditions behavior (terminate when the body ends) rather than on a wait that
+    can never fire.
+
+    ``watch`` is required and must name a signal, because a condition without a mechanical gate is
+    the unbounded keep-alive this design rejected: it would have to be evaluated against every
+    signal the agent ever sees. A missing ``when``/``then`` is equally fatal — there would be
+    nothing to judge or nothing to do.
+    """
+    if not isinstance(raw, dict):
+        return None
+    watch = raw.get("watch")
+    when, then = raw.get("when"), raw.get("then")
+    if not isinstance(watch, dict) or not isinstance(when, str) or not isinstance(then, str):
+        return None
+    signal_name = watch.get("signal") or watch.get("signal_name")
+    if not isinstance(signal_name, str) or not signal_name:
+        return None
+    if not when.strip() or not then.strip():
+        return None
+    until = raw.get("until")
+    return PendingCondition(
+        watch=SignalWait(
+            signal_name=signal_name,
+            source=watch.get("source"),
+            path=watch.get("path"),
+        ),
+        when=when,
+        then=then,
+        until=until if isinstance(until, str) and until.strip() else None,
+    )
+
+
+def _parse_plan_pending(text: str) -> tuple[PendingCondition, ...]:
+    """The ``pending`` half of the plan contract. Absent means none — every plan predates this
+    field, and a planner that declares nothing must keep working exactly as before."""
+    try:
+        data = _load_json_object(text)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return ()  # the steps parse above already raised on genuinely unparseable output
+    raw = data.get("pending") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return ()
+    parsed = (pending_from_raw(entry) for entry in raw)
+    return tuple(cond for cond in parsed if cond is not None)
+
+
 def _strip_code_fences(text: str) -> str:
     """Tolerate a ```json ... ``` or bare ``` wrapper (models can add one despite the ask not to."""
     stripped = text.strip()
@@ -938,6 +1042,39 @@ def render_steps(steps: list[Step]) -> str:
     )
 
 
+def render_pending(pending: tuple[PendingCondition, ...]) -> str:
+    """Render a plan's declared pending conditions, one block per condition, or ``""`` when there
+    are none — so a caller can append it to ``render_steps`` unconditionally and a body-only plan
+    renders exactly as it did before.
+
+    Separate from ``render_steps`` rather than folded into it because the two have different
+    audiences: ``render_steps`` is also the revalidation prompt's rendering and is handed a step
+    *tail*, which has no plan and therefore no conditions to show. Kept in the trace at all because
+    a declared condition is otherwise invisible — the body is what executes, so a plan that silently
+    failed to declare a gate and one that declared a good gate produce identical logs, and telling
+    those apart is the whole question when a run ends early."""
+    if not pending:
+        return ""
+    lines = ["pending:"]
+    for index, condition in enumerate(pending):
+        watch = {
+            "signal": condition.watch.signal_name,
+            "source": condition.watch.source,
+            "path": condition.watch.path,
+        }
+        lines.append(f"{index}: watch {json.dumps(watch, default=str)}")
+        lines.append(f"   when  {condition.when}")
+        lines.append(f"   then  {condition.then}")
+        if condition.until is not None:
+            lines.append(f"   until {condition.until}")
+    return "\n".join(lines)
+
+
+def render_plan(plan: Plan) -> str:
+    """A whole plan body for the DEBUG trace: steps, then any declared pending conditions."""
+    return "\n".join(filter(None, (render_steps(plan.steps), render_pending(plan.pending))))
+
+
 def remaining_steps(
     plan: Plan | None, step_index: int, parent_frames: list[tuple[Plan, int]]
 ) -> list[Step]:
@@ -1067,6 +1204,57 @@ def _parse_verdict(text: str) -> bool:
     except (ValueError, KeyError, TypeError):
         return True
 
+
+# --- pending conditions: the batched "did any of these fire?" judgement — ADR-0022 --------------
+
+CONDITION_SYSTEM_PROMPT = (
+    "You are deciding whether an agent's declared FOLLOW-UP CONDITIONS have come true. The agent "
+    "finished a task and is waiting in case something specific happens. Something changed in its "
+    "environment; you decide whether that change is what it was waiting for.\n"
+    "You are given the original goal, and a numbered list of conditions. Each has a `when` (what "
+    "the agent is waiting for) and, optionally, an `until` (when it should stop waiting). You are "
+    "also given the observed change and the current state it landed in.\n"
+    "For each condition decide, independently:\n"
+    "  - FIRED: the `when` has actually happened, judged from the observed state. Be strict — the "
+    "change reaching the agent is only a prompt to look; most changes are not the awaited event, "
+    "and a wrong `fired` makes the agent redo work nobody asked for.\n"
+    "  - RETIRED: the `until` is now satisfied, so the agent should stop waiting on it. A "
+    "condition with no `until` is retired only if waiting has become pointless.\n"
+    "A condition can be neither (the usual answer: keep waiting), or both.\n"
+    'Respond with ONLY a JSON object {"fired": [<indices>], "retired": [<indices>]} — 0-based '
+    "indices into the numbered list, no prose, no fences. Use empty lists when nothing applies."
+)
+
+
+def _parse_condition_verdict(text: str, count: int) -> ConditionVerdict:
+    """Parse the batched ``{"fired": [...], "retired": [...]}`` answer.
+
+    Degrades to "nothing happened" on malformed output rather than raising: the activity then keeps
+    waiting, which is the same state it was already in. The opposite default would let a flaky call
+    invent follow-up work — the expensive, user-visible failure. Out-of-range indices are dropped
+    for the same reason, so a hallucinated index cannot retire a condition that is still live.
+    """
+    try:
+        obj = _load_json_object(text)
+    except (ValueError, TypeError, AttributeError):
+        return ConditionVerdict()
+
+    def _indices(key: str) -> tuple[int, ...]:
+        raw = obj.get(key) if isinstance(obj, dict) else None
+        if not isinstance(raw, list):
+            return ()
+        out: list[int] = []
+        for entry in raw:
+            if isinstance(entry, bool) or not isinstance(entry, int):
+                continue  # bool is an int subclass; a `true` here is not index 1
+            if 0 <= entry < count and entry not in out:
+                out.append(entry)
+        return tuple(out)
+
+    return ConditionVerdict(fired=_indices("fired"), retired=_indices("retired"))
+
+
+# --- undeclared relevance: does a change bear on work that already finished? — ADR-0026 ----------
 
 # --- select: the model-escalated data-op filter predicate ($decide) — ADR-0023 -------------------
 
@@ -1203,8 +1391,19 @@ class ProceduralMemory:
             )
         system, user = self._prompt(activity, tools, observed or PerceptSnapshot(), messages or [])
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
+
+        def _to_plan(text: str) -> Plan:
+            # Both halves parse from the same object, so they share the one retry: a plan recovered
+            # without its declared conditions would look complete while quietly dropping the gate.
+            return Plan(
+                id=uuid.uuid4().hex,
+                goal=activity.goal,
+                steps=_parse_plan_steps(text),
+                pending=_parse_plan_pending(text),
+            )
+
         text = await self._llm.complete(system=system, prompt=user)
-        return Plan(id=uuid.uuid4().hex, goal=activity.goal, steps=_parse_plan_steps(text))
+        return _to_plan(text)
 
     async def ground(
         self,
@@ -1298,6 +1497,58 @@ class ProceduralMemory:
         text = await self._llm.complete(system=REVALIDATE_SYSTEM_PROMPT, prompt=user)
         return _parse_verdict(text)
 
+    async def evaluate_conditions(
+        self,
+        activity: Activity,
+        conditions: Sequence[PendingCondition],
+        changes: Sequence[Change],
+        observed: PerceptSnapshot | None = None,
+    ) -> ConditionVerdict:
+        """Judge, in ONE call, which of an activity's eligible pending conditions have fired or
+        retired (ADR-0022).
+
+        Batched by design: the alternative is a call per condition per signal, and the whole point
+        of the mechanical `watch` gate is to make the model see only changes that already passed a
+        cheap filter. Batching is what keeps that saving as conditions accumulate.
+
+        The `changes` are rendered as *where* to look; the values behind them come from the observed
+        property snapshot, which is exactly the division of labour a located change summary exists
+        to create — the judgement reads one named path instead of re-scanning a whole property.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "ProceduralMemory has no LLM configured; cannot evaluate pending conditions."
+            )
+        if not conditions:
+            return ConditionVerdict()
+        snapshot = observed or PerceptSnapshot()
+        listed = "\n".join(
+            f"{i}. when: {c.when}\n   until: {c.until or '(no explicit bound)'}"
+            for i, c in enumerate(conditions)
+        )
+        where = (
+            "\n".join(
+                f"- {ch.path or '(whole property)'}"
+                + (f" added={list(ch.added)}" if ch.added else "")
+                + (f" removed={list(ch.removed)}" if ch.removed else "")
+                + (f" updated={list(ch.updated)}" if ch.updated else "")
+                for ch in changes
+            )
+            or "(the source reported no detail about what moved)"
+        )
+        user = (
+            f"Original goal: {activity.goal}\n"
+            f"Conditions:\n{listed}\n"
+            f"What changed:\n{where}\n"
+            f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
+            f"Recently observed signals:\n{render_signals(snapshot.signals)}"
+        )
+        log.debug(
+            "reason: condition system prompt\n%s\nUser prompt\n%s", CONDITION_SYSTEM_PROMPT, user
+        )
+        text = await self._llm.complete(system=CONDITION_SYSTEM_PROMPT, prompt=user)
+        return _parse_condition_verdict(text, len(conditions))
+
     async def store(self, plan: Plan) -> None:
         """Persists a Plan that was actually followed to completion, so future retrieve() calls
         for similar goals can reuse it. Called by ReflectStrategy on success only — a failed plan
@@ -1307,10 +1558,23 @@ class ProceduralMemory:
     @staticmethod
     def _from_dict(data: dict[str, Any]) -> Plan:
         # Rebuild the dataclass graph the backend flattened to plain dict/list/scalar on store.
+        # `pending` needs rebuilding too, and its nested SignalWait with it: a JSON round-trip
+        # leaves plain dicts, so skipping this would hand back a "plan" whose declared conditions
+        # are dicts that no wait can ever match — the conditions would look present and silently
+        # never fire. Absent (a plan stored before conditions existed) means none.
         return Plan(
             id=data["id"],
             goal=data["goal"],
             steps=[Step(**step) for step in data["steps"]],
+            pending=tuple(
+                PendingCondition(
+                    watch=SignalWait(**cond["watch"]),
+                    when=cond["when"],
+                    then=cond["then"],
+                    until=cond.get("until"),
+                )
+                for cond in (data.get("pending") or ())
+            ),
         )
 
 

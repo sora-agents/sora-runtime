@@ -42,7 +42,7 @@ from sora.manual import (
     merge_manuals,
 )
 from sora.perception import Message
-from sora.types import ObservableProperty, OperationAck, Signal
+from sora.types import Change, ObservableProperty, OperationAck, Signal
 
 if TYPE_CHECKING:
     from sora.environment import Tool, Workspace, WorkspaceOrigin
@@ -59,6 +59,75 @@ _AUI_APP = "AgentUserInterface"  # ARE's user-message app; routed via the transp
 # "changed size during iteration". Mutation happens in sub-second bursts, so an immediate re-read
 # sees a settled snapshot — retry a few times before giving up.
 _STATE_READ_ATTEMPTS = 3
+
+# How deep the change diff walks before reporting a subtree coarsely. ARE state nests app -> folders
+# -> folder -> emails, so a handful of levels reaches the collections that actually matter; beyond
+# that the extra precision is not worth walking a large structure on every observe.
+_DIFF_MAX_DEPTH = 6
+
+
+def _identities(value: Any) -> dict[str, Any] | None:
+    """Read a container as {identity: item}, or None if it isn't one we can identify items in.
+
+    A dict is already keyed. A list of dicts is keyed by each item's own id-ish field — which is
+    what makes "this email appeared" expressible at all. A list of scalars has no identity to
+    report, so it degrades to the coarse form rather than inventing positional ids that would
+    change meaning whenever anything is inserted.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        keyed: dict[str, Any] = {}
+        for item in value:
+            if not isinstance(item, dict):
+                return None
+            ident = (
+                item.get("id") or item.get("uid") or item.get("event_id") or item.get("email_id")
+            )
+            if not isinstance(ident, str | int):
+                return None
+            keyed[str(ident)] = item
+        return keyed
+    return None
+
+
+def _diff_state(previous: Any, current: Any, path: str = "", depth: int = 0) -> list[Change]:
+    """Locate what moved between two app-state snapshots, as identities rather than values.
+
+    Recurses while both sides are containers whose items can be identified, so the reported path is
+    as specific as the data allows — ``folders.INBOX.emails`` rather than the whole app. That
+    specificity is the entire point: it is what lets a waiter tell an inbound message from the
+    agent's own outbound one without any reasoning about self-causation, since they land in
+    different folders.
+
+    Degrades rather than fails at every step. An unidentifiable container, a type change, or the
+    depth limit all produce a coarse ``Change`` naming the deepest path known to have moved —
+    "something under here changed" — which consumers must accept.
+    """
+    if previous == current:
+        return []
+    if depth >= _DIFF_MAX_DEPTH:
+        return [Change(path=path)]
+    prev_items, curr_items = _identities(previous), _identities(current)
+    if prev_items is None or curr_items is None:
+        return [Change(path=path)]
+    added = tuple(k for k in curr_items if k not in prev_items)
+    removed = tuple(k for k in prev_items if k not in curr_items)
+    shared = [k for k in curr_items if k in prev_items and curr_items[k] != prev_items[k]]
+    changes: list[Change] = []
+    if added or removed:
+        changes.append(Change(path=path, added=added, removed=removed, updated=tuple(shared)))
+    for key in shared:
+        child = f"{path}.{key}" if path else key
+        nested = _diff_state(prev_items[key], curr_items[key], child, depth + 1)
+        # A leaf that changed value has no sub-structure to name; report the leaf itself as moved
+        # so the path still points somewhere useful rather than vanishing from the summary.
+        changes.extend(nested or [Change(path=child)])
+    if not changes:
+        # Both sides identifiable and same keys, but unequal — a value-only change somewhere we
+        # could not localize. Report the level itself rather than nothing.
+        changes.append(Change(path=path, updated=tuple(shared)))
+    return changes
 
 
 class Simulation(Protocol):
@@ -479,13 +548,26 @@ class _AreTool:
         # from inside that screen a no-op (state == self._state -> no second push) rather than a
         # recursion.
         state = self._read_state()
-        changed = state != self._state
+        previous = self._state
+        changed = state != previous
         self._state = state
         if self._sink is not None and changed:
             # Thin: the event, not the state. The snapshot is published as the `state` observable
             # property below; duplicating it into the signal would only reproduce it in every
-            # prompt that renders wm.signals.
-            self._sink.push(self.id, Signal("state_changed", {"app": self._app.app_name()}))
+            # prompt that renders wm.signals. But thin is not contentless — the payload also names
+            # WHERE it moved, which is the one thing a replace-by-key snapshot cannot express and
+            # so duplicates nothing. This diff is nearly free: the comparison above already walks
+            # both snapshots to decide `changed` at all, and today throws the result away.
+            self._sink.push(
+                self.id,
+                Signal(
+                    "state_changed",
+                    {
+                        "app": self._app.app_name(),
+                        "changes": _diff_state(previous, state),
+                    },
+                ),
+            )
         # `self._state`, not the local: the push screen re-enters observe(), and if ARE's thread
         # mutated state in between, that nested call already advanced `self._state` past the local.
         # Returning the local would snapshot the pre-change world into working memory for one tick.
@@ -498,7 +580,12 @@ class _AreTool:
         last: RuntimeError | None = None
         for _ in range(_STATE_READ_ATTEMPTS):
             try:
-                return self._sim.run(self._app.get_state)
+                # Same normalization invoke() applies to an op result. ARE builds app state with
+                # asdict(), which leaves Enum members in place: a mechanical `eq` against "Female"
+                # then fails against <Gender.FEMALE: 'Female'>, and the value defeats JSON rendering
+                # in prompts. Observed state is ground for the same comparisons an op result is, so
+                # it has to arrive in the same shape.
+                return _to_serializable(self._sim.run(self._app.get_state))
             except RuntimeError as exc:  # concurrent modification by the ARE event-loop thread
                 last = exc
         assert last is not None

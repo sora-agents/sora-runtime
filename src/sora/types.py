@@ -23,9 +23,31 @@ class ObservableProperty:
 
 
 @dataclass(frozen=True)
+class Change:  # WHERE an observable property moved — see Signal.payload["changes"]
+    # The one fact a replace-by-key snapshot structurally cannot hold. `properties` answers "what is
+    # true now" and never "what just moved", so a contentless signal forces every waiter to
+    # re-derive a delta against a store that keeps no previous value to diff against — impossible
+    # without the waiter shadowing the whole property itself. The three tuples carry *identities*
+    # only, never the values behind them: the snapshot stays in `properties` and this says where to
+    # look inside it, which is what makes a property dereferenceable rather than re-scannable. That
+    # keeps the thin-signal rule intact (nothing is duplicated, because a delta is not in the
+    # snapshot at all).
+    # Adapters DEGRADE rather than fail: a WoT property observation is already event-shaped, an MCP
+    # resources/updated carries only a URI, and an adapter that cannot identify individual items
+    # emits the coarse form — a `path` with all three tuples empty, meaning "something under here
+    # moved". Consumers must accept the coarse form.
+    path: str = ""  # dotted path into the property's value; "" = the property as a whole
+    added: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    updated: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Signal:
     name: str
-    payload: dict[str, Any]
+    payload: dict[
+        str, Any
+    ]  # may carry "changes": list[Change] — never the changed values themselves
 
 
 @dataclass(frozen=True)
@@ -38,6 +60,63 @@ class SignalWait:  # what a `blocked` activity is waiting for — see Activity.b
     # generally rather than blocked_on_signal.
     signal_name: str
     source: str | None = None  # tool id the signal must come from; None matches any source
+    path: str | None = None  # scope to part of the property; None matches any (today's behavior)
+
+
+def path_matches(wait_path: str | None, changes: list[Change]) -> bool:
+    """Does a path-scoped wait match a signal's change summary?
+
+    Bidirectional prefix on purpose: a change *inside* the watched subtree is relevant, and so is a
+    coarser change reported *above* it by a degrading adapter. The second direction is what keeps a
+    lossy adapter correct — it costs redundant evaluations but never missed ones, and a missed wake
+    is the failure this mechanism exists to prevent. A wait with no path matches any change, and a
+    signal with no `changes` at all matches a path-scoped wait too: an adapter that reports nothing
+    is indistinguishable from one reporting a change everywhere, so the safe reading is wide.
+
+    Prefix on *segments*, not on characters: these paths are dotted routes, and two siblings are not
+    ancestors of one another however much of a leading substring they share. A raw `startswith`
+    read `folders.INBOX_ARCHIVE` as living under `folders.INBOX`, and `contacts.contact_10` as
+    living under `contacts.contact_1` — and numerically-suffixed ids are exactly what these paths
+    are built from, so that is a systematic false wake, not an edge case.
+    """
+    if wait_path is None or not changes:
+        return True
+    return any(
+        change.path == ""
+        or change.path == wait_path
+        or change.path.startswith(f"{wait_path}.")
+        or wait_path.startswith(f"{change.path}.")
+        for change in changes
+    )
+
+
+def changes_of(signal: Signal) -> list[Change]:
+    """The `changes` a signal carries, tolerating adapters that emit none or emit plain dicts.
+
+    Payloads cross a serialization boundary (a persisted percept, a JSON-shaped adapter), so a
+    `changes` entry may arrive as a dict rather than a Change; normalize instead of trusting the
+    producer. An unparseable entry degrades to the coarse form rather than raising — a malformed
+    delta must not be able to break a wait that would otherwise have matched.
+    """
+    raw = signal.payload.get("changes") if isinstance(signal.payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out: list[Change] = []
+    for entry in raw:
+        if isinstance(entry, Change):
+            out.append(entry)
+        elif isinstance(entry, dict):
+            out.append(
+                Change(
+                    path=str(entry.get("path", "")),
+                    added=tuple(entry.get("added", ()) or ()),
+                    removed=tuple(entry.get("removed", ()) or ()),
+                    updated=tuple(entry.get("updated", ()) or ()),
+                )
+            )
+        else:
+            out.append(Change())
+    return out
 
 
 @dataclass(frozen=True)
@@ -48,6 +127,61 @@ class InputWait:  # a `blocked` activity awaiting the user's next instruction (s
     # no tool signal to match; the awaited stimulus is inbound user input, so it carries only an
     # optional human-facing note on what is being waited for.
     prompt: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingCondition:  # what would make an exhausted plan relevant again — see Plan.pending
+    # AgentSpeak's trigger, pointed forward. Only the gate is typed: `when`/`then`/`until` are prose
+    # because their consumer is _infer_, which already takes prose goals — so this adds no condition
+    # language, no predicate DSL and no event algebra to the plan. *Where to look* is the only part
+    # a protocol can answer, so it is the only part given a structure, and it is also the part that
+    # has to be cheap. `watch` is required: a condition with no gate degenerates into evaluating
+    # every condition against every signal, which is the unbounded keep-alive this design rejected.
+    # Firing does not consume a condition — `until` is what ends it — so "whenever X" needs no flag.
+    watch: SignalWait
+    when: str
+    then: str
+    until: str | None = None
+
+
+@dataclass
+class PendingConditionState:  # one PendingCondition's per-run state — on Activity, not Plan
+    # The plan holds the reusable skeleton; how far this condition has evaluated is per-run, exactly
+    # as step_index is to the body. `evaluated_through` is this condition's OWN high-water mark over
+    # WorkingMemory.signals_appended — per-waiter on purpose. A single shared cursor (the shape
+    # messages_cursor takes, correct there because a message must create an activity at most once)
+    # would let the first condition to advance it blind every other reader of that broadcast log.
+    condition: PendingCondition
+    evaluated_through: int = 0
+
+
+@dataclass(frozen=True)
+class ConditionVerdict:
+    """One batched judgement over an activity's *eligible* pending conditions (ADR-0022).
+
+    Indices are into the eligible list the call was made about, not into
+    ``Activity.pending_conditions`` — the caller holds the correspondence, so a model that echoes a
+    stale index cannot silently retire the wrong condition.
+
+    Deliberately carries no steps. A condition that fires is planned by the ordinary deliberative
+    sub-goal path afterwards, which costs a second call only in the rare case where something
+    actually holds, and keeps the common case — a gate opened, the change was not the awaited one —
+    at exactly one call. It also means this prompt never has to double as a planning prompt.
+    """
+
+    fired: tuple[int, ...] = ()
+    retired: tuple[int, ...] = ()  # `until` is now satisfied; the condition stops waiting
+
+
+@dataclass(frozen=True)
+class ConditionWait:  # the third blocked_on variant — a plan's own declared pending conditions
+    # Set when a plan body is exhausted but unsatisfied conditions remain, so the activity blocks
+    # instead of terminating. blocked_on stays a single value: the plurality lives in this one wait,
+    # whose watches are the union of the unsatisfied conditions'. Matched by the same mechanical
+    # name/source/path equality as a SignalWait, but with a different meaning on the far side —
+    # opening a gate only makes a condition ELIGIBLE. Whether it actually *holds* is a Reason
+    # judgment, because matching prose against an email body is irreducibly semantic.
+    watches: tuple[SignalWait, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,7 +248,7 @@ class InferenceResult:  # what infer()/ground() resolve to — arrives async via
     # Plan (kind "plan"/"subgoal"), grounded params dict (kind "ground"), the surviving-subset list
     # (kind "select" — a $decide data-op filter, ADR-0023), or a bool verdict (kind "revalidate" —
     # the context-adaptation plan-validity re-check, ADR-0024).
-    value: Plan | dict[str, Any] | list[Any] | bool | None = None
+    value: Plan | ConditionVerdict | dict[str, Any] | list[Any] | bool | None = None
     error: str | None = None
 
 
@@ -159,6 +293,12 @@ class Plan:  # multi-step, goal-indexed, reusable — the thing ProceduralMemory
     id: str  # stable identity for storage/reuse
     goal: str  # matched against future activities' goals — the retrieval key
     steps: list[Step]
+    # What would make this plan relevant AGAIN once its body is exhausted. Part of the reusable
+    # skeleton (the per-run state lives on Activity.pending_conditions), and deliberately NOT plan
+    # control flow: a condition is not a step, never blocks the body, and executes nothing. It
+    # declares what a wait would be *for*, while every state transition it implies — the suspend,
+    # the match, the resume — stays the cycle's. Declaring is the plan's job; waiting the cycle's.
+    pending: tuple[PendingCondition, ...] = ()
 
 
 @dataclass(frozen=True)

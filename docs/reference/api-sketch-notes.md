@@ -21,14 +21,39 @@
         value: Any
 
     @dataclass(frozen=True)
+    class Change:             # WHERE a property moved — the one fact a replace-by-key snapshot can't hold
+        path: str = ""        # dotted path into the property's value ("folders.INBOX.emails"); "" = the whole
+        #                       property. A coarse Change (path set, all three tuples empty) means "something
+        #                       under here moved" — adapters DEGRADE to it rather than fail, and consumers
+        #                       must accept it (WoT property observations are already event-shaped; an MCP
+        #                       resources/updated carries only a URI).
+        added: tuple[str, ...] = ()     # IDENTITIES only, never the values behind them — the snapshot stays
+        removed: tuple[str, ...] = ()   # in WorkingMemory.properties and the summary says where to look
+        updated: tuple[str, ...] = ()   # inside it, so the property becomes dereferenceable, not re-scannable.
+        # Thin-signal rule preserved: a Change carries no state, and a delta is exactly what the snapshot
+        # cannot express, so nothing is duplicated. The adapter owns the computation and mostly already does
+        # it — ARE's observe() diffs prev/current to decide whether anything changed at all. See ADR-0019.
+
+    @dataclass(frozen=True)
     class Signal:
         name: str
-        payload: dict
+        payload: dict         # may carry "changes": list[Change] — see Change above. Never the changed values
+        #                       themselves (that would duplicate `properties` and reproduce the payload in every
+        #                       prompt rendering wm.signals); a $prop reference reaches those.
 
     @dataclass(frozen=True)
     class SignalWait:         # what a `blocked` activity waits for — see Activity.blocked_on
         signal_name: str      # matched mechanically in Observe (name equality, plus source when scoped)
         source: str | None = None  # tool id the signal must come from; None matches any source
+        path: str | None = None    # scope the wait to part of the property (None matches any, = today's
+        #                       behavior). Matches when some Change.path is a prefix of this OR this is a
+        #                       prefix of it — BIDIRECTIONAL on purpose: a change inside the watched subtree
+        #                       is relevant, and so is a coarser one reported above it by a degrading adapter.
+        #                       Costs redundant evaluations, never missed ones. This is also what tells a
+        #                       tool's own echo from an exogenous change generally, with no per-adapter
+        #                       reasoning about self-causation: an agent that mails and awaits a reply sees
+        #                       its own send move folders.SENT.emails and the reply move folders.INBOX.emails
+        #                       — same signal name, same source, told apart by where they landed.
         # A future variant will wait on an observable property reaching a state (README's "signal *or*
         # property update") — deferred; hence Activity.blocked_on is named generally, not blocked_on_signal.
 
@@ -38,6 +63,60 @@
         # A `blocked` activity awaiting the user's next instruction, set by the interrupt handler when a
         # hard interrupt (a user stop) pauses it; cleared in Observe when a user Message arrives (not a
         # tool signal to match — the awaited stimulus is inbound user input). See ADR-0020.
+
+    @dataclass(frozen=True)
+    class ConditionWait:      # the THIRD blocked_on variant — a plan's own declared pending conditions
+        watches: tuple[SignalWait, ...] = ()   # union of the unsatisfied conditions' watches; ANY match resumes
+        # Set when a plan body is exhausted but Plan.pending still holds unsatisfied conditions, so the
+        # activity BLOCKS instead of terminating. blocked_on stays a single value — the plurality lives in
+        # this one wait. Matched by the same mechanical name/source/path equality as a SignalWait; opening a
+        # gate only makes a condition ELIGIBLE, it never decides that the condition holds (that's a Reason
+        # judgment — see PendingCondition). ADR-0022.
+
+    @dataclass(frozen=True)
+    class PendingCondition:   # what would make an exhausted plan relevant again — AgentSpeak's trigger, forward
+        watch: SignalWait     # the MECHANICAL GATE. Required: a condition with no gate degenerates into
+        #                       evaluating every condition against every signal, which is the unbounded
+        #                       keep-alive ADR-0022 rejected wearing a field name.
+        when: str             # semantic trigger, judged only against changes that already passed the gate
+        then: str             # sub-goal to pursue when `when` holds — pushed as a frame, the deliberative
+        #                       sub-goal path, triggered rather than positional
+        until: str | None = None   # the bound that retires the condition; evaluated in the same call as `when`
+        # Only the gate is typed: when/then/until are prose because their consumer is _infer_, which already
+        # takes prose goals — so this adds no condition language, no predicate DSL, no event algebra. WHERE to
+        # look is the only part a protocol can answer, so it is the only part given structure, and it is also
+        # the part that has to be cheap. Firing does not consume a condition (`until` ends it), so "whenever X"
+        # needs no extra field. ADR-0022.
+
+    @dataclass(frozen=True)
+    class ConditionVerdict:   # one BATCHED judgement over an activity's *eligible* pending conditions
+        fired: tuple[int, ...] = ()     # indices into the eligible list the call was made about — the
+        retired: tuple[int, ...] = ()   #   caller holds the correspondence, so a stale index can't
+        #                                   retire the wrong condition. `retired` = its `until` now holds.
+        # Deliberately carries NO steps: a fired condition's `then` is planned by the ordinary
+        # deliberative sub-goal path afterwards. That keeps the common case (a gate opened, the change
+        # wasn't the awaited one) at exactly one call, and costs a second only when something actually
+        # fires — and it means this prompt never doubles as a planning prompt. ADR-0022.
+
+    @dataclass(frozen=True)
+    class RelevanceCandidate:  # one terminated episode a change may have made relevant again — ADR-0026
+        episode_id: str        # the amendment points back at what it amends; that episode stays closed
+        goal: str              # the amending activity's goal, if the user says yes
+        question: str          # what the user is asked FIRST — separate from `goal` because it must be
+        #                        answerable without knowing how the runtime words goals
+        # At most one per judgement: a second-best guess about an intention nobody declared is not worth
+        # the question it would cost.
+
+    @dataclass
+    class PendingConditionState:  # one PendingCondition's per-run state — lives on Activity, not on the Plan
+        condition: PendingCondition
+        evaluated_through: int = 0   # this condition's OWN high-water mark over WorkingMemory.signals_appended:
+        #                              signals at or below it have already been judged. Per-waiter on purpose —
+        #                              a single shared cursor (the shape messages_cursor takes, correct there
+        #                              because a message must create an activity at most once) would let the
+        #                              first condition to advance it blind every other reader of the same
+        #                              broadcast log, which is the 2026-07-22 eviction bug in a new form.
+        #                              ADR-0019.
 
     @dataclass(frozen=True)
     class InterruptRequest:   # a pending hard interrupt, recorded on DecisionCycle by interrupt()
@@ -370,14 +449,35 @@
         #                                                     the before_writes checkpoint diffs it vs the live world
         reconsider_verdict: bool | None = None              # a resolved revalidation verdict parked for Reason's next
         #                                                     pass (True -> proceed + re-baseline; False -> replan)
-        blocked_on: SignalWait | InputWait | None = None    # set while BLOCKED; what's awaited before READY —
-        #                                                     a SignalWait (tool completion signal; set by
-        #                                                     _suspend_, cleared by _resume_ — see below) or an
-        #                                                     InputWait (user's next instruction after a hard
-        #                                                     interrupt; cleared in Observe on a user Message)
+        blocked_on: SignalWait | InputWait | ConditionWait | None = None  # set while BLOCKED; what's awaited
+        #                                                     before READY — a SignalWait (tool completion
+        #                                                     signal; set by _suspend_, cleared by _resume_ —
+        #                                                     see below), an InputWait (user's next instruction
+        #                                                     after a hard interrupt; cleared in Observe on a
+        #                                                     user Message), or a ConditionWait (the plan's own
+        #                                                     declared pending conditions outliving its body —
+        #                                                     ADR-0022)
+        pending_conditions: list[PendingConditionState] = []  # per-run state for Plan.pending: which conditions
+        #                                                     are still unsatisfied and how far each has
+        #                                                     evaluated. Conditions declared by ANY frame are
+        #                                                     lifted here when that frame pops — the point of a
+        #                                                     condition is to outlive the plan that noticed it,
+        #                                                     and a deliberative sub-goal is usually where the
+        #                                                     agent first learns a branch exists (it sent the
+        #                                                     mail; now a reply may come). ADR-0022.
         history: list[CompletedOperation] = []              # append-only trace of resolved ops — a later step
         #                                                     grounds param references against it (see Reason
         #                                                     grounding); last_operation keeps only the newest
+        replan_trail: list[str | None] = []                 # why each *consecutive* replan that got nowhere was
+        #                                                     taken (None = the world moved, no defect).
+        #                                                     Reason's breaker reads it and pauses to InputWait
+        #                                                     rather than spend another planning call. Counted
+        #                                                     against progress, not lifetime: replanning freely is
+        #                                                     what a dynamic environment demands. Progress is a
+        #                                                     call this activity has NOT already made (same tool,
+        #                                                     op and params) — re-issuing one already in history
+        #                                                     yields no fact the next plan lacked, so it cannot
+        #                                                     forgive a replan; only a new one clears the trail
         # context is exclusively for strategy-author data — the runtime itself never writes into it,
         # which is what keeps pending_operation/last_operation as dedicated fields instead of context keys
         # with a naming convention (no shared namespace means no collision to avoid in the first place)
@@ -587,11 +687,27 @@
             valid = await cycle.procedural.revalidate(activity, kw.get("observed"), kw.get("messages"))
             cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=valid))
 
+    class EvaluateConditionsAction:    # predefined internal action: _evaluate_conditions_ (ADR-0022)
+        name = "evaluate_conditions"   #   the batched "did any declared pending condition fire?" call
+        async def execute(self, cycle: DecisionCycle, **kwargs) -> None:
+            activity = cycle.working.activities[kwargs["activity_id"]]
+            inf_id = new_id()
+            activity.pending_inference = PendingInference(id=inf_id, kind="condition", requested_at=now())
+            activity.state = ActivityState.RUNNING
+            asyncio.create_task(self._call(cycle, activity, inf_id, kwargs))
+        async def _call(self, cycle, activity, inf_id, kw) -> None:
+            # ONE call covers every eligible condition — batching is what keeps the mechanical gate's
+            # saving as conditions accumulate. Observe parks the verdict on activity.condition_verdict.
+            verdict = await cycle.procedural.evaluate_conditions(
+                activity, kw["conditions"], kw.get("changes") or [], kw.get("observed"))
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=verdict))
+
     # Data-ops (ADR-0023): the plan's composable data-processing layer. Each is an InternalAction in
     # ActionRegistry's dedicated data-op bucket (not _internal), so only these — never a runtime-only
     # lever — are dispatchable from a plan step, and the collection-`filter` never collides with the
     # perception-prune `FilterPerceptionsAction`. A data-op reads a run-time collection Reason already
-    # resolved (from history via $from, a prior binding via $bind, or a literal) and writes a named
+    # resolved (from history via $from, a prior binding via $bind, an observed property via $prop,
+    # or a literal) and writes a named
     # binding into Activity.bindings[out], which a later step reads via {"$bind": "<name>"}. The
     # pipeline is imperative — one op per step (a declarative $foreach/$select binding spec stays
     # rejected, ADR-0022 (a)). Mechanical ops run inline; only FilterAction's $decide predicate
@@ -1047,7 +1163,10 @@
             # returns to READY; the matched signal is left in place, not evicted. Both mechanical (name
             # equality), via the _suspend_ / _resume_ internal actions — no judgment needed.
             self._suspend_on_completion_signal(cycle, just_resolved)
-            self._resume_on_signal(cycle)          # only a SignalWait — matched against observed signals
+            self._resume_on_signal(cycle)          # a SignalWait, or a ConditionWait (any of its watches) —
+            #                                        same mechanical name/source/path equality for both. For a
+            #                                        ConditionWait this only makes the condition ELIGIBLE:
+            #                                        Reason decides whether it actually holds (ADR-0022).
             if len(cycle.working.signals) > _SIGNAL_RETENTION:     # trim last: today's signal must
                 del cycle.working.signals[:-_SIGNAL_RETENTION]     # survive to be matched above first
             async for message in cycle.communication.receive():

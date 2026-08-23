@@ -405,9 +405,14 @@ async def test_observe_emits_signal_only_on_state_change() -> None:
     props = tool.observe()
     drained = [sig async for _src, sig in sink.drain()]
     assert len(drained) == 1 and drained[0].name == "state_changed"
-    # Thin: the event names which app moved, never a copy of the state (ADR-0004). The snapshot
-    # travels on the `state` observable property alone.
-    assert drained[0].payload == {"app": app.app_name()}
+    # Thin: the event names which app moved and WHERE, never a copy of the state (ADR-0004/0019).
+    # The snapshot travels on the `state` observable property alone; `changes` carries identities
+    # only, so it is the one thing the replace-by-key snapshot cannot express, duplicating nothing.
+    assert drained[0].payload["app"] == app.app_name()
+    changes = drained[0].payload["changes"]
+    assert [c.path for c in changes] == ["emails"]
+    assert len(changes[0].added) == 1  # the identity of the new email, not the email
+    assert not any(isinstance(v, dict) for c in changes for v in c.added)
     assert len(props[0].value["emails"]) == 2  # property snapshot reflects the new email
 
     tool.observe()  # no further change -> no repeat signal

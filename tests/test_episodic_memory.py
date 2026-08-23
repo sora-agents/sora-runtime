@@ -13,6 +13,7 @@ signature is the deliberately loose ``list[Any]``).
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -94,7 +95,9 @@ async def test_learn_records_the_full_experience(tmp_path: Path) -> None:
         step_index=1,
         step_count=2,
         last_result=asdict(OperationAck(ok=False, result={"error": "conflict"})),
-        plan=asdict(plan),
+        # Through a JSON round-trip: the store flattens to plain JSON, so Plan.pending's tuple
+        # comes back a list (ProceduralMemory._from_dict is what rebuilds the dataclass graph).
+        plan=json.loads(json.dumps(asdict(plan))),
     )
 
 

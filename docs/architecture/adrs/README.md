@@ -33,10 +33,10 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0016](0016-pluggable-activity-selection.md) | Activity selection is Situate's own pluggable sub-strategy, defaulting to round-robin | proposed | Decision cycle |
 | [0017](0017-parameter-grounding-in-reason.md) | Parameter grounding is a Reason decision (references + escalation); Act stays mechanistic | proposed | Decision cycle |
 | [0018](0018-manual-merge-policy-and-authored-interface.md) | Manual merge policy (adapter owns interface, author owns prose) + optional names-level authored interface | proposed | Tool & workspace model |
-| [0019](0019-blocked-state-machinery-and-percept-storage.md) | Blocked-state machinery: mechanical Observe-hosted suspend/resume + split percept storage | proposed | Decision cycle |
+| [0019](0019-blocked-state-machinery-and-percept-storage.md) | Signal content and blocked-state machinery: located change summaries, path-scoped waits, mechanical Observe-hosted suspend/resume + split percept storage | proposed | Decision cycle |
 | [0020](0020-hard-interrupt-and-await-input.md) | Hard-interrupt path: process-scheduling preemption, await-input, and a push-time InterruptPolicy seam | proposed | Decision cycle |
 | [0021](0021-llm-calls-as-async-internal-actions.md) | LLM calls as off-cycle, deferred-result internal actions (supersedes ADR-0020's mid-flight abandonment) | proposed | Decision cycle |
-| [0022](0022-plan-representation-context-guard-and-subgoals.md) | Plan representation: retrieval-binding context guard + sub-goals (loosely AgentSpeak) | proposed | Decision cycle |
+| [0022](0022-plan-representation-context-guard-and-subgoals.md) | Plan representation: retrieval-binding context guard, sub-goals, and signal-triggered pending conditions (AgentSpeak-inspired) | proposed | Decision cycle |
 | [0023](0023-structured-value-data-ops.md) | Structured-value data-ops: composable transforms as plan steps | proposed | Decision cycle |
 | [0024](0024-plan-reconsideration-context-adaptation.md) | Plan reconsideration via context-adaptation checkpoints (commitment as config) | proposed | Decision cycle |
 

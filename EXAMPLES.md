@@ -59,7 +59,7 @@ Plan(
 )
 ```
 
-Each step executes in a separate decision cycle. Two binding mechanisms feed the params, split by origin: the **context guard** binds `default_duration_min` once at plan entry from semantic memory (read in the body via `{"$bind": ...}`), while **`$from`** resolves per-step from prior results in the activity's history — the `list_emails` result feeds the `email_id` for `reply_to_email`, and the `get_calendar_events_from_to` result determines which Monday slot is free. `add_calendar_event` is a write operation, so the ARE MCP server immediately sends `resource_updated` for `CalendarApp/state` — S-ORA delivers this as a signal `Percept` (appended to `wm.signals`) on the next `observe()`, which the `ReflectStrategy` uses to confirm the operation succeeded before advancing the plan.
+Each step executes in a separate decision cycle. Two of the three binding mechanisms feed the params here, split by origin *and* timing: the **context guard** binds `default_duration_min` once at plan entry from semantic memory (read in the body via `{"$bind": ...}`), while **`$from`** resolves per-step from prior results in the activity's history — the `list_emails` result feeds the `email_id` for `reply_to_email`, and the `get_calendar_events_from_to` result determines which Monday slot is free. The third, **`$prop`**, also resolves per step but reads the observed property snapshot rather than history (`{"$prop": "CalendarApp.state"}`); this plan needs no world-state binding, since every value it grounds is either stable knowledge or a prior result. `add_calendar_event` is a write operation, so the ARE MCP server immediately sends `resource_updated` for `CalendarApp/state` — S-ORA delivers this as a signal `Percept` (appended to `wm.signals`) on the next `observe()`, which the `ReflectStrategy` uses to confirm the operation succeeded before advancing the plan.
 
 If the request instead named *several* people to reply to — "reply to everyone who asked" — the plan would not hard-code a reply count; it would emit a **sub-goal** step (`next_action="subgoal"`), which Reason expands into one `reply_to_email` per requester. That mechanism, mechanical and deliberative, is illustrated on the multi-item RentAFlat scenario below.
 
@@ -154,7 +154,11 @@ S-ORA's `AreMcpWorkspaceAdapter` curates this one resource per app into exactly 
 
 Because no schema exists anywhere along this path, any structure an agent needs about `state`'s actual content has to live in a hand-authored manual's prose, paired in via `ManualSource`/`merge_manuals` ([ADR-0018](docs/architecture/adrs/0018-manual-merge-policy-and-authored-interface.md)) — see `examples/are/mcp/email_calendar/manuals/email-client.md` for a worked example describing the shape (folders, emails, and their fields) in full.
 
-The two halves divide the labour strictly: the **property** carries the state, the **signal** carries only the fact that it moved. `state_changed` names the resource that changed and nothing else — a signal never duplicates an observable property it accompanies ([ADR-0004](docs/architecture/adrs/0004-tool-usage-interface.md)). Carrying the snapshot in both would put a copy of the whole mailbox into `wm.signals` on *every* write, where the append-log semantics keep all of them and each prompt renders a length-capped — hence unusable — prefix of one.
+The two halves divide the labour strictly: the **property** carries the state, the **signal** carries only the fact that it moved, plus *where*. A signal never duplicates an observable property it accompanies ([ADR-0004](docs/architecture/adrs/0004-tool-usage-interface.md)): carrying the snapshot in both would put a copy of the whole mailbox into `wm.signals` on *every* write, where the append-log semantics keep all of them and each prompt renders a length-capped — hence unusable — prefix of one.
+
+But thin must not collapse into **contentless**. A payload of `{"app": "Emails"}` tells a waiter that something moved and leaves it to re-derive what — against `properties`, which is a replace-by-key snapshot and by construction holds *no previous value to diff against*. That derivation isn't merely wasteful, it's impossible unless the waiter keeps its own shadow copy. So the payload also carries `changes: list[Change]` — a dotted `path` into the property plus the **identities** that appeared, vanished, or were updated, never the values behind them ([ADR-0019](docs/architecture/adrs/0019-blocked-state-machinery-and-percept-storage.md)). The snapshot stays in `properties` and the summary says where to look inside it, so the property becomes *dereferenceable* rather than re-scannable — reading one named record where a re-scan walks 127. Nothing is duplicated, because a delta is exactly what a snapshot cannot express.
+
+The in-process adapter gets this nearly free: `observe()` already diffs the previous and current snapshots to decide whether anything changed at all, and today throws that delta away.
 
 ## Signals from ARE write operations
 
@@ -166,7 +170,11 @@ async def focus(self, sink: SignalSink) -> None:
     self._session.set_resource_updated_handler(
         lambda uri: sink.push(
             source=self._tool_id_for(uri),   # the globally-unique id discover() assigned, not the bare app name — ADR-0014
-            signal=Signal(name="state_changed", payload={"uri": str(uri)}),   # the event, not the state
+            # The event, not the state. MCP's resources/updated carries a URI and nothing else, so this
+            # adapter DEGRADES to the coarse Change — "something under here moved" — rather than failing
+            # or inventing a delta it cannot compute. Consumers must accept this form (ADR-0019).
+            signal=Signal(name="state_changed",
+                          payload={"uri": str(uri), "changes": [Change(path=str(uri))]}),
         )
     )
 ```
@@ -209,6 +217,44 @@ No work already in flight is lost or misapplied: an interrupt never abandons a d
 A user `/stop` follows the same reconsideration-by-replan model, driven by user input rather than an inbound email: the stop pauses the activity to `BLOCKED`/`InputWait`, and the follow-up line the user then types is treated as **reconsideration input seen at the next inference, not a new task** — it resumes the paused activity (clearing its plan so Reason re-infers with the message and executed history visible) and is *not* turned into a second activity. So typing "nothing, continue" resumes the original work rather than spawning a do-nothing ghost activity alongside it.
 
 Timing caveat (override path): the ARE bridge emits `state_changed` from `tool.observe()`, i.e. *during* the Observe phase (Observe-cadence, for determinism), not off a background thread — so the policy fires inside the current tick's Observe and the checkpoint after Observe aborts the rest of that tick before Act. For the ARE sim as-is this is a clean *relocation* of the reconsideration trigger into the interrupt seam rather than new timing capability; a genuinely off-cycle signal source (a `/stop` user stop today, a future off-cycle ARE push) would let the policy fire mid-tick instead. Either way, because inference runs off-cycle, no in-flight model call is ever cut short — a stale inference is discarded when it resolves, never abandoned mid-generation.
+
+### Staying relevant after the activity ends
+
+Both paths above handle a change that arrives **while** the activity is live: the checkpoint re-validates an in-flight plan, the interrupt preempts one. Neither generalizes to a change that arrives *after* the goal already completed, which is why the hard-interrupt showcase carries the ad-hoc clause "if the change landed after the goal already completed (no live activity), it spawns one corrective activity" — an ARE-shaped answer wired into an example handler. Three pieces of general runtime machinery replace it.
+
+An adaptability run makes the gap concrete. The agent cleared a conflicting appointment, scheduled a full-day event, emailed the attendee, confirmed to the user, and terminated the activity. Minutes later the attendee replied that he could not make it and proposed Thursday instead. Nothing was left alive to read it: **4 of 11** oracle actions. Three independent defects, one per layer — an unlimited wall clock would not have helped with any of them.
+
+**1. The plan could not say what would revive it.** The synthesized plan's own prose stated three conditional clauses; its body encoded none, because a body is a finite sequence and nothing in the representation distinguished *this goal is finished* from *this goal's body is finished*. `Plan.pending` is that missing declaration — the trigger half of the plan schema, pointed forward:
+
+```python
+Plan(
+    goal="Schedule a Film Production Day with Åke and let him know",
+    steps=[...],                     # delete the conflict, add the event, email Åke, confirm
+    pending=(PendingCondition(
+        # The mechanical GATE — required. Typed, because "where to look" is the only part a protocol
+        # can answer, and the only part that has to be cheap.
+        watch=SignalWait(signal_name="state_changed",
+                         source="insim:are/Emails",
+                         path="folders.INBOX.emails"),
+        when="Åke replies that he cannot make the scheduled date, or proposes a different one",
+        then="Move the Film Production Day to the date Åke proposes: clear what is already "
+             "scheduled that day, then re-add the full-day event",
+        until="the Film Production Day has taken place",
+    )),
+)
+```
+
+With that unsatisfied condition the exhausted activity **blocks on a `ConditionWait`** instead of terminating. It is not a step and never blocks the body — it declares what a wait would be *for*, while every transition stays the cycle's.
+
+**2. The signal could not say what changed.** `{"app": "Emails"}` would have told a revived activity only that the mailbox moved. With `changes` (above), the reply is a `Change(path="folders.INBOX.emails", added=("email-…",))`.
+
+That `path` is also what makes the gate discriminate without any reasoning about self-causation. Of the run's four signals, two came from Calendar and fail on `source`; the agent's **own** `send_email` moved `folders.SENT.emails` and fails on `path`; only Åke's reply lands in `folders.INBOX.emails` and opens the gate. This is the same discrimination the showcase's `InboxChangeGate` and `MailDiffInterruptPolicy` hand-code as an ARE-email-shaped efference filter — now falling out of general machinery, because *where a change landed* is protocol-level information rather than a domain judgment.
+
+Observe's existing resume pass matches the gate and returns the activity to `READY` — mechanically, no model. Being eligible is not the same as holding, so Reason then spends **one** batched `_infer_` over every eligible condition (*which `when`s hold, is any `until` satisfied, and if so the plan for its `then`*), and pushes `then` as a frame. One extra model call for the whole scenario, against the seven the failing run already spent.
+
+**3. The planner might not declare anything at all** — as it demonstrably did not here, having written all three clauses in prose. So a change that opens **no** declared gate falls to undeclared-relevance recovery ([ADR-0026](docs/architecture/adrs/0026-undeclared-relevance-recovery.md)): a judge over recent episodes, **idle-scheduled** so it never displaces work that can actually advance, producing at most one candidate. That candidate becomes a **new** activity amending the terminated one — born `BLOCKED` on an `InputWait`, so the user is asked before the agent acts on a goal nobody stated, and the closed episode is never rewritten into a lie.
+
+The three compose by subtraction, cheapest first: layer 1 claims a change that matched a declared gate, and only what is left over reaches the expensive judge. **Every condition the planner learns to declare removes work from layer 3** — they are complements, and the guess is the fallback.
 
 ## Running dynamic scenarios in-process
 

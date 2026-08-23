@@ -1,4 +1,4 @@
-# Blocked-state machinery: mechanical Observe-hosted suspend/resume + split percept storage
+# Signal content and blocked-state machinery: located change summaries, path-scoped waits, mechanical Observe-hosted suspend/resume + split percept storage
 
 * Status: proposed
 * Date: 2026-07-22
@@ -20,6 +20,11 @@ be answered together, because the third owns the signal lifecycle the first two 
    `payload: Any` — a smell surfaced during the Observe snapshot work. Signal retention/eviction was
    explicitly deferred to "the blocked-state machinery" by `_filter_`/`UnfocusAction`. Should signals
    be handled as percepts or not?
+4. A waiter can learn *that* a tool changed but not *what* changed. E.g., the ARE adapter's payload is
+   `{"app": "Emails"}`, and `properties` is a replace-by-key snapshot, which by construction holds
+   no delta — a snapshot can answer "what is true now", never "what just moved". Anything that must
+   act on the change has to re-scan the whole property and diff it against a memory it does not
+   keep. Does the signal carry the change, and if so, how much of it?
 
 ## Decision Drivers
 
@@ -32,6 +37,10 @@ be answered together, because the third owns the signal lifecycle the first two 
   ([ADR-0017](0017-parameter-grounding-in-reason.md)). Neither should grow manual-interpreting suspend logic.
 * The property/signal flat-list smell (a side index over a `payload: Any`) should be removed at the
   source, not masked further.
+* A signal must stay **thin**: the snapshot belongs in `properties`, and copying it into
+  `wm.signals` would reproduce it in every prompt that renders the log. But thin must not collapse
+  into contentless — *where* a property moved is the one fact the snapshot cannot express, so
+  carrying it duplicates nothing.
 
 ## Considered Options
 
@@ -44,6 +53,18 @@ be answered together, because the third owns the signal lifecycle the first two 
   (`RUNNING -> READY` always); a *separate* pass then blocks the activity if the just-completed op
   declares a completion signal; a signal-declared structurally in the manual makes both suspend and
   resume name-equality matches. Paired with splitting the percept store.
+
+For question 4 specifically:
+
+* **Contentless signals, waiter re-scans the property** (the original) — rejected: it makes every
+  waiter re-derive a delta the adapter already computed, against a snapshot that holds no previous
+  value to diff against, so the derivation is not merely wasteful but impossible without the waiter
+  keeping its own shadow copy.
+* **Fat signals: the payload carries the changed records** — rejected: duplicates `properties` and
+  reproduces the whole payload in every prompt that renders `wm.signals`, for data already reachable
+  by a `$prop` reference.
+* **Located change summaries (chosen)** — the payload names *where* the property moved and the
+  identities that appeared, vanished, or were updated; never the values behind them.
 
 ## Decision Outcome
 
@@ -93,6 +114,53 @@ newest-win) evicts it, whether it was ever matched or not (an early or orphan si
 later cycle's suspend/resume the same way an unmatched one does). `_filter_`/`UnfocusAction` prune
 only `properties`.
 
+**Change summaries.** A signal's payload carries a `changes` list of `Change(path, added, removed,
+updated)` records. `path` is a dotted path into the property's value; the three tuples carry
+*identities* only, never the values behind them. The snapshot stays in `properties` and the summary
+says where to look inside it — the property becomes dereferenceable instead of re-scannable. This
+does not reverse the thin-signal rule: a `Change` carries no state, and a delta is exactly what a
+replace-by-key snapshot cannot hold, so nothing is duplicated.
+
+The adapter owns the computation and already has what it needs: ARE's `observe()` compares the
+previous and current snapshots to decide whether anything changed at all, so the delta is computed
+and thrown away today. Adapters **degrade rather than fail** — a WoT property observation is already
+event-shaped (`Change(path="", updated=(name,))`); an MCP `resources/updated` carries a URI
+(`Change(path=uri)`); an adapter that cannot identify individual items emits the coarse form, a
+`path` with all three tuples empty, meaning "something under here moved". Consumers must accept the
+coarse form.
+
+**Path-scoped waits.** `SignalWait` gains `path: str | None` (`None` matches any, preserving today's
+behavior). A wait matches when name and `source` match as before *and* some `Change.path` in the
+payload is a prefix of the wait's path or the wait's path is a prefix of it. The bidirectional
+prefix is deliberate: a change *inside* the watched subtree is relevant, and so is a coarser change
+reported *above* it by a degrading adapter — the second costs a redundant evaluation but never a
+missed one. The match stays what every other match in this runtime is: mechanical equality on
+declared fields, no fuzziness, no model.
+
+This is what lets a waiter separate changes that `(name, source)` cannot. An agent that sends mail
+and waits for a reply sees its own `send_email` move `folders.SENT.emails` and the reply move
+`folders.INBOX.emails` — same signal name, same source, told apart by where they landed. The
+runtime never has to infer which changes it caused itself, which is not expressible in every
+protocol and would be adapter-specific reasoning if it were.
+
+**Per-waiter evaluation marks.** A waiter that must not re-evaluate a signal it has already seen
+keeps its own high-water mark. There is deliberately **no shared cursor** over `wm.signals`: a
+single global one (the shape `messages_cursor` takes over `wm.messages`, where it is correct
+because a message must drive activity-creation at most once) would reintroduce the 2026-07-22 bug
+in a new form — the first waiter to advance it blinds every other reader of the same broadcast log.
+Because the retention cap front-evicts, the mark cannot be a list index either; `WorkingMemory`
+carries a monotonic count of signals ever appended, so the sequence number of `signals[i]` is
+`signals_appended - len(signals) + i`. That stays stable across eviction and adds no field to
+`Percept`, where a sequence number would be meaningless for the property half of the store.
+
+This ADR owns the signal's shape and the mechanics of waiting on one. The plan-side representation
+of *what* to wait for — declared conditions that outlive an exhausted plan — enriches
+[ADR-0022](0022-plan-representation-context-guard-and-subgoals.md) instead, and is what supplies a
+`SignalWait`'s `path`. `blocked_on` stays a single value under that change: an activity waiting on
+several declared conditions blocks on one `ConditionWait` carrying their watches — the third
+`blocked_on` variant, slotted in additively exactly as [ADR-0020](0020-hard-interrupt-and-await-input.md)'s
+`InputWait` was, and matched by the same mechanical equality this ADR's resume pass already applies.
+
 This **supersedes**, in [ADR-0009](0009-five-phase-decision-cycle.md)'s "explicit place for
 suspending/resuming" and the README/CLAUDE prose, the "resume is a judgment call left to
 Situate/Reflect" framing (now: mechanical, in Observe). It **refines** [ADR-0012](0012-percepts-vs-messages.md)
@@ -107,6 +175,13 @@ reverted.
 * The `payload: Any` side-index smell is gone: the property store is keyed directly; signals are
   their own typed list with their own lifecycle.
 * Reflect and Act are untouched; Act stays mechanistic (ADR-0017 preserved).
+* A waiter can act on *what* changed without re-scanning the property it changed inside: reading one
+  named record is O(1) where a snapshot re-scan is O(n) — and on a 127-item mailbox that is the
+  difference between a usable prompt and an unusable one.
+* Telling a tool's own echo from an exogenous change falls out of path scoping, generally, instead
+  of needing per-adapter reasoning about which changes the agent caused.
+* `Change` is additive: `SignalWait.path` defaults to `None` and an adapter that emits no `changes`
+  key behaves exactly as before, so existing completion-signal waits are unaffected.
 
 ### Negative Consequences
 
@@ -139,6 +214,25 @@ reverted.
   machinery; revisited only if silent stuck activities prove to be a real operational problem.
 * A property-reaches-state completion (README's "signal *or* property update") is not yet
   implemented — `blocked_on` is named generally so a `PropertyWait` variant slots in additively.
+* Delta quality is adapter-dependent and unverifiable from the runtime side: a coarse-form `Change`
+  is indistinguishable from a precise one that genuinely has nothing to name, so a waiter cannot
+  tell "nothing identifiable moved here" from "this adapter never identifies anything". Accepted —
+  the alternative is a per-adapter capability declaration, which is more machinery than the
+  degradation costs.
+* Bidirectional prefix matching admits false positives by construction: a coarse change reported
+  above the watched path wakes every waiter beneath it. Deliberate — a redundant evaluation is
+  recoverable, a missed one is the failure this mechanism exists to prevent.
+* The retention cap now bounds something with more consequence than before. Losing a signal used to
+  lose the fact that an event happened; it now also loses the only record of *where* it happened,
+  which no later snapshot can reconstruct. The cap's existing weakness (fixed size, neither age- nor
+  ownership-aware) is unchanged, but its cost is higher.
+* Computing a `Change` is real work in the adapter's poll path, proportional to snapshot size —
+  ARE's `Emails.state` diff walks 127 records per observation. Acceptable at v0.1.0 poll rates; an
+  adapter over a large collection will want a change feed from its own protocol rather than a diff.
+* A waiter's mark is per-waiter, so N waiters on the same `(name, source, path)` each evaluate the
+  same signal independently. Where evaluation is more than a field comparison, that fan-out has to
+  be batched by the consumer — this ADR guarantees only that the broadcast log makes the fan-out
+  *possible*, not that it is cheap.
 
 ## Links
 
@@ -148,3 +242,9 @@ reverted.
   tool signal"; preserves [ADR-0017](0017-parameter-grounding-in-reason.md) (Act stays mechanistic)
 * Builds on [ADR-0011](0011-phase-fusion-via-threaded-result.md) (Observe/Reflect deterministic by
   default; fusion starts at Situate)
+* Supplies the wait mechanics that [ADR-0022](0022-plan-representation-context-guard-and-subgoals.md)'s
+  declared conditions depend on; the split is that this ADR owns the signal's shape and how a wait
+  matches it, ADR-0022 owns what a plan declares it is waiting *for*
+* Bounds [ADR-0026](0026-undeclared-relevance-recovery.md) — a signal no wait ever matched survives
+  in the shared log exactly as an orphan does, so the retention cap above is also what limits how
+  long an unclaimed change stays available for undeclared-relevance recovery to consider

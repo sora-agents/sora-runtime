@@ -34,6 +34,7 @@ only for their non-dispatch, not their own behavior (their own tests come with t
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -439,7 +440,10 @@ async def test_reflect_terminates_completed_activity_and_records_episode(tmp_pat
     # and the last operation result.
     assert episode["succeeded"] is True
     assert activity.plan is not None
-    assert episode["plan"] == asdict(activity.plan)
+    # Compared through a JSON round-trip, not against asdict() directly: the store flattens to
+    # plain JSON, so Plan.pending's tuple comes back a list. That normalization is the storage
+    # boundary doing its job — ProceduralMemory._from_dict is what rebuilds the dataclass graph.
+    assert episode["plan"] == json.loads(json.dumps(asdict(activity.plan)))
     assert episode["step_index"] == 1
     assert episode["step_count"] == 1
     assert episode["last_result"] == asdict(OperationAck(ok=True))
@@ -466,7 +470,10 @@ async def test_reflect_terminates_failed_activity_without_storing_plan(tmp_path:
     episode = episodes[0]
     assert episode["succeeded"] is False
     assert activity.plan is not None
-    assert episode["plan"] == asdict(activity.plan)
+    # Compared through a JSON round-trip, not against asdict() directly: the store flattens to
+    # plain JSON, so Plan.pending's tuple comes back a list. That normalization is the storage
+    # boundary doing its job — ProceduralMemory._from_dict is what rebuilds the dataclass graph.
+    assert episode["plan"] == json.loads(json.dumps(asdict(activity.plan)))
     assert episode["step_index"] == 1
     assert episode["step_count"] == 3
     assert episode["last_result"] == asdict(OperationAck(ok=False))

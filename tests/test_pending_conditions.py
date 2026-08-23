@@ -1,0 +1,739 @@
+"""Declared pending conditions (ADR-0022).
+
+The failure these exist for: an agent scheduled an event, emailed the attendee, confirmed to the
+user and TERMINATED — then the attendee replied "can't make it, Thursday instead" and nothing was
+left alive to read it. The plan's own prose had stated the conditional; its body encoded none of it,
+because nothing in the representation distinguished *this goal is finished* from *this goal's body
+is finished*.
+
+Layer 1 gives a plan somewhere to declare that, and blocks instead of terminating. Layer 3 covers
+the case the planner declares nothing at all — which is what actually happened — by judging changes
+that opened no declared gate against recent episodes, and asking the user before acting.
+
+The invariants pinned hardest are the cost controls, because they are what make either layer
+affordable and are the easiest thing to quietly break: a condition is only ever judged against a
+change that mechanically matched its declared watch, and it is never judged twice for the same
+signal.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from sora.action import default_action_registry
+from sora.activity import Activity, ActivityState
+from sora.cycle import DecisionCycle
+from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.memory import (
+    EpisodicMemory,
+    FileMemoryBackend,
+    ProceduralMemory,
+    SemanticMemory,
+    WorkingMemory,
+    pending_from_raw,
+)
+from sora.perception import Percept
+from sora.strategies import (
+    DefaultActStrategy,
+    DefaultObserveStrategy,
+    DefaultReasonStrategy,
+    DefaultReflectStrategy,
+    DefaultSituateStrategy,
+    Strategies,
+)
+from sora.transport import MessageTransport
+from sora.types import (
+    Change,
+    ConditionWait,
+    PendingCondition,
+    PendingConditionState,
+    Plan,
+    Signal,
+    SignalWait,
+    Step,
+)
+
+_ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
+
+
+class _NullTransport:
+    async def send(self, to: str, content: dict[str, Any]) -> None: ...
+
+    async def receive(self) -> Any:
+        return
+        yield  # pragma: no cover — never reached; makes this an async generator
+
+
+def _cycle(
+    tmp_path: Path, procedural: ProceduralMemory, transport: MessageTransport | None = None
+) -> tuple[DecisionCycle, WorkingMemory]:
+    tool = FakeTool("insim:are/Emails")
+    registry = EnvironmentRegistry(
+        adapters={_ORIGIN: FakeAdapter("fake", FakeWorkspace("ws", _ORIGIN, [tool]))}
+    )
+    working = WorkingMemory(registry=registry)
+    transport = transport if transport is not None else _NullTransport()
+    cycle = DecisionCycle(
+        strategies=Strategies(
+            observe=DefaultObserveStrategy(),
+            reflect=DefaultReflectStrategy(),
+            situate=DefaultSituateStrategy(),
+            reason=DefaultReasonStrategy(),
+            act=DefaultActStrategy(),
+        ),
+        communication=transport,
+        actions=default_action_registry(),
+        registry=registry,
+        working=working,
+        semantic=SemanticMemory(FileMemoryBackend(tmp_path / "semantic")),
+        procedural=procedural,
+        episodic=EpisodicMemory(FileMemoryBackend(tmp_path / "episodic")),
+    )
+    return cycle, working
+
+
+_INBOX = SignalWait(
+    signal_name="state_changed", source="insim:are/Emails", path="folders.INBOX.emails"
+)
+
+
+def _condition(watch: SignalWait = _INBOX) -> PendingCondition:
+    return PendingCondition(
+        watch=watch,
+        when="the attendee replies that the date does not work",
+        then="Rebook for the day the attendee proposes",
+        until="the booking has taken place",
+    )
+
+
+def _exhausted(plan_pending: tuple[PendingCondition, ...] = ()) -> Activity:
+    """An activity whose body has just run out — the moment the old code terminated it."""
+    plan = Plan(
+        id="p1", goal="book it and tell them", steps=[Step("wait", {})], pending=plan_pending
+    )
+    return Activity(id="a1", goal="book it and tell them", context={}, plan=plan, step_index=1)
+
+
+def _signal(working: WorkingMemory, path: str, source: str = "insim:are/Emails") -> None:
+    working.signals.append(
+        Percept(
+            source, Signal("state_changed", {"changes": [Change(path=path, added=("e9",))]}), 0.0
+        )
+    )
+    working.signals_appended += 1
+
+
+# --------------------------------------------------------------------------------------------------
+# Parsing: what the planner emits
+# --------------------------------------------------------------------------------------------------
+
+
+def test_pending_condition_parses_from_planner_json() -> None:
+    cond = pending_from_raw(
+        {
+            "watch": {"signal": "state_changed", "source": "t1", "path": "folders.INBOX.emails"},
+            "when": "they reply",
+            "then": "rebook",
+            "until": "it happened",
+        }
+    )
+    assert cond is not None
+    assert cond.watch == SignalWait("state_changed", "t1", "folders.INBOX.emails")
+    assert (cond.when, cond.then, cond.until) == ("they reply", "rebook", "it happened")
+
+
+def test_condition_without_a_watch_is_dropped() -> None:
+    # A gate is REQUIRED. Without one the condition would have to be evaluated against every signal
+    # the agent ever sees — the unbounded keep-alive this design exists to reject, wearing a field
+    # name. Dropping lands the run back on "terminate when the body ends", which is honest; keeping
+    # it would create a wait that can never fire.
+    assert pending_from_raw({"when": "they reply", "then": "rebook"}) is None
+    assert pending_from_raw({"watch": {}, "when": "they reply", "then": "rebook"}) is None
+
+
+def test_malformed_condition_is_dropped_not_raised() -> None:
+    # The body is the part that does the work; failing a whole plan because an optional
+    # forward-looking clause was mis-shaped would trade a partial success for a total failure.
+    assert pending_from_raw({"watch": {"signal": "s"}, "when": "", "then": "x"}) is None
+    assert pending_from_raw("not a dict") is None  # type: ignore[arg-type]
+
+
+async def test_infer_parses_pending_alongside_steps(tmp_path: Path) -> None:
+    response = json.dumps(
+        {
+            "steps": [{"action": "focus", "tool_id": "t1"}],
+            "pending": [
+                {
+                    "watch": {"signal": "state_changed", "path": "folders.INBOX.emails"},
+                    "when": "they reply",
+                    "then": "rebook",
+                }
+            ],
+        }
+    )
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path), llm=FakeLLMClient(response))
+    plan = await procedural.infer(Activity(id="a", goal="g", context={}), {})
+    assert len(plan.steps) == 1
+    assert len(plan.pending) == 1 and plan.pending[0].then == "rebook"
+
+
+async def test_a_plan_that_declares_nothing_is_unchanged(tmp_path: Path) -> None:
+    # Most goals are unconditional; the feature existing must cost them nothing.
+    procedural = ProceduralMemory(
+        FileMemoryBackend(tmp_path), llm=FakeLLMClient(json.dumps({"steps": []}))
+    )
+    plan = await procedural.infer(Activity(id="a", goal="g", context={}), {})
+    assert plan.pending == ()
+
+
+# --------------------------------------------------------------------------------------------------
+# Layer 1: block instead of terminate
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_exhausted_body_with_a_condition_blocks_instead_of_terminating(
+    tmp_path: Path,
+) -> None:
+    # The core fix. Before this, an exhausted body meant TERMINATED and the reply had nothing to
+    # reach.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted((_condition(),))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, ConditionWait)
+    assert activity.blocked_on.watches == (_INBOX,)
+
+
+async def test_exhausted_body_without_conditions_still_terminates(tmp_path: Path) -> None:
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.TERMINATED
+
+
+async def test_blocking_records_no_episode_yet(tmp_path: Path) -> None:
+    # An episode is a claim about how work ENDED. Writing one for an activity that is still waiting
+    # would be a claim about an outcome that has not happened.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted((_condition(),))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert await cycle.episodic.consult(activity) == []
+
+
+async def test_conditions_are_live_before_the_body_finishes(tmp_path: Path) -> None:
+    # Lifted at plan install, not when the body runs out — so a reply that BEATS the last step is
+    # watched for, rather than being discovered only after the plan happens to end.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    plan = Plan(
+        id="p", goal="g", steps=[Step("wait", {}), Step("wait", {})], pending=(_condition(),)
+    )
+    activity = Activity(id="a1", goal="g", context={}, plan=plan, step_index=0)  # mid-body
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert len(activity.pending_conditions) == 1
+    assert activity.state is ActivityState.READY  # still running its body, not blocked
+
+
+async def test_lifting_is_idempotent_across_cycles(tmp_path: Path) -> None:
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted((_condition(),))
+    working.activities[activity.id] = activity
+
+    for _ in range(3):
+        activity.state = ActivityState.READY
+        await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert len(activity.pending_conditions) == 1
+
+
+async def test_a_new_condition_ignores_the_signal_backlog(tmp_path: Path) -> None:
+    # A condition declared now cannot be about a change from before it existed, and the retention
+    # log holds hundreds. Starting the mark at zero would re-judge the whole backlog immediately.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    _signal(working, "folders.INBOX.emails")  # arrived BEFORE the plan existed
+    activity = _exhausted((_condition(),))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.pending_conditions[0].evaluated_through == working.signals_appended
+
+
+# --------------------------------------------------------------------------------------------------
+# Layer 1: the mechanical gate — what reaches a model and what never does
+# --------------------------------------------------------------------------------------------------
+
+
+def _blocked_with_condition(working: WorkingMemory, watch: SignalWait = _INBOX) -> Activity:
+    activity = _exhausted()
+    activity.state = ActivityState.BLOCKED
+    activity.pending_conditions = [
+        PendingConditionState(condition=_condition(watch), evaluated_through=0)
+    ]
+    activity.blocked_on = ConditionWait(watches=(watch,))
+    working.activities[activity.id] = activity
+    return activity
+
+
+async def test_matching_change_resumes_the_blocked_activity(tmp_path: Path) -> None:
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.INBOX.emails")
+
+    await cycle.strategies.observe.observe(cycle)
+
+    assert activity.state is ActivityState.READY
+    assert activity.blocked_on is None
+
+
+async def test_the_agents_own_outbound_write_does_not_wake_it(tmp_path: Path) -> None:
+    # THE cost control, and the general replacement for a domain efference filter: the agent's own
+    # send lands in SENT, an inbound reply in INBOX. Same signal name, same source, told apart by
+    # where they landed — with no reasoning about which changes the agent caused.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.SENT.emails")
+
+    await cycle.strategies.observe.observe(cycle)
+
+    assert activity.state is ActivityState.BLOCKED
+
+
+async def test_a_different_tool_does_not_wake_it(tmp_path: Path) -> None:
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.INBOX.emails", source="insim:are/Calendar")
+
+    await cycle.strategies.observe.observe(cycle)
+
+    assert activity.state is ActivityState.BLOCKED
+
+
+async def test_an_already_judged_signal_does_not_wake_it_again(tmp_path: Path) -> None:
+    # Without the per-condition mark the activity would resume, find nothing new, re-block, and
+    # spin — burning a model call every cycle for as long as the signal stays in retention.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.INBOX.emails")
+    activity.pending_conditions[0].evaluated_through = working.signals_appended  # already judged
+
+    await cycle.strategies.observe.observe(cycle)
+
+    assert activity.state is ActivityState.BLOCKED
+
+
+async def test_reflect_does_not_undo_the_resume_observe_just_did(tmp_path: Path) -> None:
+    # The livelock. Observe resumes a gate-opened activity so Reason can judge it, but Reflect runs
+    # next in the SAME cycle, saw an exhausted body with pending conditions, and blocked it straight
+    # back — before Situate could select it. Both phases passed their own tests; the defect lived
+    # only in their composition, which is why this test drives them together.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.INBOX.emails")
+
+    await cycle.strategies.observe.observe(cycle)
+    assert activity.state is ActivityState.READY  # Observe woke it
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.READY  # ...and Reflect left it awake to be judged
+    assert activity.blocked_on is None
+
+
+async def test_the_gate_opening_reaches_the_judgement_instead_of_spinning(tmp_path: Path) -> None:
+    # End to end over two cycles, which is what the log showed going wrong ~1400 times: cycle one
+    # must actually spend the judgement (advancing the marks), and cycle two must then find nothing
+    # eligible and settle back to BLOCKED rather than waking on the same signal again.
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.INBOX.emails")
+
+    await cycle.strategies.observe.observe(cycle)
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+    # Situate is the phase the livelock actually starved: it only ever selects a READY activity, so
+    # a Reflect that re-blocked meant Reason was never handed the activity at all. Go through it
+    # rather than calling reason() directly, or the test proves nothing about the spin.
+    situated = await cycle.strategies.situate.situate([activity], working, cycle, _tick())
+    assert situated.activity is activity
+    await cycle.strategies.reason.reason(activity, working, cycle, situated)
+    await _settle()
+
+    assert len(llm.calls) == 1  # the judgement the spin never reached
+    assert activity.pending_conditions[0].evaluated_through == working.signals_appended
+
+    await cycle.strategies.observe.observe(cycle)  # second cycle: same signal, now judged
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.BLOCKED
+    assert len(llm.calls) == 1  # and no second call for a signal already judged
+
+
+async def test_an_exhausted_body_with_no_open_gate_still_blocks(tmp_path: Path) -> None:
+    # The guard is narrow: only an UNJUDGED open gate keeps the activity awake. With nothing
+    # eligible, an exhausted body must still park on its conditions rather than sit ready forever.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    activity.pending_conditions = [
+        PendingConditionState(condition=_condition(), evaluated_through=0)
+    ]
+    working.activities[activity.id] = activity
+    _signal(working, "folders.SENT.emails")  # never passes the gate
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, ConditionWait)
+
+
+async def test_evaluation_fires_one_call_for_several_eligible_conditions(tmp_path: Path) -> None:
+    # Batched: the gate is what makes this affordable, and batching is what keeps the saving as
+    # conditions accumulate. One call, not one per condition.
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    activity.pending_conditions = [
+        PendingConditionState(condition=_condition(), evaluated_through=0),
+        PendingConditionState(
+            condition=PendingCondition(watch=_INBOX, when="something else", then="do that"),
+            evaluated_through=0,
+        ),
+    ]
+    working.activities[activity.id] = activity
+    _signal(working, "folders.INBOX.emails")
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    assert len(llm.calls) == 1
+    assert activity.condition_batch and len(activity.condition_batch) == 2
+
+
+async def test_marks_advance_at_fire_time_so_the_same_signal_is_not_rejudged(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    activity.pending_conditions = [
+        PendingConditionState(condition=_condition(), evaluated_through=0)
+    ]
+    working.activities[activity.id] = activity
+    _signal(working, "folders.INBOX.emails")
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.pending_conditions[0].evaluated_through == working.signals_appended
+
+
+async def test_no_eligible_condition_costs_no_call(tmp_path: Path) -> None:
+    # The common case by construction. A procedural with no LLM raises if anything escalates, so
+    # this proves nothing did.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    activity.pending_conditions = [
+        PendingConditionState(condition=_condition(), evaluated_through=0)
+    ]
+    working.activities[activity.id] = activity
+    _signal(working, "folders.SENT.emails")  # never passes the gate
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())  # must not raise
+
+
+# --------------------------------------------------------------------------------------------------
+# Layer 1: applying the verdict
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_a_fired_condition_pursues_its_then_as_a_subgoal(tmp_path: Path) -> None:
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=0)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    # Pursued through the ordinary deliberative sub-goal path — `then` is a goal, planned fresh when
+    # the moment comes, which is why it is prose rather than steps.
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "subgoal"
+
+
+async def test_nothing_fired_goes_back_to_waiting(tmp_path: Path) -> None:
+    # Must NOT fall through to Reflect, which would see an exhausted plan and terminate outright.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=99)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict()
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, ConditionWait)
+
+
+def _other_condition(then: str) -> PendingCondition:
+    return PendingCondition(watch=_INBOX, when="a team member replies", then=then, until="never")
+
+
+async def test_every_fired_condition_is_pursued_not_just_the_first(tmp_path: Path) -> None:
+    """A batched verdict fires plural on purpose — one call judges every eligible condition, and a
+    single reply can satisfy two gates. Dropping the extras is silent and unrecoverable: every
+    judged condition's mark was advanced at fire time, so the signal that opened those gates is no
+    longer eligible and nothing re-fires them."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    first = PendingConditionState(condition=_condition(), evaluated_through=99)
+    second = PendingConditionState(
+        condition=_other_condition("Tell the user the schedule slipped"), evaluated_through=99
+    )
+    activity.pending_conditions = [first, second]
+    activity.condition_batch = [first, second]
+    activity.condition_verdict = _verdict(fired=(0, 1))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    assert activity.pending_inference is not None  # planning the first `then`
+    assert first.condition.then in llm.calls[-1][1]
+
+    # The first `then` has been planned and run: its sub-plan popped, so the body is exhausted
+    # again and nothing new has arrived. The second fired condition is what is left to do.
+    activity.pending_inference = None
+    activity.state = ActivityState.READY
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    assert second.condition.then in llm.calls[-1][1]
+
+
+async def test_a_queued_fired_condition_does_not_nest_inside_the_first(tmp_path: Path) -> None:
+    """In order and at the same depth. While the first `then`'s sub-plan is still running the body
+    is not exhausted, so pursuing the second there would push a frame inside a frame — inverting the
+    order the verdict listed them in and walking the activity toward the recursion breaker."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    first = PendingConditionState(condition=_condition(), evaluated_through=99)
+    second = PendingConditionState(
+        condition=_other_condition("Tell the user the schedule slipped"), evaluated_through=99
+    )
+    activity.pending_conditions = [first, second]
+    activity.condition_batch = [first, second]
+    activity.condition_verdict = _verdict(fired=(0, 1))
+    working.activities[activity.id] = activity
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+    calls_after_first = len(llm.calls)
+    assert calls_after_first == 1  # the first `then` was planned
+
+    # The first `then`'s sub-plan landed and is mid-body: one step left to run, nothing exhausted.
+    activity.pending_inference = None
+    activity.state = ActivityState.READY
+    activity.parent_frames.append((activity.plan, 1))  # type: ignore[arg-type]  # plan is set
+    activity.plan = Plan(id="sub", goal="rebook", steps=[Step("wait", {})])
+    activity.step_index = 0
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    assert len(llm.calls) == calls_after_first  # no second `then` planned on top of the first
+
+
+async def test_reflect_does_not_terminate_over_a_fired_condition(tmp_path: Path) -> None:
+    """The queue outlives the condition that produced it — a fired condition is usually retired in
+    the same verdict, so `pending_conditions` can be empty while committed work is still queued.
+    Terminating there would write a success episode for a goal with a `then` still owed."""
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    activity.condition_fired = [PendingConditionState(condition=_condition(), evaluated_through=99)]
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.READY
+
+
+async def test_a_retired_condition_stops_waiting(tmp_path: Path) -> None:
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=99)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(retired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.pending_conditions == []
+    # With nothing left to wait for, Reflect completes it on the next pass as it always did.
+    activity.state = ActivityState.READY
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+    assert activity.state is ActivityState.TERMINATED
+
+
+async def test_a_retired_condition_is_not_re_lifted_from_the_plan(tmp_path: Path) -> None:
+    """Retiring removes the per-run state, but `Plan.pending` is the frozen skeleton and never
+    changes — so the declaration is still there for Reflect to lift again on the very next pass,
+    putting the condition back on watch for an `until` the verdict already judged satisfied."""
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    condition = _condition()
+    activity = _exhausted(plan_pending=(condition,))
+    state = PendingConditionState(condition=condition, evaluated_through=99)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(retired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    assert activity.pending_conditions == []
+
+    activity.state = ActivityState.READY
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.pending_conditions == []  # stays retired; the plan does not resurrect it
+    assert activity.state is ActivityState.TERMINATED
+
+
+async def test_a_condition_the_plan_declares_is_still_lifted_after_an_unrelated_retirement(
+    tmp_path: Path,
+) -> None:
+    """Retirement is per-condition, not a switch on the plan: a second declared condition must go on
+    watching after its sibling retires."""
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    done, live = _condition(), _other_condition("Tell the user the schedule slipped")
+    activity = _exhausted(plan_pending=(done, live))
+    state = PendingConditionState(condition=done, evaluated_through=99)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(retired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    activity.state = ActivityState.READY
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert [s.condition for s in activity.pending_conditions] == [live]
+    assert activity.state is ActivityState.BLOCKED  # still waiting on the one that did not retire
+
+
+async def test_a_hallucinated_index_cannot_retire_a_live_condition(tmp_path: Path) -> None:
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=99)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(retired=(7,))  # out of range
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.pending_conditions == [state]
+
+
+# --------------------------------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------------------------------
+
+
+def _tick() -> Any:
+    from sora.strategies import TickResult
+
+    return TickResult()
+
+
+def _verdict(fired: tuple[int, ...] = (), retired: tuple[int, ...] = ()) -> Any:
+    from sora.types import ConditionVerdict
+
+    return ConditionVerdict(fired=fired, retired=retired)
+
+
+async def _settle() -> None:
+    """Let a spawned off-cycle call run to completion — the tests drive phases directly rather than
+    through the loop, so there is no tick to carry the resolve."""
+    import asyncio
+
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+
+# --------------------------------------------------------------------------------------------------
+# Rendering: a declared condition has to be visible in the trace
+# --------------------------------------------------------------------------------------------------
+# Without this, a plan that declared a good gate and a plan that silently declared none produce
+# byte-identical logs — and telling those two apart is the entire question when a run ends early.
+
+
+def test_render_plan_shows_declared_conditions() -> None:
+    from sora.memory import render_plan
+
+    plan = Plan(
+        id="p1",
+        goal="g",
+        steps=[Step("invoke", {"tool_id": "t1", "operation_name": "send_email"})],
+        pending=(
+            PendingCondition(
+                watch=SignalWait("state_changed", "t1", "folders.INBOX.emails"),
+                when="he replies that he cannot make it",
+                then="rebook for the date he proposes",
+                until="the day has passed",
+            ),
+        ),
+    )
+    rendered = render_plan(plan)
+    assert "0: invoke" in rendered
+    assert "pending:" in rendered
+    assert "folders.INBOX.emails" in rendered
+    assert "he replies that he cannot make it" in rendered
+    assert "rebook for the date he proposes" in rendered
+    assert "the day has passed" in rendered
+
+
+def test_render_plan_without_conditions_is_exactly_the_body() -> None:
+    """A body-only plan must render as it did before conditions existed — no trailing header."""
+    from sora.memory import render_plan, render_steps
+
+    plan = Plan(
+        id="p1", goal="g", steps=[Step("invoke", {"tool_id": "t1", "operation_name": "send_email"})]
+    )
+    assert render_plan(plan) == render_steps(plan.steps)
+    assert "pending" not in render_plan(plan)
+
+
+def test_render_plan_omits_an_absent_until() -> None:
+    from sora.memory import render_plan
+
+    plan = Plan(
+        id="p1",
+        goal="g",
+        steps=[],
+        pending=(
+            PendingCondition(
+                watch=SignalWait("state_changed", "t1", None), when="w", then="t", until=None
+            ),
+        ),
+    )
+    rendered = render_plan(plan)
+    assert "when" in rendered and "until" not in rendered

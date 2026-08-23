@@ -11,8 +11,12 @@ from sora.types import SupersededPlan  # constructed at run time by reset_for_re
 if TYPE_CHECKING:
     from sora.types import (
         CompletedOperation,
+        ConditionVerdict,
+        ConditionWait,
         InputWait,
         OperationAck,
+        PendingCondition,
+        PendingConditionState,
         PendingInference,
         PendingOperation,
         Plan,
@@ -57,9 +61,38 @@ class Activity:
     # on one of two declared things. A SignalWait — a manual-declared completion signal, set by
     # _suspend_ and cleared by _resume_, matched in Observe. Or an InputWait — the user's next
     # instruction, set by the interrupt handler when a hard interrupt pauses it, cleared in
-    # Observe when a user Message arrives. Named generally (not blocked_on_signal) to admit
-    # this second variant.
-    blocked_on: SignalWait | InputWait | None = None
+    # Observe when a user Message arrives. Or a ConditionWait — the plan's own declared pending
+    # conditions outliving an exhausted body, set when the body runs out with conditions still
+    # unsatisfied. Named generally (not blocked_on_signal) to admit these later variants.
+    blocked_on: SignalWait | InputWait | ConditionWait | None = None
+    # Per-run state for Plan.pending: which declared conditions are still unsatisfied and how far
+    # each has evaluated. Conditions declared by ANY frame are lifted here when that frame pops —
+    # the point of a condition is to outlive the plan that noticed it, and a deliberative sub-goal
+    # is usually where the agent first learns a branch exists (it sent the mail; now a reply may
+    # come). Transient run state, like history/bindings: the durable copy is Plan.pending.
+    pending_conditions: list[PendingConditionState] = field(default_factory=list)
+    # A resolved condition evaluation parked for Reason's next pass — the pending-condition
+    # counterpart to reconsider_verdict. Holds indices into the eligible list the call was made
+    # about, so Reason re-derives that list to apply it. Transient run state.
+    condition_verdict: ConditionVerdict | None = None
+    # The conditions the in-flight (or just-resolved) evaluation was made about, in the order the
+    # call presented them — the verdict's indices are into THIS list. Kept next to the verdict so
+    # the correspondence travels with the activity rather than in strategy-held state, which would
+    # not survive a strategy being rebuilt and could leak across activities. Transient run state.
+    condition_batch: list[PendingConditionState] = field(default_factory=list)
+    # Conditions a verdict judged fired whose `then` has not been pursued yet, oldest first. One
+    # call judges the whole eligible batch and may fire several at once (a single reply can satisfy
+    # two gates), but each `then` is a goal in its own right and runs one at a time — so the rest
+    # queue here rather than being dropped. A queue is required, not a convenience: every judged
+    # condition's mark is advanced at fire time, so the signal that opened those gates is already
+    # behind them and nothing would ever re-fire the ones not pursued. Transient run state.
+    condition_fired: list[PendingConditionState] = field(default_factory=list)
+    # Conditions whose `until` a verdict judged satisfied. Retiring drops the per-run state, but
+    # Plan.pending is the frozen skeleton and never changes — so without a record here the next
+    # lift would read the same declaration off the same plan and put the condition straight back on
+    # watch. By condition VALUE (the same key the lift dedups on), not by state identity, since the
+    # state being retired is exactly the object being thrown away. Transient run state.
+    retired_conditions: set[PendingCondition] = field(default_factory=set)
     # Append-only trace of resolved operations this activity ran — a later step grounds its params
     # against it (last_operation keeps only the newest, overwritten each step). Transient:
     # not persisted, and episodic learn() captures selectively, not a blind asdict(activity).

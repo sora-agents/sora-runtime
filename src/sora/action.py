@@ -524,6 +524,57 @@ class RevalidateAction:  # predefined internal action: _revalidate_ — the plan
         cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=valid))
 
 
+class EvaluateConditionsAction:  # predefined internal action: _evaluate_conditions_ (ADR-0022)
+    name = "evaluate_conditions"
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        # The pending-condition judgement, fired off-cycle exactly like _revalidate_: the activity
+        # goes RUNNING with pending_inference(kind="condition") and the verdict lands a later cycle
+        # via inference_sink (Observe parks it on condition_verdict). Never blocks the cycle.
+        #
+        # ONE call covers every eligible condition. The caller passes the conditions it judged
+        # eligible, in order, and the verdict's indices refer to that list — so the correspondence
+        # stays with the caller and a stale index can't retire the wrong condition.
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        conditions = kwargs["conditions"]
+        changes = kwargs.get("changes") or []
+        observed = kwargs.get("observed")
+        inf_id = uuid.uuid4().hex
+        activity.pending_inference = PendingInference(
+            id=inf_id, kind="condition", requested_at=time.time()
+        )
+        activity.state = ActivityState.RUNNING
+        log.info(
+            "reason: evaluating %d pending condition(s) for %r", len(conditions), activity.goal
+        )
+        _spawn_tracked(
+            self._tasks, self._call(cycle, activity, inf_id, conditions, changes, observed)
+        )
+
+    async def _call(
+        self,
+        cycle: DecisionCycle,
+        activity: Activity,
+        inf_id: str,
+        conditions: Any,
+        changes: Any,
+        observed: Any,
+    ) -> None:
+        current_inference_id.set(inf_id)
+        try:
+            verdict = await cycle.procedural.evaluate_conditions(
+                activity, conditions, changes, observed
+            )
+        except Exception as exc:  # noqa: BLE001 — any model/parse/wire failure resolves as an error
+            log.exception("reason: condition evaluation failed for activity %s", activity.id)
+            cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))
+            return
+        cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, value=verdict))
+
+
 # --- data-ops: composable structured-value transforms (ADR-0023) ---------------------------------
 # A data-op is an InternalAction the *plan* composes as a step (not a runtime lever like _suspend_):
 # it reads a run-time collection Reason already resolved (from Activity.history via $from, a prior
@@ -757,6 +808,7 @@ def default_action_registry() -> ActionRegistry:
         InferAction(),
         GroundAction(),
         RevalidateAction(),
+        EvaluateConditionsAction(),
     ):
         registry.register_internal(internal)
     for data_op in (

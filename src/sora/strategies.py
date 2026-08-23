@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from sora.action import (
     CollectAction,
     CreateActivityAction,
+    EvaluateConditionsAction,
     FilterAction,
     FilterPerceptionsAction,
     FocusAction,
@@ -30,7 +31,7 @@ from sora.action import (
     UnloadManualAction,
     pluck,
 )
-from sora.activity import ActivityState
+from sora.activity import Activity, ActivityState
 from sora.llm import log_llm_discarded
 from sora.memory import PerceptSnapshot, render_steps, step_from_raw
 from sora.perception import Percept
@@ -40,11 +41,17 @@ from sora.types import (
     TOOL_ID,
     USER_STOP,
     WAIT,
+    Change,
     CompletedOperation,
+    ConditionVerdict,
+    ConditionWait,
     InputWait,
     OperationInvocation,
+    PendingConditionState,
     SignalWait,
     Step,
+    changes_of,
+    path_matches,
     walk_path,
 )
 
@@ -52,12 +59,96 @@ from sora.types import (
 # can't import this module); keep the private alias so the many call sites below stay untouched.
 _walk_path = walk_path
 
-# Bound on retained signals: they're consumption-evicted (a matched signal leaves when its activity
-# resumes), but an *orphan* — one that arrives before its waiter, or that nothing ever waits on —
-# can't be dropped eagerly without losing the early-arrival window (a completion signal that beats
-# its op's ack must survive to the cycle that suspends). Cap the append log so orphans can't grow it
-# without bound; the newest win. Deliberately simple, revisited when a real multi-waiter scenario
-# needs age- or ownership-based eviction.
+
+def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
+    """Copy any conditions the activity's live frames declare onto the activity itself.
+
+    Conditions are declared per-plan (the reusable skeleton) but must outlive the frame that
+    declared them — a deliberative sub-goal is usually where the agent first learns a branch exists
+    (it sent the mail; now a reply may come), and that sub-plan's frame pops long before the reply
+    arrives. Lifting is idempotent: a condition already present is not re-added, so this can run
+    every cycle without accumulating duplicates.
+
+    A newly-lifted condition starts its mark at the CURRENT signal count, not at zero. Signals that
+    arrived before the condition was declared cannot be the event it is waiting for, and the
+    retention log still holds a few hundred of them — starting at zero would make every new
+    condition immediately re-judge the whole backlog.
+
+    Retired conditions are excluded explicitly rather than by absence. Dedup alone cannot tell "not
+    lifted yet" from "lifted and then retired", and `Plan.pending` is a frozen skeleton that still
+    declares what retirement removed — so without `retired_conditions` a satisfied `until` would be
+    undone by the very next lift, putting the condition back on watch for good.
+    """
+    frames = [activity.plan, *(plan for plan, _ in activity.parent_frames)]
+    known = {state.condition for state in activity.pending_conditions}
+    known |= activity.retired_conditions
+    for plan in frames:
+        if plan is None:
+            continue
+        for condition in plan.pending:
+            if condition in known:
+                continue
+            known.add(condition)
+            activity.pending_conditions.append(
+                PendingConditionState(condition=condition, evaluated_through=wm.signals_appended)
+            )
+
+
+def _body_exhausted(activity: Activity) -> bool:
+    """Has the whole intention stack run out — the same test Reflect uses to decide completion?
+
+    A just-exhausted *sub*-plan is not exhausted work: parent frames are still waiting to pop, so
+    the activity has more body to run and must not go back to waiting on its conditions.
+    """
+    return (
+        activity.plan is not None
+        and activity.step_index >= len(activity.plan.steps)
+        and not activity.parent_frames
+    )
+
+
+def _condition_watches(activity: Activity) -> tuple[SignalWait, ...]:
+    """The distinct watches of an activity's unsatisfied conditions, order-stable.
+
+    Denormalized onto the ConditionWait so `blocked_on` describes the wait on its own — what a
+    diagnostic renders, and what a harness inspects to tell a live wait from a stuck activity.
+    Matching itself reads `pending_conditions`, because that is where the per-condition marks live.
+    """
+    seen: dict[SignalWait, None] = {}
+    for state in activity.pending_conditions:
+        seen.setdefault(state.condition.watch, None)
+    return tuple(seen)
+
+
+def _eligible_conditions(
+    activity: Activity, wm: WorkingMemory
+) -> list[tuple[PendingConditionState, Percept]]:
+    """The conditions whose gate has opened on a signal they have not already judged.
+
+    This is the whole cost control: a condition is only ever evaluated against a change that
+    mechanically matched its declared watch — name, source, and path — so the unrelated events an
+    agent observes never reach a model. On the run that motivated this, that filter turns four
+    observed signals into one evaluation (two fail on `source`, and the agent's own outbound write
+    fails on `path` because it lands somewhere different from what the condition watches).
+    """
+    eligible: list[tuple[PendingConditionState, Percept]] = []
+    for state in activity.pending_conditions:
+        match = DefaultObserveStrategy._match_signal(
+            wm, state.condition.watch, since=state.evaluated_through
+        )
+        if match is not None:
+            eligible.append((state, match))
+    return eligible
+
+
+# Bound on retained signals. Nothing is ever evicted for being *matched* — `wm.signals` is a shared
+# broadcast log, so one waiter's satisfaction must not remove an event another waiter (or a strategy
+# reading the log directly) still needs, and a signal that arrives before its waiter has to survive
+# to the cycle that suspends. The retention cap is therefore the only eviction, and it runs after
+# both the suspend and resume passes so a signal that arrived this tick is matched before it can be
+# a candidate. The newest win. Deliberately simple; note the cap now bounds something with more
+# consequence than it used to — losing a signal loses not just the fact that an event happened but
+# the only record of *where*, which no later snapshot can reconstruct.
 _SIGNAL_RETENTION = 256
 
 if TYPE_CHECKING:
@@ -396,6 +487,9 @@ class DefaultObserveStrategy:
         self._snapshot_properties(wm)
         async for source, signal in cycle.signal_sink.drain():
             wm.signals.append(Percept(source, signal, time.time()))
+            # Bumped with the append, never with the eviction: this is what a per-waiter high-water
+            # mark is measured against, so it has to survive the retention trim below.
+            wm.signals_appended += 1
             log.info("observe: signal %s from %s", signal.name, source)
         just_resolved: list[tuple[Activity, OperationInvocation]] = []
         async for invocation_id, ack in cycle.result_sink.drain():
@@ -569,6 +663,21 @@ class DefaultObserveStrategy:
                             out,
                             activity.id,
                         )
+                    elif kind == "condition":
+                        # The batched pending-condition verdict (ADR-0022): park it for Reason's
+                        # next pass, which applies it against the eligible list it re-derives.
+                        # Deliberation output, like plan/ground/select/revalidate — never a Percept.
+                        verdict = res.value
+                        activity.condition_verdict = (
+                            verdict if isinstance(verdict, ConditionVerdict) else ConditionVerdict()
+                        )
+                        activity.state = ActivityState.READY
+                        log.info(
+                            "observe: condition verdict fired=%s retired=%s for activity %s",
+                            activity.condition_verdict.fired,
+                            activity.condition_verdict.retired,
+                            activity.id,
+                        )
                     elif kind == "revalidate":
                         # The context-adaptation validity verdict (ADR-0024): park the bool for
                         # Reason's next pass (proceed / reset_for_replan) — deliberation output,
@@ -654,8 +763,17 @@ class DefaultObserveStrategy:
         wm = cycle.working
         resume = cycle.actions.internal(ResumeAction.name)
         for activity in wm.activities.values():
-            # Only a SignalWait is satisfied by an observed signal; an InputWait waits on a user
-            # Message and is resumed in _resume_on_input, not here.
+            # An InputWait waits on a user Message and is resumed in _resume_on_input, not here.
+            if isinstance(activity.blocked_on, ConditionWait):
+                # A gate opening only makes a condition ELIGIBLE — whether it actually holds is a
+                # Reason judgment, because matching prose against an email body is irreducibly
+                # semantic. Resuming is how the activity gets selected so Reason can make it.
+                # Gated on an UNJUDGED match (each condition's own mark): resuming on a signal
+                # every condition has already dismissed would re-block immediately and spin.
+                if _eligible_conditions(activity, wm):
+                    log.info("observe: activity %s has an eligible pending condition", activity.id)
+                    await resume.execute(cycle, activity_id=activity.id)
+                continue
             if not isinstance(activity.blocked_on, SignalWait):
                 continue
             if self._match_signal(wm, activity.blocked_on) is not None:
@@ -673,14 +791,25 @@ class DefaultObserveStrategy:
         return op.completion_signal if op is not None else None
 
     @staticmethod
-    def _match_signal(wm: WorkingMemory, wait: SignalWait) -> Percept | None:
-        """The first stored signal satisfying `wait` (name equality, plus source when scoped), or
-        None. Mechanical — no LLM judgment — since the wait is a manual-declared signal name."""
-        for percept in wm.signals:
+    def _match_signal(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> Percept | None:
+        """The first stored signal satisfying `wait` (name equality, source when scoped, and path
+        when scoped), or None. Mechanical — no LLM judgment — since every field is declared.
+
+        `since` is a high-water mark over `wm.signals_appended`: only signals appended *after*
+        it are considered. The default of 0 considers everything retained, which a completion-signal
+        wait wants (it must see a signal that beat its own ack). A pending-condition waiter passes
+        its own mark so it never re-judges a signal it already judged — per-waiter, never shared.
+        """
+        # signals[i]'s sequence number; the cap front-evicts, so this is not the list index.
+        first_seq = wm.signals_appended - len(wm.signals)
+        for offset, percept in enumerate(wm.signals):
+            if first_seq + offset < since:
+                continue
             if percept.payload.name == wait.signal_name and (
                 wait.source is None or percept.source == wait.source
             ):
-                return percept
+                if path_matches(wait.path, changes_of(percept.payload)):
+                    return percept
         return None
 
     @staticmethod
@@ -722,9 +851,17 @@ class DefaultReflectStrategy:
     async def reflect(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
+        # Lift any conditions the live frames declare onto the activity, before the state check so
+        # it happens on every cycle regardless of state. Idempotent (dedup by condition value), so
+        # this is also what makes a condition live from plan ENTRY rather than only once the body is
+        # exhausted — the early-reply case (a reply that beats the confirmation step) needs the
+        # condition already watching while the body is still running.
+        _lift_pending_conditions(activity, wm)
         # Only READY activities are judged: RUNNING has an operation still in flight (nothing to
-        # judge yet), BLOCKED is waiting on a signal, and TERMINATED was already recorded — skipping
-        # it is what makes reflect() idempotent across the cycles it runs on every activity.
+        # judge yet), BLOCKED is waiting on a signal or on the user, and TERMINATED already recorded
+        # its own episode — every path that sets TERMINATED writes one before handing back (this
+        # strategy below, and Observe's residual inference-failure branch), which is what lets
+        # reflect() skip them and stay idempotent across the cycles it runs on every activity.
         if activity.state is not ActivityState.READY:
             return result
         if self.failed(activity):
@@ -738,9 +875,50 @@ class DefaultReflectStrategy:
         ):
             # Complete only when the *top-level* plan is exhausted: a just-exhausted sub-plan still
             # has parent frames to pop (Reason does that next cycle), so it isn't done (ADR-0022).
-            activity.state = ActivityState.TERMINATED
-            log.info("reflect: activity %s completed; storing episode", activity.id)
-            self._dispatch(self._record_success(cycle, activity))
+            eligible = _eligible_conditions(activity, wm) if activity.pending_conditions else []
+            if activity.condition_fired:
+                # A condition fired and its `then` is still owed. The queue outlives the condition
+                # that produced it — a fired condition is usually retired by the same verdict, so
+                # `pending_conditions` can be empty while committed work is still queued. Leave it
+                # READY for Reason to drain; terminating here would write a success episode for a
+                # goal that has an unrun `then`.
+                log.info(
+                    "reflect: activity %s body exhausted; leaving ready to pursue %d fired "
+                    "condition(s)",
+                    activity.id,
+                    len(activity.condition_fired),
+                )
+            elif eligible:
+                # A gate has opened on a signal no condition has judged yet, and Observe resumed
+                # this activity precisely so Reason can judge it. Re-blocking here would undo that
+                # resume in the same cycle, before Situate could ever select it — and since the
+                # per-condition mark advances only when Reason *fires* the batched judgement, the
+                # same unjudged signal would reopen the gate next cycle, forever. That is the
+                # Observe-resume/Reflect-reblock livelock seen on 2026-08-21: ~1400 cycles of
+                # resume->reblock after a single Emails `state_changed`, spending no model calls and
+                # making no progress, with the pending condition never once evaluated. Leave it
+                # READY; Reason advances the marks and re-blocks (or retires) from its own verdict.
+                log.info(
+                    "reflect: activity %s body exhausted; leaving ready to judge %d condition(s)",
+                    activity.id,
+                    len(eligible),
+                )
+            elif activity.pending_conditions:
+                # The body is finished but the GOAL is not: unsatisfied declared conditions mean
+                # this plan said what would make it relevant again. Block rather than terminate, and
+                # record no episode yet — the activity has not ended, so an episode written here
+                # would be a claim about an outcome that hasn't happened (ADR-0022/ADR-0026).
+                activity.state = ActivityState.BLOCKED
+                activity.blocked_on = ConditionWait(watches=_condition_watches(activity))
+                log.info(
+                    "reflect: activity %s body exhausted; blocking on %d pending condition(s)",
+                    activity.id,
+                    len(activity.pending_conditions),
+                )
+            else:
+                activity.state = ActivityState.TERMINATED
+                log.info("reflect: activity %s completed; storing episode", activity.id)
+                self._dispatch(self._record_success(cycle, activity))
         # Reflect never fills in the decision fields (activity/step/invocation) — it threads
         # `result` through untouched.
         return result
@@ -1294,6 +1472,21 @@ class DefaultReasonStrategy:
     async def reason(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
+        # Pending conditions come first: a condition that has fired redirects the activity, so
+        # deciding that before advancing the body is what lets a reply that beats the last step be
+        # acted on rather than discovered after the fact (ADR-0022).
+        if activity.condition_verdict is not None:
+            return await self._apply_condition_verdict(activity, wm, cycle, result)
+        if activity.condition_fired and _body_exhausted(activity):
+            # A verdict that fired several conditions pursued the first and queued the rest. Drain
+            # the queue before judging anything new: this work has already been judged and paid for.
+            # Gated on an idle intention stack so each `then` runs after its predecessor rather than
+            # nested inside it.
+            return await self._pursue_fired_condition(activity, wm, cycle, result)
+        if activity.pending_conditions:
+            fired = await self._evaluate_pending_conditions(activity, wm, cycle, result)
+            if fired is not None:
+                return fired
         if activity.plan is None:
             plan = await cycle.procedural.retrieve(activity)  # reuse across runs (cheap)
             if plan is None:
@@ -1486,6 +1679,105 @@ class DefaultReasonStrategy:
         await op.execute(cycle, activity_id=activity.id, collection=collection, **passthrough)
         return activity.pending_inference is not None
 
+    async def _evaluate_pending_conditions(
+        self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
+    ) -> TickResult | None:
+        """Fire the batched condition judgement if any gate has opened on an unjudged signal.
+
+        Returns the threaded result when a call was fired (no step this cycle — the activity is
+        RUNNING on the inference), or None to let Reason carry on with the body. The common case is
+        None: gates are mechanical and narrow, so most cycles nothing is eligible and this costs a
+        list comprehension.
+        """
+        eligible = _eligible_conditions(activity, wm)
+        if not eligible:
+            return None
+        # Advance every judged condition's mark NOW, at fire time rather than on resolve. A signal
+        # that lands while the call is in flight gets a higher sequence number and so earns its own
+        # evaluation later; advancing on resolve instead would either re-judge the same signal (a
+        # spin) or swallow one that arrived mid-flight.
+        for state, _ in eligible:
+            state.evaluated_through = wm.signals_appended
+        changes: list[Change] = []
+        for _, percept in eligible:
+            changes.extend(changes_of(percept.payload))
+        observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+        evaluate = cycle.actions.internal(EvaluateConditionsAction.name)
+        await evaluate.execute(
+            cycle,
+            activity_id=activity.id,
+            conditions=[state.condition for state, _ in eligible],
+            changes=changes,
+            observed=observed,
+        )
+        activity.condition_batch = [state for state, _ in eligible]
+        return result
+
+    async def _apply_condition_verdict(
+        self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
+    ) -> TickResult:
+        """Consume a resolved condition verdict: retire what is done, pursue what fired.
+
+        A fired condition's `then` is pursued through the ordinary deliberative sub-goal path — it
+        is a goal, planned fresh when the moment comes, which is the whole reason `then` is prose
+        rather than steps. That reuse is also why a fired condition costs a second call and a
+        non-firing one costs none: the judgement and the planning stay separate concerns.
+        """
+        verdict = activity.condition_verdict or ConditionVerdict()
+        activity.condition_verdict = None
+        judged = activity.condition_batch
+        activity.condition_batch = []
+        # Identity, not equality: PendingConditionState is mutable (its mark advances), so it is
+        # unhashable, and two conditions can compare equal while being distinct waiters.
+        retired = {id(judged[i]) for i in verdict.retired if i < len(judged)}
+        if retired:
+            activity.pending_conditions = [
+                state for state in activity.pending_conditions if id(state) not in retired
+            ]
+            # Remember WHAT retired, not just that something did: the declaration survives on the
+            # frozen Plan.pending, so the next lift would otherwise put it straight back on watch.
+            activity.retired_conditions.update(
+                judged[i].condition for i in verdict.retired if i < len(judged)
+            )
+            log.info("reason: retired %d pending condition(s) on %s", len(retired), activity.id)
+        fired = [
+            judged[i] for i in verdict.fired if i < len(judged) and id(judged[i]) not in retired
+        ]
+        # Queue every fire, pursue one. The verdict is plural on purpose — one call judges the whole
+        # eligible batch, and a single reply can satisfy two gates — so keeping only the first would
+        # discard judgements already paid for and unrecoverable: the marks advanced at fire time, so
+        # the signal that opened the other gates can no longer make them eligible.
+        activity.condition_fired.extend(fired)
+        if activity.condition_fired:
+            return await self._pursue_fired_condition(activity, wm, cycle, result)
+        # Nothing fired. If the body is finished, go back to waiting rather than falling through to
+        # Reflect, which would otherwise see an exhausted plan and terminate the activity outright.
+        if activity.pending_conditions and _body_exhausted(activity):
+            activity.state = ActivityState.BLOCKED
+            activity.blocked_on = ConditionWait(watches=_condition_watches(activity))
+            log.info("reason: no pending condition fired on %s; waiting again", activity.id)
+        return result
+
+    async def _pursue_fired_condition(
+        self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
+    ) -> TickResult:
+        """Take the oldest queued fire and pursue its `then` as a deliberative sub-goal.
+
+        One at a time, in the order the verdict listed them: each `then` is a goal in its own right,
+        and pursuing a second while the first one's sub-plan is still running would nest it inside
+        its predecessor — inverting the order and walking the activity toward the recursion breaker
+        for reasons that have nothing to do with the goals themselves. The queue is therefore only
+        drained when the intention stack is otherwise idle (see `reason`).
+        """
+        state = activity.condition_fired.pop(0)
+        log.info("reason: pending condition fired on %s -> %r", activity.id, state.condition.then)
+        step = Step(
+            next_action=SUBGOAL,
+            params={"goal": state.condition.then, "mode": "deliberative"},
+        )
+        await self._subgoal(step, activity, wm, cycle)
+        return result
+
     async def _subgoal(
         self, step: Step, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle
     ) -> object:
@@ -1495,7 +1787,8 @@ class DefaultReasonStrategy:
         sub-goal out over its collection and splice the expansion into the plan *in place* — a
         per-run copy via ``replace``, so the stored skeleton keeps its ``subgoal`` step — leaving
         ``step_index`` on the first expanded step and reporting ``_SUBGOAL_SPLICED`` so ``reason``
-        re-reads it. An empty/unresolvable collection expands to nothing (the sub-goal vanishes)."""
+        re-reads it. An empty collection expands to nothing and the sub-goal simply vanishes; one
+        that could not be *read* is a plan defect instead -> replan (``_SUBGOAL_DEFECT``)."""
         mode = step.params.get("mode", "deliberative")
         if mode == "deliberative":
             goal = step.params["goal"]
