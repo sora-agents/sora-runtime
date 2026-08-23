@@ -336,6 +336,12 @@ class TerminalSession:
         idle_since: float | None = None
         try:
             console.line(_paint(self._banner(), _BOLD, enabled=self._color))
+            # Which model is behind the run, under the banner where a reader looks for it. The
+            # runtime logs the same fact at startup, but the terse view shows no trace records at
+            # all and the banner never reaches a --log-file, so neither line covers the other; the
+            # cost is that --verbose prints both, one as chrome and one as trace.
+            model = self._agent.procedural.model
+            console.line(_paint(f"model: {model or 'none configured'}", _DIM, enabled=self._color))
             sent_seen = 0
             while not runner.done() and not stop_reading.is_set():
                 sent = self._transport.sent

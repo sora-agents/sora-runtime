@@ -147,6 +147,13 @@ class LLMClient(Protocol):
     async def complete(self, *, system: str, prompt: str) -> str: ...
 
 
+def _model_name(client: object) -> str | None:
+    """A client's own model id, if it names one. Duck-typed on purpose: `LLMClient` is deliberately
+    a single method, so this is an optional courtesy a client may offer, never a requirement."""
+    model = getattr(client, "model", None)
+    return model if isinstance(model, str) else None
+
+
 class MeteredLLMClient:
     """A transparent ``LLMClient`` decorator that times each round-trip and logs a ``sora.llm`` cue.
 
@@ -158,8 +165,16 @@ class MeteredLLMClient:
     (`LLMMeter`, the CLI presenter) never has to parse it back out of the message text.
     """
 
-    def __init__(self, inner: LLMClient) -> None:
+    def __init__(self, inner: LLMClient, *, model: str | None = None) -> None:
         self._inner = inner
+        # The model id, purely descriptive — a run surface reads it to record *which* model produced
+        # a trace (an unexpected trajectory is a different question for a small local model than for
+        # a frontier one). It lives here rather than on `LLMClient` because the Protocol is one
+        # method wide by design and a concrete client is free not to name its model at all.
+        # Bootstrap passes what config says; falling back to the client's own name matters, because
+        # a config that omits `model:` still runs a model — the client's default — and reporting
+        # "none" there would be a plain lie rather than a missing detail.
+        self.model = model if model is not None else _model_name(inner)
 
     async def complete(self, *, system: str, prompt: str) -> str:
         start = time.perf_counter()

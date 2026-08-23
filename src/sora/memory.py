@@ -1072,6 +1072,15 @@ class ProceduralMemory:
         self._prompt = prompt
         self._ground_prompt = ground_prompt
 
+    @property
+    def model(self) -> str | None:
+        """The name of the model behind infer()/ground(), for a run surface to record in its trace.
+        Read off the client rather than stored here: bootstrap knows the name from config and puts
+        it on the instrumentation wrapper it builds. Optional by design — `LLMClient` is one method
+        wide, so a client that names no model (and a memory with no model at all) answers None."""
+        model = getattr(self._llm, "model", None)
+        return model if isinstance(model, str) else None
+
     async def retrieve(self, activity: Activity) -> Plan | None:
         """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
         similarity, backend-dependent. The cheap path: skips infer() entirely when it hits."""

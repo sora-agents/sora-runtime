@@ -22,12 +22,13 @@ from pathlib import Path
 
 import pytest
 
-from fakes import FakeAdapter, FakeTool, FakeWorkspace
+from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cli import _BANNER, _DIM, _MAGENTA, _RESET, TerminalSession, _Console, _Presenter, main
 from sora.cycle import Agent, DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.llm import LLMClient, MeteredLLMClient
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -50,7 +51,7 @@ from sora.types import Plan, Signal, Step
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
 
 
-def _build_agent(tmp_path: Path) -> Agent:
+def _build_agent(tmp_path: Path, llm: LLMClient | None = None) -> Agent:
     workspace = FakeWorkspace(
         "clock", _ORIGIN, [FakeTool("Clock", invoke_results={"get_time": {}})]
     )
@@ -71,7 +72,7 @@ def _build_agent(tmp_path: Path) -> Agent:
         registry=registry,
         working=working,
         semantic=semantic,
-        procedural=ProceduralMemory(FileMemoryBackend(tmp_path / "procedural")),
+        procedural=ProceduralMemory(FileMemoryBackend(tmp_path / "procedural"), llm=llm),
         episodic=EpisodicMemory(FileMemoryBackend(tmp_path / "episodic")),
     )
     return Agent(
@@ -398,6 +399,25 @@ async def test_run_prints_the_banner_and_submits_stdin_lines_as_user_messages(
         await _stop(session, task, stdin)
 
 
+async def test_run_names_the_model_under_the_banner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Under the banner, before any trace: which model is behind this run. The runtime logs the
+    same fact, but the terse view shows no trace records at all — and a reader who has to scroll
+    a trajectory to work out what produced it will simply not check."""
+    agent = _build_agent(tmp_path, llm=MeteredLLMClient(FakeLLMClient(), model="qwen3:30b-64k"))
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    session = TerminalSession(agent, poll_interval=0.0)
+    task = asyncio.create_task(session.run())
+    try:
+        out = await _collect_until(capsys, "model:", task)
+        assert out.startswith(f"{_BANNER}\nmodel: qwen3:30b-64k\n")
+    finally:
+        await _stop(session, task, stdin)
+
+
 async def test_run_treats_slash_stop_as_a_hard_interrupt_not_a_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -522,10 +542,14 @@ from sora.transport import InProcessTransport
 class _FakeWorkingMemory:
     activities: dict = {{}}
 
+class _FakeProceduralMemory:
+    model = None  # the session reads this to name the model under the banner
+
 class _FakeAgent:
     def __init__(self):
         self.communication = InProcessTransport()
         self.working = _FakeWorkingMemory()
+        self.procedural = _FakeProceduralMemory()
         self._stopped = False
 
     async def run(self):
@@ -772,6 +796,9 @@ async def test_log_file_captures_the_trace_and_is_written_to_disk(
     assert log_path.exists()
     captured = log_path.read_text(encoding="utf-8")
     assert "startup: joining workspace" in captured  # a real runtime log record reached the file
+    # The model line is the reason this file is readable weeks later: the banner names the model
+    # on stdout but never reaches the file, so the startup record is what carries it in here.
+    assert "startup: model (none configured)" in captured
     assert "\x1b[" not in captured  # no ANSI escapes in the file mirror
 
 

@@ -287,9 +287,12 @@ def llm_for(config: AgentConfig) -> LLMClient | None:
     client = client_cls(**settings)
     # Wrap every built client so each round-trip is timed and logged (`sora.llm`) — instrumentation
     # a run surface reads back via `LLMMeter`, without the concrete client growing that concern.
+    # The model id rides along on the wrapper for the same reason: config is where it is known, and
+    # a run that doesn't record which model produced its trace can't be read back later.
     from sora.llm import MeteredLLMClient
 
-    return MeteredLLMClient(client)
+    model = settings.get("model")
+    return MeteredLLMClient(client, model=str(model) if model is not None else None)
 
 
 def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]:

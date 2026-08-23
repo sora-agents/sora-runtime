@@ -54,6 +54,16 @@ async def test_metered_client_is_transparent_and_forwards_arguments() -> None:
     assert inner.calls == [("sys", "usr")]  # forwards keyword args unchanged
 
 
+def test_metered_client_falls_back_to_the_clients_own_model() -> None:
+    """An `llm:` block may omit `model:` and let the client use its default — that run still has a
+    model, so reporting "none" would be a lie rather than a missing detail."""
+
+    class _NamedClient(_StubClient):
+        model = "claude-sonnet-4-5"
+
+    assert MeteredLLMClient(_NamedClient()).model == "claude-sonnet-4-5"
+
+
 @pytest.mark.asyncio
 async def test_metered_client_logs_one_timed_cue_per_call(_llm_logging_enabled: None) -> None:
     metered = MeteredLLMClient(_StubClient())

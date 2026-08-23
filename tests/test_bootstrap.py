@@ -316,6 +316,17 @@ def test_llm_for_builds_named_client_with_kwargs() -> None:
     # Every built client is wrapped for per-call timing/logging; the named client is underneath.
     assert isinstance(client, MeteredLLMClient)
     assert isinstance(client._inner, FakeLLMClient)
+    assert client.model is None  # this config names no model
+
+
+def test_llm_for_carries_the_model_id_for_the_run_trace() -> None:
+    """`model:` is passed to the client as a kwarg like any other setting, but it is *also* the one
+    the runtime reports at startup — a trace that doesn't name its model can't be read back."""
+    from sora.llm import MeteredLLMClient
+
+    client = llm_for(_config(llm={"client": "fakes.FakeLLMClient", "model": "qwen3:30b-64k"}))
+    assert isinstance(client, MeteredLLMClient)
+    assert client.model == "qwen3:30b-64k"
 
 
 def test_transport_for_defaults_to_in_process() -> None:

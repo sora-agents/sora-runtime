@@ -299,6 +299,12 @@ class Agent:
         # together, exactly as a mid-run _join_ would; that's what lets the default Situate's _load_
         # find each tool's manual, and sets up restore() across runs. activity_id is absorbed (join
         # doesn't use it). Idempotent: origins already joined are skipped.
+        # First line of every run's trace: which model produced what follows. Logged here rather
+        # than printed with the CLI banner because a log record reaches every run surface — the
+        # terminal, a --log-file capture, a batch driver's own handler — and the banner reaches
+        # only stdout. Always emitted, so "no model" reads as a configuration fact rather than as
+        # an older build that didn't say.
+        log.info("startup: model %s", self.procedural.model or "(none configured)")
         join = self.cycle.actions.external(JoinAction.name)
         already_joined = {ws.origin for ws in self.registry.joined_workspaces()}
         for origin in self.registry.configured_origins():

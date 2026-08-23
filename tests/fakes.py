@@ -112,7 +112,11 @@ class FakeLLMClient:
     ``LLMClient`` Protocol (enforced by ``mypy --strict`` at its use sites), so it plugs straight
     into ``ProceduralMemory(llm=...)``."""
 
-    def __init__(self, response: str | Sequence[str] = "") -> None:
+    def __init__(self, response: str | Sequence[str] = "", model: str | None = None) -> None:
+        # `model` is accepted and ignored, as every real client takes one: bootstrap passes the
+        # whole `llm:` block through as kwargs, so a fake that rejected it couldn't stand in for a
+        # config that names a model.
+        self.model = model
         self._responses = [response] if isinstance(response, str) else list(response)
         self.calls: list[tuple[str, str]] = []  # (system, prompt) per call, for assertions
 

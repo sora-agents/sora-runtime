@@ -19,6 +19,7 @@
     | Type a goal in plain English to delegate it. |
     | Type '/exit' or '/quit' to quit.             |
     +----------------------------------------------+
+    model: claude-opus-4-8
     what time is it?
     [invoking clock.get_time...]
     It's 14:32.

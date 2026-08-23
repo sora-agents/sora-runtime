@@ -72,13 +72,13 @@ class OpenAICompatLLMClient:
         if base_url is not None:
             client_kwargs["base_url"] = base_url
         self._client = AsyncOpenAI(**client_kwargs)
-        self._model = model
+        self.model = model  # public: bootstrap's metered wrapper reports it in the run trace
         self._max_tokens = max_tokens
         self._instrument = instrument
 
     async def complete(self, *, system: str, prompt: str) -> str:
         kwargs: dict[str, Any] = {
-            "model": self._model,
+            "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},

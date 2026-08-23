@@ -49,7 +49,7 @@ class AnthropicLLMClient:
     ) -> None:
         # api_key=None lets the SDK resolve credentials from the environment / an `ant` profile.
         self._client = AsyncAnthropic(api_key=api_key) if api_key else AsyncAnthropic()
-        self._model = model
+        self.model = model  # public: bootstrap's metered wrapper reports it in the run trace
         self._max_tokens = max_tokens
         self._instrument = instrument
 
@@ -59,7 +59,7 @@ class AnthropicLLMClient:
         # plan-inference budget behind adaptive thinking crosses. Streaming lifts that ceiling;
         # get_final_message() consumes the whole stream and returns the same assembled Message.
         async with self._client.messages.stream(
-            model=self._model,
+            model=self.model,
             max_tokens=self._max_tokens,
             system=system,
             thinking={"type": "adaptive"},
