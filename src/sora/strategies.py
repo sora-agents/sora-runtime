@@ -1029,6 +1029,46 @@ def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
     return goals
 
 
+# The names a windowed list operation uses for the metadata it returns *beside* its payload. Closed
+# and deliberately short: it is the only thing separating a paginated envelope from a record that
+# happens to carry one list field, so every addition widens what gets read as a collection. A name
+# belongs here only if no tool would plausibly use it for a record's own field.
+_PAGE_META = frozenset(
+    {
+        "count",
+        "cursor",
+        "has_more",
+        "limit",
+        "next_cursor",
+        "next_offset",
+        "offset",
+        "page",
+        "page_size",
+        "per_page",
+        "range",
+        "total",
+        "total_count",
+        "view_limit",
+    }
+)
+
+
+def _paginated_payload(value: dict[str, Any]) -> list[Any] | None:
+    """The payload list out of ``{"events": [...], "range": ..., "total": ...}``, or ``None`` when
+    this is not that shape: exactly one list-valued key, every other key a ``_PAGE_META`` scalar.
+    The vocabulary check is the whole load-bearing part — without it a one-list-field record
+    qualifies (see ``_as_collection`` tier 3)."""
+    payload: list[Any] | None = None
+    for key, item in value.items():
+        if isinstance(item, list):
+            if payload is not None:
+                return None  # two candidate payloads: which one was meant is not mechanical
+            payload = item
+        elif isinstance(item, dict) or key not in _PAGE_META:
+            return None
+    return payload
+
+
 def _as_collection(value: Any) -> list[Any] | None:
     """Coerce a resolved value to the list a fan-out/pipeline iterates, in deterministic tiers so a
     plan author never has to hand-shape a tool's return:
@@ -1050,10 +1090,19 @@ def _as_collection(value: Any) -> list[Any] | None:
        The principled fix for a tool that returns all-mapping-field records is the deferred
        model-escalated extraction below, not another shape heuristic — every mechanical tie-break
        here only shifts *which* shape misfires.
-    3. **``{id -> record}`` mapping** (ARE's ``list_all_apartments`` / ``search_apartments`` /
+    3. **paginated envelope** (a lone list-valued key beside pagination metadata, e.g. ARE's
+       ``get_calendar_events_from_to`` -> ``{"events": [...], "range": "(0, 1)", "total": 1}``):
+       take the list. Unlike tier 2 this cannot be decided structurally — a record with one list
+       field and scalar siblings (``{"event_id": ..., "title": ..., "attendees": [...]}``, an ARE
+       calendar event) is *shape-identical* to the envelope, and reading that as a collection of
+       attendees would be worse than refusing. So the siblings must additionally all be scalars
+       drawn from a closed pagination vocabulary (``_PAGE_META``), which a record's own field names
+       are not in. Narrow on purpose: it buys the one shape ARE's windowed list operations actually
+       return, and nothing else.
+    4. **``{id -> record}`` mapping** (ARE's ``list_all_apartments`` / ``search_apartments`` /
        ``list_saved_apartments``): every value a mapping -> iterate the *values*; the id is carried
        inside each record, so values-iteration is lossless.
-    4. anything else -> ``None``: a single record's fields, an ``{id -> scalar}`` map, a scalar. NOT
+    5. anything else -> ``None``: a single record's fields, an ``{id -> scalar}`` map, a scalar. NOT
        mechanically a collection, so the caller logs the shape rather than fanning out over garbage.
 
     An empty dict is an empty collection (``[]``), not "unresolvable". (Model-escalated extraction
@@ -1067,6 +1116,9 @@ def _as_collection(value: Any) -> list[Any] | None:
             inner = _as_collection(next(iter(value.values())))
             if inner is not None:
                 return inner  # single-key envelope: the lone value is the real collection
+        paginated = _paginated_payload(value)
+        if paginated is not None:
+            return paginated
         if all(isinstance(v, dict) for v in value.values()):
             return list(value.values())
     return None  # single record / envelope-of-scalars / id->scalar / scalar: refuse to guess

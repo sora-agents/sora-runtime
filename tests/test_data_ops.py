@@ -657,16 +657,33 @@ async def test_reset_for_replan_clears_bindings(tmp_path: Path) -> None:
 
 def test_as_collection_only_treats_an_id_record_map_as_a_collection() -> None:
     # A list is itself; an {id -> record} map iterates its values (lossless); an empty dict is an
-    # empty collection. But a single record, a {"results": [...], "count": n} envelope, an
-    # {id -> scalar} map, and a scalar are NOT collections — coercing them fans out over garbage.
+    # empty collection. But a single record, an {id -> scalar} map, and a scalar are NOT
+    # collections — coercing them fans out over garbage.
     assert _as_collection([{"id": "a1"}, {"id": "a2"}]) == [{"id": "a1"}, {"id": "a2"}]
     assert _as_collection({"a1": {"crime": 3}, "a2": {"crime": 6}}) == [{"crime": 3}, {"crime": 6}]
     assert _as_collection({}) == []
     assert _as_collection({"apartment_id": "a1", "crime": 6}) is None  # a single record's fields
-    assert _as_collection({"results": [1, 2], "count": 2}) is None  # multi-key: not a lone envelope
     assert _as_collection({"90210": 7, "10001": 3}) is None  # id -> scalar (lossy) -> refuse
     assert _as_collection("not-a-collection") is None
     assert _as_collection(5) is None
+
+
+def test_as_collection_takes_the_payload_out_of_a_paginated_envelope() -> None:
+    # The shape ARE's windowed list operations return. One list-valued key, every sibling a
+    # pagination-metadata scalar -> take the list.
+    events = {"events": [{"id": "e1"}], "range": "(0, 1)", "total": 1}
+    assert _as_collection(events) == [{"id": "e1"}]
+    assert _as_collection({"results": [1, 2], "count": 2}) == [1, 2]
+    assert _as_collection({"contacts": [], "range": "(0, 0)", "total": 0}) == []
+    # The vocabulary is the whole safeguard: an identically-shaped RECORD is refused, because
+    # fanning out over one event's attendees instead of over events is worse than not reading it.
+    record = {"event_id": "e1", "title": "Standup", "attendees": [{"id": "a1"}]}
+    assert _as_collection(record) is None
+    # Mixed evidence stays refused: a non-metadata sibling, a dict sibling, or a second list all
+    # mean the payload is not the one obvious thing in the dict.
+    assert _as_collection({"events": [1], "notes": "hi"}) is None
+    assert _as_collection({"events": [1], "total": 1, "page_info": {"n": 1}}) is None
+    assert _as_collection({"events": [1], "errors": [], "total": 1}) is None
 
 
 def test_as_collection_unwraps_a_single_key_envelope() -> None:

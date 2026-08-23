@@ -156,8 +156,8 @@ decides collection-hood (both the mechanical sub-goal and every data-op resolve 
 2. a **single-key envelope** (`{"apartments": {id -> rec}}`, `{"results": […]}`) is unwrapped and
    recursed into, *iff* the lone value is itself a collection — a single-element `{id -> record}`
    map whose record has *any* scalar field makes the recursion refuse, so it correctly falls
-   through to tier 3. The residual ambiguity is any single-element map `{"a1": {record}}` whose lone
-   record's fields are *all* mapping-valued — a one-field record (`{"a1": {"photos": […]}}`) **or** a
+   through to the **mapping** tier. The residual ambiguity is any single-element map
+   `{"a1": {record}}` whose lone record's fields are *all* mapping-valued — a one-field record (`{"a1": {"photos": […]}}`) **or** a
    many-field one (`{"a1": {"loc": {…}, "meta": {…}}}`): both recurse to a collection, so the record
    is unwrapped into its field-*values* instead of kept as one record. This is **undecidable** at
    this layer — `{K: {k1: {…}, k2: {…}}}` is structurally identical whether `K` is an id or a wrapper
@@ -166,14 +166,35 @@ decides collection-hood (both the mechanical sub-goal and every data-op resolve 
    real envelopes are plural `{id -> record}` maps that must unwrap; the principled resolution for a
    tool returning all-mapping-field records is the deferred model-escalated extraction, not a further
    shape heuristic;
-3. an **`{id -> record}` mapping** (every value a mapping) iterates its *values* — lossless, since
+3. a **paginated envelope** — exactly one list-valued key, every sibling a *scalar drawn from a
+   closed pagination vocabulary* (`total`, `range`, `offset`, `count`, `limit`, `has_more`, …) —
+   yields that list. Added 2026-08-21 (see below); unlike the **single-key envelope** tier it
+   deliberately is **not** purely structural;
+4. an **`{id -> record}` mapping** (every value a mapping) iterates its *values* — lossless, since
    each record carries its own id;
-4. anything else (a single record's fields, an `{id -> scalar}` map, a scalar) is **refused**
+5. anything else (a single record's fields, an `{id -> scalar}` map, a scalar) is **refused**
    (`None`) rather than guessed at.
 
-An empty dict is an empty collection (`[]`), not a failure. Richer recovery for shapes tier 4 still
-refuses — model-escalated *extraction* of a collection from an unrecognized envelope — is deferred
-(the same escalation seam the `$decide` filter already uses).
+An empty dict is an empty collection (`[]`), not a failure. Richer recovery for the shapes the
+final tier still refuses — model-escalated *extraction* of a collection from an unrecognized
+envelope — is deferred (the same escalation seam the `$decide` filter already uses).
+
+**Why the paginated-envelope tier gives up on being structural (2026-08-21).** ARE's windowed list
+operations return `{"events": […], "range": "(0, 1)", "total": 1}`, which the tiers above refused:
+it is not a lone-key envelope and its values are not all mappings. Refusing was defensible in isolation but not in
+context — those operations *declare* a bare return type, and the planning prompt tells the planner to
+match the declared shape, so the plan wrote the empty path `""` exactly as instructed and the runtime
+answered "add a `path`". A run lost a 220-second replanning round-trip to being punished for
+believing the catalog. The obvious structural rule — one list-valued key, scalar siblings — is
+**wrong**, and this is the point worth recording: an ARE calendar *event* is
+`{"event_id": …, "title": …, "attendees": […]}`, the identical shape, and reading it as a collection
+would fan a sub-goal out over one event's attendees instead of over events. So that tier additionally
+requires every sibling key to come from a **closed vocabulary of pagination-metadata names**, which a
+record's own fields are not drawn from. That is a vocabulary heuristic, not a structural proof, and
+it is stated as such: it buys exactly the shape windowed list operations return, and every name added
+to the vocabulary widens what gets read as a collection. The alternative — fixing the mis-declared
+return types at the adapter — is worth doing too, but it cannot be relied on, since the runtime does
+not control what an imported tool's schema claims about itself.
 
 Observability is consolidated into a **single diagnostic site**, `_resolve_collection`: it is the
 one place that logs *why* a resolution came up empty, distinguishing an **unresolved reference** (the
