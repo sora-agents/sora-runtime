@@ -37,6 +37,7 @@ from sora.types import (
     SignalWait,
     Step,
     SupersededPlan,
+    UnresolvableGrounding,
 )
 
 if TYPE_CHECKING:
@@ -266,6 +267,13 @@ def _tool_record_from_dict(d: dict[str, Any]) -> ToolRecord:
 # planning into a ReasonStrategy); the *response contract* stays fixed — a custom prompt must still
 # yield the {"steps": [...]} JSON that `_parse_plan_steps` reads.
 
+# Worked examples in this prompt are deliberately drawn from a domain nothing evaluates this
+# runtime on (a museum collection catalogue). They used to be drawn from the ARE/Gaia2 apartment
+# search that most runs exercise — which quietly turned a benchmark score into a partial measure of
+# how well the prompt pre-solved that benchmark's own task family. The structural rules are what
+# these examples exist to teach and they are domain-free; keeping the nouns off any evaluated domain
+# costs nothing and keeps the number honest. When adding an example, do NOT reach for the scenario
+# you happen to be debugging.
 PLAN_SYSTEM_PROMPT = (
     "You are the planning component of an autonomous agent runtime. Given a goal and the tools "
     "available to the agent, produce a short, ordered plan of concrete steps that achieves the "
@@ -290,12 +298,38 @@ PLAN_SYSTEM_PROMPT = (
     "so it is NEVER how you message anyone else. When the goal asks to email/message/notify some "
     "OTHER person, that is a domain tool's own operation (e.g. an email client's `send_email`), "
     "filling recipient / subject / body from earlier results; when it must reach EACH of several "
-    "recipients (e.g. email each relative), fan that invoke out with a mechanical sub-goal.\n"
+    "recipients (e.g. notify each curator), fan that invoke out with a mechanical sub-goal.\n"
     "When a parameter's value depends on the RESULT of an earlier step (e.g. an id or address you "
     "only learn by first listing/searching), you do NOT know it yet — never invent a literal. "
     "Instead reference the earlier result:\n"
     '  {"$from": "<operation_name>", "path": "<dotted path into that operation\'s result>"}, or\n'
     '  {"$decide": "<what value is needed>"} when picking the value needs judgement.\n'
+    "A value already in the CURRENTLY OBSERVED PROPERTIES above needs no operation at all — "
+    "reference it directly:\n"
+    '  {"$prop": "<tool_id>.<property_name>", "path": "<dotted path into the property value>"}\n'
+    "Two rules. A property is observed only while its tool is FOCUSED, so emit a `focus` step for "
+    "that tool before the first step that references it. And qualify the name with its tool "
+    "whenever more than one focused tool exposes a property by that name (many tools publish a "
+    "`state`) — a bare name is accepted only when it is unambiguous.\n"
+    "Prefer $prop over paginated scanning: where a property already holds the whole collection "
+    "(e.g. an app's `state`), filter THAT with a data-op in one step rather than calling a "
+    "list/search operation repeatedly to page through the same data.\n"
+    "To spot that case, read the shape each property is listed with above: it names the fields and "
+    'gives the count, e.g. `Contacts.state = {contacts: {<key>: {..., job: "..."}} x 125}`. A '
+    "count that large is the COMPLETE collection, and a list operation that returns ten at a time "
+    "is a window onto this same data — so filter the property on the field you need and skip the "
+    "operation entirely. A search operation is a guess that can return [] even when the record is "
+    "there; filtering the property cannot.\n"
+    "A value you must COMPUTE from an earlier result is in the same boat, and a DATE is the case "
+    'that most often goes wrong. "This coming Saturday", "tomorrow", "an hour after the '
+    "meeting\" all depend on a clock reading you have not taken yet: you do not know today's date "
+    "at planning time, so a literal date baked into a step is a guess, and a plan that reads the "
+    "clock in step 0 and then hardcodes a date in step 2 has thrown that reading away. Take the "
+    "reading in an earlier step and express every value derived from it as a $decide naming the "
+    "calculation, e.g. "
+    '{"start_datetime": {"$decide": "the first Saturday on or after the get_current_time result, '
+    'at 08:00:00, formatted YYYY-MM-DD HH:MM:SS"}}'
+    " — it is then computed at run time against the real clock.\n"
     "For a $from path, read the referenced operation's declared `returns:` shape in the tool "
     "catalog and index into THAT: a numeric segment indexes a list position, a name indexes a "
     "field. So if an operation returns an array of records, the id of the first record is "
@@ -305,14 +339,22 @@ PLAN_SYSTEM_PROMPT = (
     "`returns:` exactly (do not assume a wrapper key or a field name that isn't listed there).\n"
     "A reference must be the WHOLE value of its key, never embedded inside a larger string — "
     '{"text": "It is {"$from": ...}."} is invalid and will be sent to the user unresolved, '
-    "literal braces and all. To report a not-yet-known result in prose, make the field itself a "
+    "literal braces and all. It MAY, though, stand as a whole ELEMENT of a list when the "
+    'parameter is a list — {"attendees": [{"$decide": "the manager\'s full name"}]} is '
+    "valid and resolves element by element; that is the only way to express a list whose members "
+    "are not known until run time. "
+    "To report a not-yet-known result in prose, make the field itself a "
     '$decide reference describing the sentence to produce, e.g. {"text": {"$decide": "one '
     'sentence reporting the get_time result"}} — it is phrased from the real result at run time, '
     "not at plan time.\n"
-    "Prefer a narrowing step first (e.g. search for the specific item) so a $from reference points "
-    "at an unambiguous result.\n"
-    "When a step must be repeated once PER ITEM of a collection you only learn at run time (save "
-    "each of the found apartments, email each relative), do NOT hard-code one step per item and do "
+    "Where the data is reachable only through operations, prefer a narrowing step first (e.g. "
+    "search for the specific item) so a $from reference points at an unambiguous result. Check the "
+    "observed properties before reaching for that, though: if one already holds the collection, "
+    "$prop plus a filter beats a search — it sees every record rather than the first page, and it "
+    "costs no operation at all.\n"
+    "When a step must be repeated once PER ITEM of a collection you only learn at run time "
+    "(catalogue each of the found artifacts, notify each curator), do NOT hard-code one step per "
+    "item and do "
     "NOT collapse it to a single step — you do not know how many items there will be. Emit ONE "
     '`subgoal` step instead. For a uniform repeat over a collection, use "mode": "mechanical" '
     "with:\n"
@@ -344,7 +386,7 @@ PLAN_SYSTEM_PROMPT = (
     '"value_path": "<field to read from each item of that collection>"}: '
     "this keeps (in) / excludes "
     "(not_in) items whose `path` value is among that other collection's `value_path` values — e.g. "
-    "keep apartments NOT already saved. Omit `value_path` when the referenced "
+    "keep artifacts NOT already catalogued. Omit `value_path` when the referenced "
     "collection is already "
     "a list of the bare keys,\n"
     '  {"action": "distinct", "in": ..., "out": "<name>", "by": "<field>"}  drop duplicates (omit '
@@ -355,23 +397,24 @@ PLAN_SYSTEM_PROMPT = (
     "every run of that operation — use it after a mechanical sub-goal that invoked one operation "
     "per item, to turn the scattered per-item results into one list. Each collected item also "
     "carries that call's INPUT arguments, so you can filter/join on them even when the result "
-    "doesn't echo them back — e.g. after get_crime_rate per zip, `collect` yields items with both "
-    "the returned rate AND the zip_code it was called for, so a mechanical `between` then an "
-    "`in`/`not_in` membership join on zip_code needs no $decide,\n"
+    "doesn't echo them back — e.g. after get_condition_score per gallery, `collect` yields items "
+    "with both the returned score AND the gallery_id it was called for, so a mechanical `between` "
+    "then an `in`/`not_in` membership join on gallery_id needs no $decide,\n"
     '  {"action": "reduce", "in": ..., "out": "<name>", "op": "<sum|min|max|count|mean>", '
     '"by": "<field>"}  aggregate to a single value.\n'
-    "So the 'save each QUALIFYING apartment' shape is: search -> `filter` the results into a "
+    "So the 'catalogue each QUALIFYING artifact' shape is: search -> `filter` the results into a "
     '`qualifying` binding -> a mechanical sub-goal whose "in" is {"$bind": "qualifying"}. To act '
-    "on values a tool produced per item (e.g. a crime rate per zip), map with a mechanical "
-    "sub-goal, then `collect` its results before filtering or reducing them.\n"
+    "on values a tool produced per item (e.g. a condition score per gallery), map with a "
+    "mechanical sub-goal, then `collect` its results before filtering or reducing them.\n"
     "For a plain top-N selection, `sort` + `take` is the right tool — and it stays right even when "
     "ties on the sort key are possible, AS LONG AS the goal does not dictate how to break them "
     "(any of the tied items is an acceptable pick). Do NOT reach for a $decide just because a tie "
     "could happen. ONLY when the goal SPECIFIES a tie-break or priority rule that the sort order "
     "cannot encode — one that applies among items tied on the primary key, or that depends on how "
-    "many items qualify (e.g. 'the two cheapest; if their prices tie, prefer the ones with "
-    "laundry, ordered alphabetically; if fewer than two have laundry, take the ones with the most "
-    "amenities') — is `sort` + `take` wrong: taking first collapses the tie by the sort's "
+    "many items qualify (e.g. 'the two oldest; if their dates tie, prefer the ones with a "
+    "conservation report, ordered alphabetically; if fewer than two have a report, take the ones "
+    "with the most provenance records') — is `sort` + `take` wrong: taking first collapses the "
+    "tie by the sort's "
     "incidental order and DISCARDS the other tied candidates before the specified rule can weigh "
     "them. For that case bring the candidates together with `sort` on the primary key, then apply "
     "the WHOLE rule in ONE `$decide` filter over that sorted collection — "
@@ -617,6 +660,90 @@ def _render_json(value: Any) -> str:
         return json.dumps(str(value))
 
 
+# Past this rendered length a property is sketched by shape instead of truncated — see
+# _render_property_value. The caps below bound the sketch itself: how deep it descends, how many
+# fields it enumerates, and how much of a scalar it shows.
+_TRUNCATE_LIMIT = 400
+_SHAPE_MAX_DEPTH = 3
+_SHAPE_MAX_FIELDS = 24  # a record's field NAMES are the payload here, so enumerate generously
+_SHAPE_SAMPLE = 5  # values compared when testing a dict for homogeneity — maps run to the hundreds
+_SHAPE_MAX_SCALAR = 40  # a scalar longer than this is a placeholder, not information
+
+
+def _value_signature(value: Any) -> object:
+    """What makes two dict values "the same shape" for _is_keyed_collection."""
+    if isinstance(value, dict):
+        return frozenset(value)
+    if isinstance(value, list):
+        return list
+    return type(value)
+
+
+def _is_keyed_collection(value: dict[Any, Any]) -> bool:
+    """Whether to read this dict as an ``{id -> record}`` map — describe one entry and count them —
+    rather than as a record whose field names should be enumerated.
+
+    Key count alone cannot tell the two apart, and getting it wrong is not cosmetic. An ARE contact
+    has fifteen fields, wider than any plausible enumeration cap, so a count-only rule reported it
+    as ``{<key>: "Astrid"} x 15`` — withholding every field name, which is the one thing a planner
+    needs in order to write a ``$prop`` path or a filter predicate over the property. Real keyed
+    collections are *homogeneous* (every value the same shape) where a record is not (a contact
+    mixes str, bool and int), so homogeneity is the discriminator and the count is only a floor.
+    That floor keeps a small homogeneous dict like ``{INBOX: ..., SENT: ...}`` enumerated, where
+    the keys are path segments a planner has to write verbatim rather than opaque ids."""
+    if len(value) <= _SHAPE_MAX_FIELDS:
+        return False
+    signatures = {_value_signature(v) for v in list(value.values())[:_SHAPE_SAMPLE]}
+    return len(signatures) == 1
+
+
+def _property_shape(value: Any, depth: int = 0) -> str | None:
+    """A shape sketch for a container too big to show whole, or ``None`` if it should be shown
+    verbatim. Bulk state — ARE publishes 125 contacts under one ``state`` property — is the case a
+    length cap serves worst: a truncated quarter-kilobyte of one record tells a planner nothing
+    about the *path* it must write, which is the only thing it needs from this line. So past the
+    threshold, describe the container instead: its keys, or its element shape and cardinality."""
+    if isinstance(value, dict):
+        if not value:
+            return None
+        if depth >= _SHAPE_MAX_DEPTH:
+            return f"{{... x {len(value)}}}"
+        keys = list(value)
+        if _is_keyed_collection(value):  # describe one record, count them
+            return f"{{<key>: {_shape_or_value(value[keys[0]], depth)}}} x {len(value)}"
+        shown = keys[:_SHAPE_MAX_FIELDS]
+        inner = ", ".join(f"{k}: {_shape_or_value(value[k], depth)}" for k in shown)
+        if len(keys) > len(shown):
+            inner += f", ... +{len(keys) - len(shown)} more"
+        return f"{{{inner}}}"
+    if isinstance(value, list):
+        if not value:
+            return None
+        return f"[{_shape_or_value(value[0], depth)}] x {len(value)}"
+    return None  # a scalar is its own best rendering
+
+
+def _shape_or_value(value: Any, depth: int) -> str:
+    """One member of a shape sketch: its own sketch if it has one, else the scalar itself when
+    that is short enough to be worth more than a placeholder (``view_limit: 10`` tells the planner
+    something ``view_limit: <value>`` does not)."""
+    shape = _property_shape(value, depth + 1)
+    if shape is not None:
+        return shape
+    rendered = _render_json(value)
+    return rendered if len(rendered) <= _SHAPE_MAX_SCALAR else "<value>"
+
+
+def _render_property_value(value: Any) -> str:
+    """Verbatim JSON while it fits; a shape sketch once it doesn't. The cutoff is the same
+    ``_truncate`` limit, so small properties are unaffected and read exactly as before."""
+    rendered = _render_json(value)
+    if len(rendered) <= _TRUNCATE_LIMIT:
+        return rendered
+    shape = _property_shape(value)
+    return shape if shape is not None else _truncate(rendered)
+
+
 def render_properties(properties: list[Percept]) -> str:
     """Render the agent's currently observed property snapshot (``WorkingMemory.properties``) for a
     planning/grounding prompt — the runtime's currently-known world state, not just the results of
@@ -628,7 +755,7 @@ def render_properties(properties: list[Percept]) -> str:
     if not properties:
         return "(none observed yet)"
     return "\n".join(
-        f"- {p.source}.{p.payload.name} = {_truncate(_render_json(p.payload.value))}"
+        f"- {p.source}.{p.payload.name} = {_render_property_value(p.payload.value)}"
         for p in properties
     )
 
@@ -747,14 +874,38 @@ def default_plan_prompt(
         # omits the section then carries no dangling instruction about one that isn't there. Worded
         # as reusable material rather than as a negative example — told "this was wrong", a planner
         # avoids the parts that were fine too, which is the whole benefit lost.
-        user += (
-            "\n\nA previous plan for this goal was abandoned because the world moved; the "
-            "observations above supersede the assumptions it was written against. Reuse whatever "
-            "still applies and re-derive whatever does not — it is stale, not wrong throughout. "
-            "The intermediate values its earlier steps had bound were discarded with it, so a "
-            "remaining step that reads one must be re-derived rather than carried over as-is.\n"
-            f"{render_superseded_plan(activity.superseded)}"
-        )
+        if activity.superseded.defect is None:
+            framing = (
+                "\n\nA previous plan for this goal was abandoned because the world moved; the "
+                "observations above supersede the assumptions it was written against. Reuse "
+                "whatever still applies and re-derive whatever does not — it is stale, not wrong "
+                "throughout. The intermediate values its earlier steps had bound were discarded "
+                "with it, so a remaining step that reads one must be re-derived rather than "
+                "carried over as-is.\n"
+            )
+        else:
+            # The opposite brief, and it has to be explicit about scope: told only "that was
+            # wrong", a planner throws out the steps that were fine too (the same trap the
+            # reconsideration wording above is worded around). So: name the one broken step, say
+            # plainly that re-deriving it will not help, and bless the rest. Deliberately covers
+            # every defect the runtime can detect rather than one — the remedies differ (a
+            # different operation, a corrected param name) but the shape of the advice does not.
+            framing = (
+                "\n\nA previous plan for this goal was abandoned because one of its steps could "
+                f"not be carried out: {activity.superseded.defect}. That is not a stale reading "
+                "that a fresh look would fix — writing that step the same way again will fail in "
+                "the same place, so the replacement has to differ THERE. Depending on what the "
+                "problem was: reach the value by a different operation, or by a broader query "
+                "narrowed afterwards with a filter step; take parameter names only from the tool "
+                "catalog above, never from an operation's prose description. If what the step "
+                "needed genuinely is not available anywhere, plan to tell the user so instead of "
+                "proceeding without it — never substitute a value that merely looks plausible. "
+                "Everything in the plan that did not depend on that step was fine and should be "
+                "reused; the intermediate values its earlier steps had bound were discarded with "
+                "it, so a remaining step that reads one must be re-derived rather than carried "
+                "over as-is.\n"
+            )
+        user += f"{framing}{render_superseded_plan(activity.superseded)}"
     return PLAN_SYSTEM_PROMPT, user
 
 
@@ -921,7 +1072,23 @@ GROUND_SYSTEM_PROMPT = (
     "observed property/signal from the ACTUAL data given, and keep already-concrete values as "
     "given.\n"
     'Respond with ONLY a JSON object of the form {"params": { ... }} and nothing else — no prose, '
-    "no markdown fences. Use only parameter names from the schema."
+    "no markdown fences. Use only parameter names from the schema.\n"
+    "If a reference names data that is NOT in what you were given — the operation it names "
+    "returned an empty list, the field is absent, the binding is empty — then that value does not "
+    "exist yet and you must NOT invent one. Do NOT substitute a nearby value that merely looks "
+    "plausible: the user's own name or address, some other contact, a guessed date. The agent "
+    "ACTS on what you "
+    "return and many operations are irreversible, so a wrong-but-plausible recipient is far worse "
+    "than an admitted gap — a gap can be recovered from, a sent email cannot. In that case respond "
+    'with ONLY {"unresolvable": "<which parameter, and what was missing from the data>"} instead, '
+    "and the runtime re-plans from it.\n"
+    "This applies element by element inside a LIST parameter too: if an element's reference names "
+    "data that is not there, report the gap for that parameter — do NOT quietly drop the element "
+    "and return a shorter list. A list that comes back shorter than it went in is silently doing "
+    "less than the step asked for, which reads as success and is not; the runtime rejects it.\n"
+    "That is only for missing DATA. A value you can compute or phrase from what you WERE given is "
+    "resolvable, so produce it: a $decide asking for a sentence about a result that is present, or "
+    "a date derived from a clock reading in the history, are ordinary work, not gaps."
 )
 
 
@@ -1151,7 +1318,11 @@ def default_ground_prompt(
     ``render_signals`` in a custom one."""
     observed = observed or PerceptSnapshot()
     user = (
-        f"Goal: {activity.goal}\n\n"
+        # No goal-provenance notice here, unlike default_plan_prompt: it is advice about how to end
+        # a *plan* ("do NOT invoke send_message_to_user"), which grounding one operation's params
+        # cannot act on, and this activity's `goal` is the top-level one even mid-sub-plan — so
+        # rendering it would tell the grounder the user's own request is not from the user.
+        f"Goal: {activity.goal}\n"
         f"Operation to invoke:\n{_render_operation_schema(manual, operation_name)}\n\n"
         f"Partial parameters (resolve any references, keep concrete values):\n"
         f"{json.dumps(partial_params, indent=2)}\n\n"
@@ -1166,9 +1337,18 @@ def default_ground_prompt(
     return GROUND_SYSTEM_PROMPT, user
 
 
+# The grounder's second legal answer: the data a reference names is not present. Checked before
+# "params" so a response carrying both (a model hedging) is read as the gap it reports — the safe
+# reading, since the params half of such an answer is exactly the fabrication this channel exists
+# to prevent.
+_GROUND_UNRESOLVABLE = "unresolvable"
+
+
 def _parse_params(text: str) -> dict[str, Any]:
     try:
         data = _load_json_object(text)
+        if isinstance(data, dict) and data.get(_GROUND_UNRESOLVABLE):
+            raise UnresolvableGrounding(str(data[_GROUND_UNRESOLVABLE]))
         params = data["params"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(
@@ -1177,6 +1357,32 @@ def _parse_params(text: str) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError(f"grounded params is not a JSON object: {params!r}")
     return params
+
+
+def _check_no_dropped_elements(partial_params: dict[str, Any], params: dict[str, Any]) -> None:
+    """Refuse a grounding that returned a *shorter* list than the step supplied.
+
+    ``unresolvable`` is the honest answer for a reference whose data never materialized, but a list
+    parameter offers a third way out the prompt cannot fully close: keep the shape, drop the
+    element. That answer parses, looks like success, and gets invoked — an event created with
+    ``attendees: []`` when the step asked for one attendee is not a partial success, it is a wrong
+    write that nothing downstream will question. The count is a pre-image the runtime already
+    holds, so checking it costs nothing and needs no model.
+
+    Growth is fine and expected: one reference element can resolve to many values. Only shrinkage
+    is a claim that something asked for is not there — which is what ``unresolvable`` is *for*, so
+    it is raised here on the model's behalf and drives the same replan."""
+    for name, before in partial_params.items():
+        if not isinstance(before, list) or not before:
+            continue
+        after = params.get(name)
+        kept = len(after) if isinstance(after, list) else 0
+        if kept < len(before):
+            raise UnresolvableGrounding(
+                f"{name}: the step supplied {len(before)} element(s) and grounding returned "
+                f"{kept} — the data the missing element(s) referenced is not present in this run, "
+                f"so the step cannot be carried out as written"
+            )
 
 
 # --- revalidate: the context-adaptation plan-validity re-check — ADR-0024 ------------------------
@@ -1292,12 +1498,6 @@ def _parse_keep(text: str, count: int) -> list[int]:
     return kept
 
 
-# Operation results carry the identifiers a reference resolves against, so history is rendered with
-# a generous cap (bounded, but large enough that a multi-record search result isn't cut mid-record).
-# Observed properties/signals are re-observed state that would grow every prompt, so they keep the
-# smaller default below — this is why the two aren't one shared limit.
-_HISTORY_RESULT_LIMIT = 4000
-
 # How many *entries* of an activity's history each prompt renders. History is append-only for the
 # whole life of an activity, so without a window every prompt grows with the activity — unbounded
 # in the long-lived, asynchronous setting this runtime is built for, not just in a long plan.
@@ -1318,7 +1518,7 @@ _HISTORY_RENDER_REVALIDATE = 10
 _HISTORY_RENDER_PLAN = 40
 
 
-def _truncate(value: Any, limit: int = 400) -> str:
+def _truncate(value: Any, limit: int = _TRUNCATE_LIMIT) -> str:
     """One-line, length-capped rendering of a result for a prompt/log line."""
     text = " ".join(str(value).split())
     return text if len(text) <= limit else text[:limit] + "…"
@@ -1432,7 +1632,9 @@ class ProceduralMemory:
         )
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         text = await self._llm.complete(system=system, prompt=user)
-        return _parse_params(text)
+        params = _parse_params(text)
+        _check_no_dropped_elements(partial_params, params)
+        return params
 
     async def select(self, activity: Activity, collection: list[Any], predicate: str) -> list[Any]:
         """Filter ``collection`` to the subset satisfying a natural-language ``predicate`` — the

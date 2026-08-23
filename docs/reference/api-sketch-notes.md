@@ -161,9 +161,23 @@
         #                            escalation, only for genuine judgment). Retrieval, not unification. A body
         #                            param reads a bound value via {"$bind": <name>} (optional "path") — the
         #                            named-binding sibling of $from; that is how a param binds from long-term
-        #                            memory, while $from stays history-only. Naming an unbound guard name -> plan inapplicable
+        #                            memory, while $from stays history-only and $prop reads the observed
+        #                            property snapshot. The three partition by the memory module they read and
+        #                            the update discipline it guarantees: guard-memory is long-term, so it binds
+        #                            once at entry; $from and $prop are per-step, since history grows and the
+        #                            property snapshot is replaced every cycle. Naming an unbound guard name -> plan inapplicable
         #                            (a mechanical unbindable flag, not a hallucinated literal). ADR-0022.
         steps: list[Step]
+        pending: tuple[PendingCondition, ...] = ()  # what would make this plan relevant AGAIN once its body is
+        #                            exhausted — the trigger half of AgentSpeak's trigger+guard+body, pointed
+        #                            forward. Part of the reusable SKELETON; the per-run state (which are still
+        #                            unsatisfied, how far each has evaluated) lives on Activity.pending_conditions.
+        #                            With none unsatisfied the activity TERMINATES as before; otherwise it BLOCKS
+        #                            on a ConditionWait instead, so "this goal is finished" stops being confused
+        #                            with "this goal's body is finished". NOT plan control flow: a condition is
+        #                            not a step, never blocks the body, and executes nothing — it declares what a
+        #                            wait would be FOR, while every transition it implies stays the cycle's
+        #                            (ADR-0019). Declaring is the plan's job; waiting is the cycle's. ADR-0022.
 
     @dataclass(frozen=True)
     class OperationInvocation:  # was Invocation — the concrete, schema-bound call, distinct from a Step's more abstract decision
@@ -185,6 +199,12 @@
         #                            whole-activity redirect, never frame-local (ADR-0024). Kept so the
         #                            re-infer is written against the intent it replaces instead of starting
         #                            blank; Observe clears it once the replacement plan installs.
+        defect: str | None       # why, when the plan itself was at fault — a reference naming data the run
+        #                            never produced, a param the operation's schema doesn't declare — rather
+        #                            than the world having moved. None = the reconsideration case. The
+        #                            replanning prompt picks opposite briefs from it: "stale, reuse what
+        #                            applies" vs "that step can't work, route around it". One brief for both
+        #                            had the planner re-emit the dead step verbatim.
 
     class PendingInference:   # tracks one in-flight infer()/ground() — lives on Activity, mutually exclusive
         id: str                 #   with pending_operation (a cycle emits one action). Correlates to what
@@ -208,6 +228,14 @@
         value: Plan | dict | bool  # correlates to PendingInference.id; a Plan (kind="plan"), grounded params
         #                         (kind="ground"), or a bool verdict (kind="revalidate" — ADR-0024).
         #                         DefaultObserveStrategy applies it on resolve.
+        unresolvable: str | None   # kind="ground" only: grounding reported that the data a reference names
+        #                         is absent rather than inventing a value for it. Distinct from `error`
+        #                         because it is a report, not a failure: BOTH replan, but only this one is
+        #                         the model doing what it was asked, so it carries its own account of what
+        #                         was missing (the replanning prompt shows the empty result).
+
+    class UnresolvableGrounding(Exception):   # what ground() raises to report that gap — a defect in the
+    #                                           plan, never a wire/parse failure. See ADR-0017.
 
     @dataclass(frozen=True)
     class CompletedOperation:   # one resolved invocation + its ack — an entry in Activity.history
@@ -813,8 +841,18 @@
         # Environment stimuli, stored by their opposite lifecycles: properties are a replace-by-
         # (source, name) snapshot (one entry, last value wins); signals are an append log — a matched
         # signal is never evicted just for satisfying a wait, only a fixed retention cap bounds it.
+        # A plan step addresses `properties` with {"$prop": "<tool_id>.<property_name>"} (a bare name
+        # only where exactly one focused tool exposes it); `signals` has no such token (ADR-0022).
         properties: dict[tuple[str, str], Percept]
         signals: list[Percept]
+        signals_appended: int          # monotonic count of signals EVER appended — never decremented by the
+                                        # retention cap. A waiter's high-water mark can't be a list index
+                                        # (the cap front-evicts), so the sequence number of signals[i] is
+                                        # signals_appended - len(signals) + i. Stays stable across eviction
+                                        # and adds no field to Percept, where a sequence number would be
+                                        # meaningless for the property half of the store. Deliberately NOT a
+                                        # shared consumed-cursor like messages_cursor: signals are a
+                                        # broadcast log with many independent readers (ADR-0019).
         messages: list[Message]        # inbound agent-to-agent communication — kept distinct
         messages_cursor: int           # count already routed (goal) or claimed (resume); a consumed-
                                         # cursor over the append-only log so each message is handled once
@@ -851,8 +889,11 @@
         #   The response contract ({"context_guard":[...], "steps":[...]}) stays fixed — customize the
         #   *prompt*, not the parse. PLAN_SYSTEM_PROMPT also tells the model to emit a *reference* —
         #   {"$from": "<op>", "path": "<dotted path>"} or {"$decide": "..."} — for a param whose
-        #   value depends on an earlier step's result, never a made-up literal, and to reuse an
-        #   already-observed property/signal value directly instead of re-discovering it. It further
+        #   value depends on an earlier step's result, never a made-up literal, and to read an
+        #   already-observed property directly via {"$prop": "<tool_id>.<property_name>"} rather than
+        #   re-discovering it (preceded by a `focus` step for that tool, since a property is observed
+        #   only while its tool is focused, and preferred over paging a list/search operation through
+        #   data a property already holds whole). It further
         #   tells the model to author `context_guard` clauses for values that come from long-term
         #   memory (bound by name, read via {"$bind": name}, not $from), and to emit a "subgoal" step — mechanical for a uniform
         #   map over a collection, deliberative for an open continuation — instead of guessing an

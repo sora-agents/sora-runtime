@@ -36,6 +36,7 @@ from sora.memory import (
 )
 from sora.perception import Message
 from sora.strategies import (
+    _MISSING,
     DefaultActStrategy,
     DefaultObserveStrategy,
     DefaultReasonStrategy,
@@ -44,6 +45,7 @@ from sora.strategies import (
     Strategies,
     TickResult,
     _as_collection,
+    _latest_result,
     _resolve_collection,
 )
 from sora.transport import MessageTransport
@@ -288,33 +290,26 @@ async def test_filter_membership_reference_of_scalars_needs_no_value_path(tmp_pa
     assert [e["zip"] for e in activity.bindings["covered"]] == ["90210", "60601"]
 
 
-async def test_filter_membership_unresolvable_reference_fails_open_for_not_in(
-    tmp_path: Path,
-) -> None:
-    # An unresolvable membership reference becomes an empty set: not_in keeps everything (never
-    # silently drops the whole collection), while in would keep nothing.
+async def test_filter_membership_unresolvable_reference_replans(tmp_path: Path) -> None:
+    """An unreadable membership set used to become an empty set, which fails *open* in both
+    directions — `not_in` keeps every element, `in` keeps none — so the filter confidently does the
+    wrong thing to the whole collection either way. Neither answer is knowable, so neither is
+    given: the plan is dropped for the same reason the fan-out drops it."""
     candidates = [{"id": "a1"}, {"id": "a2"}]
-    not_in_step = Step(
-        next_action="filter",
-        params={
-            "in": candidates,
-            "out": "kept",
-            "where": {"path": "id", "op": "not_in", "value": {"$from": "never_ran"}},
-        },
-    )
-    activity = await _run_one_dataop(tmp_path, not_in_step, [])
-    assert [e["id"] for e in activity.bindings["kept"]] == ["a1", "a2"]
+    for op in ("not_in", "in"):
+        step = Step(
+            next_action="filter",
+            params={
+                "in": candidates,
+                "out": "kept",
+                "where": {"path": "id", "op": op, "value": {"$from": "never_ran"}},
+            },
+        )
+        activity = await _run_one_dataop(tmp_path, step, [])
 
-    in_step = Step(
-        next_action="filter",
-        params={
-            "in": candidates,
-            "out": "kept",
-            "where": {"path": "id", "op": "in", "value": {"$from": "never_ran"}},
-        },
-    )
-    activity = await _run_one_dataop(tmp_path, in_step, [])
-    assert activity.bindings["kept"] == []
+        assert "kept" not in activity.bindings, op
+        assert activity.plan is None, op
+        assert activity.replan_trail[-1] is not None, op
 
 
 async def test_filter_membership_wrong_value_path_warns_before_failing_open(
@@ -628,9 +623,10 @@ async def test_binding_grounds_an_invoke_param(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-async def test_unresolvable_in_writes_an_empty_binding(tmp_path: Path) -> None:
-    # `in` points at an op that never ran: mirror the fan-out's never-raise contract — empty
-    # binding, not a crash.
+async def test_unresolvable_in_replans_rather_than_binding_nothing(tmp_path: Path) -> None:
+    """`in` points at an op that never ran. Writing an empty binding would be worse than crashing:
+    downstream, an empty binding reads as a *finding* — "no such contact" — and a real run reported
+    exactly that to the user off a reference that had simply never resolved."""
     step = Step(
         next_action="filter",
         params={
@@ -640,7 +636,11 @@ async def test_unresolvable_in_writes_an_empty_binding(tmp_path: Path) -> None:
         },
     )
     activity = await _run_one_dataop(tmp_path, step, [])
-    assert activity.bindings["o"] == []
+
+    assert "o" not in activity.bindings  # no fabricated empty answer
+    assert activity.plan is None
+    defect = activity.replan_trail[-1]
+    assert defect is not None and "filter" in defect
 
 
 async def test_reset_for_replan_clears_bindings(tmp_path: Path) -> None:
@@ -718,28 +718,118 @@ def test_as_collection_all_mapping_field_record_is_the_accepted_undecidable_resi
     assert _as_collection(one_record) == [{"loc": {"lat": 1}, "price": 2}]
 
 
-def test_resolve_collection_logs_distinct_reasons_for_coming_up_empty(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # _resolve_collection is the single site that explains *why* a collection came up empty, so
-    # callers need not re-warn. Two distinct reasons, each a warning; a genuinely empty collection
-    # is benign and silent.
-    with caplog.at_level(logging.WARNING, logger="sora.strategies"):
-        # (1) an unresolved reference — the $from op never ran (a plan bug: nothing narrowed first).
-        assert _resolve_collection({"$from": "search"}, [], {}) is None
-        # (2) a reference that resolves to a value of the wrong shape — a tool return these tiers
-        #     don't recognize; the warning names the offending type.
-        assert _resolve_collection({"$bind": "x"}, [], {"x": "just-a-string"}) is None
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("did not resolve against history/bindings" in m for m in messages)
-    assert any("not a list or {id -> record} map" in m and "str" in m for m in messages)
+def test_resolve_collection_separates_empty_from_unreadable() -> None:
+    """The distinction the caller replans on. "Nothing to do" and "I could not read this" both used
+    to come back as an empty collection, which is how a sub-goal over a bad reference fanned out to
+    zero steps and the plan continued as though the work were done."""
+    # (1) an unresolved reference — the $from op never ran. The defect names what *has* run, so the
+    #     planner gets a correction rather than a complaint.
+    collection, defect = _resolve_collection({"$from": "search"}, [], {})
+    assert collection is None
+    assert defect is not None and "no operation has run" in defect
 
-    # A genuinely empty collection (an empty {id -> record} map, or []) is no failure: no warning.
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="sora.strategies"):
-        assert _resolve_collection({}, [], {}) == []
-        assert _resolve_collection([], [], {}) == []
-    assert caplog.records == []
+    # (2) a reference resolving to a value of a shape these tiers refuse — the type is named.
+    collection, defect = _resolve_collection({"$bind": "x"}, [], {"x": "just-a-string"})
+    assert collection is None
+    assert defect is not None and "str" in defect
+
+    # (3) a multi-key dict that is NOT a paginated envelope (the sibling is a record field, not
+    #     pagination metadata). The defect must name the fix, since "add a path" is the only thing
+    #     that makes a retry differ from the plan just abandoned.
+    events = {"events": [{"id": "e1"}], "notes": "unfiled"}
+    collection, defect = _resolve_collection({"$bind": "x"}, [], {"x": events})
+    assert collection is None
+    assert defect is not None and "'events'" in defect and "path" in defect
+
+    # A genuinely empty collection is an answer, not a defect — this is the case that must NOT
+    # replan, or every legitimately-empty fan-out would burn a planning inference.
+    assert _resolve_collection({}, [], {}) == ([], None)
+    assert _resolve_collection([], [], {}) == ([], None)
+
+
+def test_a_bad_path_on_a_present_source_is_not_reported_as_a_missing_source() -> None:
+    """The two failures need different repairs, so they must not share a defect string.
+
+    Collapsing them told the planner that ``search_events`` had produced no result while naming
+    ``search_events`` among the operations that had run — a self-contradictory brief, aimed at a
+    step that did not need to run again. The planner wrote the same reference, the trail saw the
+    same defect twice, and the activity halted on a question the user could not answer."""
+    history = [_ran("Calendar", "search_events", [{"id": "e1"}])]
+    ref = {"$from": "search_events", "path": "events"}
+
+    collection, defect = _resolve_collection(ref, history, {})
+
+    assert collection is None
+    assert defect is not None
+    assert "names no result the plan has produced" not in defect
+    assert "IS present" in defect and "does not need to run again" in defect
+    assert "'events'" in defect  # the segment that did not fit
+    assert "list of 1 item(s)" in defect  # ...and what is actually there instead
+
+
+def test_a_bad_path_names_the_keys_the_result_does_have() -> None:
+    """Naming the alternatives is what makes the retry differ, same as the undeclared-param defect.
+    The failing segment is reported where it breaks, not at the head of the path."""
+    history = [_ran("Calendar", "search_events", {"events": [{"id": "e1"}]})]
+    ref = {"$from": "search_events", "path": "events.0.title"}
+
+    _collection, defect = _resolve_collection(ref, history, {})
+
+    assert defect is not None
+    assert "'title'" in defect
+    assert "events.0" in defect and "'id'" in defect
+
+
+def test_a_bad_path_on_a_present_binding_talks_about_the_binding_not_operations() -> None:
+    """A $bind defect used to be phrased entirely in terms of operations run so far — advice about
+    the wrong half of the plan, since no operation produces a binding."""
+    _collection, defect = _resolve_collection({"$bind": "x", "path": "nope"}, [], {"x": {"a": 1}})
+
+    assert defect is not None
+    assert "operations run so far" not in defect
+    assert "'nope'" in defect and "'a'" in defect
+
+
+def _ran(tool_id: str, operation_name: str, result: object) -> CompletedOperation:
+    return CompletedOperation(
+        OperationInvocation(tool_id, operation_name, {}), OperationAck(ok=True, result=result)
+    )
+
+
+def test_a_from_reference_resolves_bare_or_qualified() -> None:
+    """A planner reading a catalog that addresses every operation as ``tool_id.operation_name``
+    writes references that way too. Refusing that spelling resolved to nothing, and at a fan-out
+    nothing meant zero steps — a plan lost to a naming convention the runtime itself taught."""
+    history = [_ran("insim:are/Contacts", "get_contacts", {"contacts": [{"id": "c1"}]})]
+
+    expected = {"contacts": [{"id": "c1"}]}
+    assert _latest_result(history, "get_contacts") == expected
+    assert _latest_result(history, "insim:are/Contacts.get_contacts") == expected
+    # A qualification whose prefix matches no tool invoked still names the operation unambiguously
+    # (an operation name never contains a dot), so the tail is honored rather than dropped.
+    assert _latest_result(history, "Contacts.get_contacts") == expected
+
+    assert _latest_result(history, "never_ran") is _MISSING
+
+
+def test_a_qualified_reference_picks_the_tool_it_names() -> None:
+    """Where the qualified form earns its precedence: two joined workspaces exposing the same
+    operation (ARE's Contacts and InternalContacts both have ``get_contacts``). The bare name can
+    only mean "most recent"; the qualified one is a genuine disambiguation and must be honored as
+    such, not collapsed to the tail."""
+    history = [
+        _ran("insim:are/Contacts", "get_contacts", "external"),
+        _ran("insim:are/InternalContacts", "get_contacts", "internal"),
+    ]
+
+    assert _latest_result(history, "insim:are/Contacts.get_contacts") == "external"
+    assert _latest_result(history, "insim:are/InternalContacts.get_contacts") == "internal"
+    assert _latest_result(history, "get_contacts") == "internal"  # bare -> most recent
+
+
+def test_a_decide_collection_is_soft_not_a_defect() -> None:
+    # Resolved off-cycle by the model, so there is nothing to read yet and nothing to blame.
+    assert _resolve_collection({"$decide": "the interesting ones"}, [], {}) == (None, None)
 
 
 async def test_filter_between_excludes_incomparable_value(tmp_path: Path) -> None:

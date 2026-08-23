@@ -118,6 +118,15 @@ class Activity:
     # rather than from nothing (ADR-0024). Cleared by Observe once that replacement installs, so it
     # can never leak into a later, unrelated inference. Transient run state; never persisted.
     superseded: SupersededPlan | None = None
+    # Why each of the *consecutive* replans that has run no operation was taken, oldest first (None
+    # = no defect, the plan was sound and the world moved). Reason reads it to decide whether
+    # another plan is worth inferring at all. Deliberately progress-relative rather than a lifetime
+    # count: an agent in a dynamic environment is *supposed* to replan without limit, so an absolute
+    # budget on adapting would cap the thing the runtime exists to do. Executing a single operation
+    # clears the trail, which is what separates "kept adjusting while getting somewhere" from
+    # "produced N plans and never moved". Transient run state; never persisted.
+    replan_trail: list[str | None] = field(default_factory=list)
+    replan_history_mark: int = 0  # len(history) as of the last replan — the progress marker above
     # context is exclusively for strategy-author data — the runtime itself never writes into it,
     # which is what keeps pending_operation/last_operation as dedicated fields instead of context
     # keys with a naming convention: no shared namespace means no collision to avoid in the first
@@ -132,13 +141,52 @@ class Activity:
         self.pending_inference = None
         self.grounded_params = None
 
-    def reset_for_replan(self) -> None:
+    def _progressed_since_replan(self) -> bool:
+        """Whether anything genuinely new has run since the last replan.
+
+        The obvious test — did ``history`` grow — is too generous, and an observed run showed how
+        it fails. Five plans in a row each re-issued ``get_contacts(offset=0)``, a call already in
+        history, so every replan looked like progress, the trail cleared each time, and the breaker
+        never came near its cap while the agent went nowhere and the plans stayed equally stuck.
+        Re-running a call whose arguments already appear in history yields no fact the next plan
+        did not already have, so it cannot be what forgives a replan.
+
+        The test is mechanical — same tool, operation and params — and deliberately errs toward
+        *not* forgiving: re-reading state that has since changed scores as no progress even though
+        the result may differ. That direction is the safe one, because the trail only ever counts,
+        and what it counts toward is asking the user rather than terminating anything.
+        """
+        for i in range(self.replan_history_mark, len(self.history)):
+            call = self.history[i].invocation
+            if not any(
+                done.invocation.tool_id == call.tool_id
+                and done.invocation.operation_name == call.operation_name
+                and done.invocation.params == call.params
+                for done in self.history[:i]
+            ):
+                return True
+        return False
+
+    def clear_replan_trail(self) -> None:
+        """Forget the consecutive-replan trail: new direction has arrived, so the attempts that led
+        to a halt no longer bear on whether the *next* plan is worth inferring. Without this a
+        resumed activity re-trips the breaker on its first pass and could never act on the guidance
+        it just received — the halt would be permanent rather than a question."""
+        self.replan_trail.clear()
+        self.replan_history_mark = len(self.history)
+
+    def reset_for_replan(self, defect: str | None = None) -> None:
         """Drop the current plan and any in-flight/parked deliberation so Reason re-plans from
         scratch. A droppable inference in flight is invalidated and the activity returns to READY;
         an in-flight *external* op is left RUNNING (its physical side effect must complete) with
         only its stale plan cleared — it resolves to READY later and Reason re-plans then. The one
         place every plan-invalidation site (interrupt handlers, signal-driven re-planners) routes
-        through, so new deliberation state can't be forgotten at one call site."""
+        through, so new deliberation state can't be forgotten at one call site.
+
+        ``defect`` distinguishes the two reasons a plan gets dropped: pass the specific defect when
+        the plan itself cannot work (its assumption about the world is false and will stay false),
+        and leave it None when the plan was fine but the world moved under it. The replanning prompt
+        reads it to decide whether to tell the planner to reuse this plan or to route around it."""
         was_inferring = self.pending_inference is not None
         # Park what is being dropped for the *next* inference to read (ADR-0024): a blank-slate
         # replan is correct but wasteful, and the planner reuses what still applies far better than
@@ -146,7 +194,10 @@ class Activity:
         # when there is a plan — a reset with nothing in flight leaves any earlier bundle alone.
         if self.plan is not None:
             self.superseded = SupersededPlan(
-                plan=self.plan, step_index=self.step_index, parent_frames=list(self.parent_frames)
+                plan=self.plan,
+                step_index=self.step_index,
+                parent_frames=list(self.parent_frames),
+                defect=defect,
             )
         self.plan = None
         self.step_index = 0
@@ -164,6 +215,14 @@ class Activity:
         # so the next plan re-baselines against its own starting world rather than a stale one.
         self.reconsider_baseline = None
         self.reconsider_verdict = None
+        # Runaway-replan bookkeeping. Counting only — the cap, and what to do when it trips, belong
+        # to the Reason strategy (as with the sub-goal depth breaker), not to a value type. Progress
+        # since the last replan forgives everything before it: only replans that got *nowhere*
+        # accumulate.
+        if self._progressed_since_replan():
+            self.replan_trail.clear()
+        self.replan_trail.append(defect)
+        self.replan_history_mark = len(self.history)
         self.discard_inference()
         if was_inferring:
             self.state = ActivityState.READY

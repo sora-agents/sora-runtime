@@ -327,8 +327,19 @@ def _interface_entries(section_body: str | None) -> list[dict[str, Any]]:
 
 def _required_schema(required: list[str]) -> dict[str, Any]:
     """A minimal JSON-Schema-shaped dict capturing just the required keys — enough for merge_manuals
-    to cross-validate against an adapter's full schema; the adapter supplies the real shapes."""
-    return {"properties": {k: {} for k in required}, "required": list(required)}
+    to cross-validate against an adapter's full schema; the adapter supplies the real shapes.
+
+    Marked open (`additionalProperties: True`) because it genuinely is: `properties` here lists the
+    *required* keys and nothing else, so an operation's optional params are absent by construction.
+    Consumers that read `properties` as the closed universe of accepted names — `_undeclared_params`
+    treats an unlisted key as a plan defect and drops the plan — would otherwise reject every valid
+    optional param of an authored manual that never merges with an adapter's full schema. Reading
+    `required` (`_null_required_params`) is safe either way; this keeps the two symmetric."""
+    return {
+        "properties": {k: {} for k in required},
+        "required": list(required),
+        "additionalProperties": True,
+    }
 
 
 class MarkdownManualParser:  # satisfies the ManualParser Protocol (Markdown is the default format)

@@ -235,6 +235,14 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     baseline: object | None = None
 
 
+class UnresolvableGrounding(Exception):
+    """Grounding reported that a reference names data the run never produced — an operation that
+    returned an empty list, an absent field, an empty binding — rather than inventing a value for
+    it. A defect in the *plan* (it assumed a step would yield something it didn't), never a wire or
+    parse failure, so it resolves as `InferenceResult.unresolvable` and drives a replan instead of
+    terminating the activity. Carries what was missing, for the log and the replanning prompt."""
+
+
 @dataclass(frozen=True)
 class InferenceResult:  # what infer()/ground() resolve to — arrives async via inference_sink
     # Deliberation output, not observed environment state, so never a Percept (ADR-0019/0021): it
@@ -242,14 +250,21 @@ class InferenceResult:  # what infer()/ground() resolve to — arrives async via
     # PendingInference it resolves; on success `value` is a Plan (kind="plan") or a grounded params
     # dict (kind="ground") and `error` is None. A model call that raised (malformed output, no LLM,
     # a network error) resolves with `error` set and `value` None instead of stranding the activity
-    # RUNNING forever — Observe terminates the activity on it. DefaultObserveStrategy applies it on
+    # RUNNING forever — Observe degrades the activity on it (in place, or into a replan carrying the
+    # defect; it does not terminate it). DefaultObserveStrategy applies it on
     # resolve.
     id: str
     # Plan (kind "plan"/"subgoal"), grounded params dict (kind "ground"), the surviving-subset list
-    # (kind "select" — a $decide data-op filter, ADR-0023), or a bool verdict (kind "revalidate" —
-    # the context-adaptation plan-validity re-check, ADR-0024).
-    value: Plan | ConditionVerdict | dict[str, Any] | list[Any] | bool | None = None
+    # (kind "select" — a $decide data-op filter, ADR-0023), a bool verdict (kind "revalidate" —
+    # the context-adaptation plan-validity re-check, ADR-0024), or a ConditionVerdict (kind
+    # "condition" — the batched pending-condition judgement, ADR-0022).
+    value: Plan | dict[str, Any] | list[Any] | bool | ConditionVerdict | None = None
     error: str | None = None
+    # kind=="ground" only, and mutually exclusive with both `value` and `error`: the model followed
+    # the contract and reported that the data a reference names is not present, instead of
+    # fabricating it. Distinct from `error` because it is a report, not a failure: both replan, but
+    # only this one is the model doing what it was asked (DefaultObserveStrategy).
+    unresolvable: str | None = None
 
 
 @dataclass(frozen=True)
@@ -313,6 +328,12 @@ class SupersededPlan:
     plan: Plan
     step_index: int
     parent_frames: list[tuple[Plan, int]]
+    # Why the plan was dropped, but only when the cause is a DEFECT in the plan itself — a reference
+    # naming data the run never produced, say. None (the default) is the reconsideration case: the
+    # plan was sound when written and is merely stale. The two need opposite briefs in the
+    # replanning prompt — "reuse whatever still applies" makes a planner re-emit the very step that
+    # cannot work — so the framing is chosen from this field, and the text names the specific gap.
+    defect: str | None = None
 
 
 # Named constants for Step.next_action values and invoke routing keys — one source of truth instead

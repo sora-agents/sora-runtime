@@ -183,14 +183,25 @@ def test_interface_block_lifts_operation_names_and_required_keys() -> None:
     m = MarkdownManualParser().parse(_INTERFACE_MANUAL)
     ops = {op.name: op.parameters for op in m.operations}
     assert set(ops) == {"set_temperature", "set_mode"}
-    assert ops["set_temperature"] == {"properties": {"value": {}}, "required": ["value"]}
-    assert ops["set_mode"] == {"properties": {}, "required": []}
+    # Open, not closed: `properties` holds the *required* keys only, so an operation's optional
+    # params are absent by construction. A consumer reading `properties` as the closed universe of
+    # accepted names would reject every valid optional param of an unmerged authored manual.
+    assert ops["set_temperature"] == {
+        "properties": {"value": {}},
+        "required": ["value"],
+        "additionalProperties": True,
+    }
+    assert ops["set_mode"] == {"properties": {}, "required": [], "additionalProperties": True}
 
 
 def test_interface_block_lifts_observable_property_names_and_required_keys() -> None:
     m = MarkdownManualParser().parse(_INTERFACE_MANUAL)
     assert [p.name for p in m.observable_properties] == ["temperature"]
-    assert m.observable_properties[0].schema == {"properties": {"unit": {}}, "required": ["unit"]}
+    assert m.observable_properties[0].schema == {
+        "properties": {"unit": {}},
+        "required": ["unit"],
+        "additionalProperties": True,
+    }
 
 
 def test_signals_section_without_a_block_stays_empty() -> None:

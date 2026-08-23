@@ -192,9 +192,96 @@ async def test_empty_collection_expands_to_no_steps(tmp_path: Path) -> None:
     assert activity.plan.steps == []
 
 
-async def test_unresolvable_collection_expands_to_no_steps(tmp_path: Path) -> None:
-    # The `in` reference points at an operation that never ran (no narrowing search preceded the
-    # sub-goal): it can't resolve to a list, so the fan-out is empty rather than a crash.
+async def test_fan_out_resolves_a_qualified_operation_reference(tmp_path: Path) -> None:
+    """The planner wrote ``insim:are/Calendar.get_calendar_events_from_to`` — the form its own tool
+    catalog uses — and the fan-out silently produced nothing. The qualified spelling resolves."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    subgoal = _mechanical_subgoal()
+    subgoal.params["in"] = {"$from": "realestate.search_apartments", "path": ""}
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[subgoal]),
+        step_index=0,
+        history=[_history("search_apartments", [{"id": "a1"}, {"id": "a2"}])],
+    )
+    working.activities["a"] = activity
+
+    ids = []
+    for _ in range(2):
+        result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+        assert result.step is not None
+        ids.append(result.step.params["apartment_id"])
+    assert ids == ["a1", "a2"]
+    assert activity.plan is not None  # no defect: the reference was readable all along
+
+
+async def test_fan_out_reads_through_a_paginated_envelope(tmp_path: Path) -> None:
+    """The exact shape that cost a run a 220-second replan: ARE's windowed list operations return
+    ``{'events': [...], 'range': ..., 'total': N}`` while declaring a bare return type, so a
+    ``$from`` with no ``path`` — which is what the declared shape tells the planner to write —
+    landed on the envelope. Demanding a ``path`` was punishing the planner for believing the
+    catalog. The payload beside pagination metadata is unambiguous enough to just take."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    wrapped = {"apartments": [{"id": "a1"}], "range": "(0, 1)", "total": 1}
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[_mechanical_subgoal()]),
+        step_index=0,
+        history=[_history("search_apartments", wrapped)],
+    )
+    working.activities["a"] = activity
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is not None
+    assert result.step.params["apartment_id"] == "a1"
+    assert activity.plan is not None  # no defect: the envelope was readable
+    assert activity.replan_trail == []
+
+
+async def test_fan_out_over_a_record_with_a_list_field_still_replans_naming_the_path(
+    tmp_path: Path,
+) -> None:
+    """The boundary the envelope tier must not cross. A record carrying one list field has the same
+    shape as the envelope — one list, scalar siblings — and reading it as a collection would fan
+    out over an event's *attendees* instead of over events. Only pagination-metadata siblings make
+    it an envelope; anything else is still refused, with the defect naming the path to add."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    record = {"event_id": "e1", "title": "Standup", "attendees": [{"id": "a1"}]}
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[_mechanical_subgoal()]),
+        step_index=0,
+        history=[_history("search_apartments", record)],
+    )
+    working.activities["a"] = activity
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is None
+    assert activity.plan is None  # dropped, rather than "this sub-goal had nothing to do"
+    defect = activity.replan_trail[-1]
+    assert defect is not None
+    assert "'attendees'" in defect and "path" in defect
+
+
+async def test_unresolvable_collection_replans_rather_than_vanishing(tmp_path: Path) -> None:
+    """The `in` reference names an operation that never ran, so the runtime cannot tell how many
+    elements there are — which is *not* the same as knowing there are none. Splicing in zero steps
+    would silently assert the sub-goal had nothing to do; a real run lost three calendar
+    cancellations that way. The plan is dropped instead, carrying a defect the planner can use."""
     tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
     cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
     await registry.join(_ORIGIN)
@@ -209,9 +296,14 @@ async def test_unresolvable_collection_expands_to_no_steps(tmp_path: Path) -> No
     working.activities["a"] = activity
 
     result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
-    assert result.step is None
-    assert activity.plan is not None
-    assert activity.plan.steps == []
+
+    assert result.step is None  # nothing is committed off an expansion the runtime could not build
+    assert activity.plan is None  # dropped -> Reason re-infers next cycle
+    defect = activity.replan_trail[-1]
+    assert defect is not None
+    # Names the sub-goal (which one failed) and what to do (the reference produced nothing yet).
+    assert "save each apartment" in defect
+    assert "no operation has run" in defect
 
 
 async def test_bind_substitutes_a_nested_field_of_the_loop_element(tmp_path: Path) -> None:

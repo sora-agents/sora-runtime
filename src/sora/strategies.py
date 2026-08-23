@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -33,7 +33,7 @@ from sora.action import (
 )
 from sora.activity import Activity, ActivityState
 from sora.llm import log_llm_discarded
-from sora.memory import PerceptSnapshot, render_steps, step_from_raw
+from sora.memory import PerceptSnapshot, render_plan, render_steps, step_from_raw
 from sora.perception import Percept
 from sora.types import (
     OPERATION_NAME,
@@ -570,7 +570,28 @@ class DefaultObserveStrategy:
                         activity.pending_inference.baseline
                     )  # set for plan/subgoal (ADR-0024)
                     activity.pending_inference = None
-                    if res.error is not None and kind == "select":
+                    if res.unresolvable is not None:
+                        # Grounding reported that a reference names data this run never produced,
+                        # instead of fabricating a value for it. The defect is in the PLAN — it
+                        # assumed an earlier step would yield something it didn't — so the repair is
+                        # a replan, not termination: the replanning prompt carries the executed
+                        # history, so the next plan SEES the empty result that defeated this one and
+                        # can narrow differently (or just report the gap to the user). Terminating
+                        # here would be safe but useless — it leaves the user with no answer at all,
+                        # and the activity had nothing wrong with it beyond one bad assumption.
+                        # Routed through the single funnel, so the discarded plan is parked as
+                        # `superseded` for the re-inference exactly like any other invalidation —
+                        # but tagged with the defect, because unlike a reconsideration this plan was
+                        # not merely overtaken by events: the value it reaches for is not there, and
+                        # a replacement that reaches for it the same way fails the same way.
+                        activity.reset_for_replan(defect=res.unresolvable)
+                        activity.state = ActivityState.READY
+                        log.warning(
+                            "observe: grounding for activity %s resolved nothing (%s) -> replan",
+                            activity.id,
+                            res.unresolvable,
+                        )
+                    elif res.error is not None and kind == "select":
                         # A $decide filter is a transform, not control flow: a transient model or
                         # parse failure degrades to an empty shortlist (the pipeline does nothing
                         # this run) rather than terminating the activity — keeps the data-op alive.
@@ -582,6 +603,20 @@ class DefaultObserveStrategy:
                             activity.id,
                             res.error,
                             out,
+                        )
+                    elif res.error is not None and kind == "condition":
+                        # A failed condition evaluation degrades to "nothing fired" — the same
+                        # fail-soft as select/revalidate, and the same reasoning: the activity was
+                        # already waiting, so keeping it waiting changes nothing, while the opposite
+                        # default would invent follow-up work nobody asked for off a flaky call.
+                        # The marks were already advanced at fire time, so this does not re-fire on
+                        # the same signal; a genuinely new change gets its own evaluation.
+                        activity.condition_verdict = ConditionVerdict()
+                        activity.state = ActivityState.READY
+                        log.warning(
+                            "observe: condition evaluation for %s failed (%s) -> nothing fired",
+                            activity.id,
+                            res.error,
                         )
                     elif res.error is not None and kind == "revalidate":
                         # A failed revalidation must not force a replan (would thrash): degrade to
@@ -627,7 +662,7 @@ class DefaultObserveStrategy:
                         log.debug(
                             "observe: plan for activity %s\n%s",
                             activity.id,
-                            render_steps(inferred.steps),
+                            render_plan(inferred),
                         )
                     elif kind == "subgoal":
                         # A mid-plan sub-goal's synthesized sub-plan: push the parent frame (its
@@ -647,7 +682,7 @@ class DefaultObserveStrategy:
                             "observe: sub-plan for activity %s (nested under %d frame(s))\n%s",
                             activity.id,
                             len(activity.parent_frames),
-                            render_steps(sub_plan.steps),
+                            render_plan(sub_plan),
                         )
                     elif kind == "select":
                         # A $decide data-op filter (ADR-0023): the surviving subset lands into the
@@ -1076,25 +1111,98 @@ _REF_DECIDE = "$decide"
 # here is a binding read.
 _REF_BIND = "$bind"
 _REF_NAME = "$bind"  # the binding-name key inside a $bind reference (same token, read as a key)
+# The observed-world-state read token. The third and last binding source (ADR-0022): $from reads
+# Activity.history, $bind reads the named-binding namespace, $prop reads WorkingMemory.properties —
+# the snapshot Observe refreshes each cycle for every focused tool. It resolves per step, at the
+# same point $from does, because a property is re-observed state whose whole value is being current;
+# binding it once at plan entry would freeze a moving value for the plan's life.
+_REF_PROP = "$prop"
 _MISSING = object()  # sentinel: no matching history entry (distinct from a genuine None result)
+_AMBIGUOUS = object()  # sentinel: a bare property name several focused tools expose
+_BAD_PATH = object()  # sentinel: the source IS present, its `path` names nothing inside it
 
 
 def _is_reference(value: Any) -> bool:
     return isinstance(value, dict) and (
-        _REF_FROM in value or _REF_DECIDE in value or _REF_BIND in value
+        _REF_FROM in value or _REF_DECIDE in value or _REF_BIND in value or _REF_PROP in value
     )
 
 
-def _latest_result(history: list[CompletedOperation], operation_name: str) -> Any:
-    """The result of the most recent completed operation with this name, or _MISSING."""
-    for completed in reversed(history):
-        if completed.invocation.operation_name == operation_name:
-            return completed.ack.result
-    return _MISSING
+def _latest_result(history: list[CompletedOperation], reference: str) -> Any:
+    """The result of the most recent completed operation this reference names, or _MISSING.
+
+    Three accepted spellings, tried most-precise first, because a plan may name an operation any of
+    the ways its own brief shows one. The bare ``operation_name`` is the canonical form. The
+    fully-qualified ``tool_id.operation_name`` is what a planner reaches for after reading a catalog
+    that addresses every operation that way, and it is the *more* specific match when two joined
+    workspaces expose the same operation (ARE's Contacts and InternalContacts both have
+    ``get_contacts``), so it is honored rather than merely tolerated. Last, the segment after the
+    final dot, for a qualification whose prefix matches no tool actually invoked (an abbreviated or
+    misremembered tool id) — the operation name never contains a dot, so this is unambiguous.
+
+    Accepting all three is not laxity: a reference the runtime refuses resolves to nothing and, at
+    a fan-out, used to vanish silently. Refusing a reference whose *intent* is unambiguous buys no
+    safety and costs a whole plan."""
+
+    def _latest(matches: Callable[[OperationInvocation], bool]) -> Any:
+        for completed in reversed(history):
+            if matches(completed.invocation):
+                return completed.ack.result
+        return _MISSING
+
+    result = _latest(lambda inv: inv.operation_name == reference)
+    if result is not _MISSING:
+        return result
+    result = _latest(lambda inv: f"{inv.tool_id}.{inv.operation_name}" == reference)
+    if result is not _MISSING or "." not in reference:
+        return result
+    tail = reference.rsplit(".", 1)[-1]
+    return _latest(lambda inv: inv.operation_name == tail)
+
+
+def _property_ref(properties: dict[tuple[str, str], Percept], reference: str) -> tuple[Any, str]:
+    """Resolve a ``$prop`` reference to ``(value, residual_path)``, ``_MISSING``, or ``_AMBIGUOUS``.
+
+    Two spellings reach here and both name one value. The canonical one keeps the sub-path in its
+    own ``path`` key; a planner that has just read a catalog addressing everything by dotted name
+    folds the whole route into the token instead — ``insim:are/Contacts.state.contacts`` for
+    ``{"$prop": "insim:are/Contacts.state", "path": "contacts"}``. Honoring only the first cost a
+    whole plan on the 2026-08-21 adaptability run, for a spelling difference; this is the tolerance
+    ``_latest_result`` already grants ``$from``, applied to the token that lacked it.
+
+    The split is found by **matching against the live key set**, never by parsing the string. That
+    matters because the store's key is ``(source, name)`` and *neither half is dot-free*: a WoT tool
+    id contains them (``wot:lamp.local/Lamp``), and while today's adapters happen to mint dot-free
+    property names, nothing in ``ObservablePropertySpecification`` or the adapter boundary forbids a
+    property called ``sensor.temp`` — the runtime does not author names (ADR-0003), so it cannot
+    assume their shape. Joining each candidate key back to ``f"{source}.{name}"`` and comparing asks
+    the store what it actually holds, so a dotted property name resolves and a dotted tool id keeps
+    resolving, with no rule about where the boundary "should" be.
+
+    Longest reference first, so an exact key always beats a folded reading of the same string, and
+    within one length a **qualified** match beats a bare one (naming the tool is more specific).
+    Where a length is genuinely ambiguous — several tools exposing one bare name, or two distinct
+    keys that join to the same string — it comes back ``_AMBIGUOUS`` rather than whichever the dict
+    happened to yield first. ARE gives thirteen tools a ``state`` property, so guessing here would
+    be a silent wrong answer: worse than a missing one, because it is harder to see."""
+    cuts = [i for i, ch in enumerate(reference) if ch == "."]
+    for cut in [len(reference), *reversed(cuts)]:
+        head, residual = reference[:cut], reference[cut + 1 :]
+        keys = [key for key in properties if f"{key[0]}.{key[1]}" == head]
+        if not keys:  # unqualified: the planner named the property without its tool
+            keys = [key for key in properties if key[1] == head]
+        if len(keys) == 1:
+            return properties[keys[0]].payload.value, residual
+        if keys:
+            return _AMBIGUOUS, ""
+    return _MISSING, ""
 
 
 def _resolve_ref(
-    ref: dict[str, Any], history: list[CompletedOperation], bindings: dict[str, Any]
+    ref: dict[str, Any],
+    history: list[CompletedOperation],
+    bindings: dict[str, Any],
+    properties: dict[tuple[str, str], Percept] | None = None,
 ) -> Any:
     """Resolve one *hard* reference — ``$from`` (history) or ``$bind`` (a named binding) — to its
     value, walking the ``path`` into it. ``_MISSING`` when the source is absent (no such op ran / no
@@ -1108,7 +1216,77 @@ def _resolve_ref(
         if name not in bindings:
             return _MISSING
         return _walk_path(bindings[name], ref.get(_REF_PATH, ""))
+    if _REF_PROP in ref:
+        value, residual = _property_ref(properties or {}, str(ref[_REF_PROP]))
+        if value is _MISSING or value is _AMBIGUOUS:
+            return _MISSING  # both escalate; _collection_defect re-reads which, to say why
+        # A sub-path folded into the token is walked *before* an explicit `path`, since it names the
+        # outer route; the two compose so a half-folded reference resolves the same as either form.
+        folded = ".".join(p for p in (residual, str(ref.get(_REF_PATH, ""))) if p)
+        return _walk_path(value, folded)
     return _MISSING
+
+
+def _resolve_nested(
+    value: Any,
+    history: list[CompletedOperation],
+    bindings: dict[str, Any],
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> tuple[Any, bool]:
+    """Resolve every reference *anywhere* in ``value``, returning ``(resolved, fully_resolved)``.
+
+    References nest because the plan schema makes them nest: a param typed ``list[str]`` whose one
+    element is only known at run time can *only* be written ``[{"$decide": ...}]`` — a reference as
+    the whole value would yield a string, not a list. The resolver used to look at top-level param
+    values only, so such a reference was neither resolved nor reported unresolved, and the raw
+    ``{"$decide": ...}`` dict was serialized to the tool as a literal (ARE reported it as
+    ``Argument 'attendees' must be of type list[str] | None, got <class 'list'>``, naming the wrong
+    culprit). It surfaced only when the *sole* reference in a step was nested — any independently
+    unresolved top-level param escalated the whole step anyway and the model grounder filled it in,
+    which is why it hid for so long.
+
+    A dict that *is* a reference is resolved, not descended into; every other dict/list is rebuilt
+    element-wise. Partial resolution is deliberate: a list holding one resolvable ``$from`` and one
+    ``$decide`` comes back with the ``$from`` filled and the ``$decide`` left in place, so the
+    escalation the caller raises hands the grounder as much settled context as possible."""
+    if _is_reference(value):
+        if _REF_DECIDE in value:
+            return value, False  # soft — always escalates, left in place for the model
+        try:
+            got = _resolve_ref(value, history, bindings, properties)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return value, False  # bad path against a present source
+        return (value, False) if got is _MISSING else (got, True)
+    if isinstance(value, dict):
+        pairs = [
+            (key, _resolve_nested(item, history, bindings, properties))
+            for key, item in value.items()
+        ]
+        return {key: got for key, (got, _ok) in pairs}, all(ok for _key, (_got, ok) in pairs)
+    if isinstance(value, list):
+        items = [_resolve_nested(item, history, bindings, properties) for item in value]
+        return [got for got, _ok in items], all(ok for _got, ok in items)
+    return value, True
+
+
+def _reference_paths(value: Any, prefix: str = "") -> list[str]:
+    """Dotted paths of every reference token surviving in ``value`` — at any depth. ``[]`` is the
+    healthy case. Used as Act's leak guard; see ``DefaultActStrategy``."""
+    if _is_reference(value):
+        return [prefix or "<root>"]
+    if isinstance(value, dict):
+        return [
+            path
+            for key, item in value.items()
+            for path in _reference_paths(item, f"{prefix}.{key}" if prefix else str(key))
+        ]
+    if isinstance(value, list):
+        return [
+            path
+            for index, item in enumerate(value)
+            for path in _reference_paths(item, f"{prefix}.{index}" if prefix else str(index))
+        ]
+    return []
 
 
 def _manual_for(wm: WorkingMemory, tool_id: str | None) -> Manual | None:
@@ -1125,31 +1303,214 @@ def resolve_references(
     op_params: dict[str, Any],
     history: list[CompletedOperation],
     bindings: dict[str, Any] | None = None,
+    properties: dict[tuple[str, str], Percept] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Resolve a step's operation params against execution history and named bindings. Non-reference
     values pass through; a hard reference (``$from``/``$bind``) is resolved deterministically;
     anything that can't be resolved mechanically (soft ``$decide``, missing source, bad path) is
     left in place and its key returned in ``unresolved`` for the caller to escalate. Never raises on
-    a bad path — that's an escalation signal, not an error."""
+    a bad path — that's an escalation signal, not an error.
+
+    A reference is found wherever it sits — as a param's whole value, or nested inside a list or
+    dict the param holds (see ``_resolve_nested``). ``unresolved`` names the *top-level key*
+    whatever the depth, because that is the unit grounding escalates on (``partial_params`` is
+    per-param), so one stubborn leaf re-grounds its whole param."""
     binds = bindings or {}
-    resolved = dict(op_params)
+    resolved: dict[str, Any] = {}
     unresolved: list[str] = []
     for key, value in op_params.items():
-        if not _is_reference(value):
-            continue
-        if _REF_DECIDE in value:
+        got, ok = _resolve_nested(value, history, binds, properties)
+        resolved[key] = got
+        if not ok:
             unresolved.append(key)
-            continue
-        try:
-            got = _resolve_ref(value, history, binds)
-        except (KeyError, IndexError, TypeError, ValueError):
-            unresolved.append(key)
-            continue
-        if got is _MISSING:
-            unresolved.append(key)
-        else:
-            resolved[key] = got
     return resolved, unresolved
+
+
+# --- irreversibility guard: never commit a write on a plan already known to be dead ---------------
+# A run showed why this is needed. A filter chain wrote `friend_contact = []` at step 3 (the planner
+# had read only the first page of contacts, so nobody matched); the plan then kept going — reading
+# the calendar at step 4 and DELETING the user's real appointment at step 5 — and only tripped over
+# the empty binding at step 7, where it finally needed the friend's address. The plan was already
+# unfinishable two steps before the irreversible act, and the evidence was sitting in `bindings`.
+#
+# So this is not an ordering rule: that plan *was* ordered correctly, gathering before destroying.
+# It is a viability rule. Nothing rolls a delete back, and the asymmetry is stark — abandoning a
+# plan that might still have worked costs one more inference, while acting on a plan that cannot
+# work costs the user something real and unrecoverable. So: check before a write, and only a write.
+#
+# "Provably" is meant strictly. Only a binding an earlier step *already produced* and produced empty
+# counts, and only where a later step reads a VALUE out of it — a collection position (`in`, a
+# membership `where`) is exempt, because an empty collection there is a legitimate answer ("nothing
+# to iterate", "exclude nothing"), which is the same line _data_op already draws. A name a later
+# step rewrites is exempt from that point on, since it is no longer provably anything.
+#
+# The same proof holds for a `$from` read of an operation that already ran and came back empty, and
+# a later run showed the guard missing it for want of scanning that token: a plan invoked
+# `search_contacts`, got `[]`, and the runtime still committed `add_calendar_event` two steps on,
+# creating the event with no attendee. Identical evidence, identical asymmetry, different spelling —
+# so both references are scanned, with `refreshed` playing for operations the part `out` plays for
+# bindings (a step ahead of the read that re-invokes the operation makes it no longer provably
+# anything, which is what keeps a replan's second attempt at a search from being condemned by its
+# first attempt's empty result).
+#
+# What does NOT count for a `$from`, deliberately: an operation that has not run yet (a plan
+# normally reads at step 3 what it invokes at step 1 — absence here is not evidence), and a
+# *present but mis-pathed* source. The latter is a real defect but a recoverable one: grounding
+# reads the actual history and routinely resolves a value the path spelled wrong, so condemning
+# would pre-empt a repair that works. An empty source admits no such repair — there is no value at
+# any path — which is the line between the two.
+
+# Keys whose value is a collection rather than a value read out of one: an empty binding in these
+# positions is an answer, not a defect (see above). `from` is the collect data-op's operation name.
+_COLLECTION_KEYS = frozenset({"in", "where", "from"})
+
+
+def _is_empty(value: Any) -> bool:
+    """Empty in the sense that a step reading a value out of it cannot get one. Deliberately not
+    falsiness: 0 and False are perfectly good values a step can act on."""
+    if value is None:
+        return True
+    return len(value) == 0 if isinstance(value, str | bytes | list | tuple | set | dict) else False
+
+
+def _dereferenced_bindings(step: Step) -> set[str]:
+    """Binding names this step reads a *value* out of, at any nesting depth.
+
+    A mechanical sub-goal's template always contains ``{"$bind": "<as>"}`` — its own loop element,
+    bound per iteration at fan-out, not a name the plan produced. Nothing stops a plan from
+    spelling ``as`` the same as a real binding (``filter(out: "contacts")`` then
+    ``subgoal(in: {"$bind": "contacts"}, as: "contacts")`` is a natural thing to write), and when
+    that binding is empty the template's read looked like a dereference of it — so a fan-out that
+    legitimately reduces to zero steps ("nothing matched, nothing to do") condemned the plan at the
+    next write. The loop name is excluded explicitly rather than assumed distinct."""
+    loop_var = step.params.get("as")
+    names: set[str] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            name = value.get(_REF_BIND)
+            if isinstance(name, str):
+                if name != loop_var:
+                    names.add(name)
+                return
+            for nested in value.values():
+                walk(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                walk(nested)
+
+    for key, value in step.params.items():
+        if key not in _COLLECTION_KEYS:
+            walk(value)
+    return names
+
+
+# Shared tail of both defect strings: what the planner should do about it. The corrections are the
+# same whichever token carried the dead reference, and naming them is what makes the retry differ.
+_REPLAN_HINT = (
+    "Re-plan a way to obtain that data (read the whole collection rather than one page, filter on "
+    "a different field, search by another term) before any step that changes the world; the "
+    "runtime stopped short of the next one."
+)
+
+
+def _dereferenced_operations(step: Step) -> list[dict[str, Any]]:
+    """The ``$from`` reference objects this step reads a *value* out of, at any nesting depth — the
+    reference itself, not just its name, since whether it can yield a value depends on its ``path``.
+
+    Nesting matters more here than for ``$bind``: a ``$decide`` element carries its own source under
+    a plain ``from`` key (``{"$decide": "...", "from": {"$from": "search", "path": "0"}}``), which
+    is the shape that actually slipped a write past this guard. Note that ``_COLLECTION_KEYS``
+    filters only the step's *top-level* params, so such a nested ``from`` is still walked — the two
+    senses of the word do not collide."""
+    refs: list[dict[str, Any]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if isinstance(value.get(_REF_FROM), str):
+                refs.append(value)
+                return
+            for nested in value.values():
+                walk(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                walk(nested)
+
+    for key, value in step.params.items():
+        if key not in _COLLECTION_KEYS:
+            walk(value)
+    return refs
+
+
+def _spent_operation_read(
+    ref: dict[str, Any], history: list[CompletedOperation], refreshed: set[str]
+) -> tuple[str, str] | None:
+    """``(operation, what it yielded)`` when this reference provably cannot produce a value, else
+    ``None``. See the guard's header for why "never ran" and "wrong path" are both excluded."""
+    name = str(ref[_REF_FROM])
+    # Tail comparison covers all three spellings _latest_result accepts; erring toward "refreshed"
+    # errs toward NOT condemning, which is the safe direction for a guard that abandons plans.
+    if name in refreshed or name.rsplit(".", 1)[-1] in refreshed:
+        return None
+    result = _latest_result(history, name)
+    if result is _MISSING:
+        return None  # not yet run — the step that runs it may be ahead of this read
+    if _is_empty(result):
+        return name, "returned an empty result"  # no path finds a value in it
+    try:
+        value = _walk_path(result, str(ref.get(_REF_PATH, "")))
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None  # present but mis-pathed: grounding can still recover the value
+    path = str(ref.get(_REF_PATH, ""))
+    return (name, f"returned nothing at {path!r}") if _is_empty(value) else None
+
+
+def _invoked_operation(step: Step) -> str | None:
+    if step.next_action != "invoke":
+        return None
+    name = step.params.get("operation_name")
+    return name if isinstance(name, str) else None
+
+
+def _unsatisfiable_reference(activity: Activity) -> str | None:
+    """Where the rest of the plan dereferences data that provably is not there — a binding an
+    earlier step produced empty, or a ``$from`` naming an operation that already ran and came back
+    empty — described as a defect for the replanning prompt; ``None`` when nothing is provably dead.
+    Scans the active frame and then every suspended parent in resume order, since a sub-plan's
+    caller runs later and reads the same flat `bindings` and the same history."""
+    plan = activity.plan
+    if plan is None:
+        return None
+    empty = {name for name, value in activity.bindings.items() if _is_empty(value)}
+    refreshed: set[str] = set()
+    frames = [(plan, activity.step_index)]
+    frames += [(parent, index + 1) for parent, index in reversed(activity.parent_frames)]
+    for frame, start in frames:
+        for index in range(start, len(frame.steps)):
+            step = frame.steps[index]
+            dead = sorted(_dereferenced_bindings(step) & empty)
+            if dead:
+                return (
+                    f"step {index} ({step.next_action}) reads {', '.join(repr(n) for n in dead)}, "
+                    "which an earlier step of this plan produced EMPTY — nothing matched it, so "
+                    f"that step cannot work and the plan cannot finish as written. {_REPLAN_HINT}"
+                )
+            for ref in _dereferenced_operations(step):
+                spent = _spent_operation_read(ref, activity.history, refreshed)
+                if spent is not None:
+                    name, yielded = spent
+                    return (
+                        f"step {index} ({step.next_action}) reads a value out of {name!r}, which "
+                        f"already ran in this run and {yielded} — so that step cannot work and the "
+                        f"plan cannot finish as written. {_REPLAN_HINT}"
+                    )
+            out = step.params.get("out")
+            if isinstance(out, str):
+                empty.discard(out)  # rewritten here -> no longer provably empty further down
+            invoked = _invoked_operation(step)
+            if invoked is not None:
+                refreshed.add(invoked)  # re-run here -> its old empty result proves nothing below
+    return None
 
 
 # --- sub-goals: mechanical fan-out over a collection (ADR-0022) -----------------------------------
@@ -1158,10 +1519,12 @@ def resolve_references(
 # fix). _SUBGOAL_RUNNING / _SUBGOAL_SPLICED are the two outcomes _subgoal reports to reason():
 # a deliberative sub-goal fired _infer_ and is RUNNING (return, no step); a mechanical one spliced
 # its expansion into the plan in place (re-loop and read the first expanded step); a deliberative
-# one the loop-guard refused pauses the activity to await input (no step) -> _SUBGOAL_HALTED.
+# one the loop-guard refused pauses the activity to await input (no step) -> _SUBGOAL_HALTED;
+# a mechanical one whose collection could not be read dropped the plan (no step) -> _SUBGOAL_DEFECT.
 _SUBGOAL_RUNNING = object()
 _SUBGOAL_SPLICED = object()
 _SUBGOAL_HALTED = object()
+_SUBGOAL_DEFECT = object()
 
 # Circuit breaker for runaway deliberative sub-goal recursion (ADR-0022's deferred overflow valve,
 # pulled forward). Synthesis-as-selection has no termination guarantee an *authored* plan library
@@ -1302,38 +1665,147 @@ def _as_collection(value: Any) -> list[Any] | None:
     return None  # single record / envelope-of-scalars / id->scalar / scalar: refuse to guess
 
 
+def _collection_defect(
+    ref: Any,
+    value: Any,
+    history: list[CompletedOperation],
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> str:
+    """Why a collection reference could not be read, phrased for the *planner* rather than the log:
+    it goes into the replan brief, so it has to say what to write instead. Both cases have a
+    concrete correction available, and naming it is the difference between a retry that differs and
+    one that repeats — the same reason the undeclared-parameter defect lists the accepted names."""
+    if isinstance(ref, dict) and _REF_PROP in ref and value is _MISSING:
+        name = str(ref[_REF_PROP])
+        props = properties or {}
+        candidates = sorted({source for (source, prop) in props if prop == name})
+        if candidates:
+            return (
+                f"{name!r} is exposed by several focused tools ({', '.join(candidates)}) — "
+                "qualify it as '<tool_id>.<property_name>' so it names exactly one."
+            )
+        observed = ", ".join(sorted(f"{s}.{p}" for (s, p) in props))
+        return (
+            f"{name!r} names no observed property; currently observed: "
+            f"{observed or 'none — no tool is focused'}. A property is readable only while its "
+            "tool is focused — add a 'focus' step for that tool before referencing it."
+        )
+    if value is _MISSING:
+        ran = sorted({c.invocation.operation_name for c in history})
+        available = ", ".join(ran) if ran else "none yet — no operation has run"
+        return (
+            f"{ref!r} names no result the plan has produced; operations run so far: {available}. "
+            "Reference a collection only after a step has produced it."
+        )
+    if isinstance(value, dict):
+        keys = ", ".join(repr(k) for k in list(value)[:8])
+        return (
+            f"{ref!r} resolved to a dict with keys {keys}, not a list the runtime can iterate — "
+            "add a 'path' naming the field that holds the list."
+        )
+    return (
+        f"{ref!r} resolved to a {type(value).__name__}, not a list the runtime can iterate — "
+        "reference something that is a collection, or narrow to one with a data-op first."
+    )
+
+
+def _path_defect(
+    ref: dict[str, Any],
+    history: list[CompletedOperation],
+    bindings: dict[str, Any],
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> str:
+    """Why a ``path`` failed against a source that *is* present — kept apart from the missing-source
+    defect on purpose. Collapsing the two told the planner ``{'$from': 'search_events', 'path':
+    'events'} names no result the plan has produced; operations run so far: search_events`` — a
+    brief that contradicts itself and aims the repair at a step that had just run. The planner
+    rewrote the same reference, the trail saw the same defect twice, and the activity halted on a
+    question the user could not usefully answer. So: say the source ran, name the segment that did
+    not fit, and show what is actually there to name instead.
+
+    A ``$prop`` is split by `_property_ref` rather than by dropping ``path``, because its route can
+    be *folded into the token* — for `{"$prop": "Contacts.state.nope"}` there is no ``path`` key to
+    drop, so re-resolving the stripped ref just re-ran the same failing walk and re-raised out of
+    this function, out of `_resolve_collection`, and out of `tick()`: the plan-defect layer aborting
+    the run it exists to recover. Splitting head from route composes the folded and explicit halves
+    the same way `_resolve_ref` does, so either spelling reports the same segment."""
+    if _REF_PROP in ref:
+        source, residual = _property_ref(properties or {}, str(ref[_REF_PROP]))
+        if source is _MISSING or source is _AMBIGUOUS:
+            # The HEAD did not resolve: an unobserved or ambiguous property is a different question
+            # from a bad route, and _collection_defect is the one that names focusing/qualifying.
+            return _collection_defect(ref, _MISSING, history, properties)
+        path = ".".join(p for p in (residual, str(ref.get(_REF_PATH, ""))) if p)
+        return _walk_defect(ref, source, path)
+    source = _resolve_ref(
+        {k: v for k, v in ref.items() if k != _REF_PATH}, history, bindings, properties
+    )
+    path = str(ref.get(_REF_PATH, ""))
+    return _walk_defect(ref, source, path)
+
+
+def _walk_defect(ref: dict[str, Any], source: Any, path: str) -> str:
+    """Walk `path` into an already-resolved `source` and describe where it stopped fitting."""
+    value: Any = source
+    walked: list[str] = []
+    failed = path
+    for segment in filter(None, path.split(".")):
+        try:
+            value = value[int(segment)] if segment.isdigit() else value[segment]
+        except (KeyError, IndexError, TypeError, ValueError):
+            failed = segment
+            break
+        walked.append(segment)
+    at = ".".join(walked) or "the result itself"
+    if isinstance(value, dict):
+        keys = ", ".join(repr(k) for k in list(value)[:8]) or "no keys"
+        holds = f"{at} is a mapping with keys {keys}"
+    elif isinstance(value, list):
+        holds = f"{at} is a list of {len(value)} item(s) — only a numeric segment indexes it"
+    else:
+        holds = f"{at} is a {type(value).__name__}"
+    return (
+        f"{ref!r} names a source that IS present and does not need to run again, but its 'path' "
+        f"does not fit that result: {failed!r} is not readable there, because {holds}. Correct the "
+        "'path' to a field that is, or drop 'path' if the source is already the collection."
+    )
+
+
 def _resolve_collection(
-    ref: Any, history: list[CompletedOperation], bindings: dict[str, Any] | None = None
-) -> list[Any] | None:
+    ref: Any,
+    history: list[CompletedOperation],
+    bindings: dict[str, Any] | None = None,
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> tuple[list[Any] | None, str | None]:
     """The collection a mechanical sub-goal iterates or a data-op transforms: a ``$from`` reference
     resolved against history, a ``$bind`` reference resolved against named bindings (a prior data-op
     output), or a literal list. A resolved mapping iterates its values (see ``_as_collection``).
-    ``None`` when it can't be resolved to a collection (missing source, bad path, a non-collection
-    value, or a soft ``$decide``) — the caller treats that as an empty fan-out/pipeline, mirroring
-    ``resolve_references``' never-raise contract. This is the single site that logs *why* a
-    resolution came up empty (unresolved reference vs. a resolved value of the wrong shape), so
-    callers need not re-warn — an unresolved reference is likely a plan bug (nothing narrowed the
-    collection first), a wrong shape is a tool whose return these tiers don't recognize."""
+    Returns ``(collection, defect)``. A ``defect`` is set exactly when the reference could not be
+    *read* — a missing source, a bad path, or a resolved value of a shape these tiers refuse — and
+    the caller replans on it rather than proceeding. That distinction is the whole point of the
+    pair: a collection that is legitimately empty and a collection the runtime could not read both
+    used to come back as "nothing to do", so a sub-goal over an unreadable reference fanned out to
+    zero steps and the plan sailed past it as though the work were done. An observed run dropped
+    three calendar cancellations that way without a single error surfacing. Empty is an answer;
+    unreadable is a question, and only the second is a plan defect worth another inference.
+
+    ``(None, None)`` means soft, not failed: a ``$decide`` collection is resolved off-cycle, so
+    there is nothing to read here yet and nothing to blame the plan for."""
     if _is_reference(ref):
         if _REF_DECIDE in ref:
-            return None  # a $decide collection is soft — resolved off-cycle, not a failure to log
+            return None, None  # a $decide collection is soft — resolved off-cycle, not a defect
         try:
-            value: Any = _resolve_ref(ref, history, bindings or {})
+            value: Any = _resolve_ref(ref, history, bindings or {}, properties)
         except (KeyError, IndexError, TypeError, ValueError):
-            value = _MISSING
+            return None, _path_defect(ref, history, bindings or {}, properties)
         if value is _MISSING:
-            log.warning("resolve: reference %r did not resolve against history/bindings", ref)
-            return None
+            return None, _collection_defect(ref, value, history, properties)
     else:
         value = ref  # a literal (already a list, mapping, or a plan author's mistake)
     collection = _as_collection(value)
     if collection is None:
-        log.warning(
-            "resolve: %r is a %s, not a list or {id -> record} map the runtime can iterate",
-            ref,
-            type(value).__name__,
-        )
-    return collection
+        return None, _collection_defect(ref, value, history, properties)
+    return collection, None
 
 
 def _enrich_with_params(result: Any, params: dict[str, Any]) -> Any:
@@ -1352,26 +1824,33 @@ def _enrich_with_params(result: Any, params: dict[str, Any]) -> Any:
 
 
 def _resolve_membership_predicate(
-    params: dict[str, Any], history: list[CompletedOperation], bindings: dict[str, Any]
-) -> dict[str, Any]:
+    params: dict[str, Any],
+    history: list[CompletedOperation],
+    bindings: dict[str, Any],
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> tuple[dict[str, Any], str | None]:
     """For a ``filter`` whose predicate tests membership (``in``/``not_in``) against *another
     collection* named by a reference, resolve that reference to a concrete list of comparable keys
     *before* the op runs — so ``_matches`` stays a pure literal comparison and the cross-collection
     resolution lives here in Reason, next to the ``in``-collection resolution (ADR-0023 extension).
     The referenced collection is projected by ``value_path`` (default: the elements themselves, for
     a reference that already resolves to a list of scalars). A literal ``value``, or a non-
-    membership op, passes through untouched; an unresolvable reference becomes an empty set — ``in``
-    matches nothing, ``not_in`` keeps everything (the never-raise contract). A resolved-but-
-    unusable projection (a ``value_path`` that plucks to ``None`` or a non-scalar for every member)
-    is the silent-failure trap the warning below guards: it looks like an empty set and fails open
-    the same way, so it is surfaced rather than left to mis-filter invisibly."""
+    membership op, passes through untouched. Returns the resolved params and a ``defect``, set when
+    the referenced collection could not be read — reported rather than swallowed for the same reason
+    the fan-out reports it: an unreadable membership set fails *open* (``in`` matches nothing,
+    ``not_in`` keeps everything), so the filter silently does the wrong thing to every element. A
+    resolved-but-unusable projection (a ``value_path`` that plucks to ``None`` or a non-scalar for
+    every member) is the neighbouring trap the warning below guards, and fails open the same way."""
     where = params.get("where")
     if not (isinstance(where, dict) and where.get("op") in ("in", "not_in")):
-        return params
+        return params, None
     value = where.get("value")
     if not _is_reference(value):
-        return params  # a literal membership list — nothing to resolve
-    members = _resolve_collection(value, history, bindings) or []
+        return params, None  # a literal membership list — nothing to resolve
+    resolved_members, defect = _resolve_collection(value, history, bindings, properties)
+    if defect is not None:
+        return params, defect
+    members = resolved_members or []
     projected = [pluck(m, where.get("value_path", "")) for m in members]
     # A membership set is compared element-by-element against a scalar key, so only scalar members
     # can ever match. A non-scalar (dict/list) or ``None`` projection is dead weight: `in` silently
@@ -1394,7 +1873,7 @@ def _resolve_membership_predicate(
         )
     resolved_where = {k: v for k, v in where.items() if k != "value_path"}
     resolved_where["value"] = projected
-    return {**params, "where": resolved_where}
+    return {**params, "where": resolved_where}, None
 
 
 def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
@@ -1418,22 +1897,31 @@ def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
 
 
 def _expand_mechanical(
-    step: Step, history: list[CompletedOperation], bindings: dict[str, Any] | None = None
-) -> list[Step]:
+    step: Step,
+    history: list[CompletedOperation],
+    bindings: dict[str, Any] | None = None,
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> tuple[list[Step], str | None]:
     """Fan a mechanical sub-goal out to one concrete ``Step`` per element of its ``in`` collection,
     the element substituted for ``{"$bind": "<as>"}`` in its ``template``. The ``in`` collection may
-    be a ``$from`` (history) or a ``$bind`` (a data-op output binding, e.g. a filtered shortlist).
-    Empty (or an unresolvable collection) -> no steps, so the sub-goal simply vanishes."""
-    # None (unresolvable — likely a plan bug, no narrowing search ran first) and [] (a genuinely
-    # empty collection) both fan out to nothing; _resolve_collection has already logged why on None.
-    elements = _resolve_collection(step.params.get("in"), history, bindings)
+    be a ``$from`` (history), a ``$bind`` (a data-op output binding, e.g. a filtered shortlist), or
+    a ``$prop`` (bulk state an adapter publishes as an observable property).
+
+    Returns the expansion and a ``defect``. An empty collection expands to no steps and *is* the
+    answer — the sub-goal had nothing to do and the plan should continue. A collection that could
+    not be read expands to no steps too, but means the opposite, so it comes back as a defect for
+    the caller to replan on. Collapsing the two is how "cancel each event on Saturday" quietly
+    became a no-op in a real run while the event sat in history, correctly fetched, all along."""
+    elements, defect = _resolve_collection(step.params.get("in"), history, bindings, properties)
+    if defect is not None:
+        return [], defect
     if not elements:
-        return []
+        return [], None
     loop_var = step.params.get("as", "")
     template = step.params.get("template", {})
     return [
         step_from_raw(_substitute_bindings(template, loop_var, element)) for element in elements
-    ]
+    ], None
 
 
 class DefaultReasonStrategy:
@@ -1513,9 +2001,7 @@ class DefaultReasonStrategy:
             log.info(
                 "reason: reusing cached plan (%d steps) for %r", len(plan.steps), activity.goal
             )
-            log.debug(
-                "reason: cached plan for activity %s\n%s", activity.id, render_steps(plan.steps)
-            )
+            log.debug("reason: cached plan for activity %s\n%s", activity.id, render_plan(plan))
             activity.plan = plan
             activity.step_index = 0
             # A cached plan installs without an inference, so nothing consumed a parked superseded
@@ -1538,7 +2024,9 @@ class DefaultReasonStrategy:
                 outcome = await self._subgoal(step, activity, wm, cycle)
                 if outcome is _SUBGOAL_SPLICED:
                     continue  # mechanical: spliced the expansion in place -> read the first step
-                return result  # deliberative fired _infer_ (RUNNING), or the guard halted (BLOCKED)
+                # Deliberative fired _infer_ (RUNNING), the guard halted (BLOCKED), or the
+                # collection was unreadable and the plan was dropped (READY, re-infers next cycle).
+                return result
             if cycle.actions.is_data_op(step.next_action):
                 # A data-op transforms a run-time value into a named binding (ADR-0023). Advance
                 # past it either way: a mechanical op wrote its binding now (read the next step this
@@ -1546,10 +2034,27 @@ class DefaultReasonStrategy:
                 # RUNNING, its result landing in bindings[out] a later cycle — so on resume we
                 # continue after the op, not re-run it (unlike _ground_, whose step still runs).
                 parked = await self._data_op(step, activity, cycle)
+                if activity.plan is None:
+                    # The op's input was unreadable, so the plan was dropped and step_index
+                    # rewound to 0 — advancing would carry a stale index into its replacement.
+                    return result
                 activity.step_index += 1
                 if parked:
                     return result  # RUNNING on the select escalation; binding lands a later cycle
                 continue
+            # A write is the last moment the runtime can still decline to act, so before one it
+            # asks whether the plan can still finish at all (_unsatisfiable_reference). Ahead of
+            # grounding, unlike the reconsideration checkpoint below: this reads only settled state,
+            # costs nothing, and there is no sense buying a grounding call for a dead plan. Not
+            # routed through `cycle.reconsideration` deliberately — that policy is configurable and
+            # may legitimately be switched off, whereas refusing to act on a plan that provably
+            # cannot work is not a tuning knob.
+            if _step_side_effecting(step, wm) is not False:
+                dead = _unsatisfiable_reference(activity)
+                if dead is not None:
+                    log.warning("reason: plan defect for activity %s — %s", activity.id, dead)
+                    activity.reset_for_replan(defect=dead)
+                    return result  # no step this cycle; Reason re-infers against the current world
             # Ground first, *then* reconsider — the checkpoint guards the side-effecting commitment
             # (the invoke), not the grounding before it (ADR-0024). Grounding is itself an
             # off-cycle, side-effect-free model call, so checking before it would (a) spend a
@@ -1559,7 +2064,10 @@ class DefaultReasonStrategy:
             # slow grounding call is most exposed. So each step is checked once, just before commit.
             grounded = await self._ground(step, activity, wm, cycle)
             if grounded is None:
-                return result  # escalated via _ground_ (RUNNING); checked on the invoke pass later
+                # Either escalated via _ground_ (RUNNING; checked on the invoke pass later), or the
+                # plan was dropped as defective (READY, plan cleared -> re-infers next cycle).
+                # Neither commits a step this cycle, which is all this site needs to know.
+                return result
             checkpoint = await self._reconsider(step, activity, wm, cycle, result)
             if checkpoint is not None:
                 # Fired a revalidation (RUNNING), or the plan was invalidated (reset_for_replan) —
@@ -1664,17 +2172,26 @@ class DefaultReasonStrategy:
             ]
             passthrough = {k: v for k, v in step.params.items() if k != "from"}
         else:
-            # An unresolvable input becomes an empty collection (never-raise); _resolve_collection
-            # has already logged *why* on None, so the op simply transforms nothing this run.
-            resolved = _resolve_collection(
-                step.params.get("in"), activity.history, activity.bindings
+            resolved, defect = _resolve_collection(
+                step.params.get("in"),
+                activity.history,
+                activity.bindings,
+                cycle.working.properties,
             )
-            collection = resolved if resolved is not None else []
             passthrough = {k: v for k, v in step.params.items() if k != "in"}
-            if step.next_action == FilterAction.name:
-                passthrough = _resolve_membership_predicate(
-                    passthrough, activity.history, activity.bindings
+            if defect is None and step.next_action == FilterAction.name:
+                passthrough, defect = _resolve_membership_predicate(
+                    passthrough, activity.history, activity.bindings, cycle.working.properties
                 )
+            if defect is not None:
+                # Same reason as the fan-out: a data-op over an unreadable input would write an
+                # empty binding, and an empty binding reads downstream as a real answer ("no such
+                # contact") rather than as a question. Replan on it instead.
+                defect = f"data-op {step.next_action!r} could not read its input: {defect}"
+                log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
+                activity.reset_for_replan(defect=defect)
+                return True  # no step this cycle; Reason re-infers against the current world
+            collection = resolved if resolved is not None else []
         op = cycle.actions.data_op(step.next_action)
         await op.execute(cycle, activity_id=activity.id, collection=collection, **passthrough)
         return activity.pending_inference is not None
@@ -1825,7 +2342,19 @@ class DefaultReasonStrategy:
         plan = activity.plan
         assert plan is not None  # reason() only dispatches a step off a set plan
         i = activity.step_index
-        expanded = _expand_mechanical(step, activity.history, activity.bindings)
+        expanded, defect = _expand_mechanical(
+            step, activity.history, activity.bindings, cycle.working.properties
+        )
+        if defect is not None:
+            # Splicing in zero steps here would mean "this sub-goal had nothing to do", which is a
+            # claim the runtime cannot make when it could not read the collection at all. Replan
+            # carrying the reason, exactly as the undeclared-parameter check does: the planner gets
+            # a correction it can act on, and a planner that writes the same bad reference twice
+            # trips the replan breaker rather than looping.
+            defect = f"sub-goal {step.params.get('goal')!r} could not be expanded: {defect}"
+            log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
+            activity.reset_for_replan(defect=defect)
+            return _SUBGOAL_DEFECT
         activity.plan = replace(plan, steps=plan.steps[:i] + expanded + plan.steps[i + 1 :])
         log.info(
             "reason: sub-goal %r fanned out to %d step(s)", step.params.get("goal"), len(expanded)
@@ -1884,6 +2413,26 @@ class DefaultReasonStrategy:
             )
             if resolved is None:
                 return None  # escalated to _ground_; RUNNING now
+            undeclared = _undeclared_params(manual, routing[OPERATION_NAME], resolved)
+            if undeclared:
+                # A param the operation does not take. Invoking would raise an unexpected-keyword
+                # TypeError at the wire, and a failed op terminates the activity (DefaultReflect) —
+                # so a plan that is otherwise right dies on a name. It IS a plan defect: the model
+                # had the schema and wrote past it (a real run took `limit` from get_contacts' prose
+                # description, which mentions a view limit it does not accept). Dropping the key
+                # instead was rejected — silently changing what an operation is asked to do is worse
+                # on a `send`-shaped op than failing, and a misspelled *required* param would only
+                # trade this error for a null-required skip. So: replan, carrying the reason, which
+                # is what makes the retry differ from the attempt. Checked after grounding, so a key
+                # the grounder invents is caught too, not just one the planner wrote.
+                defect = (
+                    f"{routing[OPERATION_NAME]}: no such parameter(s) "
+                    f"{', '.join(repr(k) for k in undeclared)} — that operation accepts only "
+                    f"{', '.join(sorted(_declared_param_names(manual, routing[OPERATION_NAME])))}"
+                )
+                log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
+                activity.reset_for_replan(defect=defect)
+                return None
             if resolved == op_params:
                 return step  # no references -> unchanged, reuse the original Step
             return replace(step, params={**routing, **resolved})
@@ -1918,7 +2467,9 @@ class DefaultReasonStrategy:
         parked here means a deferred re-entry re-emits the same step instead of re-escalating."""
         if activity.grounded_params is not None:
             return activity.grounded_params  # the escalation resolved; peek (cleared at commit)
-        resolved, unresolved = resolve_references(params, activity.history, activity.bindings)
+        resolved, unresolved = resolve_references(
+            params, activity.history, activity.bindings, wm.properties
+        )
         if not unresolved:
             return resolved  # cheap path — resolved mechanically, no model call
         observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
@@ -1941,8 +2492,17 @@ class DefaultActStrategy:
     ActStrategy would instead ground under-specified params against the manual's schema here; the
     default assumes the Step already carries concrete params, so binding is just the key-split.
 
-    One mechanical guard sits here (still no judgment, so Act stays mechanistic per ADR-0017): a
-    **required** param that resolves to null is a schema violation, so the invoke is *skipped* — no
+    Two mechanical guards sit here (both structural checks, no judgment, so Act stays mechanistic
+    per ADR-0017). The first is a **leak guard**: grounding has already run by the time a step
+    reaches binding, so a ``$from``/``$decide``/``$bind`` dict still present in the params is not a
+    reference waiting to be filled — it is one the resolver failed to *see*, and binding it would
+    serialize the reference itself to the wire as a literal object. The tool then rejects it with a
+    message that names the wrong culprit (a type error on the enclosing list), so the guard skips
+    the invoke and logs the offending paths instead. It is a backstop for a resolver bug, not part
+    of normal flow; a healthy run never trips it.
+
+    The second: a **required** param that resolves to null is a schema violation, so the invoke is
+    *skipped* — no
     invocation is emitted and the cycle dispatches nothing this step (`_act`). Grounding (Reason)
     has already run by now, so a null at bind time is a value the model declined or could not fill,
     not an un-grounded reference; dispatching the operation anyway is the historic blind-`delete`
@@ -1958,6 +2518,16 @@ class DefaultActStrategy:
     ) -> TickResult:
         params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
         operation_name = step.params[OPERATION_NAME]
+        leaked = _reference_paths(params)
+        if leaked:
+            log.error(
+                "act: skipping invoke %s.%s — unresolved reference(s) at %s reached parameter "
+                "binding; grounding never saw them (resolver bug, not a plan bug)",
+                step.params[TOOL_ID],
+                operation_name,
+                leaked,
+            )
+            return result  # no invocation -> _act dispatches nothing this step (skip-and-continue)
         null_required = _null_required_params(manual, operation_name, params)
         if null_required:
             log.warning(
@@ -1973,6 +2543,37 @@ class DefaultActStrategy:
             params=params,
         )
         return replace(result, invocation=invocation)
+
+
+def _declared_param_names(manual: Manual | None, operation_name: str) -> list[str]:
+    """The param names the operation's schema declares — for naming the alternatives in a defect
+    message, so the replanning prompt says what IS accepted, not only what was not."""
+    spec = manual.operation(operation_name) if manual is not None else None
+    declared = spec.parameters.get("properties") if spec is not None else None
+    return list(declared) if isinstance(declared, dict) else []
+
+
+def _undeclared_params(
+    manual: Manual | None, operation_name: str, params: dict[str, Any]
+) -> list[str]:
+    """Params the operation's schema does not declare — the ones an invoke would pass as unexpected
+    keyword arguments. Empty when required-ness is unknowable (no manual, no spec, no declared
+    ``properties``), the same structured-spec dependency ``_null_required_params`` has.
+
+    Treats a schema without an explicit ``additionalProperties`` as *closed*, which inverts the
+    JSON Schema default. Deliberate: these schemas are synthesized from real callables (an ARE
+    ``AppTool`` signature, an MCP ``inputSchema``), so an undeclared key is a TypeError at the
+    wire, not a tolerated extra. An adapter whose operation genuinely takes a free-form bag
+    declares ``additionalProperties`` itself, and is then left alone."""
+    spec = manual.operation(operation_name) if manual is not None else None
+    if spec is None:
+        return []
+    if spec.parameters.get("additionalProperties", False) is not False:
+        return []
+    declared = spec.parameters.get("properties")
+    if not isinstance(declared, dict):
+        return []
+    return sorted(key for key in params if key not in declared)
 
 
 def _null_required_params(
