@@ -10,14 +10,16 @@ isolates the loop mechanics from planning (covered in ``test_are_mcp_email_calen
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
 
-from fakes import FakeAdapter, FakeTool, FakeWorkspace
+from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
 from sora.action import default_action_registry
 from sora.cycle import Agent, DecisionCycle
 from sora.environment import EnvironmentRegistry, Workspace, WorkspaceOrigin
+from sora.llm import LLMClient, MeteredLLMClient
 from sora.manual import Manual, ToolRecord, WorkspaceRecord
 from sora.memory import (
     EpisodicMemory,
@@ -39,7 +41,9 @@ from sora.transport import InProcessTransport
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
 
 
-def _build_agent(tmp_path: Path) -> tuple[Agent, EnvironmentRegistry, FakeWorkspace]:
+def _build_agent(
+    tmp_path: Path, llm: LLMClient | None = None
+) -> tuple[Agent, EnvironmentRegistry, FakeWorkspace]:
     workspace = FakeWorkspace(
         "gaia2", _ORIGIN, [FakeTool("EmailClientApp", invoke_results={"list_emails": {}})]
     )
@@ -60,7 +64,7 @@ def _build_agent(tmp_path: Path) -> tuple[Agent, EnvironmentRegistry, FakeWorksp
         registry=registry,
         working=working,
         semantic=semantic,
-        procedural=ProceduralMemory(FileMemoryBackend(tmp_path / "procedural")),
+        procedural=ProceduralMemory(FileMemoryBackend(tmp_path / "procedural"), llm=llm),
         episodic=EpisodicMemory(FileMemoryBackend(tmp_path / "episodic")),
     )
     agent = Agent(
@@ -131,6 +135,26 @@ async def test_run_partial_startup_join_failure_still_closes_joined_workspaces(
 
     assert workspace.closed is True  # the already-joined workspace was closed despite the failure
     assert registry.joined_workspaces() == []
+
+
+async def test_startup_trace_names_the_model(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A trace that doesn't name its model can't be read back later: the same odd trajectory is an
+    expected small-model artifact or a real runtime defect depending on what produced it — and the
+    log is often read weeks after the run, by someone who no longer knows which config was used.
+    Logged (not printed with the CLI banner) so it reaches a --log-file capture too."""
+    agent, registry, _ = _build_agent(
+        tmp_path, llm=MeteredLLMClient(FakeLLMClient(), model="qwen3:30b-64k")
+    )
+    with caplog.at_level(logging.INFO, logger="sora.cycle"):
+        task = asyncio.create_task(agent.run())
+        await _run_until(lambda: bool(registry.all_tools()), task)
+        await agent.stop()
+        await task
+
+    startup = [r.getMessage() for r in caplog.records if r.getMessage().startswith("startup:")]
+    assert startup[0] == "startup: model qwen3:30b-64k"  # before the workspace joins it explains
 
 
 async def test_run_is_idempotent_on_repeated_start(tmp_path: Path) -> None:

@@ -46,6 +46,7 @@ from sora.memory import (
 )
 from sora.perception import Percept
 from sora.strategies import (
+    _DEFAULT_MAX_REPLAN_ATTEMPTS,
     BeforeEachOp,
     BeforeWrites,
     DefaultActStrategy,
@@ -63,6 +64,7 @@ from sora.strategies import (
 from sora.types import (
     CompletedOperation,
     InferenceResult,
+    InputWait,
     ObservableProperty,
     OperationAck,
     OperationInvocation,
@@ -685,3 +687,230 @@ async def test_revalidate_between_grounding_and_invoke_does_not_force_a_reground
     assert activity.grounded_params is None  # consumed at commit
     assert activity.step_index == 1
     assert activity.pending_inference is None  # did not re-escalate _ground_
+
+
+# ── Runaway-replan breaker ──────────────────────────────────────────────────────────────────────
+#
+# A plan is dropped, its replacement is dropped too, and nothing ever runs — each turn costing a
+# full planning inference (minutes apiece on a local model in the run that motivated this). The
+# bound is deliberately progress-relative: replanning without limit is what an agent in a dynamic
+# environment is *for*, so what gets counted is only replans that executed no operation at all.
+
+
+def _ran_an_op(page: int = 0) -> CompletedOperation:
+    """One completed call. ``page`` varies the arguments: only a call the activity has not already
+    made counts as progress, so a fixture that re-ran one identical call would be modelling the
+    stuck agent rather than the working one."""
+    return CompletedOperation(
+        OperationInvocation("t", "read_op", {"page": page}), OperationAck(ok=True, result="ok")
+    )
+
+
+def _replanned(activity: Activity, defect: str | None) -> None:
+    """One full drop-the-plan turn: a plan has to be present for the reset to record anything."""
+    activity.plan = Plan(id="p", goal="g", steps=[invoke_step("t", "write_op")])
+    activity.reset_for_replan(defect=defect)
+
+
+def _halt_prompt(activity: Activity) -> str:
+    """The await-input text a tripped breaker parked. Asserts the shape on the way through, since
+    every caller below is checking what the text *says*, not that there is text at all."""
+    wait = activity.blocked_on
+    assert isinstance(wait, InputWait)
+    prompt = wait.prompt
+    assert prompt is not None
+    return prompt
+
+
+def _stuck(working: WorkingMemory, trail: list[str | None]) -> Activity:
+    """An activity whose last ``len(trail)`` plans were abandoned with no operation in between."""
+    activity = Activity(id="a", goal="book a day with the film producer", context={})
+    working.activities["a"] = activity
+    for defect in trail:
+        _replanned(activity, defect)
+    return activity
+
+
+def test_an_operation_running_between_replans_forgives_the_trail() -> None:
+    """The whole point of counting progress rather than attempts: an agent that keeps adjusting
+    while actually getting somewhere must never approach the cap, however long it runs."""
+    activity = Activity(id="a", goal="g", context={})
+    for page in range(_DEFAULT_MAX_REPLAN_ATTEMPTS * 3):
+        _replanned(activity, None)  # the world moved again
+        activity.history.append(_ran_an_op(page))  # ...and the new plan still got somewhere new
+    _replanned(activity, None)
+
+    assert activity.replan_trail == [None]  # only the latest; every earlier one was forgiven
+
+
+def test_re_running_an_already_made_call_does_not_forgive_the_trail() -> None:
+    """The observed runaway: every replan re-issued ``get_contacts(offset=0)``, which cleared the
+    trail each time and kept the breaker asleep while nothing new was ever learned."""
+    activity = Activity(id="a", goal="g", context={})
+    activity.history.append(_ran_an_op(0))
+    for defect in ("no such parameter 'limit'", "friend_contact is empty", "selected is empty"):
+        _replanned(activity, defect)
+        activity.history.append(_ran_an_op(0))  # the same call, all over again
+
+    assert activity.replan_trail == [
+        "no such parameter 'limit'",
+        "friend_contact is empty",
+        "selected is empty",
+    ]
+
+
+def test_replans_with_nothing_run_between_them_accumulate() -> None:
+    activity = Activity(id="a", goal="g", context={})
+    _replanned(activity, "no such parameter 'limit'")
+    _replanned(activity, None)
+    _replanned(activity, "search_contacts returned []")
+
+    assert activity.replan_trail == [
+        "no such parameter 'limit'",
+        None,
+        "search_contacts returned []",
+    ]
+
+
+def test_progress_is_counted_from_the_last_replan_not_from_zero() -> None:
+    """A single op run early must not keep forgiving later replans — the mark advances with it."""
+    activity = Activity(id="a", goal="g", context={})
+    activity.history.append(_ran_an_op())
+    _replanned(activity, "a")
+    _replanned(activity, "b")
+
+    assert activity.replan_trail == ["a", "b"]
+
+
+async def test_the_same_defect_twice_halts_before_a_third_plan(tmp_path: Path) -> None:
+    """The precise check: the planner was handed that defect in its brief and wrote past it, so a
+    third attempt would fail identically. Trips at two, well under the count backstop."""
+    cycle, working = await _cycle(tmp_path, reconsideration=NoneReconsideration())
+    defect = "get_contacts: no such parameter(s) 'limit' — that operation accepts only offset"
+    activity = _stuck(working, [defect, defect])
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is None
+    state = activity.state
+    assert state is ActivityState.BLOCKED
+    assert activity.pending_inference is None  # no planning inference was spent
+    assert defect in _halt_prompt(activity)  # the specific evidence, not just "it failed"
+
+
+async def test_two_different_defects_are_still_worth_another_attempt(tmp_path: Path) -> None:
+    """The inverse: failing differently each time is floundering, not a loop — the planner is at
+    least trying something new, so it gets the full count before anyone is interrupted."""
+    cycle, working = await _cycle(tmp_path, reconsideration=NoneReconsideration())
+    activity = _stuck(working, ["no such parameter 'limit'", "search_contacts returned []"])
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    state = activity.state
+    assert state is not ActivityState.BLOCKED
+    assert activity.pending_inference is not None  # planned again
+
+
+async def test_a_world_that_keeps_moving_does_not_trip_the_same_defect_check(
+    tmp_path: Path,
+) -> None:
+    """Consecutive reconsiderations carry no defect. Two in a row is evidence about the world, not
+    about a stuck planner, so they must not halt at two the way a repeated defect does."""
+    cycle, working = await _cycle(tmp_path, reconsideration=NoneReconsideration())
+    activity = _stuck(working, [None, None])
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    state = activity.state
+    assert state is not ActivityState.BLOCKED
+    assert activity.pending_inference is not None
+
+
+async def test_the_count_backstops_attempts_that_all_fail_differently(tmp_path: Path) -> None:
+    cycle, working = await _cycle(tmp_path, reconsideration=NoneReconsideration())
+    trail: list[str | None] = [f"distinct failure {i}" for i in range(_DEFAULT_MAX_REPLAN_ATTEMPTS)]
+    activity = _stuck(working, trail)
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    state = activity.state
+    assert state is ActivityState.BLOCKED
+    assert activity.pending_inference is None
+    prompt = _halt_prompt(activity)
+    # Mechanically rendered (no model call): every attempt is listed, in order, verbatim.
+    for i, reason in enumerate(trail, start=1):
+        assert f"  {i}. {reason}" in prompt
+    assert "How should I proceed?" in prompt
+
+
+async def test_a_world_that_keeps_moving_never_trips_the_count_either(tmp_path: Path) -> None:
+    """The moving world this runtime is built for must not be able to halt the agent on its own.
+
+    A defect-free entry is a reconsideration: the plan was fine and the world moved under it, so the
+    next plan is inferred against a different world — an attempt, not a repeat. A plan whose first
+    checkpointed step is a write has run no operation, so nothing forgives its trail, and counting
+    those entries halted an agent that had adapted honestly every time. Far past the cap here, and
+    still planning."""
+    cycle, working = await _cycle(tmp_path, reconsideration=NoneReconsideration())
+    trail: list[str | None] = [None] * (_DEFAULT_MAX_REPLAN_ATTEMPTS * 3)
+    activity = _stuck(working, trail)
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    state = activity.state
+    assert state is not ActivityState.BLOCKED
+    assert activity.pending_inference is not None
+
+
+async def test_the_halt_prompt_names_a_reconsideration_as_such(tmp_path: Path) -> None:
+    """A None entry has no defect string to quote, so the mechanical renderer supplies the reason
+    rather than printing "None" at whoever has to answer the question. Reached via a trail that
+    halts on its *defects* — reconsiderations no longer trip the breaker themselves, but they are
+    still part of the story the halt prompt has to tell."""
+    cycle, working = await _cycle(tmp_path, reconsideration=NoneReconsideration())
+    trail: list[str | None] = [None]
+    trail += [f"distinct failure {i}" for i in range(_DEFAULT_MAX_REPLAN_ATTEMPTS)]
+    activity = _stuck(working, trail)
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    prompt = _halt_prompt(activity)
+    assert "the world changed under the plan" in prompt
+    assert "None" not in prompt
+
+
+async def test_the_cap_is_configurable(tmp_path: Path) -> None:
+    """A task with legitimately many false starts can raise it, exactly like max_subgoal_depth."""
+    cycle, working = await _cycle(tmp_path, reconsideration=NoneReconsideration())
+    trail: list[str | None] = [f"distinct failure {i}" for i in range(_DEFAULT_MAX_REPLAN_ATTEMPTS)]
+    activity = _stuck(working, trail)
+
+    strategy = DefaultReasonStrategy(max_replan_attempts=_DEFAULT_MAX_REPLAN_ATTEMPTS + 1)
+    await strategy.reason(activity, working, cycle, TickResult())
+
+    state = activity.state
+    assert state is not ActivityState.BLOCKED  # the default would have halted here
+    assert activity.pending_inference is not None
+
+
+async def test_answering_the_halt_lets_the_activity_plan_again(tmp_path: Path) -> None:
+    """Without clearing the trail the breaker re-trips on the resumed activity's first Reason pass
+    and the halt is permanent — the guidance just given could never be acted on."""
+    cycle, working = await _cycle(tmp_path, reconsideration=NoneReconsideration())
+    defect = "get_contacts: no such parameter(s) 'limit'"
+    activity = _stuck(working, [defect, defect])
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    blocked = activity.state
+    assert blocked is ActivityState.BLOCKED  # precondition
+
+    resumed = DefaultObserveStrategy._resume_on_input(working)
+
+    assert resumed is True
+    assert activity.replan_trail == []  # including the resume's own reset_for_replan entry
+    ready = activity.state
+    assert ready is ActivityState.READY
+    # And it really can plan now, rather than halting again on the trail it was carrying.
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    after = activity.state
+    assert after is not ActivityState.BLOCKED
+    assert activity.pending_inference is not None

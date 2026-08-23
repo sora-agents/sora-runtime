@@ -783,6 +783,34 @@ def test_plan_prompt_steers_conditional_selection_to_a_decide_filter() -> None:
     assert "plain top-n" in lowered
 
 
+def test_plan_prompt_examples_stay_off_any_evaluated_domain() -> None:
+    """The planner's worked examples must not be drawn from a domain this runtime is scored on.
+
+    They used to be: "save each of the found apartments", "keep apartments NOT already saved", the
+    per-zip `get_crime_rate` join, and a near-verbatim RentAFlat tie-break rule — so a Gaia2 score
+    was partly measuring how well this prompt had pre-solved Gaia2's own task family. The
+    structural rules these examples teach are domain-free, so keeping the nouns off any evaluated
+    domain costs nothing. The natural way to reintroduce the bias is to reach for whatever scenario
+    is being debugged when adding an example, which is exactly what this catches."""
+    lowered = PLAN_SYSTEM_PROMPT.lower()
+    for noun in (
+        "apartment",
+        "crime_rate",
+        "zip_code",
+        "laundry",
+        "amenities",
+        "relative",
+        "cheapest",
+        "rentaflat",
+    ):
+        assert noun not in lowered, f"benchmark-domain noun {noun!r} is back in PLAN_SYSTEM_PROMPT"
+    # ...and the structure those examples carry is still taught (guards against deleting rather
+    # than re-anchoring them): a per-item fan-out, a membership exclusion, and an input-arg join.
+    assert "per item" in lowered
+    assert "not_in" in lowered
+    assert "input arguments" in lowered
+
+
 def test_plan_prompt_keeps_visible_identifiers_as_references() -> None:
     # An observed identifier (an email/event id currently visible in properties) must still be
     # referenced, not hardcoded — otherwise a goal-keyed cached plan bakes in one run's ids and
@@ -964,6 +992,26 @@ def test_default_ground_prompt_includes_percept_rendering() -> None:
     assert system == GROUND_SYSTEM_PROMPT
     assert render_properties(properties) in user
     assert render_signals(signals) in user
+
+
+def test_ground_prompt_carries_no_sub_plan_provenance_notice() -> None:
+    """The notice belongs to the *plan* prompt only, on two counts.
+
+    It is advice about how to end a plan ("do NOT invoke send_message_to_user"), which grounding one
+    operation's params cannot act on. And it would be attached to the wrong string: InferAction
+    renders a sub-plan against a copy whose `goal` is the sub-goal, but GroundAction passes the live
+    activity, whose `goal` is still the user's own request even mid-sub-plan — so the grounder would
+    be shown the user's request and told it is not a request from the user."""
+    activity = _activity_with_history("book the trip", "search_flights", {"flights": []})
+    activity.parent_frames.append(  # mid-sub-plan: exactly when the plan prompt renders the notice
+        (Plan(id="p", goal="book the trip", steps=[]), 0)
+    )
+
+    _system, user = default_ground_prompt(activity, "book_flight", None, {})
+
+    assert "book the trip" in user  # the goal is still rendered
+    assert "NOT a request from the user" not in user
+    assert "send_message_to_user" not in user
 
 
 def test_render_bindings_names_each_binding_and_its_value() -> None:

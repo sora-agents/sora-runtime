@@ -868,3 +868,33 @@ def test_step_from_raw_defaults_missing_action_to_invoke() -> None:
 
 def test_plan_prompt_documents_subgoal_steps() -> None:
     assert "subgoal" in PLAN_SYSTEM_PROMPT
+
+
+async def test_subgoal_prompt_is_told_it_is_a_subgoal_without_mutating_the_activity(
+    tmp_path: Path,
+) -> None:
+    """The provenance clause has to reach the *sub-goal's* prompt, and the frame that carries it is
+    seeded on a throwaway copy — pushing it onto the real activity here would double up when Observe
+    pushes it for real at install time."""
+    llm = FakeLLMClient(plan_json({"action": "send", "to": "user", "content": {"text": "done"}}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    cycle, working, registry = _cycle(tmp_path, procedural, FakeTool("realestate"))
+    await registry.join(_ORIGIN)
+    subgoal = Step(
+        next_action="subgoal",
+        params={"goal": "notify each relative", "mode": "deliberative"},
+    )
+    parent = Plan(id="p", goal="reconcile the shortlist", steps=[subgoal])
+    activity = Activity(id="a", goal="reconcile the shortlist", context={}, plan=parent)
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)  # let the background _infer_ task build its prompt and call the LLM
+
+    prompt = next(p for _s, p in llm.calls if "notify each relative" in p)
+    assert "NOT a request from the user" in prompt
+    # the fire itself must not have pushed the frame — Observe owns that, on the real activity
+    assert activity.parent_frames == []
+
+    await DefaultObserveStrategy().observe(cycle)
+    assert activity.parent_frames == [(parent, 0)]  # pushed exactly once, by Observe
