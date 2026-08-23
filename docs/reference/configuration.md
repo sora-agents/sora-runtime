@@ -29,6 +29,30 @@ default and fails loud (`ValueError`) if omitted.
 | `interrupt_policy` | `sora.strategies.NeverInterruptPolicy` | Which pushed signals preempt (none, by default). |
 | `change_gate` | `sora.strategies.PerceptionSignatureGate` | The pre-revalidation change gate (ADR-0024). |
 | `context_adaptation` | `before_writes` | A *level name* (`none` \| `before_writes` \| `before_each_op`) or a dotted path to a custom `ReconsiderationPolicy`. Not a dotted-path-only key like the others — see [Extension Protocols — Auxiliary seams](extension-protocols.md#auxiliary-seams). |
+| `relevance` | — (absent: the seam is `None`) | Undeclared-relevance recovery ([ADR-0026](../architecture/adrs/0026-undeclared-relevance-recovery.md)). The one key whose absence disables a layer rather than selecting a default — see below. |
+
+Omitting `relevance` does not fall back to a shipped default the way every other row does: it leaves
+`DecisionCycle.relevance` as `None` and the layer never runs. `sora.strategies.DefaultRelevanceJudge`
+ships with the runtime but stays unwired until it is named here:
+
+```yaml
+agent:
+  strategies:
+    relevance: sora.strategies.DefaultRelevanceJudge
+```
+
+It is opt-in because it spends a model call on a judgement nothing can mechanically check and, when
+it fires, interrupts a person to ask whether an observed change bears on work that already finished.
+An unattended run has nobody to ask, which is exactly where acting on a guess is worst. Its input is
+only what the declared pending conditions
+([ADR-0022](../architecture/adrs/0022-plan-representation-context-guard-and-subgoals.md)) left
+unclaimed, so every condition a plan learns to declare removes work from this fallback.
+
+The value is a dotted path called with **no arguments**, so `DefaultRelevanceJudge`'s two settings —
+`window` (how many recently-closed episodes it weighs) and `max_asks` (how many times it may
+interrupt the user) — are not reachable from `agent.yaml`. Neither number has a principled value,
+which is why they are constructor arguments rather than constants; to change them, name your own
+zero-argument factory here instead.
 
 ## `agent.memory`
 

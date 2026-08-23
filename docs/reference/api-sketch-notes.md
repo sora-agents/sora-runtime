@@ -966,8 +966,16 @@
             on the activity. `succeeded` is passed in because ActivityState.TERMINATED can't tell a
             completed activity from a failed one; only the judging ReflectStrategy knows. The plan is
             kept in full even on success (procedural memory holds it too): on failure it's the only 
-            copy, since procedural memory does not store failed plans."""
+            copy, since procedural memory does not store failed plans. Also stamps `ended_at` — the
+            episode's own record of when it closed, which is what makes "recent" expressible at all
+            (the backend's stable key order is activity id, not recency)."""
         async def consult(self, activity: Activity) -> list[Any]: ...
+        async def consult_recent(self, limit: int) -> list[Any]: ...
+            # The disambiguated sibling of consult(): consult() retrieves by GOAL-EQUALITY, which is
+            # exactly wrong for undeclared-relevance recovery — that judge holds an observed change,
+            # not a goal, and is asking which recently-closed episode a change might bear on. Newest
+            # `ended_at` first, capped. A new method on the existing module rather than a new memory
+            # type, per the standing rule for new durable data. ADR-0026.
 
     # sora/strategies.py — one pluggable strategy per phase, threaded through a shared TickResult
     @dataclass(frozen=True)
@@ -1133,6 +1141,31 @@
         projects to only the external surface is how an application removes that (e.g. the ARE example's
         INBOX-id gate, which self-writes to SENT / read-flags / calendar don't move). See ADR-0024."""
         def signature(self, wm: WorkingMemory) -> object: ...
+
+    # Undeclared-relevance recovery (ADR-0026): the fallback for a change that opened NO declared
+    # pending-condition gate. Its input is defined by SUBTRACTION from ADR-0022's declared layer, so
+    # every condition the planner learns to declare removes work from here — the two are complements
+    # and the expensive one is the fallback. Lives on DecisionCycle.relevance; None = off (the default).
+    class RelevanceJudge(Protocol):
+        async def consider(self, cycle: DecisionCycle) -> None: ...
+        #   Called ONLY on an idle tick — one where Situate selected nothing, so either nothing is
+        #   schedulable or everything schedulable is already awaiting a model. Scheduling, not
+        #   triggering: an unclaimed change makes this eligible the moment it lands, but it never runs
+        #   in preference to an activity that could advance. Must return promptly — fire any model call
+        #   off-cycle and apply the result on a later call.
+    class DefaultRelevanceJudge:    # the built-in one — deliberately OPT-IN, not the default
+        """Judges unclaimed changes against EpisodicMemory.consult_recent(window), yielding at most one
+        RelevanceCandidate, which becomes a NEW activity born BLOCKED on an InputWait: the user is asked
+        before the agent acts on a goal nobody stated, and the closed episode is never rewritten into a
+        lie. Consent needs no mechanism of its own — _resume_on_input already clears the wait, drops the
+        empty plan and re-infers with the reply visible, so a decline is answered by the same path a
+        go-ahead is. Off by default because it spends a call on a judgement nothing can mechanically
+        check and, when it fires, interrupts a person; an unattended run has nobody to ask, which is
+        exactly where acting on a guess is worst. Known inversion: idle-scheduling means the busiest
+        agent — the one observing the most change — defers this longest. Neither `window` nor `max_asks`
+        has a principled value, which is why both are settings rather than constants. See ADR-0026."""
+        def __init__(self, *, window: int = 10, max_asks: int = 3) -> None: ...
+        async def consider(self, cycle: DecisionCycle) -> None: ...
 
     class InterruptHandler(Protocol):  # decides an interrupted activity's follow-up — the "interrupt handler"
         async def handle(self, request: InterruptRequest, wm: WorkingMemory, cycle: DecisionCycle) -> bool:

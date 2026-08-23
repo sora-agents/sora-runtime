@@ -413,6 +413,15 @@ def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
         change_gate=import_object(
             config.strategies.get("change_gate", _DEFAULT_STRATEGIES["change_gate"])
         )(),
+        # Undeclared-relevance recovery (ADR-0026) — absent by default, so an agent gets the
+        # declared-condition layer and nothing else unless someone opts in by naming a judge in
+        # agent.yaml's strategies.relevance. Off rather than on because it spends a model call on
+        # an unverifiable judgement and, when it fires, interrupts a person.
+        relevance=(
+            import_object(config.strategies["relevance"])()
+            if config.strategies.get("relevance")
+            else None
+        ),
     )
     return Agent(
         cycle=cycle,

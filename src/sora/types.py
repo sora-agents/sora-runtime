@@ -174,6 +174,21 @@ class ConditionVerdict:
 
 
 @dataclass(frozen=True)
+class RelevanceCandidate:
+    """One terminated episode an observed change may have made relevant again (ADR-0026).
+
+    At most one is ever produced per judgement: a second-best guess about an intention nobody
+    declared is not worth the question it would cost. `question` is what the user is asked before
+    anything happens, and `goal` is the amending activity's goal if they say yes — kept separate
+    because the question has to be answerable without knowing how the runtime words goals.
+    """
+
+    episode_id: str  # the terminated activity's id — the amendment points back at it
+    goal: str
+    question: str
+
+
+@dataclass(frozen=True)
 class ConditionWait:  # the third blocked_on variant — a plan's own declared pending conditions
     # Set when a plan body is exhausted but unsatisfied conditions remain, so the activity blocks
     # instead of terminating. blocked_on stays a single value: the plurality lives in this one wait,

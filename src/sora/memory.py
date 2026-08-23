@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
@@ -34,6 +35,7 @@ from sora.types import (
     ConditionVerdict,
     PendingCondition,
     Plan,
+    RelevanceCandidate,
     SignalWait,
     Step,
     SupersededPlan,
@@ -1545,6 +1547,56 @@ def _parse_condition_verdict(text: str, count: int) -> ConditionVerdict:
 
 # --- undeclared relevance: does a change bear on work that already finished? — ADR-0026 ----------
 
+RELEVANCE_SYSTEM_PROMPT = (
+    "You are deciding whether something that just changed in an agent's environment means a task "
+    "it ALREADY FINISHED needs following up.\n"
+    "You are given a numbered list of recently finished tasks (what each was trying to do, how it "
+    "went) and a description of what just changed. Decide whether the change is a genuine "
+    "follow-up to exactly one of those tasks — a reply to a message it sent, a cancellation of "
+    "something it arranged, a rejection of something it submitted.\n"
+    "Answer NO unless the connection is specific and concrete. Most changes are unrelated "
+    "background activity, and the agent's own past actions often cause changes that follow from "
+    "work it already completed correctly — those are not follow-ups. A wrong YES interrupts a "
+    "person with a question about work that was already done properly.\n"
+    'Respond with ONLY a JSON object. If nothing follows up: {"relevant": false}. Otherwise:\n'
+    '  {"relevant": true, "task": <index>, "goal": "<what the agent should now do about it>", '
+    '"question": "<a one-sentence question asking the user whether to do it>"}\n'
+    "`goal` is phrased like a task instruction. `question` is addressed to the user, states what "
+    "changed and what you propose, and must be answerable with yes or no. No prose, no fences."
+)
+
+
+def _parse_relevance(text: str, episodes: Sequence[Any]) -> RelevanceCandidate | None:
+    """Parse the relevance judgement, or None for "nothing follows up".
+
+    Degrades to None on anything malformed or out of range. That asymmetry is deliberate: a missed
+    follow-up costs a silent gap the user can still notice and correct, while a fabricated one
+    interrupts them with a question about work that was already finished properly — and this is the
+    one layer whose judgement nothing downstream can mechanically check.
+    """
+    try:
+        obj = _load_json_object(text)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(obj, dict) or not obj.get("relevant"):
+        return None
+    index = obj.get("task")
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None
+    if not 0 <= index < len(episodes):
+        return None
+    goal, question = obj.get("goal"), obj.get("question")
+    if not isinstance(goal, str) or not goal.strip():
+        return None
+    if not isinstance(question, str) or not question.strip():
+        return None
+    episode = episodes[index]
+    episode_id = episode.get("activity_id") if isinstance(episode, dict) else None
+    if not isinstance(episode_id, str):
+        return None
+    return RelevanceCandidate(episode_id=episode_id, goal=goal.strip(), question=question.strip())
+
+
 # --- select: the model-escalated data-op filter predicate ($decide) — ADR-0023 -------------------
 
 SELECT_SYSTEM_PROMPT = (
@@ -1833,6 +1885,52 @@ class ProceduralMemory:
         text = await self._llm.complete(system=CONDITION_SYSTEM_PROMPT, prompt=user)
         return _parse_condition_verdict(text, len(conditions))
 
+    async def judge_relevance(
+        self,
+        episodes: Sequence[Any],
+        changes: Sequence[Change],
+        observed: PerceptSnapshot | None = None,
+    ) -> RelevanceCandidate | None:
+        """Does an observed change bear on work that already finished? (ADR-0026)
+
+        The expensive layer, and deliberately the last resort: unlike every other match in this
+        runtime there is no declared thing to compare against, so the judgement is unverifiable from
+        the runtime's side. Its input is only what the declared-condition gates left unclaimed, so
+        the cost shrinks as the planner learns to declare — the two are complements.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "ProceduralMemory has no LLM configured; cannot judge undeclared relevance."
+            )
+        if not episodes:
+            return None
+        snapshot = observed or PerceptSnapshot()
+        listed = "\n".join(
+            f"{i}. goal: {e.get('goal', '(unknown)')}\n"
+            f"   outcome: {'succeeded' if e.get('succeeded') else 'failed'}\n"
+            f"   summary: {e.get('summary', '(none)')}"
+            for i, e in enumerate(episodes)
+            if isinstance(e, dict)
+        )
+        where = (
+            "\n".join(
+                f"- {ch.path or '(whole property)'}"
+                + (f" added={list(ch.added)}" if ch.added else "")
+                + (f" removed={list(ch.removed)}" if ch.removed else "")
+                + (f" updated={list(ch.updated)}" if ch.updated else "")
+                for ch in changes
+            )
+            or "(the source reported no detail about what moved)"
+        )
+        user = (
+            f"Recently finished tasks:\n{listed}\n"
+            f"What just changed:\n{where}\n"
+            f"Current observed properties:\n{render_properties(snapshot.properties)}"
+        )
+        log.debug("relevance: system prompt\n%s\nUser prompt\n%s", RELEVANCE_SYSTEM_PROMPT, user)
+        text = await self._llm.complete(system=RELEVANCE_SYSTEM_PROMPT, prompt=user)
+        return _parse_relevance(text, episodes)
+
     async def store(self, plan: Plan) -> None:
         """Persists a Plan that was actually followed to completion, so future retrieve() calls
         for similar goals can reuse it. Called by ReflectStrategy on success only — a failed plan
@@ -1895,6 +1993,12 @@ class EpisodicMemory:
                     None if activity.last_operation is None else asdict(activity.last_operation)
                 ),
                 "plan": None if plan is None else asdict(plan),
+                # When this episode closed. Stored because recency is not otherwise recoverable:
+                # the backend orders non-ranking results by key (the activity id), which says
+                # nothing about time, so without this "the most recently finished episodes" cannot
+                # be asked for at all. Re-learning the same activity overwrites, so this is the
+                # *last* close, which is what a recency query wants.
+                "ended_at": time.time(),
             },
         )
 
@@ -1902,3 +2006,16 @@ class EpisodicMemory:
         # query() re-reads from disk, so results are fresh copies a caller can mutate without
         # corrupting the store.
         return await self._backend.query(goal=activity.goal)
+
+    async def consult_recent(self, limit: int) -> list[Any]:
+        """The most recently closed episodes, newest first — the disambiguated sibling of consult().
+
+        consult() retrieves by goal-equality, which is exactly wrong for a caller holding an
+        observed *change* rather than a goal and asking which recently-closed work it might bear on
+        (ADR-0026). Sorting happens here rather than in the backend because `query()`'s ordering
+        contract is relevance, not recency, and a ranking backend is free to ignore both. An episode
+        written before `ended_at` existed sorts oldest rather than crashing.
+        """
+        episodes = await self._backend.query()
+        episodes.sort(key=lambda e: e.get("ended_at") or 0.0, reverse=True)
+        return episodes[: max(0, limit)]

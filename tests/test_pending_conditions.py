@@ -1,4 +1,4 @@
-"""Declared pending conditions (ADR-0022).
+"""Declared pending conditions (ADR-0022) and undeclared-relevance recovery (ADR-0026).
 
 The failure these exist for: an agent scheduled an event, emailed the attendee, confirmed to the
 user and TERMINATED — then the attendee replied "can't make it, Thursday instead" and nothing was
@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, ScriptedTransport
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -41,6 +41,7 @@ from sora.strategies import (
     DefaultObserveStrategy,
     DefaultReasonStrategy,
     DefaultReflectStrategy,
+    DefaultRelevanceJudge,
     DefaultSituateStrategy,
     Strategies,
 )
@@ -48,6 +49,7 @@ from sora.transport import MessageTransport
 from sora.types import (
     Change,
     ConditionWait,
+    InputWait,
     PendingCondition,
     PendingConditionState,
     Plan,
@@ -651,6 +653,217 @@ async def test_a_hallucinated_index_cannot_retire_a_live_condition(tmp_path: Pat
     await cycle.strategies.reason.reason(activity, working, cycle, _tick())
 
     assert activity.pending_conditions == [state]
+
+
+# --------------------------------------------------------------------------------------------------
+# Layer 3: undeclared-relevance recovery
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_judge_is_off_unless_opted_in(tmp_path: Path) -> None:
+    # It spends a call on an unverifiable judgement and, when it fires, interrupts a person. An
+    # unattended run has nobody to ask, which is exactly where acting on a guess is worst.
+    cycle, _ = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    assert cycle.relevance is None
+    await cycle.tick()  # idle tick with no judge configured — must not raise
+
+
+async def test_judge_proposes_an_amending_activity_blocked_on_the_user(tmp_path: Path) -> None:
+    llm = FakeLLMClient(
+        json.dumps(
+            {
+                "relevant": True,
+                "task": 0,
+                "goal": "Rebook for Thursday",
+                "question": "Åke can't make the 19th — rebook for Thursday?",
+            }
+        )
+    )
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    judge = DefaultRelevanceJudge()
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked and emailed", succeeded=True)
+    _signal(working, "folders.INBOX.emails")  # claimed by NO declared condition
+
+    await judge.consider(cycle)  # fires
+    await _settle()
+    await judge.consider(cycle)  # applies, inside the tick
+
+    (amendment,) = [a for a in working.activities.values() if a.id != "old"]
+    assert amendment.goal == "Rebook for Thursday"
+    # Born BLOCKED on the user: never act on a goal nobody stated.
+    assert amendment.state is ActivityState.BLOCKED
+    assert isinstance(amendment.blocked_on, InputWait)
+    assert "Thursday" in (amendment.blocked_on.prompt or "")
+    # The amendment points back at what it amends; the closed episode is untouched.
+    assert amendment.context["amends"] == "old"
+    assert done.state is ActivityState.TERMINATED
+
+
+async def test_the_amendment_question_is_actually_delivered(tmp_path: Path) -> None:
+    """Setting `blocked_on` without sending `prompt` parks the agent on a question nobody can hear.
+    Worse than silent: `_resume_on_input` clears an InputWait on the user's next Message whatever it
+    says, so an unrelated instruction would be read as consent to an amendment never shown."""
+    llm = FakeLLMClient(
+        json.dumps(
+            {
+                "relevant": True,
+                "task": 0,
+                "goal": "Rebook for Thursday",
+                "question": "Åke can't make the 19th — rebook for Thursday?",
+            }
+        )
+    )
+    transport = ScriptedTransport()
+    cycle, working = _cycle(
+        tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm), transport
+    )
+    judge = DefaultRelevanceJudge()
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked and emailed", succeeded=True)
+    _signal(working, "folders.INBOX.emails")
+
+    await judge.consider(cycle)
+    await _settle()
+    await judge.consider(cycle)
+
+    (amendment,) = [a for a in working.activities.values() if a.id != "old"]
+    assert isinstance(amendment.blocked_on, InputWait)
+    # The same text, on the same channel `send_message_to_user` uses — the wait and the asking are
+    # two halves of one act.
+    assert transport.sent == [("user", {"text": amendment.blocked_on.prompt})]
+    assert transport.sent[0][1]["text"] == "Åke can't make the 19th — rebook for Thursday?"
+
+
+async def test_a_declined_repeat_asks_nothing_twice(tmp_path: Path) -> None:
+    """The dedup guard returns before the ask, so a repeat proposal must cost no second message —
+    otherwise the throttle bounds activities while the user still gets pinged every tick."""
+    responses = json.dumps({"relevant": True, "task": 0, "goal": "same goal", "question": "q?"})
+    transport = ScriptedTransport()
+    cycle, _ = _cycle(
+        tmp_path,
+        ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=FakeLLMClient(responses)),
+        transport,
+    )
+    judge = DefaultRelevanceJudge(max_asks=9)
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked", succeeded=True)
+
+    for i in range(3):
+        _signal(cycle.working, f"folders.INBOX.{i}")
+        await judge.consider(cycle)
+        await _settle()
+        await judge.consider(cycle)
+
+    assert transport.sent == [("user", {"text": "q?"})]
+
+
+async def test_a_change_claimed_by_a_declared_gate_never_reaches_the_judge(
+    tmp_path: Path,
+) -> None:
+    # The subtraction that defines this layer's input. A procedural with no LLM raises if the judge
+    # escalates, so reaching the end proves it did not.
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    judge = DefaultRelevanceJudge()
+    _blocked_with_condition(working)  # declares a watch on folders.INBOX.emails
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked", succeeded=True)
+    _signal(working, "folders.INBOX.emails")  # matches the declared gate
+
+    await judge.consider(cycle)
+    await _settle()
+
+    assert not [a for a in working.activities.values() if a.id not in {"a1", "old"}]
+
+
+async def test_judge_stops_asking_after_its_cap(tmp_path: Path) -> None:
+    # No principled value exists for this number, which is why it is a setting — but SOME bound is
+    # required: a mechanism that interrupts the user on every stray change is worse than one that
+    # misses.
+    responses = json.dumps({"relevant": True, "task": 0, "goal": "g", "question": "q?"})
+    cycle, working = _cycle(
+        tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=FakeLLMClient(responses))
+    )
+    judge = DefaultRelevanceJudge(max_asks=1)
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked", succeeded=True)
+
+    for i in range(4):
+        _signal(working, f"folders.INBOX.{i}")
+        await judge.consider(cycle)
+        await _settle()
+        await judge.consider(cycle)
+
+    assert len([a for a in working.activities.values() if a.id != "old"]) == 1
+
+
+async def test_judge_does_not_repropose_the_same_amendment(tmp_path: Path) -> None:
+    responses = json.dumps({"relevant": True, "task": 0, "goal": "same goal", "question": "q?"})
+    cycle, working = _cycle(
+        tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=FakeLLMClient(responses))
+    )
+    judge = DefaultRelevanceJudge(max_asks=9)
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked", succeeded=True)
+
+    for i in range(3):
+        _signal(working, f"folders.INBOX.{i}")
+        await judge.consider(cycle)
+        await _settle()
+        await judge.consider(cycle)
+
+    assert len([a for a in working.activities.values() if a.id != "old"]) == 1
+
+
+async def test_judge_says_nothing_when_the_answer_is_no(tmp_path: Path) -> None:
+    cycle, working = _cycle(
+        tmp_path,
+        ProceduralMemory(
+            FileMemoryBackend(tmp_path / "p"), llm=FakeLLMClient(json.dumps({"relevant": False}))
+        ),
+    )
+    judge = DefaultRelevanceJudge()
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked", succeeded=True)
+    _signal(working, "folders.INBOX.emails")
+
+    await judge.consider(cycle)
+    await _settle()
+    await judge.consider(cycle)
+
+    assert list(working.activities) == []
+
+
+async def test_malformed_judgement_degrades_to_silence(tmp_path: Path) -> None:
+    # A fabricated follow-up interrupts a person about work that was already done properly; a missed
+    # one leaves a gap they can still notice. The asymmetry decides the fail-soft direction.
+    cycle, working = _cycle(
+        tmp_path,
+        ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=FakeLLMClient("not json at all")),
+    )
+    judge = DefaultRelevanceJudge()
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked", succeeded=True)
+    _signal(working, "folders.INBOX.emails")
+
+    await judge.consider(cycle)
+    await _settle()
+    await judge.consider(cycle)
+
+    assert list(working.activities) == []
+
+
+async def test_consult_recent_orders_by_recency_not_key(tmp_path: Path) -> None:
+    # consult() retrieves by goal-equality, which is useless to a caller holding a change rather
+    # than a goal — and the backend's stable order is the activity id, saying nothing about time.
+    memory = EpisodicMemory(FileMemoryBackend(tmp_path))
+    for name in ("zzz", "aaa", "mmm"):
+        await memory.learn(Activity(id=name, goal=f"goal-{name}", context={}), "s", succeeded=True)
+
+    recent = await memory.consult_recent(2)
+
+    assert [e["activity_id"] for e in recent] == ["mmm", "aaa"]
+    assert all(e["ended_at"] for e in recent)
 
 
 # --------------------------------------------------------------------------------------------------

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         InterruptHandler,
         InterruptPolicy,
         ReconsiderationPolicy,
+        RelevanceJudge,
         Strategies,
         TickResult,
     )
@@ -52,6 +53,7 @@ class DecisionCycle:
         interrupt_policy: InterruptPolicy | None = None,
         reconsideration: ReconsiderationPolicy | None = None,
         change_gate: ChangeGate | None = None,
+        relevance: RelevanceJudge | None = None,
     ) -> None:
         self.strategies = strategies
         self.communication = communication
@@ -67,6 +69,12 @@ class DecisionCycle:
         # NoneReconsideration so a directly-constructed cycle keeps its behavior; bootstrap sets
         # the agent-facing default (before_writes) from agent.yaml's strategies.context_adaptation.
         self.reconsideration: ReconsiderationPolicy = reconsideration or NoneReconsideration()
+        # Undeclared-relevance recovery (ADR-0026), consulted only on an idle tick. None = off, and
+        # that is the default here AND in bootstrap: it spends a model call on a judgement nothing
+        # can mechanically check and, when it fires, interrupts a person — so it is opted into
+        # rather than inherited. An unattended run has nobody to ask, which is exactly the case
+        # where acting on a guess is worst.
+        self.relevance: RelevanceJudge | None = relevance
         # The pre-revalidation change-gate (ADR-0024): WHETHER the world moved, orthogonal to
         # reconsideration's WHEN. Default the domain-free signature gate; a domain gate (bootstrap,
         # from strategies.change_gate) projects perception to only its external surface so the
@@ -139,6 +147,14 @@ class DecisionCycle:
             return
         selected = result.activity
         if selected is None:
+            # The idle tick: nothing schedulable, or everything schedulable is already awaiting a
+            # model. This is the ONLY place undeclared-relevance recovery runs (ADR-0026) —
+            # scheduling, not triggering, so it never displaces an activity that could advance.
+            # The known cost of that choice is an inversion: a busy agent, observing the most
+            # change, defers this longest. Its result is applied inside the tick, not from the
+            # background call, so all working-memory mutation stays on-cycle.
+            if self.relevance is not None:
+                await self.relevance.consider(self)
             return  # nothing selectable this cycle — at most one action, never a mandatory one
         if result.step is None:
             result = await self.strategies.reason.reason(selected, self.working, self, result)

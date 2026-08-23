@@ -17,6 +17,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from unittest.mock import ANY
 
 from sora.activity import Activity, ActivityState
 from sora.memory import EpisodicMemory, FileMemoryBackend
@@ -48,6 +49,9 @@ def _episode(
         "step_count": step_count,
         "last_result": last_result,
         "plan": plan,
+        # A wall-clock stamp can't be asserted exactly; that it is *present and a number* is what
+        # consult_recent depends on, and a dedicated test below covers the ordering it enables.
+        "ended_at": ANY,
     }
 
 
