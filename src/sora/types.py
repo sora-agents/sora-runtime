@@ -251,11 +251,17 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
 
 
 class UnresolvableGrounding(Exception):
-    """Grounding reported that a reference names data the run never produced — an operation that
-    returned an empty list, an absent field, an empty binding — rather than inventing a value for
-    it. A defect in the *plan* (it assumed a step would yield something it didn't), never a wire or
-    parse failure, so it resolves as `InferenceResult.unresolvable` and drives a replan instead of
-    terminating the activity. Carries what was missing, for the log and the replanning prompt."""
+    """An escalation asked to RESOLVE a reference reported that the reference names data the run
+    never produced — an operation that returned an empty list, an absent field, an empty binding —
+    rather than inventing a value for it. A defect in the *plan* (it assumed a step would yield
+    something it didn't), never a wire or parse failure, so it resolves as
+    `InferenceResult.unresolvable` and drives a replan instead of terminating the activity. Carries
+    what was missing, for the log and the replanning prompt.
+
+    Raised by both escalations that resolve references: `ground()` for an operation parameter, and
+    `select()` for a `$decide` filter predicate. Named for the first, but the contract is one thing
+    — in both, the alternative to reporting the gap is a plausible fabrication (an invented
+    recipient; an empty shortlist that reads as "nothing qualified")."""
 
 
 @dataclass(frozen=True)
@@ -275,10 +281,13 @@ class InferenceResult:  # what infer()/ground() resolve to — arrives async via
     # "condition" — the batched pending-condition judgement, ADR-0022).
     value: Plan | dict[str, Any] | list[Any] | bool | ConditionVerdict | None = None
     error: str | None = None
-    # kind=="ground" only, and mutually exclusive with both `value` and `error`: the model followed
-    # the contract and reported that the data a reference names is not present, instead of
-    # fabricating it. Distinct from `error` because it is a report, not a failure: both replan, but
-    # only this one is the model doing what it was asked (DefaultObserveStrategy).
+    # kind=="ground" or kind=="select", and mutually exclusive with both `value` and `error`: the
+    # model followed the contract and reported that the data a reference names is not present,
+    # instead of fabricating it. Distinct from `error` because it is a report, not a failure: both
+    # replan, but only this one is the model doing what it was asked (DefaultObserveStrategy).
+    # For "select" the distinction is load-bearing rather than cosmetic — `error` degrades a
+    # $decide filter to an empty binding, which is the one answer an unresolvable predicate must
+    # NOT produce, since downstream reads it as "nothing qualified" rather than as a question.
     unresolvable: str | None = None
 
 

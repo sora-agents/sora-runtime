@@ -705,7 +705,15 @@ class FilterAction:  # predefined data-op: _filter_
             activity.state = ActivityState.RUNNING
             log.info("data-op: filter %r via the model (%d items)", out, len(collection))
             _spawn_tracked(
-                self._tasks, self._call(cycle, activity, inf_id, collection, where[_REF_DECIDE])
+                self._tasks,
+                self._call(
+                    cycle,
+                    activity,
+                    inf_id,
+                    collection,
+                    where[_REF_DECIDE],
+                    kwargs.get("observed"),
+                ),
             )
             return
         activity.bindings[out] = [e for e in collection if _matches(e, where)]
@@ -717,12 +725,28 @@ class FilterAction:  # predefined data-op: _filter_
         inf_id: str,
         collection: list[Any],
         predicate: str,
+        observed: Any = None,
     ) -> None:
         current_inference_id.set(
             inf_id
         )  # attribute this round-trip's cost to this call (see infer)
         try:
-            kept = await cycle.procedural.select(activity, collection, predicate)
+            kept = await cycle.procedural.select(activity, collection, predicate, observed)
+        except UnresolvableGrounding as exc:
+            # The predicate named something the run never produced, and the model said so instead of
+            # keeping nothing. Deliberately NOT the `error` path below: that one degrades to an
+            # empty binding, which is precisely the wrong answer here. An empty shortlist reads
+            # downstream as a real result ("no appointments that day"), so the fail-soft that keeps
+            # a flaky call from churning the plan would instead let a whole clause of the task go
+            # silently undone. This is a defect in the PLAN — a step assumed an earlier one would
+            # yield something it didn't — so it replans, exactly as an unresolvable grounding does.
+            log.warning(
+                "data-op: $decide filter for activity %s resolved nothing (%s)", activity.id, exc
+            )
+            cycle.inference_sink.push(
+                inf_id, InferenceResult(id=inf_id, unresolvable=str(exc) or "unspecified")
+            )
+            return
         except Exception as exc:  # noqa: BLE001 — any model/parse/wire failure resolves as an error
             log.exception("data-op: filter select failed for activity %s", activity.id)
             cycle.inference_sink.push(inf_id, InferenceResult(id=inf_id, error=repr(exc)))

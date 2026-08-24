@@ -30,11 +30,12 @@ from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptSnapshot,
     ProceduralMemory,
     SemanticMemory,
     WorkingMemory,
 )
-from sora.perception import Message
+from sora.perception import Message, Percept
 from sora.strategies import (
     _MISSING,
     DefaultActStrategy,
@@ -51,10 +52,12 @@ from sora.strategies import (
 from sora.transport import MessageTransport
 from sora.types import (
     CompletedOperation,
+    ObservableProperty,
     OperationAck,
     OperationInvocation,
     Plan,
     Step,
+    UnresolvableGrounding,
 )
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
@@ -902,3 +905,161 @@ async def test_reduce_sum_of_empty_is_none(tmp_path: Path) -> None:
     step = Step(next_action="reduce", params={"in": [], "out": "r", "op": "sum", "by": "v"})
     activity = await _run_one_dataop(tmp_path, step, [])
     assert activity.bindings["r"] is None
+
+
+# --------------------------------------------------------------------------------------------------
+# filter — the $decide predicate is judged against the SAME context grounding gets
+# --------------------------------------------------------------------------------------------------
+# The gaia2 adaptability run (examples/gaia2/logs/aug24-run1-gpt-5.5.log) failed here. The planner
+# is explicitly taught to write predicates referencing an earlier result — "the upcoming Saturday
+# computed from the get_current_time result" — and did exactly that. `select` then rendered only the
+# goal, the predicate and the items, so the clock reading the predicate named was nowhere in the
+# prompt: the model could not compute the date it was being asked to compare against and correctly
+# answered {"keep": []}. An empty binding reads downstream as a real answer ("no appointments that
+# day"), so the sub-goal fanned out to zero steps and the cancellation silently never happened.
+
+
+async def test_decide_filter_sees_the_result_its_predicate_names(tmp_path: Path) -> None:
+    llm = FakeLLMClient('{"keep": []}')
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    activity = _activity_with_plan(
+        [], [_history("get_current_time", {"current_datetime": "2024-10-15 07:00:54"})]
+    )
+
+    await procedural.select(activity, [{"id": "e1"}], "events on the Saturday after the clock read")
+
+    _system, prompt = llm.calls[0]
+    assert "2024-10-15 07:00:54" in prompt  # the referent, not merely the reference
+
+
+async def test_decide_filter_sees_named_bindings_and_observed_state(tmp_path: Path) -> None:
+    llm = FakeLLMClient('{"keep": []}')
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    activity = _activity_with_plan([], [])
+    activity.bindings["shortlist"] = [{"name": "Ake"}]
+    observed = PerceptSnapshot(
+        [Percept("clock", ObservableProperty("state", {"today": "2024-10-15"}), 0.0)], []
+    )
+
+    await procedural.select(activity, [{"id": "e1"}], "anything in the shortlist", observed)
+
+    _system, prompt = llm.calls[0]
+    assert "shortlist" in prompt
+    assert "2024-10-15" in prompt
+
+
+async def test_the_decide_filter_data_op_plumbs_observed_state_through(tmp_path: Path) -> None:
+    # End to end: the escalation path must hand `select` the world, not just the collection —
+    # otherwise the two tests above are unreachable from a real plan.
+    llm = FakeLLMClient('{"keep": []}')
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    tool = FakeTool("realestate")
+    cycle, working, _ = _cycle(tmp_path, procedural, tool)
+    working.properties[("clock", "state")] = Percept(
+        "clock", ObservableProperty("state", {"today": "2024-10-15"}), 0.0
+    )
+    step = Step(
+        next_action="filter",
+        params={"in": [{"id": "e1"}], "out": "qualifying", "where": {"$decide": "todays events"}},
+    )
+    activity = _activity_with_plan([step], [_history("get_current_time", {"hour": 7})])
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)  # let the background select task run
+
+    _system, prompt = llm.calls[0]
+    assert "get_current_time" in prompt
+    assert "2024-10-15" in prompt
+
+
+# --------------------------------------------------------------------------------------------------
+# filter — a $decide predicate whose referent is absent reports the gap instead of keeping nothing
+# --------------------------------------------------------------------------------------------------
+# Giving `select` the context makes a resolvable predicate resolve, but leaves the other half of the
+# same silent failure open: when the referent genuinely is not there, {"keep": []} is the model's
+# only legal answer and is indistinguishable from "nothing matched". It lands in a binding, and an
+# empty binding reads downstream as a real answer ("no appointments that day") rather than as the
+# question it actually is. Grounding already has the channel for this; so does select now.
+
+
+async def test_a_predicate_naming_absent_data_reports_the_gap(tmp_path: Path) -> None:
+    llm = FakeLLMClient(
+        '{"unresolvable": "predicate names the get_current_time result; no clock '
+        'reading is in the history"}'
+    )
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+
+    try:
+        await procedural.select(_activity_with_plan([], []), [{"id": "e1"}], "events on Saturday")
+    except UnresolvableGrounding as exc:
+        assert "no clock reading" in str(exc)
+    else:  # pragma: no cover — the assertion below is the failure report
+        raise AssertionError("expected the gap to be reported, not an empty keep-list")
+
+
+async def test_a_select_response_carrying_both_is_read_as_the_gap(tmp_path: Path) -> None:
+    # Same hedging rule grounding applies: the keep half of such an answer is the guess this channel
+    # exists to stop, so the reported gap wins.
+    llm = FakeLLMClient('{"unresolvable": "no clock reading", "keep": [0]}')
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+
+    try:
+        await procedural.select(_activity_with_plan([], []), [{"id": "e1"}], "events on Saturday")
+    except UnresolvableGrounding:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected the unresolvable report to win over the keep list")
+
+
+async def test_an_unresolvable_predicate_replans_rather_than_writing_an_empty_binding(
+    tmp_path: Path,
+) -> None:
+    # The whole point: an unresolvable predicate must NOT leave a binding a later step reads as an
+    # answer. It is a defect in the PLAN — a step assumed an earlier one would yield something it
+    # did not — so the repair is a replan carrying the defect, exactly as for grounding.
+    llm = FakeLLMClient('{"unresolvable": "predicate names a clock reading that was never taken"}')
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    tool = FakeTool("realestate")
+    cycle, working, _ = _cycle(tmp_path, procedural, tool)
+    step = Step(
+        next_action="filter",
+        params={"in": [{"id": "e1"}], "out": "qualifying", "where": {"$decide": "todays events"}},
+    )
+    activity = _activity_with_plan([step], [])
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert "qualifying" not in activity.bindings  # no empty binding masquerading as an answer
+    assert activity.plan is None  # discarded for re-inference
+    assert activity.state is ActivityState.READY
+    assert activity.superseded is not None and activity.superseded.defect is not None
+    assert "clock reading" in activity.superseded.defect
+
+
+async def test_a_transient_select_failure_still_degrades_to_an_empty_binding(
+    tmp_path: Path,
+) -> None:
+    # The distinction the new channel rests on: a model/parse FAILURE is not a reported gap. It
+    # stays fail-soft (the pipeline does nothing this run) rather than triggering a replan, so a
+    # flaky call cannot churn the plan.
+    llm = FakeLLMClient("not json at all")
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    tool = FakeTool("realestate")
+    cycle, working, _ = _cycle(tmp_path, procedural, tool)
+    step = Step(
+        next_action="filter",
+        params={"in": [{"id": "e1"}], "out": "qualifying", "where": {"$decide": "todays events"}},
+    )
+    activity = _activity_with_plan([step], [])
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.bindings["qualifying"] == []
+    assert activity.plan is not None  # not a replan

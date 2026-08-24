@@ -1422,18 +1422,20 @@ def default_ground_prompt(
     return GROUND_SYSTEM_PROMPT, user
 
 
-# The grounder's second legal answer: the data a reference names is not present. Checked before
-# "params" so a response carrying both (a model hedging) is read as the gap it reports — the safe
-# reading, since the params half of such an answer is exactly the fabrication this channel exists
-# to prevent.
-_GROUND_UNRESOLVABLE = "unresolvable"
+# The second legal answer of every escalation asked to RESOLVE a reference: the data that reference
+# names is not present. Shared by grounding ("params") and the $decide filter predicate ("keep"),
+# because it is one contract — the model reports the gap rather than inventing something to fill it.
+# Checked before the primary key so a response carrying both (a model hedging) is read as the gap it
+# reports: the other half of such an answer is exactly the fabrication this channel exists to
+# prevent, so the gap is always the safe reading.
+_UNRESOLVABLE = "unresolvable"
 
 
 def _parse_params(text: str) -> dict[str, Any]:
     try:
         data = _load_json_object(text)
-        if isinstance(data, dict) and data.get(_GROUND_UNRESOLVABLE):
-            raise UnresolvableGrounding(str(data[_GROUND_UNRESOLVABLE]))
+        if isinstance(data, dict) and data.get(_UNRESOLVABLE):
+            raise UnresolvableGrounding(str(data[_UNRESOLVABLE]))
         params = data["params"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(
@@ -1601,11 +1603,28 @@ def _parse_relevance(text: str, episodes: Sequence[Any]) -> RelevanceCandidate |
 
 SELECT_SYSTEM_PROMPT = (
     "You are filtering a list down to the subset that satisfies a natural-language predicate. You "
-    "are given the goal, the predicate, and the list items each on its own line prefixed by its "
-    "0-based index. Decide which items satisfy the predicate, judging each item ON ITS OWN DATA.\n"
+    "are given the goal, the predicate, the agent's execution context (the results of operations "
+    "already executed, the named data-op bindings, and the observed world state), and finally the "
+    "list items, each on its own line prefixed by its 0-based index.\n"
+    "The predicate may NAME a value from that context instead of spelling it out — 'the Saturday "
+    "after the get_current_time result', 'whoever is in the shortlist binding'. Resolve every such "
+    "reference against the context FIRST, down to a concrete value, and only then test the items "
+    "against it. Whether an individual item is kept is still judged on ITS OWN data; the context "
+    "supplies the values the predicate compares against, never a reason to keep an item.\n"
     'Respond with ONLY a JSON object of the form {"keep": [<indices>]} — the 0-based indices of '
     "the items to KEEP — and nothing else, no prose, no markdown fences. Keep an item only if it "
-    'clearly satisfies the predicate; if none do, respond {"keep": []}.'
+    'clearly satisfies the predicate; if none do, respond {"keep": []}.\n'
+    "There is a second legal answer, for one specific case: the predicate names something the "
+    "context does NOT contain — a result from an operation that never ran or came back empty, a "
+    "binding that is not there — so you cannot work out what to compare the items against. Do NOT "
+    "guess the missing value, and do NOT fall back on an empty keep-list: an empty answer means "
+    "'no item qualified', the agent acts on it as a real result, and a whole clause of the task "
+    "then goes silently undone. Respond with ONLY "
+    '{"unresolvable": "<what the predicate names, and what was missing from the context>"} '
+    "instead, and the runtime re-plans from it.\n"
+    "That is only for missing CONTEXT. A predicate you CAN evaluate from what you were given is "
+    "ordinary work, however much judgement it takes — including one whose honest answer is that no "
+    'item qualifies. Answer {"keep": []} for that, not "unresolvable".'
 )
 
 
@@ -1614,9 +1633,15 @@ def _parse_keep(text: str, count: int) -> list[int]:
     preserving the model's order. Out-of-range or non-integer entries are dropped (defensive against
     a stray index) and a repeated index collapses to its first occurrence (so the filtered subset
     never duplicates an item — a duplicate would double-act a downstream fan-out); a structurally
-    malformed answer raises, the anti-corruption boundary that infer/ground share."""
+    malformed answer raises, the anti-corruption boundary that infer/ground share.
+
+    The selection's *second* legal answer, ``{"unresolvable": ...}``, is checked first and raises
+    ``UnresolvableGrounding`` — the same channel and the same precedence rule grounding uses, since
+    an answer carrying both is a hedge whose keep-list is the guess the channel exists to stop."""
     try:
         data = _load_json_object(text)
+        if isinstance(data, dict) and data.get(_UNRESOLVABLE):
+            raise UnresolvableGrounding(str(data[_UNRESOLVABLE]))
         keep = data["keep"]
     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         raise ValueError(
@@ -1770,22 +1795,55 @@ class ProceduralMemory:
         _check_no_dropped_elements(partial_params, params)
         return params
 
-    async def select(self, activity: Activity, collection: list[Any], predicate: str) -> list[Any]:
+    async def select(
+        self,
+        activity: Activity,
+        collection: list[Any],
+        predicate: str,
+        observed: PerceptSnapshot | None = None,
+    ) -> list[Any]:
         """Filter ``collection`` to the subset satisfying a natural-language ``predicate`` — the
         model-escalated ``$decide`` half of the ``filter`` data-op (ADR-0023). One model call over
         the whole collection (a batching simplification of the per-element ideal): it renders each
         item with its index, asks for a ``{"keep": [<indices>]}`` answer, and returns the kept items
         in the model's order. The index contract keeps the model from re-serializing (and mangling)
-        the items. Reuses the same ``LLMClient`` seam as ``infer``/``ground``; no LLM -> raises."""
+        the items. Reuses the same ``LLMClient`` seam as ``infer``/``ground``; no LLM -> raises.
+
+        A ``$decide`` predicate is judged against **the same context ``ground`` gets** — history,
+        bindings, properties, signals — and that is load-bearing rather than symmetry for its own
+        sake. The planner is explicitly taught to write predicates that name an earlier result
+        rather than a literal ("the first Saturday on or after the get_current_time result"), which
+        is the correct instruction: a date baked in at plan time is a guess. Rendering only the
+        goal, the predicate and the items therefore handed the model a reference whose referent was
+        nowhere in the prompt. It cannot resolve that, and its honest answer is ``{"keep": []}`` —
+        which is indistinguishable from "nothing matched", lands in a binding, and reads downstream
+        as a real answer. One gaia2 run lost an entire cancellation clause that way, silently.
+
+        History is deliberately **unwindowed**, for the reason ``default_ground_prompt`` gives: the
+        predicate may name any past result, and hiding the entry holding the referent fails exactly
+        the way truncating it mid-record does.
+        """
         if self._llm is None:
             raise RuntimeError(
                 "ProceduralMemory has no LLM configured; cannot evaluate a $decide filter. Pass a "
                 "client."
             )
+        snapshot = observed or PerceptSnapshot()
         items = "\n".join(
             f"{index}: {json.dumps(item, default=str)}" for index, item in enumerate(collection)
         )
-        user = f"Goal: {activity.goal}\nPredicate: {predicate}\nItems:\n{items}"
+        user = (
+            f"Goal: {activity.goal}\n"
+            f"Predicate: {predicate}\n\n"
+            f"Results of operations already executed:\n{render_history(activity.history)}\n\n"
+            f"Named data-op bindings (the predicate may name one):\n"
+            f"{render_bindings(activity.bindings)}\n\n"
+            f"Currently observed properties:\n{render_properties(snapshot.properties)}\n\n"
+            f"Recently observed signals:\n{render_signals(snapshot.signals)}\n\n"
+            # Items last: it is by far the largest section, and the context above is what the
+            # predicate's references resolve against, so it should be read first.
+            f"Items:\n{items}"
+        )
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", SELECT_SYSTEM_PROMPT, user)
         text = await self._llm.complete(system=SELECT_SYSTEM_PROMPT, prompt=user)
         return [collection[index] for index in _parse_keep(text, len(collection))]

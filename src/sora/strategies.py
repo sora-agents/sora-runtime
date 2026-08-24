@@ -780,8 +780,9 @@ class DefaultObserveStrategy:
                     )  # set for plan/subgoal (ADR-0024)
                     activity.pending_inference = None
                     if res.unresolvable is not None:
-                        # Grounding reported that a reference names data this run never produced,
-                        # instead of fabricating a value for it. The defect is in the PLAN — it
+                        # An escalation asked to resolve a reference reported that it names data
+                        # this run never produced, instead of fabricating a value for it — grounding
+                        # a param, or a $decide filter predicate. The defect is in the PLAN — it
                         # assumed an earlier step would yield something it didn't — so the repair is
                         # a replan, not termination: the replanning prompt carries the executed
                         # history, so the next plan SEES the empty result that defeated this one and
@@ -796,7 +797,8 @@ class DefaultObserveStrategy:
                         activity.reset_for_replan(defect=res.unresolvable)
                         activity.state = ActivityState.READY
                         log.warning(
-                            "observe: grounding for activity %s resolved nothing (%s) -> replan",
+                            "observe: %s for activity %s resolved nothing (%s) -> replan",
+                            kind,
                             activity.id,
                             res.unresolvable,
                         )
@@ -2512,7 +2514,19 @@ class DefaultReasonStrategy:
                 return True  # no step this cycle; Reason re-infers against the current world
             collection = resolved if resolved is not None else []
         op = cycle.actions.data_op(step.next_action)
-        await op.execute(cycle, activity_id=activity.id, collection=collection, **passthrough)
+        # `observed` is only read by the $decide filter's escalation (the others are mechanical and
+        # ignore it), but it is passed uniformly rather than branched on: a soft predicate resolves
+        # its references against the same world grounding does, and deciding per-op which context a
+        # model call may see is how the two drifted apart in the first place.
+        await op.execute(
+            cycle,
+            activity_id=activity.id,
+            collection=collection,
+            observed=PerceptSnapshot(
+                list(cycle.working.properties.values()), list(cycle.working.signals)
+            ),
+            **passthrough,
+        )
         return activity.pending_inference is not None
 
     async def _evaluate_pending_conditions(
