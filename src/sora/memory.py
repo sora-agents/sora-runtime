@@ -1467,13 +1467,18 @@ def render_superseded_plan(superseded: SupersededPlan) -> str:
 
 
 def render_bindings(bindings: dict[str, Any], *, budget: int = _BINDINGS_CHAR_BUDGET) -> str:
-    """Render an activity's named data-op bindings for a grounding prompt. Public so a custom
-    ``GroundPrompt`` can reuse it. A ``$bind`` reference or a ``$decide`` instruction may name a
-    binding an earlier data-op step produced (a filtered/sorted/collected collection), so — like
-    history results — these are the grounder's ground truth for resolving a reference and get the
-    same all-or-nothing treatment under a total ``budget``: a binding renders whole or becomes a
-    counted placeholder, never a prefix. Insertion order is preserved in the output, but the budget
-    walk runs in reverse, so the most recently produced binding is the one guaranteed to survive."""
+    """Render an activity's named data-op bindings for a grounding or plan-validity prompt. Public
+    so a custom ``GroundPrompt`` can reuse it. A ``$bind`` reference or a ``$decide`` instruction
+    may name a binding an earlier data-op step produced (a filtered/sorted/collected collection),
+    so — like history results — these are the grounder's ground truth for resolving a reference and
+    get the same all-or-nothing treatment under a total ``budget``: a binding renders whole or
+    becomes a counted placeholder, never a prefix. Insertion order is preserved in the output, but
+    the budget walk runs in reverse, so the most recently produced binding is the one guaranteed to
+    survive.
+
+    ``revalidate`` renders them for a different reason: a data-op writes no history, so bindings are
+    the only record that its steps ran at all. They are deliberately absent from the *plan* prompt,
+    where they would be a lie — a replan discards them."""
     if not bindings:
         return "(none)"
     entries = [
@@ -1581,13 +1586,16 @@ def _check_no_dropped_elements(partial_params: dict[str, Any], params: dict[str,
 
 REVALIDATE_SYSTEM_PROMPT = (
     "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. "
-    "You are given the goal, what the agent has ALREADY DONE (the operations executed so far and "
-    "their results), the plan's REMAINING steps, and the new observed state and messages. "
+    "You are given the goal, what the agent has ALREADY DONE (the operations executed so far with "
+    "their results, and the intermediate values its earlier steps computed and named), the plan's "
+    "REMAINING steps, and the new observed state and messages. "
     "The plan is INVALID if the new information changes what the remaining steps should do — a "
     "follow-up that changes a detail the plan acted on, or a precondition that no longer holds. "
     "It is VALID if the work already executed plus the remaining steps still achieve the goal; "
     "the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps "
-    "only: work an executed operation already accomplished does not have to reappear in them.\n"
+    "only: work an executed operation already accomplished, or a value already computed and named, "
+    "does not have to reappear in them — a remaining step that reads such a value is satisfied by "
+    "it, not evidence of a gap.\n"
     'Respond with ONLY a JSON object {"valid": true} or {"valid": false} — no prose, no fences.'
 )
 
@@ -1967,6 +1975,9 @@ class ProceduralMemory:
         ``remaining``, so without history the model sees a goal whose work is nowhere in evidence
         and reasonably calls a nearly-finished plan invalid — it is also what makes "the agent's
         own prior actions don't invalidate it" a judgment it can actually make rather than guess.
+        The named bindings go with it: a data-op writes no history at all, so a plan that spent its
+        early steps narrowing a collection would otherwise arrive here looking like it had done
+        nothing, and get replanned into a copy of itself.
         Reuses the same ``LLMClient`` seam as ``infer``; no
         LLM -> raises. A ``False`` verdict re-infers; best-effort, not a guarantee, and
         deliberately general (no domain-authored predicate) — it reasons about relevance itself, so
@@ -1985,6 +1996,7 @@ class ProceduralMemory:
             f"Goal: {activity.goal}\n"
             f"Results of operations already executed:\n"
             f"{render_history(activity.history, _HISTORY_RENDER_REVALIDATE)}\n"
+            f"Intermediate values already computed:\n{render_bindings(activity.bindings)}\n"
             f"Remaining plan steps:\n{steps_text}\n"
             f"Observed properties:\n{render_properties(snapshot.properties)}\n"
             f"Observed signals:\n{render_signals(snapshot.signals)}\n"

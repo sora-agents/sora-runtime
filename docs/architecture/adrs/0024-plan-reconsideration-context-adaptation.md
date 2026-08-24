@@ -134,7 +134,8 @@ At a checkpoint the cycle runs a two-tier check:
    pluggable* below — so an application can project perception onto only its externally-meaningful
    part rather than exclude properties one at a time.
 2. **Model relevance judgment (only when the gate is hot).** A single focused call: *given this plan
-   (goal + the operations already executed + remaining steps) and these new percepts, is the plan still
+   (goal + the operations already executed + the intermediate values they bound + remaining steps) and
+   these new percepts, is the plan still
    valid?* The executed half is load-bearing, not context padding: a checkpoint late in a plan leaves
    almost nothing in *remaining*, so a judgment made without history sees a goal whose work is nowhere
    in evidence and invalidates a plan that is in fact nearly done — and it is what makes the
@@ -155,6 +156,16 @@ At a checkpoint the cycle runs a two-tier check:
    holding the referent fails the way truncating it mid-record does. Elision is marked with a count
    rather than being silent, since "nothing happened earlier" is a different claim from "not shown",
    and a planner told the former can legitimately decide to redo committed work.
+
+   **The bindings are the other half of "already executed" (2026-08-24).** A data-op
+   ([ADR-0023](0023-structured-value-data-ops.md)) appends nothing to `history` — its whole effect is
+   a named entry in `Activity.bindings`. So the argument above, made for history, applies to bindings
+   with more force: a plan whose early steps narrow a collection can reach a checkpoint having run
+   most of itself while the re-check sees `(nothing executed yet)`. An observed run replanned at step
+   9 for exactly this reason, and the replacement plan was the same plan with its bindings renamed —
+   the expensive path taken to rediscover what was already computed. The re-check therefore renders
+   `render_bindings` alongside the windowed history. The *plan* prompt deliberately does not: a
+   replan discards bindings, so showing them there would describe state the new plan will not have.
 
 **No efference, no manual relevance.** The self-write problem dissolves at tier 2: the revalidation reasons
 "my own reply does not change the meeting day" and returns *still valid*, so a coarse gate no longer

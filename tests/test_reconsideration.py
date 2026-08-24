@@ -273,6 +273,27 @@ async def test_revalidate_sees_the_operations_already_executed(tmp_path: Path) -
     assert "event_created_42" in user  # ...with its result
 
 
+async def test_revalidate_sees_the_bindings_the_data_ops_produced(tmp_path: Path) -> None:
+    # A data-op leaves nothing in history — it writes a named binding — so a plan that spends its
+    # early steps narrowing a collection reaches the checkpoint with almost none of its work in
+    # evidence. An observed run replanned at step 9 because the only executed result the judge
+    # could see was a clock reading, and the replacement plan was the same plan with its bindings
+    # renamed: a 19k-token call to rediscover what had already been computed. Unlike a replan
+    # (which discards them, so the plan prompt is right not to show them), these are live for the
+    # plan being judged, which makes them part of the work already done.
+    llm = FakeLLMClient('{"valid": true}')
+    proc = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    goal = "cancel Saturday's appointments"
+    plan = Plan(id="p", goal=goal, steps=[invoke_step("t", "delete_op")])
+    activity = Activity(id="a", goal=goal, context={}, plan=plan)
+    activity.bindings["saturday_appointments"] = [{"event_id": "evt-7", "title": "Brand meeting"}]
+
+    assert await proc.revalidate(activity) is True
+    _system, user = llm.calls[-1]
+    assert "saturday_appointments" in user  # the binding an earlier data-op step produced
+    assert "evt-7" in user  # ...and what it actually holds, not just its name
+
+
 async def test_revalidate_fail_soft_treats_malformed_answer_as_valid(tmp_path: Path) -> None:
     proc = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=FakeLLMClient("not json at all"))
     activity = Activity(id="a", goal="g", context={}, plan=Plan(id="p", goal="g", steps=[]))
