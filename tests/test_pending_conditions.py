@@ -1152,3 +1152,55 @@ async def test_the_gate_hands_the_judgement_the_source_of_each_change(tmp_path: 
 
     _system, prompt = llm.calls[0]
     assert "cannot make Saturday" in prompt
+
+
+# The relevance judge is the same judgement one layer out, and it reads the same kind of change —
+# so it needs the same dereference. It is the harder case, not the easier one: the condition judge
+# is at least handed a `when` clause naming what to look for, while this one is asked the open
+# question "does anything here bear on work that finished?" against episode summaries. Answering
+# that from ids and a shape sketch is not a judgement at all. Undeclared-relevance recovery being
+# off by default bounds the blast radius but does not make the prompt correct — and leaving two
+# sibling judges disagreeing about what a `Change` renders as is how the first one came to be wrong.
+
+
+async def test_the_relevance_judgement_is_shown_the_record_the_change_points_at(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLMClient(json.dumps({"relevant": False}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    episodes = [{"activity_id": "old", "goal": "book it", "succeeded": True, "summary": "booked"}]
+    observed = PerceptSnapshot([_inbox({"email_id": "old"}, _REPLY)], [])
+
+    await procedural.judge_relevance(
+        episodes,
+        [("insim:are/Emails", Change(path="folders.INBOX.emails", added=("e9",)))],
+        observed,
+    )
+
+    _system, prompt = llm.calls[0]
+    assert "cannot make Saturday" in prompt  # the body, not merely the id
+    assert "Tuesday the 22nd" in prompt
+
+
+async def test_the_relevance_judge_hands_the_judgement_the_source_of_each_change(
+    tmp_path: Path,
+) -> None:
+    # End to end through the judge: `consider` flattened (percept, Change) into a bare list[Change],
+    # discarding the source — which is what says WHICH property to dereference. The inbox is bulk on
+    # purpose: under its length cap `render_properties` prints the whole property and the body
+    # reaches the prompt regardless, so a one-email fixture passes without the dereference existing.
+    llm = FakeLLMClient(json.dumps({"relevant": False}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    judge = DefaultRelevanceJudge()
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked and emailed", succeeded=True)
+    noise = [{"email_id": f"n{i}", "content": f"unrelated chatter {i}"} for i in range(200)]
+    working.properties[("insim:are/Emails", "state")] = _inbox(*noise, _REPLY)
+    _signal(working, "folders.INBOX.emails")
+
+    await judge.consider(cycle)
+    await _settle()
+
+    _system, prompt = llm.calls[0]
+    assert "cannot make Saturday" in prompt
+    assert "unrelated chatter 7" not in prompt

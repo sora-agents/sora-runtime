@@ -455,9 +455,12 @@ class DefaultRelevanceJudge:
         episodes = [e for e in episodes if isinstance(e, dict) and e.get("activity_id")]
         if not episodes:
             return
-        changes: list[Change] = []
+        # Paired with the source that reported them, exactly as the declared-condition gate does:
+        # a `Change` names the path that moved but not the tool it moved on, and the judgement
+        # needs both to dereference the ids back into records (ProceduralMemory.render_changes).
+        changes: list[tuple[str, Change]] = []
         for percept in unclaimed:
-            changes.extend(changes_of(percept.payload))
+            changes.extend((percept.source, change) for change in changes_of(percept.payload))
         observed = PerceptSnapshot(
             list(cycle.working.properties.values()), list(cycle.working.signals)
         )
@@ -468,7 +471,7 @@ class DefaultRelevanceJudge:
         self,
         cycle: DecisionCycle,
         episodes: list[Any],
-        changes: list[Change],
+        changes: list[tuple[str, Change]],
         observed: PerceptSnapshot,
     ) -> None:
         try:

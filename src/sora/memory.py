@@ -2068,7 +2068,7 @@ class ProceduralMemory:
     async def judge_relevance(
         self,
         episodes: Sequence[Any],
-        changes: Sequence[Change],
+        changes: Sequence[tuple[str, Change]],
         observed: PerceptSnapshot | None = None,
     ) -> RelevanceCandidate | None:
         """Does an observed change bear on work that already finished? (ADR-0026)
@@ -2077,6 +2077,12 @@ class ProceduralMemory:
         runtime there is no declared thing to compare against, so the judgement is unverifiable from
         the runtime's side. Its input is only what the declared-condition gates left unclaimed, so
         the cost shrinks as the planner learns to declare — the two are complements.
+
+        Shares `render_changes` with `evaluate_conditions`, and for a sharper reason: that judge is
+        at least handed a `when` clause naming what to look for, while this one is asked the open
+        question against episode *summaries*. Answered from ids beside a shape-sketched property,
+        it can only say "nothing follows up" — so each change arrives paired with the **source**
+        that reported it, which is what says which property to dereference the ids against.
         """
         if self._llm is None:
             raise RuntimeError(
@@ -2092,19 +2098,9 @@ class ProceduralMemory:
             for i, e in enumerate(episodes)
             if isinstance(e, dict)
         )
-        where = (
-            "\n".join(
-                f"- {ch.path or '(whole property)'}"
-                + (f" added={list(ch.added)}" if ch.added else "")
-                + (f" removed={list(ch.removed)}" if ch.removed else "")
-                + (f" updated={list(ch.updated)}" if ch.updated else "")
-                for ch in changes
-            )
-            or "(the source reported no detail about what moved)"
-        )
         user = (
             f"Recently finished tasks:\n{listed}\n"
-            f"What just changed:\n{where}\n"
+            f"What just changed:\n{render_changes(changes, snapshot.properties)}\n"
             f"Current observed properties:\n{render_properties(snapshot.properties)}"
         )
         log.debug("relevance: system prompt\n%s\nUser prompt\n%s", RELEVANCE_SYSTEM_PROMPT, user)
