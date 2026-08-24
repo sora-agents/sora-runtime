@@ -351,10 +351,15 @@ PLAN_SYSTEM_PROMPT = (
     'sentence reporting the get_time result"}} — it is phrased from the real result at run time, '
     "not at plan time.\n"
     "Where the data is reachable only through operations, prefer a narrowing step first (e.g. "
-    "search for the specific item) so a $from reference points at an unambiguous result. Check the "
-    "observed properties before reaching for that, though: if one already holds the collection, "
-    "$prop plus a filter beats a search — it sees every record rather than the first page, and it "
-    "costs no operation at all.\n"
+    "search for the specific item, or a date/range-bounded list operation) so a $from reference "
+    "points at an unambiguous result. Check the observed properties before reaching for that: if "
+    "one already holds the collection and the narrowing is MECHANICAL (a field compared against a "
+    "value), $prop plus that filter beats a search — it sees every record rather than the first "
+    "page, and it costs no operation at all. When the narrowing would instead need a $decide "
+    "filter, prefer an operation that takes it as PARAMETERS (a from/to range, a query, a status): "
+    "a $decide filter ships EVERY item in the collection to the model, so it costs more the bigger "
+    "the collection, where the operation does the same selection in one declared call. Reach for "
+    "$prop plus a $decide filter only when no operation expresses that narrowing.\n"
     "When a step must be repeated once PER ITEM of a collection you only learn at run time "
     "(catalogue each of the found artifacts, notify each curator), do NOT hard-code one step per "
     "item and do "
@@ -383,7 +388,9 @@ PLAN_SYSTEM_PROMPT = (
     '`where` is either {"path": "<field>", "op": "<eq|ne|lt|le|gt|ge|between|in|not_in>", '
     '"value": <v>} (a mechanical comparison; `between` takes [lo, hi], '
     "`in`/`not_in` take a list) or "
-    '{"$decide": "<predicate in words>"} when keeping an item needs judgement. For `in`/`not_in`, '
+    '{"$decide": "<predicate in words>"} when keeping an item needs judgement — costly, since '
+    "every item goes to the model, so narrow with an operation or a mechanical comparison "
+    "wherever you can. For `in`/`not_in`, "
     "`value` may itself be a reference to ANOTHER collection to test membership against — "
     '{"path": "<field>", "op": "not_in", "value": {"$from": "<op>"} | {"$bind": "<name>"}, '
     '"value_path": "<field to read from each item of that collection>"}: '
