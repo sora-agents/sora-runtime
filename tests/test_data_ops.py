@@ -347,6 +347,93 @@ async def test_filter_membership_wrong_value_path_warns_before_failing_open(
 
 
 # --------------------------------------------------------------------------------------------------
+# filter — a reference-valued predicate on a NON-membership op (a threshold, a computed range)
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_filter_threshold_reads_a_reference_value(tmp_path: Path) -> None:
+    # ADR-0023's own canonical pipeline: reduce to an aggregate, then keep what beats it. The
+    # threshold is only known at run time, so it can only be written as a reference. Resolution
+    # used to be gated on in/not_in, so this reference reached _matches as a raw dict, every
+    # comparison raised TypeError, and the documented pipeline silently kept nothing.
+    data = [{"v": 2}, {"v": 4}, {"v": 9}]
+    steps = [
+        Step(next_action="reduce", params={"in": data, "out": "mean_v", "op": "mean", "by": "v"}),
+        Step(
+            next_action="filter",
+            params={
+                "in": data,
+                "out": "above",
+                "where": {"path": "v", "op": "gt", "value": {"$bind": "mean_v"}},
+            },
+        ),
+    ]
+    tool = FakeTool("realestate")
+    cycle, working, _ = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    activity = _activity_with_plan(steps, [])
+    working.activities["a"] = activity
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.bindings["mean_v"] == 5.0
+    assert [e["v"] for e in activity.bindings["above"]] == [9]  # not [] — the threshold resolved
+
+
+async def test_filter_between_reads_a_reference_range(tmp_path: Path) -> None:
+    # `between` takes a two-element value, so its reference resolves to a list without being
+    # projected the way a membership set is — the pair IS the value, not a collection to key on.
+    data = [{"v": 2}, {"v": 6}, {"v": 12}]
+    step = Step(
+        next_action="filter",
+        params={
+            "in": data,
+            "out": "inrange",
+            "where": {"path": "v", "op": "between", "value": {"$from": "get_band"}},
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("get_band", [5, 10])])
+    assert [e["v"] for e in activity.bindings["inrange"]] == [6]
+
+
+async def test_filter_threshold_unresolvable_reference_replans(tmp_path: Path) -> None:
+    """An unreadable threshold is the same hazard as an unreadable membership set: every ordered
+    comparison against a raw reference dict raises TypeError, which _matches catches as a non-match,
+    so the filter confidently keeps nothing. That answer isn't knowable, so it isn't given."""
+    step = Step(
+        next_action="filter",
+        params={
+            "in": [{"v": 2}, {"v": 9}],
+            "out": "kept",
+            "where": {"path": "v", "op": "gt", "value": {"$bind": "never_computed"}},
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+
+    assert "kept" not in activity.bindings
+    assert activity.plan is None
+    assert activity.replan_trail[-1] is not None
+
+
+async def test_filter_decide_predicate_is_not_resolved_as_a_value(tmp_path: Path) -> None:
+    # $decide is soft: FilterAction escalates the whole predicate to one model call. Widening
+    # value resolution past in/not_in must not start treating it as an unresolvable hard reference
+    # and replanning on it.
+    llm = FakeLLMClient('{"keep": [1]}')
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    tool = FakeTool("realestate")
+    cycle, working, _ = _cycle(tmp_path, procedural, tool)
+    step = Step(
+        next_action="filter",
+        params={"in": [{"v": 2}, {"v": 9}], "out": "kept", "where": {"$decide": "the big one"}},
+    )
+    activity = _activity_with_plan([step], [])
+    working.activities["a"] = activity
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.plan is not None  # escalated, not replanned
+    assert activity.state is ActivityState.RUNNING
+
+
+# --------------------------------------------------------------------------------------------------
 # filter — $decide predicate escalates to one off-cycle model call
 # --------------------------------------------------------------------------------------------------
 

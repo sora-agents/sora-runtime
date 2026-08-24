@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
 
 from sora.action import (
     CollectAction,
@@ -1392,7 +1392,7 @@ _AMBIGUOUS = object()  # sentinel: a bare property name several focused tools ex
 _BAD_PATH = object()  # sentinel: the source IS present, its `path` names nothing inside it
 
 
-def _is_reference(value: Any) -> bool:
+def _is_reference(value: Any) -> TypeGuard[dict[str, Any]]:
     return isinstance(value, dict) and (
         _REF_FROM in value or _REF_DECIDE in value or _REF_BIND in value or _REF_PROP in value
     )
@@ -2122,30 +2122,61 @@ def _enrich_with_params(result: Any, params: dict[str, Any]) -> Any:
     return {**params, "result": result}
 
 
-def _resolve_membership_predicate(
+def _resolve_predicate_value(
     params: dict[str, Any],
     history: list[CompletedOperation],
     bindings: dict[str, Any],
     properties: dict[tuple[str, str], Percept] | None = None,
 ) -> tuple[dict[str, Any], str | None]:
-    """For a ``filter`` whose predicate tests membership (``in``/``not_in``) against *another
-    collection* named by a reference, resolve that reference to a concrete list of comparable keys
-    *before* the op runs — so ``_matches`` stays a pure literal comparison and the cross-collection
-    resolution lives here in Reason, next to the ``in``-collection resolution (ADR-0023 extension).
-    The referenced collection is projected by ``value_path`` (default: the elements themselves, for
-    a reference that already resolves to a list of scalars). A literal ``value``, or a non-
-    membership op, passes through untouched. Returns the resolved params and a ``defect``, set when
-    the referenced collection could not be read — reported rather than swallowed for the same reason
-    the fan-out reports it: an unreadable membership set fails *open* (``in`` matches nothing,
-    ``not_in`` keeps everything), so the filter silently does the wrong thing to every element. A
-    resolved-but-unusable projection (a ``value_path`` that plucks to ``None`` or a non-scalar for
-    every member) is the neighbouring trap the warning below guards, and fails open the same way."""
+    """Resolve a ``filter`` predicate's ``value`` when it is a reference rather than a literal, so
+    ``_matches`` stays a pure literal comparison and the resolution lives here in Reason, next to
+    the ``in``-collection resolution (ADR-0023 extension). Two shapes, because the ops read
+    ``value`` differently:
+
+    * ``in``/``not_in`` compare against a *set*: the reference resolves as a collection and is
+      projected by ``value_path`` (default: the elements themselves, for a reference that already
+      resolves to a list of scalars) into a list of comparable keys.
+    * every other op compares against the value *itself*: the reference resolves to whatever it
+      names — a scalar for ``eq``/``ne``/``lt``/``le``/``gt``/``ge``, the pair for ``between`` —
+      and is **not** projected, since here the value is the operand rather than a collection to
+      key on. This is the threshold shape ADR-0023's own reduce-then-compare pipeline is written
+      in, and it was unreachable while resolution was gated on the membership ops: the raw
+      reference dict reached ``_matches``, every comparison against it raised ``TypeError``, that
+      was caught as a non-match, and the filter silently kept *nothing*.
+
+    A literal ``value``, or a whole-predicate ``$decide`` (which ``FilterAction`` escalates intact),
+    passes through untouched. Returns the resolved params and a ``defect``, set when the reference
+    could not be read — reported rather than swallowed for the same reason the fan-out reports it:
+    an unreadable predicate value fails *open* in some direction for every op (``in`` matches
+    nothing, ``not_in`` keeps everything, an unreadable threshold excludes everything), so the
+    filter confidently does the wrong thing to the whole collection. A resolved-but-unusable
+    projection (a ``value_path`` that plucks to ``None`` or a non-scalar for every member) is the
+    neighbouring trap the warning below guards, and fails open the same way."""
     where = params.get("where")
-    if not (isinstance(where, dict) and where.get("op") in ("in", "not_in")):
-        return params, None
+    if not isinstance(where, dict) or _REF_DECIDE in where:
+        return params, None  # no predicate, or a soft one escalated whole rather than resolved
     value = where.get("value")
     if not _is_reference(value):
-        return params, None  # a literal membership list — nothing to resolve
+        return params, None  # a literal — nothing to resolve
+    if _REF_DECIDE in value:
+        # A soft reference in the *operand* position, which no prompt documents and no op can
+        # evaluate: the comparison itself is mechanical. It used to resolve to an empty membership
+        # set (silently fails open) or a raw dict (silently excludes everything), so say what to
+        # write instead rather than let either happen.
+        return params, (
+            f"a filter predicate's 'value' cannot be a $decide reference "
+            f"({value[_REF_DECIDE]!r}) — the comparison runs mechanically, so the operand has to "
+            "be known before it. Compute it in an earlier step and reference that binding, or "
+            "make the whole 'where' a $decide predicate."
+        )
+    if where.get("op") not in ("in", "not_in"):
+        try:
+            operand: Any = _resolve_ref(value, history, bindings, properties)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return params, _path_defect(value, history, bindings, properties)
+        if operand is _MISSING:
+            return params, _collection_defect(value, operand, history, properties)
+        return {**params, "where": {**where, "value": operand}}, None
     resolved_members, defect = _resolve_collection(value, history, bindings, properties)
     if defect is not None:
         return params, defect
@@ -2508,7 +2539,7 @@ class DefaultReasonStrategy:
             )
             passthrough = {k: v for k, v in step.params.items() if k != "in"}
             if defect is None and step.next_action == FilterAction.name:
-                passthrough, defect = _resolve_membership_predicate(
+                passthrough, defect = _resolve_predicate_value(
                     passthrough, activity.history, activity.bindings, cycle.working.properties
                 )
             if defect is not None:

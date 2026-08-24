@@ -398,7 +398,11 @@ PLAN_SYSTEM_PROMPT = (
     "(not_in) items whose `path` value is among that other collection's `value_path` values — e.g. "
     "keep artifacts NOT already catalogued. Omit `value_path` when the referenced "
     "collection is already "
-    "a list of the bare keys,\n"
+    "a list of the bare keys. For the OTHER ops, `value` may likewise be a reference — to the "
+    "value being compared against, not to a collection — so a threshold computed by an earlier "
+    'step is usable directly: {"path": "score", "op": "gt", "value": {"$bind": "<mean>"}} keeps '
+    "what beats a `reduce` mean, and `between` accepts a reference resolving to [lo, hi]. No "
+    "`value_path` there: the referenced value IS the operand,\n"
     '  {"action": "distinct", "in": ..., "out": "<name>", "by": "<field>"}  drop duplicates (omit '
     "`by` to dedupe whole items),\n"
     '  {"action": "sort", "in": ..., "out": "<name>", "by": "<field>", "desc": true|false},\n'

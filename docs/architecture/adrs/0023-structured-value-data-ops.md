@@ -209,7 +209,7 @@ each call site.
 element against *another* run-time collection — "keep apartments **not** already saved", "keep the
 zips we don't yet have a crime rate for". A `filter` predicate's `value` may therefore be a reference
 (`$from`/`$bind`) to a second collection, with a new `not_in` operator alongside `in`. The reference
-is resolved **once, in Reason** (`_resolve_membership_predicate`, beside the `in`-collection
+is resolved **once, in Reason** (`_resolve_predicate_value`, beside the `in`-collection
 resolution in `_data_op`), projected by an optional `value_path` to a concrete list of keys, and
 substituted into the predicate before the op runs — so `_matches` stays a pure literal comparison and
 the batched/off-cycle machinery is untouched (membership is **mechanical, never a model call**). An
@@ -217,6 +217,25 @@ unresolvable membership reference degrades to an empty set: `in` matches nothing
 everything (fails open, so a missing exclusion list never silently drops the whole collection). This
 lets a plan split a formerly-bundled `$decide` ("in 5..10 **and** not already saved") into its
 mechanical half (`not_in` the saved list) and only the genuinely judgemental remainder.
+
+**A reference-valued predicate is not only a membership set (2026-08-24).** The paragraph above was
+written for `in`/`not_in`, and so was the code: resolution was gated on those two ops. But the need
+it describes — an operand known only at run time — is not specific to membership. The canonical
+`reduce` → "keep what beats the mean" pipeline this ADR proposes elsewhere is exactly that shape,
+and it never worked: the raw reference dict reached `_matches`, every ordered comparison against it
+raised `TypeError`, that was caught as a non-match, and the filter silently kept *nothing*. So
+`value` resolves for every op, in two shapes, because the ops read it differently — membership
+resolves as a *collection* and projects through `value_path`, while every other op resolves to the
+operand *itself* (a scalar; for `between`, the `[lo, hi]` pair) with no projection, since there is
+no collection to key on.
+
+Two consequences follow from the failure mode rather than from symmetry. An unreadable operand is a
+**defect that replans**, not a degrade-to-empty: the fail-open argument made above for membership
+says a missing exclusion list must not silently drop the collection, and an unreadable threshold
+drops it just as silently in the other direction. And a `$decide` in the *operand* position is
+rejected with a message naming what to write instead — it is the "hide the computation inside a
+parameter" shape this ADR rejected as option (a), it was never documented in any prompt, and it
+previously resolved to an empty set or a raw dict, failing open either way.
 
 **`collect` carries the fan-out key.** A map-invoke leaves N results scattered in history;
 `collect` gathers them, and — because a tool's result often doesn't echo the input it was called
