@@ -1174,17 +1174,24 @@ class DefaultReflectStrategy:
             # Complete only when the *top-level* plan is exhausted: a just-exhausted sub-plan still
             # has parent frames to pop (Reason does that next cycle), so it isn't done (ADR-0022).
             eligible = _eligible_conditions(activity, wm) if activity.pending_conditions else []
-            if activity.condition_fired:
-                # A condition fired and its `then` is still owed. The queue outlives the condition
-                # that produced it — a fired condition is usually retired by the same verdict, so
-                # `pending_conditions` can be empty while committed work is still queued. Leave it
-                # READY for Reason to drain; terminating here would write a success episode for a
-                # goal that has an unrun `then`.
+            if activity.condition_fired or activity.condition_verdict is not None:
+                # Work Reason owes: a fired condition whose `then` is still unrun, or a resolved
+                # verdict Observe parked that nothing has applied yet. The queue outlives the
+                # condition that produced it — a fired condition is usually retired by the same
+                # verdict, so `pending_conditions` can be empty while committed work is still
+                # queued. Leave it READY for Reason to drain; terminating here would write a success
+                # episode for a goal that has an unrun `then`, and BLOCKING here would strand the
+                # verdict, because Situate only ever selects a READY activity — so Reason would
+                # never apply it and a judgement already paid for would be silently discarded, with
+                # the marks already advanced past the signal that could re-open the gate. Reason's
+                # own no-fire path re-blocks (and a failed evaluation parks an empty verdict that
+                # takes exactly that path), so deferring costs nothing.
                 log.info(
                     "reflect: activity %s body exhausted; leaving ready to pursue %d fired "
-                    "condition(s)",
+                    "condition(s) and %d unapplied verdict(s)",
                     activity.id,
                     len(activity.condition_fired),
+                    0 if activity.condition_verdict is None else 1,
                 )
             elif eligible:
                 # A gate has opened on a signal no condition has judged yet, and Observe resumed

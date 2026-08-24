@@ -381,6 +381,10 @@ async def test_the_gate_opening_reaches_the_judgement_instead_of_spinning(tmp_pa
 
     await cycle.strategies.observe.observe(cycle)  # second cycle: same signal, now judged
     await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+    # Reflect leaves it READY here, because that same Observe parked the (empty) verdict and Reason
+    # is the phase that applies it. Settling back to BLOCKED is Reason's call, one phase later.
+    situated = await cycle.strategies.situate.situate([activity], working, cycle, _tick())
+    await cycle.strategies.reason.reason(activity, working, cycle, situated)
 
     assert activity.state is ActivityState.BLOCKED
     assert len(llm.calls) == 1  # and no second call for a signal already judged
@@ -578,6 +582,69 @@ async def test_reflect_does_not_terminate_over_a_fired_condition(tmp_path: Path)
     await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
 
     assert activity.state is ActivityState.READY
+
+
+async def test_reflect_does_not_block_over_an_unconsumed_verdict(tmp_path: Path) -> None:
+    """Observe parks a resolved verdict and advances the marks in the same breath, so by the time
+    Reflect runs the gate that produced it is no longer eligible and `condition_fired` is still
+    empty — only Reason fills that. Blocking here strands the verdict: Situate skips a BLOCKED
+    activity, so Reason never consumes it, and a judgement already paid for is thrown away. Seen on
+    2026-08-24 as `fired=(0, 2)` immediately followed by `blocking on 3 pending condition(s)`.
+    Reason's own no-fire path re-blocks, so there is nothing for Reflect to protect here."""
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=99)  # marks advanced
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.READY
+
+
+async def test_a_parked_verdict_survives_reflect_and_reaches_its_then(tmp_path: Path) -> None:
+    """The cross-phase version of the above: the two phases in the order the cycle runs them."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=99)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+    # Through Situate, not straight to reason(): Situate only ever selects a READY activity, so a
+    # Reflect that blocked means Reason is never handed the activity and the verdict rots in place.
+    # Calling reason() directly would pass even with the bug.
+    situated = await cycle.strategies.situate.situate([activity], working, cycle, _tick())
+    assert situated.activity is activity
+    await cycle.strategies.reason.reason(activity, working, cycle, situated)
+
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "subgoal"
+
+
+async def test_an_empty_parked_verdict_still_ends_up_blocked(tmp_path: Path) -> None:
+    """Staying READY for the verdict must not lose the re-block when nothing fired — Reason owns
+    that decision (and a failed evaluation degrades to an empty verdict, so it takes this path)."""
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=99)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict()
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())
+    after_reflect = activity.state  # a local: asserting in place would narrow it for mypy
+    assert after_reflect is ActivityState.READY  # deferred to Reason, not blocked here
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.state is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, ConditionWait)
 
 
 async def test_a_retired_condition_stops_waiting(tmp_path: Path) -> None:
