@@ -1004,7 +1004,7 @@ def test_ground_prompt_carries_no_sub_plan_provenance_notice() -> None:
     be shown the user's request and told it is not a request from the user."""
     activity = _activity_with_history("book the trip", "search_flights", {"flights": []})
     activity.parent_frames.append(  # mid-sub-plan: exactly when the plan prompt renders the notice
-        (Plan(id="p", goal="book the trip", steps=[]), 0)
+        (Plan(id="p", goal="book the trip", steps=[]), 0, 0)
     )
 
     _system, user = default_ground_prompt(activity, "book_flight", None, {})
@@ -1164,7 +1164,7 @@ def test_render_bindings_is_all_or_nothing_and_keeps_the_last_binding() -> None:
 
 def test_plan_prompt_tells_a_subgoal_plan_not_to_report_to_the_user() -> None:
     activity = _activity("notify each relative")
-    activity.parent_frames = [(Plan(id="p", goal="reconcile the shortlist", steps=[]), 0)]
+    activity.parent_frames = [(Plan(id="p", goal="reconcile the shortlist", steps=[]), 0, 0)]
     _, user = default_plan_prompt(activity, {}, PerceptSnapshot(), [])
     assert "NOT a request from the user" in user
     assert "do NOT end this plan by invoking `send_message_to_user`" in user

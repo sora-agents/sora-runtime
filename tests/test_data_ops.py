@@ -536,6 +536,32 @@ async def test_collect_gathers_history_results_by_operation_name(tmp_path: Path)
     assert [r["rate"] for r in activity.bindings["rates"]] == [7, 3, 9]
 
 
+async def test_collect_gathers_only_the_current_frames_results(tmp_path: Path) -> None:
+    """``collect`` takes EVERY history match, which across a frame boundary means it accumulates
+    results the *parent* plan produced, however stale. An observed run failed exactly here: a
+    sub-plan collected `get_calendar_events_from_to` and got back both its own proposed-day query
+    and the parent's Saturday query from 1,500 cycles earlier, then fanned out a delete over the
+    stale set — whose event the agent had already deleted itself. It failed loudly only by luck;
+    with a still-live event it would have silently deleted a real appointment on the wrong day.
+
+    ``$from`` is deliberately *not* scoped this way and stays cross-frame: it reads the LATEST
+    match, so it is naturally current, and a sub-plan referencing the event its parent created is
+    the normal case. Only ``collect`` accumulates, so only ``collect`` needs the boundary."""
+    history = [
+        _history("get_events", {"day": "saturday"}),  # the parent frame's query
+        _history("get_events", {"day": "thursday"}),  # this sub-plan's own query
+    ]
+    step = Step(next_action="collect", params={"from": "get_events", "out": "day_results"})
+    tool = FakeTool("realestate")
+    cycle, working, _ = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    activity = _activity_with_plan([step], history)
+    activity.history_mark = 1  # this frame's plan was installed after history[0] had landed
+    working.activities["a"] = activity
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.bindings["day_results"] == [{"day": "thursday"}]
+
+
 def _history_with_params(
     operation_name: str, params: dict[str, object], result: object
 ) -> CompletedOperation:

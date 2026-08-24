@@ -313,7 +313,7 @@ async def test_revalidate_sees_remaining_steps_across_the_subgoal_stack(tmp_path
     )
     subplan = Plan(id="sub", goal="sub", steps=[invoke_step("t", "read_op")])
     activity = Activity(id="a", goal="g", context={}, plan=subplan, step_index=0)
-    activity.parent_frames.append((parent_plan, 0))  # sub-goal was parent step 0
+    activity.parent_frames.append((parent_plan, 0, 0))  # sub-goal was parent step 0
 
     assert await proc.revalidate(activity) is True
     _system, user = llm.calls[-1]
@@ -395,7 +395,7 @@ async def test_invalidated_then_re_inferred_plans_are_both_traced(
     # active plan alone would understate the discard.
     parent_steps = [invoke_step("t", "sub_op"), invoke_step("t", "tail_op")]
     parent = Plan(id="p0", goal="g", steps=parent_steps)
-    activity.parent_frames.append((parent, 0))
+    activity.parent_frames.append((parent, 0, 0))
 
     with caplog.at_level(logging.DEBUG, logger="sora.strategies"):
         await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
@@ -440,7 +440,7 @@ async def test_invalid_verdict_parks_the_whole_discarded_stack_for_the_replan(
     working.signals.append(Percept("t", Signal("follow_up", {}), 0.0))  # gate hot
     parent_steps = [invoke_step("t", "sub_op"), invoke_step("t", "tail_op")]
     parent = Plan(id="p0", goal="g", steps=parent_steps)
-    activity.parent_frames.append((parent, 0))
+    activity.parent_frames.append((parent, 0, 0))
 
     await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
     await _resolve_revalidate(cycle)
@@ -464,7 +464,7 @@ async def test_superseded_plan_reaches_the_replanning_prompt(tmp_path: Path) -> 
     working.signals.append(Percept("t", Signal("follow_up", {}), 0.0))  # gate hot
     parent_steps = [invoke_step("t", "sub_op"), invoke_step("t", "tail_op")]
     parent = Plan(id="p0", goal="g", steps=parent_steps)
-    activity.parent_frames.append((parent, 0))
+    activity.parent_frames.append((parent, 0, 0))
 
     await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
     await _resolve_revalidate(cycle)

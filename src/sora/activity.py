@@ -39,12 +39,23 @@ class Activity:
     state: ActivityState = ActivityState.READY
     plan: Plan | None = None  # once set, Reason can just advance it instead of (re)planning
     step_index: int = 0
-    # The intention stack for sub-goals (ADR-0022): each entry is a suspended parent frame (its Plan
-    # and the step_index of the sub-goal that pushed it). `plan`/`step_index` above are the *active*
-    # frame; entering a deliberative sub-goal pushes the parent here (Observe) and exhausting a
-    # sub-plan pops it, resuming the parent at the step after its sub-goal (Reason). Empty for a
-    # flat plan — generalizes step_index rather than adding a separate intention type (ADR-0002).
-    parent_frames: list[tuple[Plan, int]] = field(default_factory=list)
+    # The intention stack for sub-goals (ADR-0022): each entry is a suspended parent frame (its
+    # Plan, the step_index of the sub-goal that pushed it, and that frame's `history_mark` below).
+    # `plan`/`step_index` above are the *active* frame; entering a deliberative sub-goal pushes the
+    # parent here (Observe) and exhausting a sub-plan pops it, resuming the parent at the step after
+    # its sub-goal (Reason). Empty for a flat plan — generalizes step_index rather than adding a
+    # separate intention type (ADR-0002).
+    parent_frames: list[tuple[Plan, int, int]] = field(default_factory=list)
+    # Where in `history` the *active* frame's plan began. `history` is flat and frame-agnostic (see
+    # reset_for_replan below, which relies on that), which is right for `$from` — it reads the
+    # LATEST match, so it stays current, and a sub-plan reading the event its parent created is the
+    # normal case. It is wrong for `collect`, which takes EVERY match and so silently accumulates
+    # results from plans that already finished: an observed run collected its parent's calendar
+    # query alongside its own and fanned out a delete over the stale set. So collect reads
+    # `history[history_mark:]`. Set wherever a plan is installed (inferred, cached, or a sub-plan),
+    # saved into the frame on push and restored on pop; a replan needs no reset of its own, since
+    # installing the replacement plan re-marks it past everything the discarded plan ran.
+    history_mark: int = 0
     pending_operation: PendingOperation | None = None  # set while RUNNING; cleared on resolve
     # set while RUNNING on an off-cycle infer()/ground() (the _infer_/_ground_ internal actions),
     # mutually exclusive with pending_operation. RUNNING thus has two resolve sources — an invoke
@@ -196,7 +207,9 @@ class Activity:
             self.superseded = SupersededPlan(
                 plan=self.plan,
                 step_index=self.step_index,
-                parent_frames=list(self.parent_frames),
+                # The mark is live runtime scoping, meaningless in a record that only ever gets
+                # rendered into a prompt — so the bundle keeps the (plan, step_index) shape.
+                parent_frames=[(plan, index) for plan, index, _ in self.parent_frames],
                 defect=defect,
             )
         self.plan = None

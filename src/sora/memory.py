@@ -1994,7 +1994,13 @@ class ProceduralMemory:
         # The full remaining tail across the sub-goal stack, not just the active sub-plan (ADR-0022)
         # — checking only the sub-plan would call it "still valid" while a stale parent step waits.
         steps_text = render_steps(
-            remaining_steps(activity.plan, activity.step_index, activity.parent_frames)
+            # Rendering never needs a frame's history_mark — that is live collect scoping — so the
+            # tail is read in the same (plan, step_index) shape a SupersededPlan carries.
+            remaining_steps(
+                activity.plan,
+                activity.step_index,
+                [(plan, index) for plan, index, _ in activity.parent_frames],
+            )
         )
         user = (
             f"Goal: {activity.goal}\n"

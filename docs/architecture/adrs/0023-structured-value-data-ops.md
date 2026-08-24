@@ -247,6 +247,29 @@ pipeline is fully mechanical: `collect` → `filter between 5 10` on the rate �
 on `zip_code`, with no `$decide`. Without it, correlating each rate back to its zip would force the
 judgement escalation — which, being blind to other ops' history, cannot see the rates anyway.
 
+**`collect` is scoped to the frame that ran the operations (2026-08-24).** "Gathers them" was
+written with a single fan-out in mind and implemented literally, as *every* history entry matching
+the operation name. `Activity.history` is flat and frame-agnostic — [ADR-0024](0024-plan-reconsideration-context-adaptation.md)
+relies on exactly that when it argues a replan must clear the whole intention stack — so an
+unscoped `collect` inside a sub-plan also picks up whatever the *parent* ran, however long ago and
+however stale. An observed run failed there: a sub-plan collected `get_calendar_events_from_to` and
+received both its own proposed-day query and the parent's Saturday query from 1,500 cycles earlier,
+then fanned a delete out over the stale set — whose event the agent had itself already deleted. It
+surfaced as a loud `does not exist` only by luck; with a still-live event it would have silently
+deleted a real appointment on the wrong day, and the irreversibility guard would not have caught it
+(that guard fires on a binding produced *empty*, and this one was non-empty and wrong).
+
+`Activity.history_mark` therefore records where the active frame's plan began, and `collect` reads
+`history[history_mark:]`. It is set at every plan install (inferred, cached, sub-plan), saved into
+the parent frame on push and restored on pop; a replan needs no reset of its own, since installing
+the replacement re-marks it past everything the discarded plan ran.
+
+The scoping is deliberately **not** extended to `$from`. The two read history differently:
+`$from` takes the *latest* match, so it is naturally current, and a sub-plan referencing the event
+its parent created is the ordinary case — the same run depends on it. `collect` *accumulates*, and
+only an accumulating read turns a finished plan's results into present evidence. Reachability is
+unchanged either way: a plan that genuinely wants an ancestor's result still names it with `$from`.
+
 ## Links
 
 * Refines [ADR-0022](0022-plan-representation-context-guard-and-subgoals.md) (Pass 2 item 1: the

@@ -376,7 +376,7 @@ async def test_deliberative_subgoal_infers_against_the_subgoal_goal(tmp_path: Pa
     # Observe resolves the sub-plan: push a frame and enter it, parent saved at the sub-goal index.
     await DefaultObserveStrategy().observe(cycle)
     assert len(activity.parent_frames) == 1
-    assert activity.parent_frames[0] == (parent, 0)
+    assert activity.parent_frames[0] == (parent, 0, 0)
     assert activity.plan is not None
     assert activity.plan is not parent
     assert activity.plan.goal == "notify each relative"
@@ -497,7 +497,7 @@ async def test_frame_pops_and_parent_resumes_after_the_subgoal(tmp_path: Path) -
         context={},
         plan=subplan,
         step_index=0,
-        parent_frames=[(parent, 0)],
+        parent_frames=[(parent, 0, 0)],
     )
     working.activities["a"] = activity
 
@@ -515,6 +515,73 @@ async def test_frame_pops_and_parent_resumes_after_the_subgoal(tmp_path: Path) -
     assert activity.parent_frames == []
 
 
+# --------------------------------------------------------------------------------------------------
+# The frame's history mark — what scopes `collect` to the plan that ran the operations (ADR-0023)
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_entering_a_sub_plan_marks_it_past_the_parents_results(tmp_path: Path) -> None:
+    """`history` is flat and frame-agnostic. That suits `$from`, which reads the LATEST match and so
+    stays current, but not `collect`, which takes EVERY match — unscoped, a sub-plan collects the
+    parent's results as though it had produced them itself. An observed run collected its parent's
+    Saturday calendar query beside its own proposed-day one and fanned out a delete over the stale
+    set. So entering a sub-plan marks it past whatever the parent already ran."""
+    llm = FakeLLMClient(plan_json({"action": "send", "to": "user", "content": {"text": "done"}}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    cycle, working, registry = _cycle(tmp_path, procedural, FakeTool("realestate"))
+    await registry.join(_ORIGIN)
+    subgoal = Step(
+        next_action="subgoal", params={"goal": "notify each relative", "mode": "deliberative"}
+    )
+    parent = Plan(id="p", goal="reconcile the shortlist", steps=[subgoal])
+    activity = Activity(
+        id="a",
+        goal="reconcile the shortlist",
+        context={},
+        plan=parent,
+        history=[_history("get_events", {"day": "saturday"})],  # the parent's own result
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)  # let the off-cycle _infer_ land
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.parent_frames == [(parent, 0, 0)]  # the parent's mark, saved for the pop
+    assert activity.history_mark == 1  # the sub-plan starts past the parent's one result
+
+
+async def test_frame_pop_restores_the_parent_history_mark(tmp_path: Path) -> None:
+    # The mirror of the push: a resumed parent must collect over its OWN span again. Leaving the
+    # sub-plan's mark in place would blind the parent to results it ran before the sub-goal — the
+    # same cross-frame bleed, in the opposite direction.
+    cycle, working, registry = _cycle(
+        tmp_path, _no_llm_procedural(tmp_path), FakeTool("realestate")
+    )
+    await registry.join(_ORIGIN)
+    subgoal = Step(next_action="subgoal", params={"goal": "sub", "mode": "deliberative"})
+    report = Step(next_action="send", params={"to": "user", "content": "all done"})
+    parent = Plan(id="p", goal="top", steps=[subgoal, report])
+    subplan = Plan(id="s", goal="sub", steps=[Step(next_action="send", params={"to": "x"})])
+    activity = Activity(
+        id="a",
+        goal="top",
+        context={},
+        plan=subplan,
+        step_index=0,
+        parent_frames=[(parent, 0, 2)],  # the parent's plan was installed at history index 2
+        history=[_history("op", n) for n in range(5)],
+    )
+    activity.history_mark = 4  # ...and the sub-plan later still
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())  # exhaust sub-plan
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())  # pop the frame
+
+    assert activity.plan is parent
+    assert activity.history_mark == 2  # the parent's span, not the sub-plan's
+
+
 async def test_reflect_does_not_complete_a_parent_while_a_frame_is_pending(tmp_path: Path) -> None:
     # A just-exhausted sub-plan must not be judged "completed": the parent still has work, waiting
     # on the frame pop Reason does next. Completion needs the top plan exhausted AND no frames.
@@ -528,7 +595,7 @@ async def test_reflect_does_not_complete_a_parent_while_a_frame_is_pending(tmp_p
         context={},
         plan=subplan,
         step_index=1,  # exhausted sub-plan
-        parent_frames=[(parent, 0)],
+        parent_frames=[(parent, 0, 0)],
     )
 
     result = await DefaultReflectStrategy().reflect(activity, cycle.working, cycle, TickResult())
@@ -567,7 +634,7 @@ async def test_nested_subgoals_pop_the_frame_stack_in_order(tmp_path: Path) -> N
         context={},
         plan=leaf,
         step_index=1,  # leaf exhausted
-        parent_frames=[(grandparent, 0), (parent, 0)],  # deepest first
+        parent_frames=[(grandparent, 0, 0), (parent, 0, 0)],  # deepest first
     )
     working.activities["a"] = activity
 
@@ -576,7 +643,7 @@ async def test_nested_subgoals_pop_the_frame_stack_in_order(tmp_path: Path) -> N
     assert step.step is not None
     assert step.step.params == {"n": "p-after"}
     assert activity.plan is parent
-    assert activity.parent_frames == [(grandparent, 0)]
+    assert activity.parent_frames == [(grandparent, 0, 0)]
     assert activity.step_index == 2  # parent's post-sub-goal step consumed
 
     # Parent exhausted -> pop grandparent, resuming it at the step after ITS sub-goal (index 1).
@@ -598,13 +665,14 @@ async def test_deliberative_subgoal_halts_at_the_depth_cap(tmp_path: Path) -> No
     await registry.join(_ORIGIN)
     # A stack already _DEFAULT_MAX_SUBGOAL_DEPTH deep, ancestor goals all distinct so the *depth*
     # cap (not the overlap check) is what trips. _no_llm_procedural would raise if _infer_ fired.
-    frames: list[tuple[Plan, int]] = [
+    frames: list[tuple[Plan, int, int]] = [
         (
             Plan(
                 id=f"f{i}",
                 goal=f"g{i}",
                 steps=[Step(next_action="subgoal", params={"goal": f"ancestor task number {i}"})],
             ),
+            0,
             0,
         )
         for i in range(_DEFAULT_MAX_SUBGOAL_DEPTH)
@@ -652,7 +720,9 @@ async def test_deliberative_subgoal_halts_when_goal_repeats_an_ancestor(tmp_path
         goal="active",
         steps=[Step(next_action="subgoal", params={"goal": repeated_goal, "mode": "deliberative"})],
     )
-    activity = Activity(id="a", goal="root", context={}, plan=active, parent_frames=[(parent, 0)])
+    activity = Activity(
+        id="a", goal="root", context={}, plan=active, parent_frames=[(parent, 0, 0)]
+    )
     working.activities["a"] = activity
 
     result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
@@ -691,7 +761,9 @@ async def test_deliberative_subgoal_halts_on_reworded_elaboration(tmp_path: Path
         goal="active",
         steps=[Step(next_action="subgoal", params={"goal": reworded_goal, "mode": "deliberative"})],
     )
-    activity = Activity(id="a", goal="root", context={}, plan=active, parent_frames=[(parent, 0)])
+    activity = Activity(
+        id="a", goal="root", context={}, plan=active, parent_frames=[(parent, 0, 0)]
+    )
     working.activities["a"] = activity
 
     result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
@@ -709,13 +781,14 @@ async def test_deliberative_subgoal_depth_cap_is_configurable(tmp_path: Path) ->
     # Two frames deep with distinct goals: the default cap (4) would let this infer, but a strategy
     # built with max_subgoal_depth=2 trips the depth cap instead. Proves the agent.yaml knob reaches
     # the guard. _no_llm_procedural would raise if _infer_ fired.
-    frames: list[tuple[Plan, int]] = [
+    frames: list[tuple[Plan, int, int]] = [
         (
             Plan(
                 id=f"f{i}",
                 goal=f"g{i}",
                 steps=[Step(next_action="subgoal", params={"goal": f"ancestor task number {i}"})],
             ),
+            0,
             0,
         )
         for i in range(2)
@@ -768,7 +841,9 @@ async def test_deliberative_subgoal_infers_when_distinct_and_shallow(tmp_path: P
             )
         ],
     )
-    activity = Activity(id="a", goal="root", context={}, plan=active, parent_frames=[(parent, 0)])
+    activity = Activity(
+        id="a", goal="root", context={}, plan=active, parent_frames=[(parent, 0, 0)]
+    )
     working.activities["a"] = activity
 
     result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
@@ -897,4 +972,4 @@ async def test_subgoal_prompt_is_told_it_is_a_subgoal_without_mutating_the_activ
     assert activity.parent_frames == []
 
     await DefaultObserveStrategy().observe(cycle)
-    assert activity.parent_frames == [(parent, 0)]  # pushed exactly once, by Observe
+    assert activity.parent_frames == [(parent, 0, 0)]  # pushed exactly once, by Observe

@@ -217,7 +217,7 @@ async def test_the_guard_scans_a_suspended_parent_frame_too(tmp_path: Path) -> N
         ],
     )
     activity = _activity(working, [invoke_step("t", "delete_op")], bindings={"friend_contact": []})
-    activity.parent_frames.append((parent, 0))
+    activity.parent_frames.append((parent, 0, 0))
 
     result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
 

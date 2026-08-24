@@ -82,7 +82,7 @@ def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
     declares what retirement removed — so without `retired_conditions` a satisfied `until` would be
     undone by the very next lift, putting the condition back on watch for good.
     """
-    frames = [activity.plan, *(plan for plan, _ in activity.parent_frames)]
+    frames = [activity.plan, *(plan for plan, _, _ in activity.parent_frames)]
     known = {state.condition for state in activity.pending_conditions}
     known |= activity.retired_conditions
     for plan in frames:
@@ -902,6 +902,7 @@ class DefaultObserveStrategy:
                         inferred: Plan = res.value  # type: ignore[assignment]  # kind=="plan" => Plan
                         activity.plan = inferred
                         activity.step_index = 0
+                        activity.history_mark = len(activity.history)
                         # The superseded bundle has now been consumed by the inference that
                         # produced this plan (ADR-0024): drop it so it can never reach a later,
                         # unrelated inference.
@@ -926,11 +927,14 @@ class DefaultObserveStrategy:
                         # plan + the sub-goal's step_index) and enter the sub-plan, so Reason
                         # advances it and pops back to the parent when it exhausts (ADR-0022). It
                         # lands like a top-level plan, only onto a stacked frame not the activity.
-                        frame = (activity.plan, activity.step_index)
+                        frame = (activity.plan, activity.step_index, activity.history_mark)
                         activity.parent_frames.append(frame)  # type: ignore[arg-type]  # plan set mid-plan
                         sub_plan: Plan = res.value  # type: ignore[assignment]  # kind=="subgoal" => Plan
                         activity.plan = sub_plan
                         activity.step_index = 0
+                        # The sub-plan collects only what it runs itself, not what the parent left
+                        # in history before it was entered.
+                        activity.history_mark = len(activity.history)
                         # Re-anchor the gate to the sub-plan's own infer-time world (ADR-0024).
                         activity.reconsider_baseline = baseline
                         activity.state = ActivityState.READY
@@ -1754,7 +1758,7 @@ def _unsatisfiable_reference(activity: Activity) -> str | None:
     empty = {name for name, value in activity.bindings.items() if _is_empty(value)}
     refreshed: set[str] = set()
     frames = [(plan, activity.step_index)]
-    frames += [(parent, index + 1) for parent, index in reversed(activity.parent_frames)]
+    frames += [(parent, index + 1) for parent, index, _ in reversed(activity.parent_frames)]
     for frame, start in frames:
         for index in range(start, len(frame.steps)):
             step = frame.steps[index]
@@ -1861,7 +1865,7 @@ def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
     ``activity.goal`` is deliberately excluded: the first decomposition legitimately shares its
     vocabulary, so comparing against it would false-trip a single, valid refinement."""
     goals: list[str] = []
-    for plan, idx in activity.parent_frames:
+    for plan, idx, _ in activity.parent_frames:
         if 0 <= idx < len(plan.steps):
             goal = plan.steps[idx].params.get("goal")
             if isinstance(goal, str):
@@ -2351,6 +2355,7 @@ class DefaultReasonStrategy:
             log.debug("reason: cached plan for activity %s\n%s", activity.id, render_plan(plan))
             activity.plan = plan
             activity.step_index = 0
+            activity.history_mark = len(activity.history)
             # A cached plan installs without an inference, so nothing consumed a parked superseded
             # bundle (ADR-0024) — drop it here too, or it outlives the re-plan it was parked for.
             activity.superseded = None
@@ -2361,9 +2366,10 @@ class DefaultReasonStrategy:
                 if activity.parent_frames:
                     # Sub-plan exhausted: pop the frame and resume the parent at the step *after*
                     # its sub-goal, then loop to read it (or pop again if that frame is exhausted).
-                    parent_plan, parent_index = activity.parent_frames.pop()
+                    parent_plan, parent_index, parent_mark = activity.parent_frames.pop()
                     activity.plan = parent_plan
                     activity.step_index = parent_index + 1
+                    activity.history_mark = parent_mark  # the parent collects over its own span
                     continue
                 return result  # top-level plan exhausted -> no step this cycle
             step = plan.steps[activity.step_index]
@@ -2524,9 +2530,12 @@ class DefaultReasonStrategy:
         result into ``activity.bindings[out]`` (or, for the escalation, Observe does so later)."""
         if step.next_action == CollectAction.name:
             op_name = step.params.get("from")
+            # Scoped to the active frame's span (Activity.history_mark): collect takes EVERY match,
+            # so an unscoped read accumulates results from plans that already finished — a sub-plan
+            # collecting its parent's stale calendar query alongside its own, then deleting over it.
             collection: list[Any] = [
                 _enrich_with_params(completed.ack.result, completed.invocation.params)
-                for completed in activity.history
+                for completed in activity.history[activity.history_mark :]
                 if completed.invocation.operation_name == op_name
             ]
             passthrough = {k: v for k, v in step.params.items() if k != "from"}

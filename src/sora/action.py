@@ -412,7 +412,7 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # existing custom prompt keeps working and gains the ancestor chain for free.
         frames = list(activity.parent_frames)
         if goal is not None and activity.plan is not None:
-            frames.append((activity.plan, activity.step_index))
+            frames.append((activity.plan, activity.step_index, activity.history_mark))
         target = (
             activity
             if goal is None
