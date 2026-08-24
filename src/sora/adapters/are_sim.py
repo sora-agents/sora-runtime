@@ -28,7 +28,7 @@ import logging
 import threading
 import time
 import typing
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import UnionType
@@ -337,6 +337,206 @@ def initialize_turns(scenario: Any) -> None:
     from are.simulation.scenarios.scenario_imported_from_json.utils import preprocess_scenario
 
     preprocess_scenario(scenario, judge_config=None)
+
+
+def populate_oracle_events(scenario: Any) -> None:
+    """Replay the scenario's ``OracleEvent``s in ARE's oracle mode to populate
+    ``oracle_run_event_log`` (and the turn map) *without* attaching a judge — the input
+    ``write_count_check`` needs.
+
+    ``preprocess_scenario`` already does this, but only as a side effect of being given a
+    ``judge_config``, and taking that path costs a scoring judge: it also installs
+    ``judge.validate`` as the per-turn release gate, so every turn boundary contacts the judge model
+    (see ``attach_judge``). The replay itself is deterministic and modelless, so it is separable,
+    and separating it is what lets an *unscored* dev run still be told whether it would have
+    cleared ARE's tool-call-count gate.
+
+    Call **before** ``initialize_turns``/``attach_judge`` and before ``AreSimulation.start()``:
+    this mirrors ARE's own ordering (initialize -> oracle replay -> ``soft_reset``), and that
+    ``soft_reset`` hands the agent run a clean environment afterwards. A no-op when the log is
+    there, so pairing it with ``attach_judge`` wastes nothing; also a no-op for a scenario with no
+    ``OracleEvent``s, which simply has no oracle to compare against."""
+    from are.simulation.environment import Environment, EnvironmentConfig
+    from are.simulation.scenarios.scenario_imported_from_json.benchmark_scenario import (
+        build_event_id_to_turn_idx,
+    )
+    from are.simulation.types import OracleEvent
+
+    if getattr(scenario, "oracle_run_event_log", None) is not None:
+        return
+    # initialize() first, then look for OracleEvents — ARE's own ordering, and load-bearing: a
+    # freshly loaded scenario's events are only built during initialize(), so testing before it
+    # finds none and silently skips the replay.
+    scenario.initialize()  # idempotent (guarded by Scenario._initialized)
+    if not any(isinstance(e, OracleEvent) for e in scenario.events):
+        return
+    env = Environment(
+        EnvironmentConfig(oracle_mode=True, queue_based_loop=True, start_time=scenario.start_time)
+    )
+    env.run(scenario)
+    env.stop()
+    oracle_log = env.event_log.list_view()
+    if any(e.failed() for e in oracle_log):
+        raise RuntimeError(
+            f"oracle replay failed: {[e.metadata.exception for e in oracle_log if e.failed()]}"
+        )
+    scenario.soft_reset()
+    scenario.oracle_run_event_log = oracle_log
+    if getattr(scenario, "event_id_to_turn_idx", None) is None:
+        build_event_id_to_turn_idx(scenario=scenario)
+
+
+_AUI_TOOL = "AgentUserInterface__send_message_to_user"
+
+
+@dataclass(frozen=True)
+class TurnWriteCounts:
+    """One turn's agent-vs-oracle tally of *write* tool calls, and whether it clears ARE's gate.
+
+    ``agent``/``oracle`` exclude ``send_message_to_user``, which is counted separately because the
+    judge treats it differently: surplus replies *to the user* are tolerated up to
+    ``extra_user_replies_allowed``, while any surplus call to a domain tool fails outright."""
+
+    turn: int
+    agent: Mapping[str, int]
+    oracle: Mapping[str, int]
+    agent_user_replies: int
+    oracle_user_replies: int
+    extra_user_replies_allowed: int
+
+    @property
+    def surplus(self) -> dict[str, int]:
+        """Calls the agent made more often than the oracle — the usual reason a good-looking run
+        fails, since an action nobody asked for is invisible in the trajectory."""
+        return {
+            name: n - self.oracle.get(name, 0)
+            for name, n in self.agent.items()
+            if n > self.oracle.get(name, 0)
+        }
+
+    @property
+    def missing(self) -> dict[str, int]:
+        return {
+            name: n - self.agent.get(name, 0)
+            for name, n in self.oracle.items()
+            if n > self.agent.get(name, 0)
+        }
+
+    @property
+    def passed(self) -> bool:
+        return (
+            dict(self.agent) == dict(self.oracle)
+            and self.oracle_user_replies
+            <= self.agent_user_replies
+            <= self.oracle_user_replies + self.extra_user_replies_allowed
+        )
+
+
+@dataclass(frozen=True)
+class WriteCountCheck:
+    """ARE's ``preliminary_checks`` gate, recomputed offline. Not a score: clearing it only means
+    the run reaches the judge's per-event matching, which can still fail it. Failing it, though, is
+    conclusive — it is a hard gate ARE applies *before* any model-backed matching, so no verdict on
+    the trajectory's quality can rescue a run whose write counts differ."""
+
+    turns: tuple[TurnWriteCounts, ...]
+
+    @property
+    def passed(self) -> bool:
+        return all(t.passed for t in self.turns)
+
+    def summary(self) -> str:
+        lines = []
+        for t in self.turns:
+            verdict = "ok" if t.passed else "MISMATCH"
+            lines.append(f"  turn {t.turn}: {verdict}")
+            if not t.passed:
+                if t.surplus:
+                    lines.append(f"    surplus (agent did, oracle did not): {t.surplus}")
+                if t.missing:
+                    lines.append(f"    missing (oracle did, agent did not): {t.missing}")
+                if not (
+                    t.oracle_user_replies
+                    <= t.agent_user_replies
+                    <= t.oracle_user_replies + t.extra_user_replies_allowed
+                ):
+                    lines.append(
+                        f"    user replies: agent {t.agent_user_replies}, oracle "
+                        f"{t.oracle_user_replies} (+{t.extra_user_replies_allowed} allowed)"
+                    )
+        head = "write-count gate: PASS" if self.passed else "write-count gate: FAIL"
+        return "\n".join([head, *lines])
+
+
+def write_count_check(
+    scenario: Any,
+    environment: Any,
+    *,
+    extra_user_replies_allowed: int = 1,
+) -> WriteCountCheck | None:
+    """Recompute ARE's tool-call-count gate for a finished run — **no judge model, no tokens**.
+
+    ``GraphPerEventJudge.preliminary_checks`` requires the agent's write actions to match the
+    oracle's as an exact ``Counter``, per turn, and applies it before any per-event LLM matching. So
+    a run can perform every oracle action correctly and still score zero on one unrequested write,
+    with nothing in the trajectory to show for it. This reproduces that arithmetic from the same ARE
+    helpers the judge uses (``AgentEventFilter`` — non-failed AGENT writes only — plus ARE's own
+    turn splitting at each ``send_message_to_user``), which is what keeps it from drifting.
+
+    Returns ``None`` when the scenario carries no oracle log (not a benchmark scenario, or
+    ``populate_oracle_events``/``attach_judge`` was never called). ``extra_user_replies_allowed``
+    mirrors ``GraphPerEventJudgeConfig.extra_send_message_to_user_allowed`` (ARE's default is 1)."""
+    from collections import Counter
+
+    from are.simulation.validation.utils.event_utils import AgentEventFilter
+    from are.simulation.validation.utils.scenario_utils import (
+        extract_agent_events,
+        extract_oracle_events,
+    )
+
+    if getattr(scenario, "oracle_run_event_log", None) is None:
+        return None
+    nb_turns = getattr(scenario, "nb_turns", None)
+    if not nb_turns:
+        return None
+
+    def split(events: list[Any]) -> tuple[dict[str, int], int]:
+        counter = Counter(e.tool_name for e in events)
+        replies = counter.pop(_AUI_TOOL, 0)
+        return dict(counter), replies
+
+    turns: list[TurnWriteCounts] = []
+    for turn_idx in range(nb_turns):
+        # One filter instance per call, as ARE does: `filter` also *preprocesses* each event
+        # (reclassifying a couple of app-specific calls), so it must be the judge's own.
+        oracle_events, _ = extract_oracle_events(scenario, AgentEventFilter(), turn_idx)
+        try:
+            agent_events = extract_agent_events(environment, AgentEventFilter(), turn_idx)
+        except AssertionError:
+            # ARE asserts the turn exists in the agent's own log. It won't when the agent sent
+            # fewer `send_message_to_user` replies than the scenario has turns — a real failure
+            # (it never reported back), and an empty tally is the truthful tally for that turn.
+            agent_events = []
+        agent, agent_replies = split(agent_events)
+        oracle, oracle_replies = split(oracle_events)
+        turns.append(
+            TurnWriteCounts(
+                turn=turn_idx,
+                agent=agent,
+                oracle=oracle,
+                agent_user_replies=agent_replies,
+                oracle_user_replies=oracle_replies,
+                extra_user_replies_allowed=extra_user_replies_allowed,
+            )
+        )
+    if not any(t.oracle or t.oracle_user_replies for t in turns):
+        # The oracle asked for *nothing* anywhere in the run. Almost always extraction silently
+        # yielding nothing rather than a real scenario — e.g. events whose actions never got their
+        # WRITE classification, which AgentEventFilter then drops wholesale. Comparing two empty
+        # tallies would report a confident PASS built on no evidence, and this check is precisely
+        # what an unscored run trusts to tell it the run was clean. Unknown, not clean.
+        return None
+    return WriteCountCheck(turns=tuple(turns))
 
 
 # -- app -> S-ORA usage-interface extraction ------------------------------------------------------

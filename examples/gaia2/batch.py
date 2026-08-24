@@ -91,6 +91,7 @@ def _jsonl_record(
     exception: BaseException | None,
     trace_id: str | None,
     awaiting_input: list[str] | None = None,
+    write_counts: Any = None,
 ) -> dict[str, Any]:
     """One ``output.jsonl`` line, matching ARE's ``_export_benchmark_result_jsonl`` exactly:
     ``task_id``/``trace_id``/``score`` at top level, and a ``metadata`` dict with all-None values
@@ -109,6 +110,18 @@ def _jsonl_record(
         # invisible otherwise. None when there was none, so the strip below keeps every ordinary
         # run's record byte-identical to ARE's own shape.
         "awaiting_input": awaiting_input or None,
+        # ARE's tool-call-count gate, recomputed offline (no judge model). Recorded only when it
+        # FAILS: a failure is conclusive — the judge applies this gate before any per-event
+        # matching — so it explains a zero that the rationale otherwise attributes to the
+        # trajectory. None when it passed or could not be computed, so the strip below keeps an
+        # ordinary record byte-identical to ARE's own shape.
+        "write_count_mismatch": None
+        if write_counts is None or write_counts.passed
+        else [
+            {"turn": t.turn, "surplus": t.surplus, "missing": t.missing}
+            for t in write_counts.turns
+            if not t.passed
+        ],
     }
     metadata = {k: v for k, v in metadata.items() if v is not None}
     return {"task_id": scenario_id, "trace_id": trace_id, "score": score, "metadata": metadata}
@@ -241,7 +254,11 @@ def _run_one_scenario(
     from are.simulation.scenarios.scenario import ScenarioStatus
 
     from examples.gaia2._runner import run_scenario
-    from sora.adapters.are_sim import attach_judge, initialize_turns
+    from sora.adapters.are_sim import (
+        attach_judge,
+        initialize_turns,
+        populate_oracle_events,
+    )
 
     try:
         if args.judge_model:
@@ -251,8 +268,12 @@ def _run_one_scenario(
                 provider=args.judge_provider,
                 endpoint=args.judge_endpoint,
             )
-        elif args.init_turns:
-            initialize_turns(scenario)
+        else:
+            # Replays the oracle so an unscored sweep still reports ARE's tool-call-count gate;
+            # deterministic and modelless, and must precede initialize_turns (it soft_resets).
+            populate_oracle_events(scenario)
+            if args.init_turns:
+                initialize_turns(scenario)
         result = run_scenario(
             scenario,
             config=args.config,
@@ -296,6 +317,7 @@ def _run_one_scenario(
         exception=result.exception,
         trace_id=trace_id,
         awaiting_input=result.awaiting_input,
+        write_counts=result.write_counts,
     )
 
 

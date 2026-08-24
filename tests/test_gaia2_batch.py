@@ -199,20 +199,29 @@ def _patch_seams(monkeypatch: Any) -> list[str]:
     )
     monkeypatch.setattr("sora.adapters.are_sim.attach_judge", lambda *a, **k: calls.append("judge"))
     monkeypatch.setattr(
+        "sora.adapters.are_sim.populate_oracle_events",
+        lambda s: calls.append("oracle"),
+        raising=False,
+    )
+    monkeypatch.setattr(
         "examples.gaia2._runner.run_scenario",
         lambda *a, **k: SimpleNamespace(
-            outcome=SimpleNamespace(success=None, rationale=None), exception=None
+            outcome=SimpleNamespace(success=None, rationale=None),
+            exception=None,
+            write_counts=None,
         ),
     )
     return calls
 
 
 def test_init_turns_wires_turns_without_a_judge(monkeypatch: Any) -> None:
+    # Oracle replay first: it soft_resets the apps, so it has to precede the turn wiring (ARE's own
+    # ordering) — the order asserted here is load-bearing, not incidental.
     from examples.gaia2.run_benchmark import main
 
     calls = _patch_seams(monkeypatch)
     main(["--scenario", "s.json", "--init-turns"])
-    assert calls == ["init"]
+    assert calls == ["oracle", "init"]
 
 
 def test_judge_model_attaches_the_judge_not_the_bare_turn_init(monkeypatch: Any) -> None:
@@ -223,13 +232,25 @@ def test_judge_model_attaches_the_judge_not_the_bare_turn_init(monkeypatch: Any)
     assert calls == ["judge"]
 
 
-def test_plain_run_prepares_neither(monkeypatch: Any) -> None:
-    """The pre-existing default has to stay untouched: no flag, no preprocessing."""
+def test_a_judge_run_does_not_replay_the_oracle_twice(monkeypatch: Any) -> None:
+    """attach_judge already populates the oracle log as a side effect of preprocessing, so the
+    standalone replay must not also run — it would be pure duplicated work."""
+    from examples.gaia2.run_benchmark import main
+
+    calls = _patch_seams(monkeypatch)
+    main(["--scenario", "s.json", "--judge-model", "some-model"])
+    assert "oracle" not in calls
+
+
+def test_a_plain_run_still_replays_the_oracle_for_the_write_count_gate(monkeypatch: Any) -> None:
+    """No judge and no --init-turns still replays the oracle: it is deterministic and modelless,
+    and it is the only thing that lets an unscored run report ARE's tool-call-count gate — the
+    check that would have caught run 4's surplus reply_to_email. Turn wiring stays opt-in."""
     from examples.gaia2.run_benchmark import main
 
     calls = _patch_seams(monkeypatch)
     main(["--scenario", "s.json"])
-    assert calls == []
+    assert calls == ["oracle"]
 
 
 def test_init_turns_with_judge_model_is_refused(monkeypatch: Any) -> None:

@@ -127,7 +127,12 @@ def main(argv: list[str] | None = None) -> None:
 
     # Lazy: ARE and the LLM client are optional dependency groups, only needed for an actual run.
     from examples.gaia2._runner import run_scenario
-    from sora.adapters.are_sim import attach_judge, initialize_turns, load_scenario
+    from sora.adapters.are_sim import (
+        attach_judge,
+        initialize_turns,
+        load_scenario,
+        populate_oracle_events,
+    )
 
     print(f"loading scenario {args.scenario!r} ...", flush=True)
     scenario: Any = load_scenario(args.scenario)
@@ -141,10 +146,15 @@ def main(argv: list[str] | None = None) -> None:
             provider=args.judge_provider,
             endpoint=args.judge_endpoint,
         )
-    elif args.init_turns:
-        # Same turn wiring, no judge and no gate: every turn is released regardless of how the
-        # earlier ones went, which is what exercising a later turn's behaviour needs.
-        initialize_turns(scenario)
+    else:
+        # No judge, so nothing else would replay the oracle — do it here (deterministic, no model)
+        # purely so the run can still be told whether it cleared ARE's tool-call-count gate. Must
+        # precede initialize_turns: it soft_resets the apps, which is ARE's own ordering.
+        populate_oracle_events(scenario)
+        if args.init_turns:
+            # Same turn wiring, no judge and no gate: every turn is released regardless of how the
+            # earlier ones went, which is what exercising a later turn's behaviour needs.
+            initialize_turns(scenario)
 
     # run_scenario owns the turn-aware done condition (ride through the idle gaps between a
     # scenario's turns; stop once the timeline has completed and the agent is idle; a wall-clock cap
@@ -178,6 +188,13 @@ def _print_score(result: Any, *, scored: bool) -> None:
         print(f"\nGaia2 validation: {'✅ PASS' if outcome.success else '❌ FAIL'}")
     if getattr(outcome, "rationale", None):
         print(f"    {outcome.rationale}")
+    # Printed for scored and unscored runs alike. On an unscored run it is the only pass/fail
+    # signal available; on a scored one it says whether a FAIL was decided before the judge ever
+    # looked at the trajectory, which is the difference between "did the wrong thing" and "did an
+    # extra thing".
+    counts = getattr(result, "write_counts", None)
+    if counts is not None:
+        print(f"\n{counts.summary()}")
     # A run that stopped to ask something looks identical to a run that merely did badly, unless
     # the question is printed. It is the most actionable line in the output when it appears.
     for prompt in getattr(result, "awaiting_input", []):

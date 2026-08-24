@@ -14,10 +14,13 @@ extra installed.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -27,13 +30,17 @@ class RunResult:
     record an ``exception`` result for this one scenario and carry on instead of aborting the sweep.
     ``outcome`` is a ``sora.adapters.are_sim.ValidationOutcome`` (``success=None`` when unscored or
     when the run failed before scoring). ``awaiting_input`` holds the prompts of any activity the
-    run ended on a question from — empty for every ordinary run."""
+    run ended on a question from — empty for every ordinary run. ``write_counts`` is a
+    ``sora.adapters.are_sim.WriteCountCheck`` when an oracle log was available (None otherwise) —
+    ARE's tool-call-count gate recomputed offline, which costs no model tokens and so is filled in
+    for *unscored* runs too."""
 
     outcome: Any
     environment: Any
     duration: float
     exception: Exception | None = None
     awaiting_input: list[str] = field(default_factory=list)
+    write_counts: Any = None
 
 
 def _awaiting_input(agent: Any) -> list[str]:
@@ -111,7 +118,7 @@ def run_scenario(
     unscored (``outcome.success is None``). A run-time crash or a ``validate()`` error is captured
     on ``RunResult.exception`` rather than raised, so a batch loop can record it and move on;
     ``KeyboardInterrupt`` still propagates so an operator can abort."""
-    from sora.adapters.are_sim import AreSimulation, ValidationOutcome
+    from sora.adapters.are_sim import AreSimulation, ValidationOutcome, write_count_check
     from sora.bootstrap import build_agent
     from sora.cli import TerminalSession
 
@@ -147,6 +154,16 @@ def run_scenario(
             outcome = simulation.validate()
         except Exception as e:  # judge/oracle failure surfaces here, not as a silent unscored run
             exc = e
+
+    # Deliberately outside the judge guard and after validate(): it needs no judge and no tokens, so
+    # an unscored dev run — where it is the only pass/fail signal there is — gets it too. Never lets
+    # a reporting failure cost the run's real result.
+    counts: Any = None
+    try:
+        counts = write_count_check(scenario, simulation.environment())
+    except Exception:  # a diagnostic must never cost the run its real result
+        log.warning("write-count check failed", exc_info=True)
+
     return RunResult(
         outcome=outcome,
         environment=simulation.environment(),
@@ -156,4 +173,5 @@ def run_scenario(
         # error: the agent halting to ask rather than looping is the designed behavior, and the
         # scenario is still scored normally — this only records *why* it stopped short.
         awaiting_input=_awaiting_input(agent),
+        write_counts=counts,
     )
