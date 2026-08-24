@@ -767,6 +767,34 @@ def test_plan_prompt_instructs_references_for_runtime_dependent_params() -> None
     assert "$from" in PLAN_SYSTEM_PROMPT and "$decide" in PLAN_SYSTEM_PROMPT
 
 
+def test_plan_prompt_forbids_unrequested_outward_communication() -> None:
+    """The planner must not correspond with third parties off its own bat.
+
+    A plan that does everything asked plus one courtesy note has acted in the user's name on a
+    matter they never raised. It is also expensive to get wrong under ARE's judge, which gates on
+    an exact per-turn tool-call count before any semantic matching, so a single unrequested send
+    scores the whole scenario zero — see ``sora.adapters.are_sim.write_count_check``."""
+    lowered = PLAN_SYSTEM_PROMPT.lower()
+    assert "never add outward communication" in lowered
+    assert "only where the goal explicitly asks" in lowered
+    # The reply channel to the user stays required — the rule must not be read as suppressing it.
+    assert "not an exception to route around this" in lowered
+
+
+def test_plan_prompt_reads_acceptance_verbs_as_state_changes_not_speech() -> None:
+    """The rule above is not self-applying, and that is what actually failed: a goal saying to
+    "accept any date the other party proposes" was read as a speech act, so the plan replied to
+    them *and* rescheduled. Nothing in the goal asked for the reply — "accept" named the decision,
+    not an instruction to announce it. A bare "don't communicate unless asked" leaves that reading
+    intact, so the verb class has to be named explicitly."""
+    lowered = PLAN_SYSTEM_PROMPT.lower()
+    for verb in ("accept", "confirm", "agree to", "acknowledge", "decline"):
+        assert verb in lowered, f"acceptance verb {verb!r} no longer named for the planner"
+    assert "only look like speech" in lowered
+    # ...and the planner is told what to emit instead, not merely what to avoid.
+    assert "operations that change state" in lowered
+
+
 def test_plan_prompt_steers_conditional_selection_to_a_decide_filter() -> None:
     # A selection with a CONDITIONAL tie-break (only applies among items tied on the primary key,
     # or count-dependent) must NOT be resolved by `sort` + `take` — taking first collapses the tie

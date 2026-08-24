@@ -28,6 +28,7 @@ from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
 from sora.memory import (
+    CONDITION_SYSTEM_PROMPT,
     EpisodicMemory,
     FileMemoryBackend,
     PerceptSnapshot,
@@ -708,6 +709,66 @@ async def test_a_condition_the_plan_declares_is_still_lifted_after_an_unrelated_
 
     assert [s.condition for s in activity.pending_conditions] == [live]
     assert activity.state is ActivityState.BLOCKED  # still waiting on the one that did not retire
+
+
+def test_condition_prompt_licenses_retiring_an_overtaken_branch() -> None:
+    """The runtime has always been able to retire a sibling; the judge was never told it may. The
+    prompt defined RETIRED purely in terms of `until`, so a branch whose `when` had become
+    impossible had no ground to be retired on and stayed armed indefinitely."""
+    lowered = CONDITION_SYSTEM_PROMPT.lower()
+    assert "mutually exclusive" in lowered
+    assert "can no longer happen" in lowered
+    # It must not be read as licensing retirement in general. The parser deliberately degrades
+    # toward "keep waiting" so a flaky call cannot invent work; over-retiring pushes the other way
+    # and drops follow-ups silently, so the ground stays logical impossibility alone.
+    assert "logical incompatibility only" in lowered
+    assert "less likely" in lowered  # named as an explicit non-reason
+
+
+def test_condition_prompt_keeps_firing_a_per_condition_judgement() -> None:
+    # The retirement rule is the one cross-condition inference allowed. Firing must stay independent
+    # per condition, or one branch judged true starts dragging its neighbours along with it.
+    lowered = CONDITION_SYSTEM_PROMPT.lower()
+    assert "judge fired for each condition on its own" in lowered
+
+
+async def test_firing_one_branch_can_retire_its_exclusive_sibling(tmp_path: Path) -> None:
+    """One conditional clause in a goal commonly lifts into several conditions that are exclusive
+    branches of it, and the evidence that fires one branch is exactly the evidence that kills the
+    others. Left armed, the loser keeps watching for something that can no longer happen — and its
+    `then` was written for a world that did not come about, so a later misfire acts on a decision
+    already overtaken. One verdict has to be able to carry both halves of that — pursue the branch
+    that happened, and take the branch it excluded off watch for good."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    taken, overtaken = _condition(), _other_condition("Undo what the other branch arranged")
+    activity = _exhausted(plan_pending=(taken, overtaken))
+    states = [
+        PendingConditionState(condition=taken, evaluated_through=99),
+        PendingConditionState(condition=overtaken, evaluated_through=99),
+    ]
+    activity.pending_conditions = list(states)
+    activity.condition_batch = list(states)
+    activity.condition_verdict = _verdict(fired=(0,), retired=(1,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    # The retired branch is off the watch; firing is not itself retirement, so the branch that fired
+    # keeps watching (its own `until` is what ends it).
+    assert [s.condition for s in activity.pending_conditions] == [taken]
+    # The declaration lives on the frozen Plan.pending, so Reflect would otherwise re-arm the branch
+    # that was just judged dead.
+    assert overtaken in activity.retired_conditions
+    assert taken not in activity.retired_conditions
+    # The winner — and only the winner — is being pursued. Worth pinning because the loser's `then`
+    # is destructive: a branch retired in the same breath must not also be acted on.
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "subgoal"
+    planned = "\n".join(prompt for _, prompt in llm.calls)
+    assert taken.then in planned
+    assert overtaken.then not in planned
 
 
 async def test_a_hallucinated_index_cannot_retire_a_live_condition(tmp_path: Path) -> None:

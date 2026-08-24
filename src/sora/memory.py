@@ -302,6 +302,17 @@ PLAN_SYSTEM_PROMPT = (
     "OTHER person, that is a domain tool's own operation (e.g. an email client's `send_email`), "
     "filling recipient / subject / body from earlier results; when it must reach EACH of several "
     "recipients (e.g. notify each curator), fan that invoke out with a mechanical sub-goal.\n"
+    "Never add outward communication the goal did not ask for. A step that sends something to "
+    "anyone other than the user — a message, a reply, an invitation, a confirmation — belongs in "
+    "the plan ONLY where the goal explicitly asks for it. Doing the requested work AND one extra "
+    "courtesy note is not thoroughness: it speaks in the user's name on a matter they did not "
+    "raise. (`send_message_to_user` is not an exception to route around this — it reports back to "
+    "the user, who asked.)\n"
+    "Some verbs only LOOK like speech. To accept, confirm, agree to, acknowledge, approve, decline "
+    "or turn down an offer or proposal names a DECISION and the state change that records it — not "
+    "an instruction to compose a message saying so. Plan those as the operations that change state "
+    "(make the booking, cancel what it supersedes, update the record), and tell the other party "
+    "only where the goal separately says to.\n"
     "When a parameter's value depends on the RESULT of an earlier step (e.g. an id or address you "
     "only learn by first listing/searching), you do NOT know it yet — never invent a literal. "
     "Instead reference the earlier result:\n"
@@ -1631,6 +1642,13 @@ CONDITION_SYSTEM_PROMPT = (
     "  - RETIRED: the `until` is now satisfied, so the agent should stop waiting on it. A "
     "condition with no `until` is retired only if waiting has become pointless.\n"
     "A condition can be neither (the usual answer: keep waiting), or both.\n"
+    "Judge FIRED for each condition on its own, but retirement is not always independent. "
+    "Conditions listed together usually come from ONE clause of the goal, and often describe "
+    'MUTUALLY EXCLUSIVE branches of it ("if they propose an alternative" / "if they propose '
+    'none"). Firing one branch settles the others: also retire any condition whose `when` can no '
+    "longer happen given what you just judged to be true — a branch that has been overtaken is not "
+    "still waiting, it is decided. Retire on that logical incompatibility only, never because a "
+    "condition merely looks less likely now, and never to tidy up.\n"
     'Respond with ONLY a JSON object {"fired": [<indices>], "retired": [<indices>]} — 0-based '
     "indices into the numbered list, no prose, no fences. Use empty lists when nothing applies."
 )
