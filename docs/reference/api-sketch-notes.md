@@ -1,16 +1,17 @@
-# API Sketch (Archived)
+# API Sketch (Annotated)
 
-!!! warning "Archived, not maintained"
-    This page is a **verbatim snapshot** of `README.md`'s former `## API Sketch` section, kept for
-    historical/browsing continuity after the sketch was removed from README in favor of the
-    generated [Python API Reference](python-api.md). It is **not updated** and **can drift** from
-    the real code — unlike `python-api.md`, nothing rebuilds this page from source. If this page and
-    `python-api.md` ever disagree, `python-api.md` is correct.
+!!! warning "Hand-maintained, not generated"
+    This page began as a **verbatim snapshot** of `README.md`'s former `## API Sketch` section, kept
+    after the sketch was removed from README in favor of the generated [Python API
+    Reference](python-api.md). It is still updated by hand as the code changes, so — unlike
+    `python-api.md`, which is rebuilt from source on every `mkdocs build` — it **can drift**. If this
+    page and `python-api.md` ever disagree, `python-api.md` is correct.
 
-    Use it only as an annotated, narrative-commented companion to the exact reference — the inline
-    `#` comments here often explain *why* a field/type exists in a way the generated page (which
-    mirrors docstrings, and most types intentionally have none — see `CLAUDE.md`'s code-style note)
-    does not.
+    What it offers that the generated page does not is the whole surface in one place, annotated and
+    grouped the way the source is: the inline `#` comments explain *why* a field or type exists, and
+    neighbouring types are read together rather than looked up one at a time. It is also the only
+    view of the API that renders when browsing this repository directly — `python-api.md` is a set
+    of `mkdocstrings` directives that resolve at build time and show nothing on GitHub.
 
 ```python
     # sora/types.py — primitives referenced throughout; kept minimal on purpose
