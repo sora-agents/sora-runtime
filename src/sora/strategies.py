@@ -2548,9 +2548,12 @@ class DefaultReasonStrategy:
         # spin) or swallow one that arrived mid-flight.
         for state, _ in eligible:
             state.evaluated_through = wm.signals_appended
-        changes: list[Change] = []
+        # Paired with the source that reported them, not flattened into a bare list: a `Change`
+        # names the path that moved but not the tool it moved on, and the judgement needs both to
+        # dereference the ids back into records (see ProceduralMemory.render_changes).
+        changes: list[tuple[str, Change]] = []
         for _, percept in eligible:
-            changes.extend(changes_of(percept.payload))
+            changes.extend((percept.source, change) for change in changes_of(percept.payload))
         observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
         evaluate = cycle.actions.internal(EvaluateConditionsAction.name)
         await evaluate.execute(

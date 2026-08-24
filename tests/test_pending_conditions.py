@@ -30,6 +30,7 @@ from sora.environment import EnvironmentRegistry, WorkspaceOrigin
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptSnapshot,
     ProceduralMemory,
     SemanticMemory,
     WorkingMemory,
@@ -50,6 +51,7 @@ from sora.types import (
     Change,
     ConditionWait,
     InputWait,
+    ObservableProperty,
     PendingCondition,
     PendingConditionState,
     Plan,
@@ -950,3 +952,136 @@ def test_render_plan_omits_an_absent_until() -> None:
     )
     rendered = render_plan(plan)
     assert "when" in rendered and "until" not in rendered
+
+
+# --------------------------------------------------------------------------------------------------
+# The judgement must be able to READ what changed, not just be told where it is
+# --------------------------------------------------------------------------------------------------
+# ADR-0022 divides the labour: `Change` carries identities only, and "the values behind them come
+# from the observed property snapshot" — so the judge "reads one named path instead of re-scanning a
+# whole property". The dereference half was never implemented. `evaluate_conditions` rendered the
+# raw ids plus `render_properties`, which collapses any property over its length cap to a shape
+# sketch, so a 129-email ARE inbox arrived as `emails: [{... x 10}] x 129` and the id that had just
+# landed was never resolved to its body. In the gaia2 adaptability run the gate opened correctly,
+# the activity resumed correctly, and the judge then answered fired=() — having been shown an id and
+# a shape, and asked whether someone had declined an invitation.
+
+
+def _inbox(*emails: dict[str, Any]) -> Percept:
+    """An ARE-shaped Emails.state: bulk enough that render_properties must shape-sketch it."""
+    return Percept(
+        "insim:are/Emails",
+        ObservableProperty(
+            "state",
+            {
+                "user_email": "astrid@example.com",
+                "folders": {
+                    "INBOX": {"folder_name": "INBOX", "emails": list(emails)},
+                    "SENT": {"folder_name": "SENT", "emails": []},
+                },
+            },
+        ),
+        0.0,
+    )
+
+
+_REPLY = {
+    "email_id": "e9",
+    "sender": "ake@filmproduktion.se",
+    "subject": "Re: Film Production Day",
+    "content": "Sorry, I cannot make Saturday. How about Tuesday the 22nd at 10:00?",
+}
+
+
+async def test_the_judgement_is_shown_the_record_the_change_points_at(tmp_path: Path) -> None:
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    activity = _exhausted()
+    observed = PerceptSnapshot([_inbox({"email_id": "old"}, _REPLY)], [])
+
+    await procedural.evaluate_conditions(
+        activity,
+        [_condition()],
+        [("insim:are/Emails", Change(path="folders.INBOX.emails", added=("e9",)))],
+        observed,
+    )
+
+    _system, prompt = llm.calls[0]
+    assert "cannot make Saturday" in prompt  # the body, not merely the id
+    assert "Tuesday the 22nd" in prompt
+
+
+async def test_only_the_changed_record_is_dereferenced_not_the_whole_property(
+    tmp_path: Path,
+) -> None:
+    # The point of a located change: one named path, not a re-scan. An inbox holding hundreds of
+    # unrelated emails must not drag them all into the prompt just because one arrived.
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    noise = [{"email_id": f"n{i}", "content": f"unrelated chatter {i}"} for i in range(200)]
+    observed = PerceptSnapshot([_inbox(*noise, _REPLY)], [])
+
+    await procedural.evaluate_conditions(
+        activity := _exhausted(),
+        [_condition()],
+        [("insim:are/Emails", Change(path="folders.INBOX.emails", added=("e9",)))],
+        observed,
+    )
+    assert activity is not None
+
+    _system, prompt = llm.calls[0]
+    assert "cannot make Saturday" in prompt
+    assert "unrelated chatter 7" not in prompt
+
+
+async def test_a_coarse_change_carries_no_ids_and_still_judges(tmp_path: Path) -> None:
+    # Adapters DEGRADE rather than fail (types.py): a coarse Change names a path with all three
+    # tuples empty. There is nothing to dereference, and that must not raise.
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    observed = PerceptSnapshot([_inbox(_REPLY)], [])
+
+    await procedural.evaluate_conditions(
+        _exhausted(),
+        [_condition()],
+        [("insim:are/Emails", Change(path="folders.INBOX.emails"))],
+        observed,
+    )
+
+    assert len(llm.calls) == 1
+
+
+async def test_a_change_path_that_no_longer_resolves_is_skipped_not_raised(tmp_path: Path) -> None:
+    # The snapshot is read at judgement time, not change time, so a path can have gone away.
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    observed = PerceptSnapshot([_inbox(_REPLY)], [])
+
+    await procedural.evaluate_conditions(
+        _exhausted(),
+        [_condition()],
+        [("insim:are/Emails", Change(path="folders.ARCHIVE.emails", added=("e9",)))],
+        observed,
+    )
+
+    assert len(llm.calls) == 1
+
+
+async def test_the_gate_hands_the_judgement_the_source_of_each_change(tmp_path: Path) -> None:
+    # End to end through Reason: the strategy used to flatten (percept, Change) into a bare
+    # list[Change], discarding the source — which is what says WHICH property to dereference.
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    activity.pending_conditions = [
+        PendingConditionState(condition=_condition(), evaluated_through=0)
+    ]
+    working.activities[activity.id] = activity
+    working.properties[("insim:are/Emails", "state")] = _inbox(_REPLY)
+    _signal(working, "folders.INBOX.emails")
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, prompt = llm.calls[0]
+    assert "cannot make Saturday" in prompt

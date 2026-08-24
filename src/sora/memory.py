@@ -40,6 +40,7 @@ from sora.types import (
     Step,
     SupersededPlan,
     UnresolvableGrounding,
+    walk_path,
 )
 
 if TYPE_CHECKING:
@@ -760,6 +761,103 @@ def render_properties(properties: list[Percept]) -> str:
         f"- {p.source}.{p.payload.name} = {_render_property_value(p.payload.value)}"
         for p in properties
     )
+
+
+# A located change resolves to whole records, and the same all-or-nothing rule as history applies:
+# a record cut mid-field is worse than an absent one, because the judgement reads it as complete.
+# Smaller than the history budget — this is a delta (what just moved), not an execution trace.
+_CHANGED_RECORD_BUDGET = 12_000
+
+
+def _identifies(item: Any, wanted: set[str]) -> bool:
+    """Whether a record is one of the ones a ``Change`` named. An adapter reports *which* ids moved
+    but never which FIELD carries the id, so matching any string field is the only general test —
+    and an id is opaque enough that a collision against an unrelated field would itself be a real
+    coincidence rather than a routine false positive."""
+    if isinstance(item, dict):
+        return any(value in wanted for value in item.values() if isinstance(value, str))
+    return isinstance(item, str) and item in wanted
+
+
+def _records_for_change(value: Any, change: Change) -> list[Any]:
+    """The records inside one property that a ``Change``'s ids point at.
+
+    Handles both container shapes an adapter publishes: an ``{id -> record}`` map (indexed straight)
+    and a list of records (scanned for the id). ``removed`` ids are deliberately not looked up —
+    they are gone from the snapshot by definition, so naming them is all that can be done.
+    """
+    ids = change.added + change.updated
+    if not ids:  # the coarse form: "something under here moved", nothing to dereference
+        return []
+    try:
+        container = walk_path(value, change.path)
+    except (KeyError, IndexError, TypeError, ValueError):
+        # The snapshot is read at judgement time, not at change time, so a path can have gone away
+        # between the two. Skip it: the change line still says where to look.
+        return []
+    if isinstance(container, dict):
+        return [container[key] for key in ids if key in container]
+    if isinstance(container, list):
+        wanted = set(ids)
+        return [item for item in container if _identifies(item, wanted)]
+    return []
+
+
+def render_changes(changes: Sequence[tuple[str, Change]], properties: list[Percept]) -> str:
+    """Render located changes for a judgement prompt: *where* each one landed, and then the actual
+    records behind the ids, dereferenced out of the property snapshot.
+
+    This is the division of labour ADR-0022 specifies — ``Change`` carries identities only, and "the
+    values behind them come from the observed property snapshot", so the judgement "reads one named
+    path instead of re-scanning a whole property". Only the dereference makes that true. Without it
+    the judge got the ids and `render_properties`, which shape-sketches any property past its length
+    cap: a 129-email inbox arrives as ``emails: [{... x 10}] x 129`` and the id that just landed is
+    nowhere in the prompt. Asking whether someone declined an invitation, while showing neither the
+    invitation nor the reply, can only produce "nothing fired".
+
+    Duplicate changes are collapsed. Several conditions on one activity routinely declare the same
+    watch, and each eligible one contributes its own copy of the identical ``Change`` — six of them
+    in the run this was found in, six identical lines in the prompt.
+    """
+    if not changes:
+        return "(the source reported no detail about what moved)"
+    seen: set[tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = set()
+    located: list[str] = []
+    records: list[tuple[str, str | None, str]] = []
+    rendered_records: set[str] = set()
+    for source, change in changes:
+        key = (source, change.path, change.added, change.removed, change.updated)
+        if key in seen:
+            continue
+        seen.add(key)
+        where = f"{source}.{change.path or '(whole property)'}"
+        detail = "".join(
+            f" {label}={list(ids)}"
+            for label, ids in (
+                ("added", change.added),
+                ("removed", change.removed),
+                ("updated", change.updated),
+            )
+            if ids
+        )
+        located.append(f"- {where}{detail}")
+        for percept in properties:
+            if percept.source != source:
+                continue
+            found = _records_for_change(percept.payload.value, change)
+            for record in found:
+                body = _one_line(_render_json(record))
+                if body not in rendered_records:
+                    rendered_records.add(body)
+                    records.append((where, None, body))
+            if found:
+                break  # a Change names a path, not a property; the first that resolves is it
+    block = "\n".join(located)
+    if records:
+        block += "\n\nThe records behind those ids, read from the current snapshot:\n" + "\n".join(
+            _fit_to_budget(records, _CHANGED_RECORD_BUDGET)
+        )
+    return block
 
 
 def render_signals(signals: list[Percept]) -> str:
@@ -1895,7 +1993,7 @@ class ProceduralMemory:
         self,
         activity: Activity,
         conditions: Sequence[PendingCondition],
-        changes: Sequence[Change],
+        changes: Sequence[tuple[str, Change]],
         observed: PerceptSnapshot | None = None,
     ) -> ConditionVerdict:
         """Judge, in ONE call, which of an activity's eligible pending conditions have fired or
@@ -1905,9 +2003,14 @@ class ProceduralMemory:
         of the mechanical `watch` gate is to make the model see only changes that already passed a
         cheap filter. Batching is what keeps that saving as conditions accumulate.
 
-        The `changes` are rendered as *where* to look; the values behind them come from the observed
-        property snapshot, which is exactly the division of labour a located change summary exists
-        to create — the judgement reads one named path instead of re-scanning a whole property.
+        The `changes` are rendered as *where* to look, and `render_changes` then dereferences their
+        ids against the observed property snapshot to show the records themselves — which is the
+        division of labour a located change summary exists to create: the judgement reads one named
+        path instead of re-scanning a whole property. Each change is paired with the **source** that
+        reported it, because a bare `Change` says which path moved but not on which tool, and both
+        are needed to find the value. Note the dereference is what makes the whole layer work at
+        all: the judgement is irreducibly semantic ("did he decline?"), so a prompt carrying only
+        opaque ids and a shape sketch of the property cannot answer it, and answers "nothing fired".
         """
         if self._llm is None:
             raise RuntimeError(
@@ -1920,20 +2023,10 @@ class ProceduralMemory:
             f"{i}. when: {c.when}\n   until: {c.until or '(no explicit bound)'}"
             for i, c in enumerate(conditions)
         )
-        where = (
-            "\n".join(
-                f"- {ch.path or '(whole property)'}"
-                + (f" added={list(ch.added)}" if ch.added else "")
-                + (f" removed={list(ch.removed)}" if ch.removed else "")
-                + (f" updated={list(ch.updated)}" if ch.updated else "")
-                for ch in changes
-            )
-            or "(the source reported no detail about what moved)"
-        )
         user = (
             f"Original goal: {activity.goal}\n"
             f"Conditions:\n{listed}\n"
-            f"What changed:\n{where}\n"
+            f"What changed:\n{render_changes(changes, snapshot.properties)}\n"
             f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
             f"Recently observed signals:\n{render_signals(snapshot.signals)}"
         )
