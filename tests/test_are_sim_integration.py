@@ -214,3 +214,33 @@ def test_undated_scenario_starts_now_rather_than_at_the_epoch() -> None:
         assert sim.environment().time_manager.time() >= before
     finally:
         sim.stop()
+
+
+# ------------------------------------------------------------------------------------------------
+# is_running() — a paused environment is mid-flight, not finished.
+# ------------------------------------------------------------------------------------------------
+
+
+def test_a_paused_environment_still_reports_running() -> None:
+    """ARE's per-turn gate wraps the judge in ``env.pause()``/``env.resume()``, so with a
+    model-backed judge the environment sits in ``PAUSED`` for the length of that call — seconds to
+    tens of seconds. ARE's own ``Environment.is_running()`` is ``state == RUNNING`` exactly, so
+    delegating to it reports "not running" for that whole window; an eval runner polling this
+    alongside "every activity is blocked" then tears the run down mid-judgement and loses every turn
+    after the first. Only STOPPED/FAILED mean the timeline is over."""
+    from are.simulation.types import EnvironmentState
+
+    sim = AreSimulation(_DynamicScenario())
+    sim.start()
+    try:
+        assert sim.is_running() is True
+        env = sim.environment()
+        env.pause()
+        assert env.state is EnvironmentState.PAUSED
+        assert env.is_running() is False  # ARE's own view — the thing we must not delegate to
+        assert sim.is_running() is True  # ours: paused is still live
+        env.resume()
+        assert sim.is_running() is True
+    finally:
+        sim.stop()
+    assert sim.is_running() is False  # stopped is genuinely over

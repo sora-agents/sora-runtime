@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+from examples.gaia2 import _runner
 from examples.gaia2._runner import _awaiting_input, _make_stop_when
 from examples.gaia2.batch import (
     _jsonl_record,
@@ -20,7 +22,7 @@ from examples.gaia2.batch import (
 )
 
 from sora.activity import ActivityState
-from sora.types import InputWait, SignalWait
+from sora.types import ConditionWait, InputWait, SignalWait
 
 # -- _score_status: the four ARE-parity cases ----------------------------------------------------
 
@@ -145,13 +147,21 @@ def _agent_with(
     return SimpleNamespace(working=SimpleNamespace(activities=activities))
 
 
+def _sim(*, running: bool, paused: bool = False) -> SimpleNamespace:
+    """The predicate reads both flags, so a fake has to answer both. They are not exclusive: a
+    paused environment is one ARE holds mid-turn around a judge call, and ``is_running()`` counts
+    that as live — the pair a real ``AreSimulation`` reports while a judge is in flight is
+    ``running=True, paused=True``."""
+    return SimpleNamespace(is_running=lambda: running, is_paused=lambda: paused)
+
+
 def test_stop_when_none_when_exit_when_idle_set() -> None:
     # Opting into the quiet-window heuristic means no custom predicate.
     assert _make_stop_when(SimpleNamespace(), SimpleNamespace(), 8.0, 1200.0) is None
 
 
 def test_stop_when_rides_through_live_timeline() -> None:
-    sim = SimpleNamespace(is_running=lambda: True)
+    sim = _sim(running=True)
     agent = _agent_with([ActivityState.TERMINATED])  # even fully idle, a live timeline keeps going
     predicate = _make_stop_when(sim, agent, None, 1200.0)
     assert predicate is not None
@@ -159,14 +169,14 @@ def test_stop_when_rides_through_live_timeline() -> None:
 
 
 def test_stop_when_stops_once_timeline_done_and_all_terminated() -> None:
-    sim = SimpleNamespace(is_running=lambda: False)
+    sim = _sim(running=False)
     predicate = _make_stop_when(sim, _agent_with([ActivityState.TERMINATED]), None, 1200.0)
     assert predicate is not None
     assert predicate() is True
 
 
 def test_stop_when_waits_for_in_flight_activity_after_timeline_done() -> None:
-    sim = SimpleNamespace(is_running=lambda: False)
+    sim = _sim(running=False)
     agent = _agent_with([ActivityState.TERMINATED, ActivityState.READY])
     predicate = _make_stop_when(sim, agent, None, 1200.0)
     assert predicate is not None
@@ -174,10 +184,64 @@ def test_stop_when_waits_for_in_flight_activity_after_timeline_done() -> None:
 
 
 def test_stop_when_wall_clock_cap_fires() -> None:
-    sim = SimpleNamespace(is_running=lambda: True)  # timeline still live, but the cap wins
+    sim = _sim(running=True)  # timeline still live, but the cap wins
     predicate = _make_stop_when(sim, _agent_with([ActivityState.READY]), None, -1.0)
     assert predicate is not None
     assert predicate() is True
+
+
+# -- the pause cap: bound a stalled judge without bounding a slow scenario ------------------------
+
+
+def test_stop_when_rides_through_a_judge_pause() -> None:
+    """The run-6 shape, pinned: ARE pauses the timeline around each per-turn judge call, so the
+    environment is mid-turn while every activity sits on the conditions its exhausted plan body
+    left behind — which past the end of a timeline is exactly what "finished" looks like. The run
+    has to sit through the pause instead, or it is torn down inside the judge's own window and
+    every later turn is lost."""
+    sim = _sim(running=True, paused=True)
+    agent = _agent_with([ActivityState.BLOCKED], [ConditionWait()])
+    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    assert predicate is not None
+    assert predicate() is False
+
+
+def test_stop_when_a_pause_that_never_ends_is_a_stall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A judge that never answers leaves the environment paused for good — ARE's pause/resume
+    bracket is not exception-safe. Without a cap the run sits out its whole wall clock, which on a
+    sweep is the difference between three minutes and twenty per hung scenario."""
+    clock = 1000.0
+    monkeypatch.setattr("examples.gaia2._runner.time.monotonic", lambda: clock)
+    sim = _sim(running=True, paused=True)
+    predicate = _make_stop_when(sim, _agent_with([ActivityState.READY]), None, 1200.0)
+    assert predicate is not None
+    assert predicate() is False  # the first poll only starts the pause clock
+
+    clock += _runner.MAX_PAUSE_SECONDS - 1
+    assert predicate() is False  # still inside the allowance
+    clock += 1
+    assert predicate() is True
+
+
+def test_stop_when_pause_allowance_resets_between_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cap is per pause, not cumulative: a scenario pauses once per turn, and summing those
+    would fail a perfectly healthy multi-turn run."""
+    clock = 1000.0
+    monkeypatch.setattr("examples.gaia2._runner.time.monotonic", lambda: clock)
+    paused = True
+    sim = SimpleNamespace(is_running=lambda: True, is_paused=lambda: paused)
+    predicate = _make_stop_when(sim, _agent_with([ActivityState.READY]), None, 1200.0)
+    assert predicate is not None
+    assert predicate() is False
+
+    clock += _runner.MAX_PAUSE_SECONDS - 1  # a long, but answered, judge call
+    paused = False
+    assert predicate() is False  # resumed: the allowance is spent, not banked
+
+    paused = True  # the next turn's judge call starts its own allowance
+    assert predicate() is False
+    clock += _runner.MAX_PAUSE_SECONDS - 1
+    assert predicate() is False
 
 
 # -- --init-turns: turn wiring without a judge ----------------------------------------------------
@@ -284,7 +348,7 @@ def _asking(prompt: str = "Stuck on 'x': ... How should I proceed?") -> SimpleNa
 
 
 def test_stop_when_stops_on_a_question_nobody_is_left_to_answer() -> None:
-    sim = SimpleNamespace(is_running=lambda: False)  # timeline over: no further user turn is coming
+    sim = _sim(running=False)  # timeline over: no further user turn is coming
     agent = _agent_with([ActivityState.BLOCKED], [InputWait(prompt="How should I proceed?")])
     predicate = _make_stop_when(sim, agent, None, 1200.0)
     assert predicate is not None
@@ -295,7 +359,7 @@ def test_stop_when_lets_a_live_timeline_answer_the_question() -> None:
     """The guard order matters: while turns are still arriving one of them can resume the activity
     (Observe clears an InputWait on a user Message), so cutting the run here throws away a
     recoverable state rather than saving wall clock."""
-    sim = SimpleNamespace(is_running=lambda: True)
+    sim = _sim(running=True)
     agent = _agent_with([ActivityState.BLOCKED], [InputWait(prompt="How should I proceed?")])
     predicate = _make_stop_when(sim, agent, None, 1200.0)
     assert predicate is not None
@@ -305,7 +369,7 @@ def test_stop_when_lets_a_live_timeline_answer_the_question() -> None:
 def test_stop_when_still_waits_on_an_activity_blocked_for_a_signal() -> None:
     """Only a *question* ends the run. A SignalWait resolves from tool state, which can still
     settle after the timeline stops, so the narrower InputWait test is the deliberate one."""
-    sim = SimpleNamespace(is_running=lambda: False)
+    sim = _sim(running=False)
     agent = _agent_with([ActivityState.BLOCKED], [SignalWait(signal_name="job_done")])
     predicate = _make_stop_when(sim, agent, None, 1200.0)
     assert predicate is not None
@@ -313,7 +377,7 @@ def test_stop_when_still_waits_on_an_activity_blocked_for_a_signal() -> None:
 
 
 def test_stop_when_a_question_does_not_excuse_work_still_in_flight() -> None:
-    sim = SimpleNamespace(is_running=lambda: False)
+    sim = _sim(running=False)
     agent = _agent_with(
         [ActivityState.READY, ActivityState.BLOCKED],
         [None, InputWait(prompt="How should I proceed?")],

@@ -22,6 +22,13 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# How long ARE may hold the timeline paused before the run is treated as stalled. The pause bracket
+# around a per-turn judge call is the only thing that pauses a benchmark run, and a judge that is
+# answering at all answers in seconds; three minutes is slack for a slow endpoint, not for a call
+# that will never return. Deliberately not a CLI flag: it separates "the judge died" from "this
+# scenario is slow", which is a property of the judge, not of the run being scored.
+MAX_PAUSE_SECONDS = 180.0
+
 
 @dataclass
 class RunResult:
@@ -73,10 +80,23 @@ def _make_stop_when(
     if exit_when_idle is not None:
         return None
     deadline = time.monotonic() + max_wall_seconds
+    paused_since: float | None = None
 
     def _timeline_done() -> bool:
-        if time.monotonic() >= deadline:
+        nonlocal paused_since
+        now = time.monotonic()
+        if now >= deadline:
             return True
+        # A paused environment is a judge call in flight, so the timeline is mid-turn, not over --
+        # but bound that wait on its own. The whole-run clock already backstops a stalled judge;
+        # what it cannot do is tell a stall from a slow scenario, so it can only be set to the
+        # larger of the two and then pays that price per hung scenario across a sweep. This keeps
+        # the two independent: a judge that answers in seconds is never touched, and one that never
+        # answers costs MAX_PAUSE_SECONDS instead of the full wall clock.
+        if simulation.is_paused():
+            paused_since = now if paused_since is None else paused_since
+            return now - paused_since >= MAX_PAUSE_SECONDS
+        paused_since = None
         if simulation.is_running():
             return False  # timeline live — keep going, more turns may arrive
         acts = list(agent.working.activities.values())

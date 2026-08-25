@@ -71,6 +71,7 @@ async def test_are_mcp_agent_runs_against_real_are(tmp_path: Path) -> None:
     transport.submit(Message(sender="user", content={"text": _TASK}, received_at=time.time()))
 
     runner = asyncio.create_task(agent.run())
+    tool_ids: set[str] = set()
     try:
         deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline:
@@ -80,6 +81,10 @@ async def test_are_mcp_agent_runs_against_real_are(tmp_path: Path) -> None:
             activities = list(agent.working.activities.values())
             if activities and any(a.state is ActivityState.TERMINATED for a in activities):
                 break
+        # Snapshot the registry while the agent is still up: stopping it leaves/closes every
+        # workspace, so reading tool ids afterwards yields an empty set and the no-made-up-ids
+        # assertion below fails against nothing regardless of what the model planned.
+        tool_ids = {t.id for t in agent.registry.all_tools()}
     finally:
         await agent.stop()
         if not runner.done():
@@ -95,7 +100,7 @@ async def test_are_mcp_agent_runs_against_real_are(tmp_path: Path) -> None:
     assert activity.plan is not None, "the model produced no plan"
     assert activity.plan.steps, "the model returned an empty plan"
     # Every invoke step references a real ARE tool that discover() registered (no made-up ids).
-    tool_ids = {t.id for t in agent.registry.all_tools()}
+    assert tool_ids, "the registry was empty while the agent was running"
     for step in activity.plan.steps:
         if step.next_action == "invoke":
             assert step.params["tool_id"] in tool_ids

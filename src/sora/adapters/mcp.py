@@ -28,7 +28,13 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.types import ResourceUpdatedNotification, ServerNotification, TextContent
+from mcp.shared.exceptions import McpError
+from mcp.types import (
+    METHOD_NOT_FOUND,
+    ResourceUpdatedNotification,
+    ServerNotification,
+    TextContent,
+)
 
 from sora.manual import (
     Manual,
@@ -382,6 +388,7 @@ class _McpTool:
         self._bindings = bindings
         self._sink: SignalSink | None = None
         self._cache: dict[str, Any] = {}  # property_name -> last-known value
+        self._subscribed: set[str] = set()  # uris this server actually accepted a subscription for
 
     async def invoke(self, operation_name: str, **params: Any) -> OperationAck:
         result = await self._session.call_tool(
@@ -393,15 +400,37 @@ class _McpTool:
         self._sink = sink
         for binding in self._bindings:
             self._cache[binding.property_name] = await self._read(binding.uri)
-            await self._session.subscribe_resource(binding.uri)
-            self._router.register(binding.uri, self._make_handler(binding))
+            if await self._subscribe(binding.uri):
+                self._router.register(binding.uri, self._make_handler(binding))
 
     async def unfocus(self) -> None:
         for binding in self._bindings:
             self._router.unregister(binding.uri)
-            await self._session.unsubscribe_resource(binding.uri)
+            if binding.uri in self._subscribed:
+                await self._session.unsubscribe_resource(binding.uri)
+        self._subscribed.clear()
         self._cache.clear()
         self._sink = None
+
+    async def _subscribe(self, uri: str) -> bool:
+        """Subscribe to a resource, reporting whether this server will actually push updates for it.
+
+        ``resources/subscribe`` is an OPTIONAL capability in MCP: a server may serve resources and
+        implement no subscription at all, answering ``Method not found``. Focusing such a tool must
+        still work — the property was already read into the cache above, so ``observe()`` reports a
+        real value and only *change signals* are unavailable. Letting the error escape instead
+        propagates out of Observe and kills the run over a capability the spec never required (real
+        case: ARE's own MCP server). Only ``Method not found`` degrades; any other error is this
+        server failing at something it does implement, and must not be swallowed.
+        """
+        try:
+            await self._session.subscribe_resource(uri)
+        except McpError as exc:
+            if exc.error.code != METHOD_NOT_FOUND:
+                raise
+            return False
+        self._subscribed.add(uri)
+        return True
 
     def observe(self) -> list[ObservableProperty]:
         return [

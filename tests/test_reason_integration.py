@@ -17,13 +17,38 @@ import pytest
 
 from fakes import fake_manual
 from sora.activity import Activity
+from sora.bootstrap import load_dotenv
+from sora.manual import Manual
 from sora.memory import FileMemoryBackend, ProceduralMemory
 from sora.types import Step
+
+
+async def _user_channel() -> dict[str, Manual]:
+    """The agent's own reply channel, exactly as bootstrap always joins it.
+
+    ``PLAN_SYSTEM_PROMPT`` requires a plan for a user-given goal to end by invoking this tool, so a
+    catalog without it asks the model to obey an instruction it cannot satisfy — and an obedient
+    model then invents an id, tripping the no-hallucinated-tools assertion below on a plan that was
+    actually correct. Built through the real adapter rather than a literal id so it cannot drift
+    from what bootstrap wires."""
+    from sora.adapters.runtime_io import RUNTIME_IO_ADAPTER, RUNTIME_IO_ADDRESS, RuntimeIOAdapter
+    from sora.environment import WorkspaceOrigin
+    from sora.transport import InProcessTransport
+
+    adapter = RuntimeIOAdapter(
+        origin=WorkspaceOrigin(adapter=RUNTIME_IO_ADAPTER, address=RUNTIME_IO_ADDRESS),
+        transport=InProcessTransport(),
+    )
+    (workspace,) = await adapter.discover()
+    return {tool.id: tool.manual for tool in workspace.tools()}
 
 
 @pytest.mark.integration
 async def test_infer_produces_a_plan_against_real_claude(tmp_path: Path) -> None:
     pytest.importorskip("anthropic")
+    # The same convenience `build_agent` applies, for the same reason: without it this test skips
+    # even when a local .env has the key, and reports "not set" rather than "not run".
+    load_dotenv()
     if not os.environ.get("ANTHROPIC_API_KEY"):
         pytest.skip("ANTHROPIC_API_KEY not set")
     from sora.adapters.anthropic_llm import AnthropicLLMClient
@@ -33,6 +58,7 @@ async def test_infer_produces_a_plan_against_real_claude(tmp_path: Path) -> None
     tools = {
         "EmailClientApp": fake_manual("EmailClientApp", ["list_emails", "send_email"]),
         "CalendarApp": fake_manual("CalendarApp", ["list_events", "create_event"]),
+        **(await _user_channel()),
     }
     activity = Activity(
         id="a",

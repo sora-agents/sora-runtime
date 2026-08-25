@@ -20,6 +20,9 @@ import pytest
 
 pytest.importorskip("mcp")
 
+from mcp.shared.exceptions import McpError  # noqa: E402
+from mcp.types import INVALID_PARAMS, METHOD_NOT_FOUND, ErrorData  # noqa: E402
+
 from sora.adapters.are_mcp import AreMcpWorkspaceAdapter  # noqa: E402
 from sora.adapters.mcp import (  # noqa: E402
     McpSession,
@@ -192,8 +195,10 @@ async def test_vanilla_invoke_uses_identity_name_assembly() -> None:
 # ------------------------------------------------------------------------------------------------
 # 3–4. ARE grouping: one tool per app, <App>__<op> name assembly, origin-qualified ids
 # ------------------------------------------------------------------------------------------------
-def _are_session() -> FakeMcpSession:
-    return FakeMcpSession(
+def _are_session(cls: type[FakeMcpSession] = FakeMcpSession) -> FakeMcpSession:
+    """The shared ARE-shaped fixture. ``cls`` swaps in a session that behaves differently on one
+    method (e.g. a server with no subscription support) without restating the tools/resources."""
+    return cls(
         tools=[
             _mcp_tool("EmailClientApp__list_emails"),
             _mcp_tool("EmailClientApp__send_email"),
@@ -297,6 +302,65 @@ async def test_unfocus_unsubscribes_and_clears_properties() -> None:
     await email.unfocus()
     assert session.subscribed == set()
     assert email.observe() == []
+
+
+class _NoSubscribeSession(FakeMcpSession):
+    """A server that serves resources but implements no subscription — a spec-legal shape, since
+    ``resources/subscribe`` is an optional capability. ARE's own MCP server is one."""
+
+    async def subscribe_resource(self, uri: Any) -> Any:
+        raise McpError(ErrorData(code=METHOD_NOT_FOUND, message="Method not found"))
+
+
+async def test_focus_survives_a_server_without_subscriptions() -> None:
+    """Focusing must not require the optional subscribe capability. The property is read straight
+    into the cache, so the tool is still observable — only change *signals* are unavailable. Letting
+    the error escape propagates out of Observe and takes the whole run down over something the spec
+    never obliged the server to implement."""
+    origin = _origin()
+    session = _are_session(_NoSubscribeSession)
+    workspace = (await _are_adapter(session, origin).discover())[0]
+    email = next(t for t in workspace.tools() if t.id.endswith("EmailClientApp"))
+
+    await email.focus(NotificationQueueSink[Signal]())
+
+    assert {p.name: p.value for p in email.observe()} == {"state": {"unread": 3}}
+    assert session.subscribed == set()
+
+
+async def test_unfocus_does_not_unsubscribe_what_was_never_subscribed() -> None:
+    # Unsubscribing a URI the server never accepted would raise the same Method not found on the
+    # way out — turning a clean teardown into a second failure.
+    origin = _origin()
+    session = _are_session(_NoSubscribeSession)
+    unsubscribed: list[str] = []
+    session.unsubscribe_resource = unsubscribed.append  # type: ignore[method-assign,assignment]
+    workspace = (await _are_adapter(session, origin).discover())[0]
+    email = next(t for t in workspace.tools() if t.id.endswith("EmailClientApp"))
+
+    await email.focus(NotificationQueueSink[Signal]())
+    await email.unfocus()
+
+    assert unsubscribed == []
+    assert email.observe() == []
+
+
+async def test_a_subscribe_failure_that_is_not_method_not_found_still_raises() -> None:
+    """The degrade is narrow on purpose: only "this server has no subscriptions" is tolerated. Any
+    other error means the server does implement subscribe and failed at it, which is a real fault —
+    swallowing it would leave the tool silently signal-less with nothing to show why."""
+
+    class _BrokenSession(FakeMcpSession):
+        async def subscribe_resource(self, uri: Any) -> Any:
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="bad uri"))
+
+    origin = _origin()
+    session = _are_session(_BrokenSession)
+    workspace = (await _are_adapter(session, origin).discover())[0]
+    email = next(t for t in workspace.tools() if t.id.endswith("EmailClientApp"))
+
+    with pytest.raises(McpError):
+        await email.focus(NotificationQueueSink[Signal]())
 
 
 # ------------------------------------------------------------------------------------------------

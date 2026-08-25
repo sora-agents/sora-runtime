@@ -212,14 +212,44 @@ class AreSimulation:
         self._started = False
 
     def is_running(self) -> bool:
-        """True while the scenario's event loop is still advancing (ARE
-        ``EnvironmentState.RUNNING``). Flips to False when the timeline completes
-        (``scenario.duration`` reached) or fails: ARE's ``_event_loop`` sets ``STOPPED``/``FAILED``
-        on loop exit, *after* every scheduled user turn and the per-turn judge
-        ``ConditionCheckEvent``s have fired. So an eval runner that waits for this to go False
-        before calling ``validate()`` scores a fully-played-out scenario, riding through the idle
-        gaps between turns that a quiet-window heuristic would exit on prematurely."""
-        return self._env is not None and self._started and bool(self._env.is_running())
+        """True while the scenario still has timeline left to play — ARE ``RUNNING`` or ``PAUSED``.
+        Flips to False only when the timeline completes (``scenario.duration`` reached) or fails:
+        ARE's ``_event_loop`` sets ``STOPPED``/``FAILED`` on loop exit, *after* every scheduled user
+        turn and the per-turn judge ``ConditionCheckEvent``s have fired. So an eval runner that
+        waits for this to go False before calling ``validate()`` scores a fully-played-out scenario,
+        riding through the idle gaps between turns that a quiet-window heuristic would exit on
+        prematurely.
+
+        ``PAUSED`` counts as live, which is *not* what ARE's own ``Environment.is_running()`` says
+        (that one is ``state == RUNNING`` exactly). ARE's per-turn gate wraps the judge in
+        ``env.pause()`` / ``env.resume()`` (``scenarios/utils/turn_conditions.py``), so with a
+        model-backed judge attached the environment sits in ``PAUSED`` for however long that call
+        takes. Delegating raw would report "not running" for that whole window, and a runner polling
+        this alongside "all activities blocked" would tear the run down mid-judgement — losing every
+        turn after the first. ARE documents ``PAUSED`` as "can be restarted"; it is mid-flight, not
+        finished. A judge that actually rejects a turn calls ``env.stop()``, so the run still ends
+        promptly on a genuine failure."""
+        if self._env is None or not self._started:
+            return False
+        from are.simulation.types import EnvironmentState
+
+        return self._env.state in (EnvironmentState.RUNNING, EnvironmentState.PAUSED)
+
+    def is_paused(self) -> bool:
+        """True while ARE holds the timeline paused — in practice, while a per-turn judge call is
+        in flight (``turn_conditions.wrapped_condition`` brackets it in ``pause()``/``resume()``).
+
+        Exposed so eval tooling can bound *that wait specifically* rather than only the whole run:
+        a healthy judge answers in seconds, so a pause lasting minutes is a stalled call, and the
+        two are indistinguishable through a single wall clock. Note ARE's bracket is not
+        exception-safe — ``resume()`` is not in a ``finally`` — so a judge that raises leaves the
+        environment paused for good. Like ``environment()``, deliberately not on the ``Simulation``
+        Protocol: it says nothing to the adapter/transport, and only concrete eval code reads it."""
+        if self._env is None or not self._started:
+            return False
+        from are.simulation.types import EnvironmentState
+
+        return bool(self._env.state == EnvironmentState.PAUSED)
 
     def apps(self) -> list[Any]:
         return list(getattr(self._scenario, "apps", None) or [])
