@@ -433,6 +433,118 @@ async def test_filter_decide_predicate_is_not_resolved_as_a_value(tmp_path: Path
     assert activity.state is ActivityState.RUNNING
 
 
+async def test_filter_between_reads_a_reference_at_each_end_of_the_pair(tmp_path: Path) -> None:
+    """Two bounds produced by two different steps can only be written as a pair OF references —
+    no single earlier result holds the assembled [lo, hi]. A list isn't itself a reference, so
+    both ends used to reach _matches as raw dicts, every comparison raised TypeError, and the
+    filter kept nothing while reporting an ordinary empty result."""
+    data = [{"v": 2}, {"v": 6}, {"v": 12}]
+    step = Step(
+        next_action="filter",
+        params={
+            "in": data,
+            "out": "inrange",
+            "where": {
+                "path": "v",
+                "op": "between",
+                "value": [{"$from": "get_floor"}, {"$from": "get_ceiling"}],
+            },
+        },
+    )
+    activity = await _run_one_dataop(
+        tmp_path, step, [_history("get_floor", 5), _history("get_ceiling", 10)]
+    )
+    assert [e["v"] for e in activity.bindings["inrange"]] == [6]
+
+
+async def test_filter_between_with_one_unreadable_end_replans(tmp_path: Path) -> None:
+    # A pair is only as comparable as its worse end: one unresolvable bound kills the whole
+    # predicate exactly as two would, so it is a defect, not a half-usable range.
+    step = Step(
+        next_action="filter",
+        params={
+            "in": [{"v": 2}, {"v": 9}],
+            "out": "inrange",
+            "where": {
+                "path": "v",
+                "op": "between",
+                "value": [{"$from": "get_floor"}, {"$bind": "never_computed"}],
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("get_floor", 5)])
+
+    assert "inrange" not in activity.bindings
+    assert activity.plan is None
+    assert activity.superseded is not None
+    assert "never_computed" in (activity.superseded.defect or "")
+
+
+async def test_filter_threshold_resolving_to_a_record_is_a_defect_not_an_empty_result(
+    tmp_path: Path,
+) -> None:
+    """Reading cleanly is not the same as being comparable. A reference that lands on the whole
+    record instead of one of its fields — the commonest way to write this wrong — makes every
+    ordered comparison raise TypeError inside _matches, where it is caught as a non-match by
+    design. The filter then keeps nothing and the empty binding reads downstream as a fact about
+    the world. Say which reference cannot compare instead."""
+    step = Step(
+        next_action="filter",
+        params={
+            "in": [{"v": 2}, {"v": 9}],
+            "out": "above",
+            "where": {"path": "v", "op": "gt", "value": {"$from": "get_budget"}},
+        },
+    )
+    activity = await _run_one_dataop(
+        tmp_path, step, [_history("get_budget", {"amount": 5, "currency": "EUR"})]
+    )
+
+    assert "above" not in activity.bindings
+    assert activity.plan is None
+    assert activity.superseded is not None
+    defect = activity.superseded.defect or ""
+    assert "get_budget" in defect
+    assert "'amount'" in defect  # names what IS there, so the retry can reach for a path
+
+
+async def test_filter_between_against_a_scalar_is_a_defect(tmp_path: Path) -> None:
+    # `between` compares against a pair and treats anything else as a blanket non-match, so a
+    # reference resolving to one bound is dead the same way an unreadable one is.
+    step = Step(
+        next_action="filter",
+        params={
+            "in": [{"v": 2}, {"v": 9}],
+            "out": "inrange",
+            "where": {"path": "v", "op": "between", "value": {"$from": "get_cap"}},
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("get_cap", 5)])
+
+    assert "inrange" not in activity.bindings
+    assert activity.plan is None
+    assert activity.superseded is not None
+    assert "[lo, hi]" in (activity.superseded.defect or "")
+
+
+async def test_filter_eq_against_a_resolved_none_still_runs(tmp_path: Path) -> None:
+    """The shape check must not overreach: `eq` against a null is a legitimate predicate (keep the
+    items whose field is unset), so an operand shape that CAN match is never a defect — only one
+    that provably matches nothing is."""
+    step = Step(
+        next_action="filter",
+        params={
+            "in": [{"v": None}, {"v": 9}],
+            "out": "unset",
+            "where": {"path": "v", "op": "eq", "value": {"$from": "get_nothing"}},
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("get_nothing", None)])
+
+    assert activity.bindings["unset"] == [{"v": None}]
+    assert activity.plan is not None
+
+
 # --------------------------------------------------------------------------------------------------
 # filter — $decide predicate escalates to one off-cycle model call
 # --------------------------------------------------------------------------------------------------
@@ -560,6 +672,37 @@ async def test_collect_gathers_only_the_current_frames_results(tmp_path: Path) -
     await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
 
     assert activity.bindings["day_results"] == [{"day": "thursday"}]
+
+
+async def test_collect_of_a_replaced_plans_results_is_a_defect_not_an_empty_binding(
+    tmp_path: Path,
+) -> None:
+    """A replan resets the frame's span, so results the *replaced* plan fanned out are no longer
+    collectible — deliberately, since a plan is usually discarded because the world moved under it.
+    But the replanning planner is shown the whole history, so it can reasonably write a collect over
+    them. Left alone that binds empty, and the emptiness resurfaces a step later as the generic
+    "an earlier step produced EMPTY — nothing matched", which reads as a fact about the world: the
+    planner re-plans into the same collect on that false premise until the replan breaker parks the
+    activity. Naming the real cause is what breaks the loop."""
+    history = [
+        _history("get_crime_rate", {"zip": "1", "rate": 7}),
+        _history("get_crime_rate", {"zip": "2", "rate": 3}),
+    ]
+    step = Step(next_action="collect", params={"from": "get_crime_rate", "out": "rates"})
+    tool = FakeTool("realestate")
+    cycle, working, _ = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    activity = _activity_with_plan([step], history)
+    activity.history_mark = len(history)  # the replacement plan has run nothing of its own yet
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert "rates" not in activity.bindings  # no empty binding to mislead a later step
+    assert activity.plan is None  # dropped for a replan
+    assert activity.superseded is not None
+    defect = activity.superseded.defect or ""
+    assert "get_crime_rate" in defect
+    assert "PREVIOUS plan" in defect  # the actual cause, not "nothing matched"
 
 
 def _history_with_params(

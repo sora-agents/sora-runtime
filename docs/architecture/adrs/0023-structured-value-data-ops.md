@@ -89,7 +89,11 @@ Concretely:
 * **`collect` is map-invoke's MapReduce gather**: a fan-out leaves N results scattered across
   `Activity.history`; `collect` materializes them (by operation name) into one binding that any
   downstream op (filter/sort/take/reduce) can consume. This is why `collect` is kept separate from
-  `reduce` — fold it in and only `reduce` could see a fan-out's output.
+  `reduce` — fold it in and only `reduce` could see a fan-out's output. It gathers only the runs of
+  the *current* plan frame (`Activity.history_mark`), since it accumulates every match and would
+  otherwise sweep up a finished plan's stale results alongside its own; a replan resets that span
+  with the plan, so a `collect` naming an operation that ran only *before* it is reported as a plan
+  defect (re-invoke it here) rather than silently binding empty.
 
 Named bindings are transient run state (a sibling of `history`/`grounded_params`, **not** a new
 memory module) and are cleared on replan, since they are coupled to the plan that produced them.
@@ -236,6 +240,26 @@ drops it just as silently in the other direction. And a `$decide` in the *operan
 rejected with a message naming what to write instead — it is the "hide the computation inside a
 parameter" shape this ADR rejected as option (a), it was never documented in any prompt, and it
 previously resolved to an empty set or a raw dict, failing open either way.
+
+**A reference may sit inside a list operand (2026-08-26).** Resolution above reads the whole `value`
+position, and a list is not itself a reference — so a list *of* references passed straight through.
+That is precisely how a `between` over two independently computed bounds has to be written,
+`[{"$bind": "lo"}, {"$bind": "hi"}]`, since no single earlier step produces the assembled pair. It
+reached `_matches` with its reference dicts intact and kept nothing. References inside a list
+operand are now resolved element-wise. One unreadable end is a defect for the whole predicate: a
+pair is only as comparable as its worse end.
+
+**Reading is not comparing (2026-08-26).** A reference can resolve cleanly and still leave an
+operand that nothing can be compared against — `None`, a whole record, a list. Ordered comparisons
+against one raise inside `_matches`, which catches that as a non-match *by design*, and `between`
+rejects anything that is not a two-element pair the same way. Either way the filter keeps nothing
+and reports it as an ordinary empty result. So the resolved operand is checked against its op's
+shape — one value for `lt/le/gt/ge`, a pair for `between` — and a shape that can match nothing is a
+defect on the same grounds as an unreadable one: empty is an answer, uncomparable is a question. A
+literal operand is checked identically, since how the operand was written makes no difference to
+the filter it kills. `eq`/`ne` are excluded deliberately: any shape can genuinely match there — a
+field that really is null, an object compared whole — so a defect would refuse a legitimate
+predicate to guard against a mistake the shape alone does not prove.
 
 **`collect` carries the fan-out key.** A map-invoke leaves N results scattered in history;
 `collect` gathers them, and — because a tool's result often doesn't echo the input it was called

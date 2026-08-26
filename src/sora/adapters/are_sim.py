@@ -23,6 +23,7 @@ satisfy, so S-ORA-side logic stays testable without ARE (see ADR-0003).
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import logging
 import threading
@@ -385,7 +386,11 @@ def populate_oracle_events(scenario: Any) -> None:
     this mirrors ARE's own ordering (initialize -> oracle replay -> ``soft_reset``), and that
     ``soft_reset`` hands the agent run a clean environment afterwards. A no-op when the log is
     there, so pairing it with ``attach_judge`` wastes nothing; also a no-op for a scenario with no
-    ``OracleEvent``s, which simply has no oracle to compare against."""
+    ``OracleEvent``s, which simply has no oracle to compare against.
+
+    Raises when the replay itself fails, leaving the scenario as it was found — the apps are
+    restored either way — so a caller for whom the gate is only a diagnostic can catch it and run
+    without one rather than lose the run."""
     from are.simulation.environment import Environment, EnvironmentConfig
     from are.simulation.scenarios.scenario_imported_from_json.benchmark_scenario import (
         build_event_id_to_turn_idx,
@@ -403,14 +408,24 @@ def populate_oracle_events(scenario: Any) -> None:
     env = Environment(
         EnvironmentConfig(oracle_mode=True, queue_based_loop=True, start_time=scenario.start_time)
     )
-    env.run(scenario)
-    env.stop()
-    oracle_log = env.event_log.list_view()
+    try:
+        env.run(scenario)
+        oracle_log = env.event_log.list_view()
+    finally:
+        # The replay drives the scenario's *live* apps, so its writes land in the very state the
+        # agent is about to be run against, and ``soft_reset`` is what takes them back out again.
+        # It has to run on the failure path too: a replay that raises partway (or one whose events
+        # failed, checked below) would otherwise hand the agent an environment already carrying
+        # the oracle's emails and calendar entries, with nothing anywhere to say so — a corrupted
+        # run that still looks like a run. Restoring unconditionally is also what lets a caller
+        # treat this whole check as optional and continue without it. ``stop`` only sets a flag
+        # in ARE, so it is safe whether or not the loop ever started.
+        env.stop()
+        scenario.soft_reset()
     if any(e.failed() for e in oracle_log):
         raise RuntimeError(
             f"oracle replay failed: {[e.metadata.exception for e in oracle_log if e.failed()]}"
         )
-    scenario.soft_reset()
     scenario.oracle_run_event_log = oracle_log
     if getattr(scenario, "event_id_to_turn_idx", None) is None:
         build_event_id_to_turn_idx(scenario=scenario)
@@ -453,13 +468,21 @@ class TurnWriteCounts:
         }
 
     @property
-    def passed(self) -> bool:
+    def replies_within_band(self) -> bool:
+        """Whether the replies *to the user* clear the judge's band. Named because it is the one
+        failing dimension ``surplus``/``missing`` cannot express — both are empty when the domain
+        tallies match exactly and only the reply count is off, so a reader handed just those two
+        sees a mismatch with no evidence attached. Anything reporting a failed turn has to be able
+        to ask this separately."""
         return (
-            dict(self.agent) == dict(self.oracle)
-            and self.oracle_user_replies
+            self.oracle_user_replies
             <= self.agent_user_replies
             <= self.oracle_user_replies + self.extra_user_replies_allowed
         )
+
+    @property
+    def passed(self) -> bool:
+        return dict(self.agent) == dict(self.oracle) and self.replies_within_band
 
 
 @dataclass(frozen=True)
@@ -485,17 +508,36 @@ class WriteCountCheck:
                     lines.append(f"    surplus (agent did, oracle did not): {t.surplus}")
                 if t.missing:
                     lines.append(f"    missing (oracle did, agent did not): {t.missing}")
-                if not (
-                    t.oracle_user_replies
-                    <= t.agent_user_replies
-                    <= t.oracle_user_replies + t.extra_user_replies_allowed
-                ):
+                if not t.replies_within_band:
                     lines.append(
                         f"    user replies: agent {t.agent_user_replies}, oracle "
                         f"{t.oracle_user_replies} (+{t.extra_user_replies_allowed} allowed)"
                     )
         head = "write-count gate: PASS" if self.passed else "write-count gate: FAIL"
         return "\n".join([head, *lines])
+
+
+def _detached_events(events: list[Any]) -> list[Any]:
+    """Shallow copies of ARE ``CompletedEvent``s, safe to hand to an ``EventFilter``.
+
+    ARE's filters don't only filter: ``EventFilter.__call__`` first runs ``preprocess_event``, which
+    *mutates* the event it is given — an agent ``add_email`` is relabeled ``EventType.ENV``, a
+    ``CabApp.get_quotation`` becomes a READ, ``makedirs`` is renamed. Those are validation-time
+    carve-outs that keep the judge's tallies honest, and under ARE's own runner they are invisible
+    because everything downstream of the judge already expects them.
+
+    Here they would not be: this check runs on *unscored* runs too, where no judge would otherwise
+    have touched anything, and the HF trace is exported from these same objects afterwards — the
+    exporter writes ``event.event_type.name``, so a relabeled agent write would be published as an
+    environment event. Copying the event (and its ``action``, which carries ``operation_type``)
+    leaves the tallies identical and the exported trace untouched."""
+    detached = []
+    for event in events:
+        clone = copy.copy(event)
+        if getattr(clone, "action", None) is not None:
+            clone.action = copy.copy(clone.action)
+        detached.append(clone)
+    return detached
 
 
 def write_count_check(
@@ -517,7 +559,9 @@ def write_count_check(
     ``populate_oracle_events``/``attach_judge`` was never called). ``extra_user_replies_allowed``
     mirrors ``GraphPerEventJudgeConfig.extra_send_message_to_user_allowed`` (ARE's default is 1)."""
     from collections import Counter
+    from types import SimpleNamespace
 
+    from are.simulation.types import EventLog
     from are.simulation.validation.utils.event_utils import AgentEventFilter
     from are.simulation.validation.utils.scenario_utils import (
         extract_agent_events,
@@ -530,6 +574,19 @@ def write_count_check(
     if not nb_turns:
         return None
 
+    # Both extractors are handed a stand-in holding *detached* events (see `_detached_events`), so
+    # the filter's preprocessing can't reach the live environment the trace is exported from, nor
+    # the scenario's oracle log. Each reads only these attributes; a missing one still surfaces as
+    # ARE's own error, since the stand-in carries the same None through.
+    agent_env = SimpleNamespace(
+        event_log=EventLog.from_list_view(_detached_events(environment.event_log.list_view()))
+    )
+    oracle_view = SimpleNamespace(
+        oracle_run_event_log=_detached_events(list(scenario.oracle_run_event_log)),
+        event_id_to_turn_idx=getattr(scenario, "event_id_to_turn_idx", None),
+        events=getattr(scenario, "events", []),
+    )
+
     def split(events: list[Any]) -> tuple[dict[str, int], int]:
         counter = Counter(e.tool_name for e in events)
         replies = counter.pop(_AUI_TOOL, 0)
@@ -539,9 +596,9 @@ def write_count_check(
     for turn_idx in range(nb_turns):
         # One filter instance per call, as ARE does: `filter` also *preprocesses* each event
         # (reclassifying a couple of app-specific calls), so it must be the judge's own.
-        oracle_events, _ = extract_oracle_events(scenario, AgentEventFilter(), turn_idx)
+        oracle_events, _ = extract_oracle_events(oracle_view, AgentEventFilter(), turn_idx)
         try:
-            agent_events = extract_agent_events(environment, AgentEventFilter(), turn_idx)
+            agent_events = extract_agent_events(agent_env, AgentEventFilter(), turn_idx)
         except AssertionError:
             # ARE asserts the turn exists in the agent's own log. It won't when the agent sent
             # fewer `send_message_to_user` replies than the scenario has turns — a real failure

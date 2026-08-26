@@ -82,6 +82,31 @@ def _score_status(
     return None, "no_validation"
 
 
+def _resolve_model_label(label: str | None, config_path: str) -> str | None:
+    """The ``model_id`` stamped into every exported trace — and read straight off the leaderboard —
+    names which model produced the run, so it must not be able to disagree with the model the run
+    actually used. ``--model`` is only a *label* (a submission is org-prefixed, e.g.
+    ``S-ORA/claude-opus-4-8``): nothing threads a model id into ``build_agent``, so agent.yaml's
+    ``llm.model`` is the sole thing that selects one. Hence: omit the label and the configured model
+    id becomes it; pass one and it has to name the configured model, or the run is refused up front
+    rather than mislabeled after the tokens are spent."""
+    from sora.bootstrap import load_yaml
+
+    configured = (load_yaml(config_path).llm or {}).get("model")
+    if configured is None:
+        return label  # no `llm:` block, so nothing for the label to contradict
+    configured = str(configured)
+    if label is None:
+        return configured
+    if configured not in label:
+        raise SystemExit(
+            f"--model {label!r} does not name the model {config_path} actually uses "
+            f"({configured!r}). The label is only recorded in the trace — it cannot override the "
+            f"config. Fix the label, or change llm.model in the config."
+        )
+    return label
+
+
 def _jsonl_record(
     *,
     scenario_id: str,
@@ -115,10 +140,30 @@ def _jsonl_record(
         # matching — so it explains a zero that the rationale otherwise attributes to the
         # trajectory. None when it passed or could not be computed, so the strip below keeps an
         # ordinary record byte-identical to ARE's own shape.
+        # `user_replies` appears only when that is a failing dimension, but it has to appear then:
+        # replies to the user are counted apart from the domain tools (the judge tolerates a few
+        # extra), so a turn that made exactly the right tool calls and one reply too many has an
+        # empty `surplus` AND an empty `missing` — a recorded mismatch with nothing in it to say
+        # what mismatched, which is indistinguishable from a bug in this check.
         "write_count_mismatch": None
         if write_counts is None or write_counts.passed
         else [
-            {"turn": t.turn, "surplus": t.surplus, "missing": t.missing}
+            {
+                "turn": t.turn,
+                "surplus": t.surplus,
+                "missing": t.missing,
+                **(
+                    {}
+                    if t.replies_within_band
+                    else {
+                        "user_replies": {
+                            "agent": t.agent_user_replies,
+                            "oracle": t.oracle_user_replies,
+                            "extra_allowed": t.extra_user_replies_allowed,
+                        }
+                    }
+                ),
+            }
             for t in write_counts.turns
             if not t.passed
         ],
@@ -271,7 +316,15 @@ def _run_one_scenario(
         else:
             # Replays the oracle so an unscored sweep still reports ARE's tool-call-count gate;
             # deterministic and modelless, and must precede initialize_turns (it soft_resets).
-            populate_oracle_events(scenario)
+            try:
+                populate_oracle_events(scenario)
+            except Exception as exc:  # noqa: BLE001 — a diagnostic must never cost the run
+                # Caught here rather than by the outer handler, which would record the scenario as
+                # an *errored run* and export no trace: the gate is optional information, so
+                # failing to compute it must not turn a runnable scenario into a hole in the
+                # sweep. The replay restores the scenario before it raises, so the run below still
+                # starts from a clean environment — just without a gate.
+                print(f"  {scenario.scenario_id}: oracle replay failed ({exc}) — no gate")
             if args.init_turns:
                 initialize_turns(scenario)
         result = run_scenario(
@@ -360,7 +413,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model",
         metavar="LABEL",
-        help="Agent-model label recorded in the trace (should match agent.yaml's llm.model).",
+        help=(
+            "Agent-model label recorded in the trace, org-prefixed for a submission (e.g. "
+            "S-ORA/claude-opus-4-8). It must name agent.yaml's llm.model — which is the only thing "
+            "that selects the model — or the run is refused. Omit to label with llm.model itself."
+        ),
     )
     parser.add_argument("--num-runs", type=int, default=1, help="Runs per scenario (default: 1).")
     parser.add_argument(
@@ -407,6 +464,11 @@ def main(argv: list[str] | None = None) -> None:
         # Only the first of the two takes effect (ARE's initialize_turns is idempotent), leaving the
         # judge as the turn gate — the opposite of what --init-turns asks for. Refuse, don't ignore.
         raise SystemExit("--init-turns and --judge-model are mutually exclusive")
+
+    # Before a single token is spent: the trace label has to agree with the model the config selects
+    # (and absent a label, becomes it), so an exported trace can't attribute the run to a model that
+    # never ran it.
+    args.model = _resolve_model_label(args.model, args.config)
 
     # Absolutize the artifact root before anything writes under it: the HF trace path ARE returns
     # (and stores as each record's `trace_id`) is `os.path.join(output_dir, "hf", <file>)`, and the

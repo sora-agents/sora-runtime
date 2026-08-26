@@ -195,6 +195,112 @@ def test_an_unclassified_scenario_is_unknown_rather_than_a_pass() -> None:
     assert write_count_check(scenario, _replay(_Unclassified())) is None
 
 
+class _EmailScenario(Scenario):  # type: ignore[misc]
+    """One turn whose single write is an ``add_email`` — the one call ARE's ``EventFilter``
+    *rewrites* rather than merely reads (``preprocess_event`` relabels an agent ``add_email`` on
+    EmailClientApp/V2 to ``EventType.ENV``, so it stops counting as an agent write)."""
+
+    start_time = 0
+    duration = 8
+
+    def init_and_populate_apps(self, *args: object, **kwargs: object) -> None:
+        from are.simulation.apps.email_client import EmailClientApp
+
+        self.email = EmailClientApp()
+        self.aui = AgentUserInterface()
+        self.apps = [self.email, self.aui]
+
+    def build_events_flow(self) -> None:
+        from are.simulation.apps.email_client import Email
+
+        with EventRegisterer.capture_mode():
+            ask = self.aui.send_message_to_agent(content="File this.").with_id("ask")
+            add = (
+                self.email.add_email(
+                    email=Email(sender="a@b.com", recipients=["c@d.com"], subject="Hi")
+                )
+                .oracle()
+                .with_id("add")
+                .depends_on(ask, delay_seconds=1)
+            )
+            reply = (
+                self.aui.send_message_to_user(content="Filed.")
+                .oracle()
+                .with_id("reply")
+                .depends_on(add, delay_seconds=1)
+            )
+            self.events = [ask, add, reply]
+
+
+def test_the_check_leaves_the_environment_it_read_unmodified() -> None:
+    """The check must not disturb the run it inspects: the same event objects are handed to ARE's
+    trace exporter afterwards, and the exporter publishes ``event_type.name``. ARE's filter mutates
+    what it is given, so a naive call relabels the agent's ``add_email`` to ENV *in the live
+    environment* — the exported trace would then attribute an agent write to the environment. This
+    bites unscored runs especially: no judge ran, so nothing else would have touched these events.
+    """
+    from are.simulation.types import EventType
+
+    scenario = _EmailScenario()
+    populate_oracle_events(scenario)
+    env = _replay(_EmailScenario())
+    agent_writes = [
+        e
+        for e in env.event_log.list_view()
+        if e.event_type is EventType.AGENT and e.tool_name.endswith("__add_email")
+    ]
+    assert agent_writes, "precondition: the replay produced an agent add_email to be relabeled"
+
+    check = write_count_check(scenario, env)
+
+    assert check is not None
+    assert all(e.event_type is EventType.AGENT for e in agent_writes)
+
+
+def test_a_failed_oracle_replay_leaves_the_apps_as_it_found_them() -> None:
+    """The replay drives the scenario's *live* apps and takes its writes back out with
+    ``soft_reset``. When it fails partway, that undo is exactly what still has to happen: whoever
+    called this may well continue without the gate (it is only a diagnostic), and the agent would
+    then start from an environment already carrying whatever the oracle managed to write — a run
+    corrupted before its first tick, with nothing anywhere to say so."""
+
+    class _HalfFailing(_TwoTurnScenario):
+        """First oracle write lands, second fails: a replay that gets far enough to dirty the
+        apps and then cannot finish."""
+
+        def build_events_flow(self) -> None:
+            with EventRegisterer.capture_mode():
+                ask = self.aui.send_message_to_agent(content="Book Monday.").with_id("ask")
+                add = (
+                    self.calendar.add_calendar_event(
+                        title="Slot",
+                        start_datetime="2024-01-08 09:00:00",
+                        end_datetime="2024-01-08 10:00:00",
+                    )
+                    .oracle()
+                    .with_id("add")
+                    .depends_on(ask, delay_seconds=1)
+                )
+                doomed = (
+                    self.calendar.delete_calendar_event(event_id="no-such-event")
+                    .oracle()
+                    .with_id("doomed")
+                    .depends_on(add, delay_seconds=1)
+                )
+                self.events = [ask, add, doomed]
+
+    scenario = _HalfFailing()
+
+    with pytest.raises(RuntimeError, match="oracle replay failed"):
+        populate_oracle_events(scenario)
+
+    titles = {e.title for e in scenario.calendar.events.values()}
+    assert titles == {"Standup"}  # the seeded event only — "Slot" was taken back out
+    # And no half-built log was published — probed the way the check itself probes it, since a
+    # scenario that never got one does not carry the attribute at all.
+    assert getattr(scenario, "oracle_run_event_log", None) is None
+
+
 def test_the_check_is_absent_rather_than_wrong_without_an_oracle() -> None:
     """No oracle log -> None, not a vacuous PASS. A scenario that was never preprocessed has
     nothing to compare against, and reporting "gate cleared" there would be a false green."""

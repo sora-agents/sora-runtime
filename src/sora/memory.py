@@ -412,15 +412,24 @@ PLAN_SYSTEM_PROMPT = (
     "a list of the bare keys. For the OTHER ops, `value` may likewise be a reference — to the "
     "value being compared against, not to a collection — so a threshold computed by an earlier "
     'step is usable directly: {"path": "score", "op": "gt", "value": {"$bind": "<mean>"}} keeps '
-    "what beats a `reduce` mean, and `between` accepts a reference resolving to [lo, hi]. No "
-    "`value_path` there: the referenced value IS the operand,\n"
+    "what beats a `reduce` mean, and `between` accepts either a reference resolving to [lo, hi] or "
+    'the pair with a reference at each end: {"op": "between", "value": [{"$bind": "<lo>"}, '
+    '{"$bind": "<hi>"}]}, for two bounds that come from two different steps. No '
+    "`value_path` there: the referenced value IS the operand. Whichever way you write it, the "
+    "operand has to end up being something the op can compare against — a single value for "
+    "lt/le/gt/ge, a two-element pair for `between`. A reference to a whole record, or to nothing, "
+    "does not compare and is rejected as a plan defect rather than silently matching no item,\n"
     '  {"action": "distinct", "in": ..., "out": "<name>", "by": "<field>"}  drop duplicates (omit '
     "`by` to dedupe whole items),\n"
     '  {"action": "sort", "in": ..., "out": "<name>", "by": "<field>", "desc": true|false},\n'
     '  {"action": "take", "in": ..., "out": "<name>", "n": <count>}  the first n items,\n'
     '  {"action": "collect", "from": "<operation_name>", "out": "<name>"}  gather the results of '
-    "every run of that operation — use it after a mechanical sub-goal that invoked one operation "
-    "per item, to turn the scattered per-item results into one list. Each collected item also "
+    "every run of that operation THIS plan performs — use it after a mechanical sub-goal that "
+    "invoked one operation per item, to turn the scattered per-item results into one list. It "
+    "reaches only this plan's own runs: results listed under 'Results of operations already "
+    "executed' that a PREVIOUS, replaced plan produced are NOT collectible, and collecting them "
+    "yields an empty list — if this plan needs those values, run the operation again. Each "
+    "collected item also "
     "carries that call's INPUT arguments, so you can filter/join on them even when the result "
     "doesn't echo them back — e.g. after get_condition_score per gallery, `collect` yields items "
     "with both the returned score AND the gallery_id it was called for, so a mechanical `between` "

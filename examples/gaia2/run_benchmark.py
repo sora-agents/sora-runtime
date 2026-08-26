@@ -150,7 +150,15 @@ def main(argv: list[str] | None = None) -> None:
         # No judge, so nothing else would replay the oracle — do it here (deterministic, no model)
         # purely so the run can still be told whether it cleared ARE's tool-call-count gate. Must
         # precede initialize_turns: it soft_resets the apps, which is ARE's own ordering.
-        populate_oracle_events(scenario)
+        try:
+            populate_oracle_events(scenario)
+        except Exception as exc:  # noqa: BLE001 — a diagnostic must never cost the run
+            # The gate is extra information *about* a run that is otherwise perfectly runnable, and
+            # this is the unscored path — nobody asked to be scored here. Aborting would trade the
+            # whole run for a check that was optional to begin with, so say what was lost and go
+            # on. The replay restores the scenario before it raises, so the agent still starts
+            # from a clean environment; it just starts without a gate to be judged against.
+            print(f"warning: oracle replay failed ({exc}) — running without the write-count gate")
         if args.init_turns:
             # Same turn wiring, no judge and no gate: every turn is released regardless of how the
             # earlier ones went, which is what exercising a later turn's behaviour needs.

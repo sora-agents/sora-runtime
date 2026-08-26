@@ -2129,6 +2129,106 @@ def _enrich_with_params(result: Any, params: dict[str, Any]) -> Any:
     return {**params, "result": result}
 
 
+_ORDERED_OPS = ("lt", "le", "gt", "ge")  # the ops whose operand must be a single comparable value
+
+
+def _shape_of(value: Any) -> str:
+    """A resolved value's shape, phrased for a plan defect — what the planner needs to see is what
+    it got instead of a comparable value, not the value itself (which can be a whole record)."""
+    if value is None:
+        return "None"
+    if isinstance(value, dict):
+        keys = ", ".join(repr(k) for k in list(value)[:8]) or "no keys"
+        return f"a mapping with keys {keys}"
+    if isinstance(value, (list, tuple)):
+        return f"a list of {len(value)} item(s)"
+    return f"a {type(value).__name__}"
+
+
+def _resolve_operand_items(
+    items: list[Any] | tuple[Any, ...],
+    history: list[CompletedOperation],
+    bindings: dict[str, Any],
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> tuple[list[Any], str | None]:
+    """Resolve references written *inside* a list operand, element-wise.
+
+    A list is not itself a reference, so ``_is_reference`` says no to it and the whole thing used
+    to pass through as a literal. But the natural way to write a ``between`` whose ends are each
+    computed is exactly a list of references — ``[{"$bind": "lo"}, {"$bind": "hi"}]`` — since a
+    reference in the *whole-value* position would have to resolve to the pair already assembled,
+    which no single earlier step produces. Written the natural way, the reference dicts reached
+    ``_matches`` intact, every ``lo <= actual`` raised ``TypeError``, that was caught as a
+    non-match, and the filter kept nothing at all while reporting an ordinary empty result. The
+    same applies to a literal ``in`` set with a reference among its members.
+
+    Resolving per element makes both spellings mean what they read as. A defect here is a defect
+    for the whole predicate: a pair with one unreadable end is no more comparable than one with
+    two."""
+    resolved: list[Any] = []
+    for item in items:
+        if not _is_reference(item):
+            resolved.append(item)
+            continue
+        if _REF_DECIDE in item:
+            return [], (
+                f"a filter predicate's 'value' cannot contain a $decide reference "
+                f"({item[_REF_DECIDE]!r}) — the comparison runs mechanically, so every part of "
+                "the operand has to be known before it. Compute it in an earlier step and "
+                "reference that binding, or make the whole 'where' a $decide predicate."
+            )
+        try:
+            value = _resolve_ref(item, history, bindings, properties)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return [], _path_defect(item, history, bindings, properties)
+        if value is _MISSING:
+            return [], _collection_defect(item, value, history, properties)
+        resolved.append(value)
+    return resolved, None
+
+
+def _operand_defect(where: dict[str, Any], written: Any, operand: Any) -> str | None:
+    """Why a predicate operand that *read* cleanly still cannot be compared against.
+
+    Resolving is not the same as being usable, and the gap between the two is silent: an operand
+    that lands on ``None``, a whole record, or a list makes every ordered comparison raise
+    ``TypeError`` inside ``_matches``, where it is caught as a non-match by design — so no element
+    survives and the step writes an empty binding that reads downstream as a fact about the world.
+    ``between`` is the same trap one level up: it compares against exactly a two-element pair and
+    treats anything else as a blanket non-match. In both cases the filter is not selecting badly,
+    it is not selecting at all, so this is reported as a plan defect rather than an answer.
+
+    ``eq``/``ne`` are deliberately excluded. An operand of any shape can genuinely match there — a
+    field that really is null, an object compared whole — so refusing one would refuse a
+    legitimate predicate to guard against a mistake that isn't provable from the shape alone.
+    ``in``/``not_in`` are excluded too: their operand is a collection, already checked as one."""
+    op = where.get("op", "eq")
+    if op == "between":
+        if not (isinstance(operand, (list, tuple)) and len(operand) == 2):
+            return (
+                f"the 'between' predicate's value {written!r} is {_shape_of(operand)}, not the "
+                "[lo, hi] pair 'between' compares against — every element then fails the "
+                "comparison and the filter keeps nothing at all. Give it two ends: a reference "
+                "that resolves to a pair, or the two bounds written out as [<lo>, <hi>]."
+            )
+        if any(end is None for end in operand):
+            return (
+                f"the 'between' predicate's value {written!r} resolved to {list(operand)!r}, a "
+                "pair with a missing end — a null bound excludes every element. Produce both "
+                "bounds before comparing against them, or use 'lt'/'gt' against the one that "
+                "exists."
+            )
+        return None
+    if op in _ORDERED_OPS and (operand is None or isinstance(operand, (dict, list, tuple))):
+        return (
+            f"the {op!r} predicate's value {written!r} is {_shape_of(operand)}, not a single "
+            f"value to compare against — {op!r} then fails for every element and the filter "
+            "keeps nothing at all. Add a 'path' naming the field that holds the threshold, or "
+            "compute the threshold in an earlier step and reference that binding."
+        )
+    return None
+
+
 def _resolve_predicate_value(
     params: dict[str, Any],
     history: list[CompletedOperation],
@@ -2151,9 +2251,18 @@ def _resolve_predicate_value(
       reference dict reached ``_matches``, every comparison against it raised ``TypeError``, that
       was caught as a non-match, and the filter silently kept *nothing*.
 
-    A literal ``value``, or a whole-predicate ``$decide`` (which ``FilterAction`` escalates intact),
-    passes through untouched. Returns the resolved params and a ``defect``, set when the reference
-    could not be read — reported rather than swallowed for the same reason the fan-out reports it:
+    A reference may also sit *inside* a list operand rather than being the whole of it — the only
+    way to write a ``between`` whose two ends come from two different steps — so those are resolved
+    element-wise first (``_resolve_operand_items``); a list is not a reference, so without that the
+    pair reached ``_matches`` with its reference dicts intact and kept nothing.
+
+    A whole-predicate ``$decide`` (which ``FilterAction`` escalates intact) passes through
+    untouched. A literal ``value`` has nothing to resolve, but is still shape-checked like a
+    resolved one: whether an uncomparable operand was written out or arrived through a reference
+    makes no difference to the filter it kills. Returns the resolved params and a ``defect``, set
+    when the reference could not be read, or when it read cleanly but landed on a shape the op
+    cannot compare against (``_operand_defect``) — reported rather than swallowed for the same
+    reason the fan-out reports it:
     an unreadable predicate value fails *open* in some direction for every op (``in`` matches
     nothing, ``not_in`` keeps everything, an unreadable threshold excludes everything), so the
     filter confidently does the wrong thing to the whole collection. A resolved-but-unusable
@@ -2162,9 +2271,20 @@ def _resolve_predicate_value(
     where = params.get("where")
     if not isinstance(where, dict) or _REF_DECIDE in where:
         return params, None  # no predicate, or a soft one escalated whole rather than resolved
-    value = where.get("value")
+    written = where.get("value")  # what the plan wrote, kept for the defect messages
+    value: Any = written
+    if isinstance(value, (list, tuple)) and any(_is_reference(v) for v in value):
+        items, list_defect = _resolve_operand_items(value, history, bindings, properties)
+        if list_defect is not None:
+            return params, list_defect
+        where = {**where, "value": items}
+        params = {**params, "where": where}
+        value = items
     if not _is_reference(value):
-        return params, None  # a literal — nothing to resolve
+        # A literal, or a list whose members just resolved: nothing left to resolve, but the shape
+        # still has to be one the op can compare against — an uncomparable operand is as dead
+        # written out as it is referenced.
+        return params, _operand_defect(where, written, value)
     if _REF_DECIDE in value:
         # A soft reference in the *operand* position, which no prompt documents and no op can
         # evaluate: the comparison itself is mechanical. It used to resolve to an empty membership
@@ -2183,6 +2303,8 @@ def _resolve_predicate_value(
             return params, _path_defect(value, history, bindings, properties)
         if operand is _MISSING:
             return params, _collection_defect(value, operand, history, properties)
+        if (shape_defect := _operand_defect(where, written, operand)) is not None:
+            return params, shape_defect
         return {**params, "where": {**where, "value": operand}}, None
     resolved_members, defect = _resolve_collection(value, history, bindings, properties)
     if defect is not None:
@@ -2527,10 +2649,12 @@ class DefaultReasonStrategy:
         off-cycle model call (only a ``$decide`` filter does). Resolves the op's input collection
         here — a ``collect`` gathers the per-element results of a fanned-out operation straight from
         ``history`` (its ``from`` is an operation name, not an ``in`` reference), each result
-        carrying its invoking params so a downstream op can correlate it to its input; every other
-        op resolves ``in`` from history/bindings, an unresolvable input becoming an empty collection
-        (the fan-out's never-raise contract). Dispatches from the data-op bucket; the op writes its
-        result into ``activity.bindings[out]`` (or, for the escalation, Observe does so later)."""
+        carrying its invoking params so a downstream op can correlate it to its input (a ``collect``
+        whose operation ran only *before* this plan's span is a plan defect, not an empty result);
+        every other op resolves ``in`` from history/bindings, an unresolvable input becoming an
+        empty collection (the fan-out's never-raise contract). Dispatches from the data-op bucket;
+        the op writes its result into ``activity.bindings[out]`` (or, for the escalation, Observe
+        does so later)."""
         if step.next_action == CollectAction.name:
             op_name = step.params.get("from")
             # Scoped to the active frame's span (Activity.history_mark): collect takes EVERY match,
@@ -2541,6 +2665,26 @@ class DefaultReasonStrategy:
                 for completed in activity.history[activity.history_mark :]
                 if completed.invocation.operation_name == op_name
             ]
+            if not collection and any(
+                completed.invocation.operation_name == op_name
+                for completed in activity.history[: activity.history_mark]
+            ):
+                # The operation ran, but only OUTSIDE this plan's span — under a plan that has since
+                # been replaced. The mark stays where it is (results a discarded plan gathered may
+                # no longer hold, which is usually *why* it was discarded), but the planner is shown
+                # the full history, so writing this collect is a reasonable mistake to make. Say so
+                # precisely: left alone, the empty binding surfaces a step later as the generic
+                # "an earlier step produced EMPTY — nothing matched", which reads as a fact about
+                # the world, and the planner re-plans into the same collect on that false premise.
+                defect: str | None = (
+                    f"the {step.next_action!r} step reads {op_name!r}, which ran only under a "
+                    "PREVIOUS plan that has since been replaced — a collect reaches only the runs "
+                    "its own plan performs, so this yields nothing. Invoke it again in this plan "
+                    f"if its results are needed. {_REPLAN_HINT}"
+                )
+                log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
+                activity.reset_for_replan(defect=defect)
+                return True  # no step this cycle; Reason re-infers against the current world
             passthrough = {k: v for k, v in step.params.items() if k != "from"}
         else:
             resolved, defect = _resolve_collection(

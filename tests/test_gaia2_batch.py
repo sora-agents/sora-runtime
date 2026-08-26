@@ -17,6 +17,7 @@ from examples.gaia2._runner import _awaiting_input, _make_stop_when
 from examples.gaia2.batch import (
     _jsonl_record,
     _pass_at_1,
+    _resolve_model_label,
     _score_status,
     aggregate,
 )
@@ -41,6 +42,45 @@ def test_score_status_exception() -> None:
 
 def test_score_status_no_validation() -> None:
     assert _score_status(None, None) == (None, "no_validation")
+
+
+# -- _resolve_model_label: the trace label can't disagree with the configured model ---------------
+
+
+def _write_agent_yaml(root: Path, model: str | None) -> str:
+    llm = f"  llm:\n    model: {model}\n" if model is not None else ""
+    path = root / "agent.yaml"
+    path.write_text(
+        "agent:\n"
+        "  name: t\n"
+        "  strategies:\n"
+        "    reason: sora.strategies.DefaultReasonStrategy\n" + llm,
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_model_label_defaults_to_the_configured_model(tmp_path: Path) -> None:
+    config = _write_agent_yaml(tmp_path, "claude-opus-4-8")
+    assert _resolve_model_label(None, config) == "claude-opus-4-8"
+
+
+def test_model_label_kept_when_it_names_the_configured_model(tmp_path: Path) -> None:
+    config = _write_agent_yaml(tmp_path, "claude-opus-4-8")
+    assert _resolve_model_label("S-ORA/claude-opus-4-8", config) == "S-ORA/claude-opus-4-8"
+
+
+def test_model_label_naming_another_model_is_refused(tmp_path: Path) -> None:
+    # The failure this exists for: a config left on some other model, swept under an Opus label.
+    config = _write_agent_yaml(tmp_path, "gpt-5.5")
+    with pytest.raises(SystemExit, match="gpt-5.5"):
+        _resolve_model_label("S-ORA/claude-opus-4-8", config)
+
+
+def test_model_label_untouched_when_config_names_no_model(tmp_path: Path) -> None:
+    config = _write_agent_yaml(tmp_path, None)
+    assert _resolve_model_label("S-ORA/whatever", config) == "S-ORA/whatever"
+    assert _resolve_model_label(None, config) is None
 
 
 # -- _jsonl_record: matches ARE's _export_benchmark_result_jsonl shape ----------------------------
@@ -84,6 +124,70 @@ def test_jsonl_record_exception_carries_type_and_message() -> None:
     assert rec["metadata"]["exception_type"] == "ValueError"
     assert rec["metadata"]["exception_message"] == "bad graph"
     assert rec["metadata"]["rationale"] == "graph mismatch"
+
+
+def test_jsonl_record_reply_count_mismatch_carries_its_evidence() -> None:
+    """Replies to the user are tallied apart from the domain tools (the judge tolerates a few
+    extra), so a turn that made exactly the right tool calls and one reply too many has an empty
+    `surplus` AND an empty `missing`. Recorded with only those two, the line said a turn mismatched
+    and gave nothing that mismatched — unreadable, and indistinguishable from a bug in the check."""
+    from sora.adapters.are_sim import TurnWriteCounts, WriteCountCheck
+
+    turn = TurnWriteCounts(
+        turn=2,
+        agent={"EmailClientApp__send_email": 1},
+        oracle={"EmailClientApp__send_email": 1},
+        agent_user_replies=3,
+        oracle_user_replies=1,
+        extra_user_replies_allowed=1,
+    )
+    assert not turn.passed and not turn.surplus and not turn.missing  # the shape being guarded
+
+    rec = _jsonl_record(
+        scenario_id="s3",
+        run_number=0,
+        success=False,
+        rationale=None,
+        exception=None,
+        trace_id=None,
+        write_counts=WriteCountCheck(turns=(turn,)),
+    )
+    assert rec["metadata"]["write_count_mismatch"] == [
+        {
+            "turn": 2,
+            "surplus": {},
+            "missing": {},
+            "user_replies": {"agent": 3, "oracle": 1, "extra_allowed": 1},
+        }
+    ]
+
+
+def test_jsonl_record_tool_count_mismatch_omits_the_reply_counts() -> None:
+    # The reply tally is evidence only when it is the thing that failed; a surplus tool call
+    # already says what went wrong, and every mismatch record staying lean is what keeps a sweep's
+    # output.jsonl readable.
+    from sora.adapters.are_sim import TurnWriteCounts, WriteCountCheck
+
+    turn = TurnWriteCounts(
+        turn=0,
+        agent={"EmailClientApp__reply_to_email": 1},
+        oracle={},
+        agent_user_replies=1,
+        oracle_user_replies=1,
+        extra_user_replies_allowed=1,
+    )
+    rec = _jsonl_record(
+        scenario_id="s4",
+        run_number=0,
+        success=False,
+        rationale=None,
+        exception=None,
+        trace_id=None,
+        write_counts=WriteCountCheck(turns=(turn,)),
+    )
+    assert rec["metadata"]["write_count_mismatch"] == [
+        {"turn": 0, "surplus": {"EmailClientApp__reply_to_email": 1}, "missing": {}}
+    ]
 
 
 # -- pass@1 + aggregate ---------------------------------------------------------------------------
@@ -315,6 +419,23 @@ def test_a_plain_run_still_replays_the_oracle_for_the_write_count_gate(monkeypat
     calls = _patch_seams(monkeypatch)
     main(["--scenario", "s.json"])
     assert calls == ["oracle"]
+
+
+def test_a_failed_oracle_replay_does_not_abort_the_run(monkeypatch: Any) -> None:
+    """The replay exists only to report ARE's write-count gate, which is extra information about a
+    run that is otherwise perfectly runnable — and this is the unscored path, where nobody asked to
+    be scored at all. A failure there must cost the gate, not the run."""
+    from examples.gaia2.run_benchmark import main
+
+    calls = _patch_seams(monkeypatch)
+
+    def _boom(_scenario: Any) -> None:
+        calls.append("oracle")
+        raise RuntimeError("oracle replay failed: [ValueError('nope')]")
+
+    monkeypatch.setattr("sora.adapters.are_sim.populate_oracle_events", _boom, raising=False)
+    main(["--scenario", "s.json", "--init-turns"])
+    assert calls == ["oracle", "init"]  # the turn wiring and the run itself still happened
 
 
 def test_init_turns_with_judge_model_is_refused(monkeypatch: Any) -> None:
