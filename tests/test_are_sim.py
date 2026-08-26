@@ -8,6 +8,7 @@ integration-gated ``test_are_sim_integration.py``.
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, TypedDict
@@ -23,6 +24,7 @@ from sora.adapters.are_sim import (
     _record_fields,
     _returns_schema,
     _type_to_schema,
+    relax_judge_verdict_case,
 )
 from sora.environment import WorkspaceOrigin
 from sora.manual import Manual
@@ -672,3 +674,151 @@ def test_validate_passes_through_scored_verdicts() -> None:
         SimpleNamespace(success=False, exception=None, rationale="wrong tool")
     )
     assert sim.validate() == ValidationOutcome(success=False, rationale="wrong tool")
+
+
+# --- ARE's case-sensitive judge-verdict parse (upstream defect) ---------------------------------
+#
+# `relax_judge_verdict_case` patches a class it imports from ARE, which is an optional extra. These
+# stub that module in `sys.modules` so the contract is exercised in CI either way — and so the test
+# pins OUR replacement's behavior rather than whatever ARE happens to ship.
+
+
+class _StubChecker:
+    """Mirrors the surface `relax_judge_verdict_case` replaces: ARE's `LLMChecker`, whose `__call__`
+    tallies votes with a case-SENSITIVE membership test and returns None when nothing parsed."""
+
+    def __init__(
+        self, response: str, success: str = "[[True]]", failure: str = "[[False]]"
+    ) -> None:
+        self.success_str = success
+        self.failure_str = failure
+        self.num_votes = 1
+
+        def judge(_args: dict[str, str]) -> str:
+            return response
+
+        self.judge = judge
+
+    def __call__(self, user_prompt_args: dict[str, str]) -> bool | None:
+        votes: list[bool] = []
+        for _ in range(self.num_votes):
+            response = self.judge(user_prompt_args)
+            if response is None:
+                continue
+            if self.success_str in response:
+                votes.append(True)
+            elif self.failure_str in response:
+                votes.append(False)
+        if len(votes) == 0:
+            return None
+        return sum(votes) >= len(votes) / 2
+
+
+def _stub_are(monkeypatch: pytest.MonkeyPatch) -> type[_StubChecker]:
+    """Install a fresh stub `LLMChecker` under ARE's import path and return the class."""
+
+    class LLMChecker(_StubChecker):
+        pass
+
+    module = SimpleNamespace(LLMChecker=LLMChecker)
+    monkeypatch.setitem(sys.modules, "are.simulation.validation.utils.llm_utils", module)
+    return LLMChecker
+
+
+def test_are_discards_a_lowercase_verdict_before_the_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The defect itself, stated as a test: the judge signed off, and ARE records no vote at all.
+    checker = _stub_are(monkeypatch)("The tone is polite and suitable. Evaluation: [[true]]")
+    assert checker({}) is None  # not False — the verdict was discarded, not disagreed with
+
+
+def test_relax_judge_verdict_case_reads_a_lowercase_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    cls = _stub_are(monkeypatch)
+    assert relax_judge_verdict_case() is True
+    assert cls("The tone is polite and suitable. Evaluation: [[true]]")({}) is True
+
+
+def test_relax_judge_verdict_case_reads_a_lowercase_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Relaxing the case must not turn every verdict into a pass — a real rejection still rejects.
+    cls = _stub_are(monkeypatch)
+    relax_judge_verdict_case()
+    assert cls("The signature names someone else. Evaluation: [[false]]")({}) is False
+
+
+def test_relax_judge_verdict_case_keeps_none_for_an_unparseable_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only the marker's CASE is relaxed; a response carrying no marker still records no vote, so a
+    # genuinely broken judge is still distinguishable from one that answered.
+    cls = _stub_are(monkeypatch)
+    relax_judge_verdict_case()
+    assert cls("I am not sure what to make of this email.")({}) is None
+
+
+def test_relax_judge_verdict_case_leaves_the_other_marker_family_working(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Four checkers use [[True]]; the rest use [[Success]]. Both must keep parsing.
+    cls = _stub_are(monkeypatch)
+    relax_judge_verdict_case()
+    checker = cls("Evaluation: [[success]]", success="[[Success]]", failure="[[Failure]]")
+    assert checker({}) is True
+
+
+def test_relax_judge_verdict_case_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_are(monkeypatch)
+    assert relax_judge_verdict_case() is True
+    assert relax_judge_verdict_case() is False  # already patched — not re-wrapped
+
+
+def test_relax_judge_verdict_case_is_a_no_op_without_are(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ARE is an optional extra, so the patch must degrade quietly rather than break an import.
+    monkeypatch.setitem(sys.modules, "are.simulation.validation.utils.llm_utils", None)
+    assert relax_judge_verdict_case() is False
+
+
+def test_ares_own_engine_mangles_a_true_verdict_before_the_checker_sees_it() -> None:
+    """The root cause, pinned against the real package: the casing is ARE's, not the model's.
+
+    Both engines ARE ships end ``chat_completion`` with ``.replace("True", "true")`` — a
+    JSON-shaped normalization of *agent* output that also rewrites judge verdicts in transit.
+    ``create_judge_engine`` returns a ``LiteLLMEngine``, so ``success_str="[[True]]"`` is
+    unsatisfiable on the shipped path regardless of which model answers, and the
+    ``[[True]]``-family checkers can only ever return ``None``. Uses LiteLLM's ``mock_response``,
+    so no network and no model — the "model output" is fixed here and we observe the transit.
+    """
+    litellm_engine = pytest.importorskip("are.simulation.agents.llm.litellm.litellm_engine")
+    llm_utils = pytest.importorskip("are.simulation.validation.utils.llm_utils")
+    prompts = pytest.importorskip("are.simulation.validation.prompts")
+
+    def engine(verdict: str) -> Any:
+        eng = litellm_engine.LiteLLMEngine(
+            model_config=litellm_engine.LiteLLMModelConfig(model_name="gpt-4o", provider="openai")
+        )
+        eng.mock_response = verdict
+        return eng
+
+    assert engine("[[True]]")([{"role": "user", "content": "x"}])[0] == "[[true]]"
+    assert engine("[[False]]")([{"role": "user", "content": "x"}])[0] == "[[false]]"
+    # The other marker family survives the replace — which is why only some tools are affected.
+    assert engine("[[Success]]")([{"role": "user", "content": "x"}])[0] == "[[Success]]"
+
+    def verdict(response: str) -> bool | None:
+        checker = llm_utils.LLMChecker(
+            engine=engine(response),
+            prompt_templates=prompts.SIGNATURE_CHECKER_TEMPLATES,
+            num_votes=1,
+            success_str="[[True]]",
+            failure_str="[[False]]",
+        )
+        result: bool | None = checker({"agent_action_call": "hi", "user_name": "n"})
+        return result
+
+    # Not False — no vote was recorded at all, for a pass *and* for a fail.
+    assert verdict("Evaluation: [[True]]") is None
+    assert verdict("Evaluation: [[False]]") is None
+
+    relax_judge_verdict_case()
+    assert verdict("Evaluation: [[True]]") is True
+    assert verdict("Evaluation: [[False]]") is False

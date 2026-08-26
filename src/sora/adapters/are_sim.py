@@ -307,6 +307,84 @@ def load_scenario(ref: str) -> Any:
     return obj() if isinstance(obj, type) else obj
 
 
+def relax_judge_verdict_case() -> bool:
+    """Work around an upstream ARE defect: its soft checkers parse the judge model's verdict with a
+    **case-sensitive** substring test, so a judge that answers ``[[true]]`` instead of ``[[True]]``
+    records no vote at all.
+
+    ``LLMChecker.__call__`` (``are/simulation/validation/utils/llm_utils.py``) collects votes with
+    ``if self.success_str in response`` / ``elif self.failure_str in response`` and returns ``None``
+    when neither matched. ``SoftToolJudge.compare`` then calls it as ``if not checker_fn(...)``, and
+    ``None`` is falsy — so an *unparsed* verdict rejects the event on exactly the same code path a
+    genuine ``False`` would, with no distinguishing signal downstream. The judge's real answer is
+    discarded.
+
+    That is not merely a scoring error. ``turn_condition_wrapper`` gates each turn's release on the
+    same verdict and calls ``env.stop()`` when it is falsy, so one discarded verdict on turn 0 ends
+    the scenario at the agent's first reply and every later turn's oracle writes are then recorded
+    as work the agent "did not perform" — work it was never given the chance to do.
+
+    The casing never comes from the model, and no judge can avoid it. Both engines ARE ships end
+    ``chat_completion`` with ``res.replace("False", "false").replace("True", "true")``
+    (``agents/llm/litellm/litellm_engine.py``, ``agents/llm/hf/hf_engine.py``) — a JSON-shaped
+    normalization of *agent* output that also rewrites every judge response on its way to the
+    checker. ``create_judge_engine`` returns a ``LiteLLMEngine`` unconditionally, so on the shipped
+    path ``"[[True]]" in response`` is **unsatisfiable**: the checker is handed ``[[true]]`` no
+    matter which model answered. ``[[False]]`` is mangled identically, so the failure branch is dead
+    too and the checker's only reachable return is ``None``. Verified offline through the real
+    ``LLMChecker`` with LiteLLM's ``mock_response`` — model output ``[[True]]`` in, ``None`` out.
+
+    So every ``[[True]]``-family checker — ``signature_checker``, ``tone_checker``,
+    ``sanity_checker``, ``cab_checker`` — is structurally incapable of returning a verdict, while
+    the ``[[Success]]`` family is untouched by the replace and works. Per
+    ``validation/constants.py``'s ``PER_TOOL_TO_SOFT_CHECKER_TYPES`` that puts a dead checker in the
+    loop for ``send_email``, ``reply_to_email``, ``send_message``, ``send_message_to_user`` and
+    ``order_ride``; and ``SoftToolJudge.compare`` reaches that loop only when ``equality_checker``
+    (exact match after normalization) has already failed — so a free-text body that differs from the
+    oracle's at all is routed to a judge that cannot say yes.
+
+    This relaxes **only** the marker comparison to case-insensitive; prompts, checkers, vote
+    tallying and every other rule are untouched, so it restores the parse ARE's own prompts and unit
+    tests intend rather than loosening the bar. Idempotent, and returns False if ARE is absent or
+    already patched. Remove once ARE fixes this upstream — at the parse or at the engine — and note
+    that a run scored with it applied is not the same artifact as one scored under stock ARE.
+    """
+    try:
+        from are.simulation.validation.utils.llm_utils import LLMChecker
+    except ImportError:  # ARE not installed — nothing to patch
+        return False
+    if getattr(LLMChecker, "_sora_case_insensitive_verdicts", False):
+        return False
+
+    def __call__(self: Any, user_prompt_args: dict[str, str]) -> bool | None:
+        # Mirrors ARE's own implementation, with `.lower()` on both sides of the two membership
+        # tests. Kept as a full replacement rather than a wrapper because the comparison sits in the
+        # middle of the voting loop, with no seam to intercept the response on its way out.
+        votes: list[bool] = []
+        success = self.success_str.lower()
+        failure = self.failure_str.lower()
+        for _ in range(self.num_votes):
+            response = self.judge(user_prompt_args)
+            if response is None:
+                continue
+            lowered = response.lower()
+            if success in lowered:
+                votes.append(True)
+            elif failure in lowered:
+                votes.append(False)
+        if len(votes) == 0:
+            return None
+        return sum(votes) >= len(votes) / 2
+
+    LLMChecker.__call__ = __call__
+    LLMChecker._sora_case_insensitive_verdicts = True
+    log.info(
+        "patched ARE LLMChecker: judge verdict markers compared case-insensitively "
+        "(upstream defect — a [[true]] verdict is otherwise discarded and read as a rejection)"
+    )
+    return True
+
+
 def attach_judge(
     scenario: Any,
     *,
@@ -314,6 +392,7 @@ def attach_judge(
     provider: str | None = None,
     endpoint: str | None = None,
     offline_validation: bool = False,
+    relax_verdict_case: bool = True,
 ) -> None:
     """Attach ARE's GraphPerEvent judge so ``AreSimulation.validate()`` scores a benchmark scenario
     against its oracle event graph (the Gaia2 scoring path) instead of the ``success=None`` no-op.
@@ -327,10 +406,19 @@ def attach_judge(
     under online validation (``offline_validation=False``, the default) ARE installs
     ``judge.trigger_condition`` as each turn's release gate, so the judge is also called mid-run at
     every turn boundary, and a verdict of "turn failed" stops the environment and withholds the
-    remaining turns. Use ``initialize_turns`` when the later turns are wanted without that gate."""
+    remaining turns. Use ``initialize_turns`` when the later turns are wanted without that gate.
+
+    ``relax_verdict_case`` (default on) applies ``relax_judge_verdict_case`` first — see there for
+    why: without it an OpenAI-family judge's ``[[true]]`` is discarded, which both mis-scores the
+    event and, because the same verdict gates turn release, silently truncates the scenario. It is
+    on by default because a run scored without it is not interpretable, and it logs when it fires so
+    no run is patched silently. Pass False to reproduce stock ARE behavior exactly."""
     from are.simulation.agents.are_simulation_agent_config import LLMEngineConfig
     from are.simulation.scenarios.scenario_imported_from_json.utils import preprocess_scenario
     from are.simulation.validation.configs import GraphPerEventJudgeConfig, create_judge_engine
+
+    if relax_verdict_case:
+        relax_judge_verdict_case()
 
     engine_config = (
         LLMEngineConfig(model_name=model, provider=provider, endpoint=endpoint)

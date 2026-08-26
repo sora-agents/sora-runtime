@@ -411,3 +411,75 @@ remaining work:
 
 Status caveat: call the integration "complete in the small," not done — either
 integration gap above can poison the numbers with no runtime gap in sight.
+
+## Update (2026-08-26): ARE's case-sensitive verdict parse — patched, and disclose it
+
+**Any Gaia2 number produced before 2026-08-26 with an OpenAI-family judge is not
+interpretable.** ARE's soft checkers parse the judge model's verdict with a
+case-sensitive substring test for `[[True]]`. OpenAI-family judges write `[[true]]`,
+so `LLMChecker.__call__` records no vote, returns `None`, and `SoftToolJudge.compare`
+reads that falsy `None` on the same code path as a genuine `False`. The judge's actual
+answer — often an explicit pass, on the merits — is discarded, and nothing downstream
+distinguishes it from a content failure.
+
+It is worse than mis-scoring. `turn_condition_wrapper`
+(`are/simulation/scenarios/utils/turn_conditions.py`) gates each turn's *release* on the
+same verdict and calls `env.stop()` when it is falsy. The gate fires on the agent's
+`send_message_to_user`, so one discarded verdict on turn 0 ends the scenario at the
+agent's first reply. Every later turn's oracle writes are then reported by the
+write-count gate as `missing (oracle did, agent did not)` — work the agent was never
+given the chance to do, indistinguishable in the output from work it failed to do.
+
+**The casing is not the model's** (corrected 2026-08-26 — an earlier version of this note
+blamed OpenAI-family judges, and that was wrong). Both engines ARE ships end
+`chat_completion` with `res.replace("False", "false").replace("True", "true")`
+(`agents/llm/litellm/litellm_engine.py`, `agents/llm/hf/hf_engine.py`) — a JSON-shaped
+normalization of *agent* output that also rewrites every judge response in transit. Since
+`create_judge_engine` returns a `LiteLLMEngine` unconditionally, `"[[True]]" in response`
+is **unsatisfiable on the shipped path, for every model**: the checker is handed
+`[[true]]` no matter who answered. `[[False]]` is mangled the same way, so the failure
+branch is dead too and the checker's only reachable return is `None`.
+
+So the four `[[True]]`-family checkers — `signature_checker`, `tone_checker`,
+`sanity_checker`, `cab_checker` — are structurally incapable of returning a verdict, while
+the `[[Success]]` family is untouched by the replace and works normally. Pinned as a
+regression test against the real package
+(`tests/test_are_sim.py::test_ares_own_engine_mangles_a_true_verdict_before_the_checker_sees_it`,
+using LiteLLM's `mock_response`, so no network and no tokens).
+
+Why it survives in a high-profile benchmark, given that it is *not* model-specific:
+
+- **It only fires off the fast path.** `SoftToolJudge.compare` returns `True` early when
+  `equality_checker` (exact match after normalization) succeeds, and only then runs the
+  soft checkers. So the dead checkers are reached exactly when the agent's free-text
+  differs from the oracle's — which reads as "the paraphrase was judged and rejected".
+- **It is silent.** `None` is falsy, so it rejects on the same code path a genuine `False`
+  takes; the graph judge records only a boolean (`judge.py`, `TOOL_JUDGE_REJECT`) with no
+  reasoning. On a benchmark where agents are *expected* to fail, that FAIL invites no
+  investigation.
+- **It is common-mode.** Every agent scored by the same judge is penalized identically, so
+  aggregate leaderboard ordering still looks sane; it shows up only by replaying a single
+  event pair offline.
+- **It is glue.** A dozen lines of marker parsing plus one `.replace` in an engine written
+  for a different purpose. Nothing tests the two together, and the unit tests for
+  `LLMChecker` feed it strings directly, bypassing the engine that does the damage.
+
+**Patched here** by `relax_judge_verdict_case()` (`sora/adapters/are_sim.py`), applied
+by `attach_judge` by default and logged when it fires. It relaxes *only* that
+comparison's case — prompts, checkers and vote tallying are untouched — so it restores
+the parse ARE's own prompts and unit tests intend rather than lowering the bar.
+`run_benchmark.py`
+prints which parse a run used and takes `--strict-verdict-case` to reproduce stock ARE.
+
+**When reporting numbers, say which parse was used.** A score obtained with the parse
+relaxed is a different artifact from one obtained under stock ARE, and the distinction
+has to survive being pasted somewhere without the log. Remove the patch once ARE fixes
+this upstream.
+
+**Still unexplained:** `aug25` and `aug26` ran the same two-turn scenario with
+near-identical turn-0 work and got *opposite* gate verdicts. The mangling is
+deterministic, so the earlier "nondeterministic casing / coin flip" reading of that pair
+is dead — whatever separates the two runs is upstream of the parse (most likely which
+side of `equality_checker`'s fast path each run's args landed on) and has not been
+established. Either way, no runtime A/B on a multi-turn email scenario was meaningful
+before this patch.
