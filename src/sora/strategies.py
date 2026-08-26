@@ -31,7 +31,9 @@ from sora.action import (
     UnfocusAction,
     UnloadManualAction,
     _spawn_tracked,
+    attend,
     pluck,
+    release,
 )
 from sora.activity import Activity, ActivityState
 from sora.llm import log_llm_discarded
@@ -353,6 +355,18 @@ class ActivitySelectionStrategy(Protocol):
         SituateStrategy concern. `async` + the `cycle` handle are for a richer policy (priority,
         aging, deadlines, or an LLM-based scheduler) that consults memory or a model; the mechanical
         default consults neither."""
+        ...
+
+
+class FocusPolicy(Protocol):
+    def attend(self, wm: WorkingMemory) -> set[str]:
+        """Tool ids the agent should be attending to this cycle.
+
+        Pure and set-valued: the caller owns the diff against `wm.focused_tools` and performs the
+        focus/unfocus, so a policy never touches the environment and can be unit-tested as a
+        function. A scheduling-style sub-strategy, not a phase — the same shape as
+        `ActivitySelectionStrategy` (ADR-0016), and injected the same way (a constructor argument
+        to the default Observe strategy, not an `agent.yaml` key)."""
         ...
 
 
@@ -689,11 +703,190 @@ async def _await_input(cycle: DecisionCycle, activity: Activity, prompt: str) ->
     await _report_to_user(cycle, prompt)
 
 
+def _prop_tool_ids(params: Any, joined: set[str]) -> set[str]:
+    """Tool ids named by any ``$prop`` reference nested anywhere inside a step's params.
+
+    A ``$prop`` is the one way a step reads a tool it never invokes, and it lives *inside* the
+    param bag — under a data-op's ``in``, a sub-goal's collection — not under ``TOOL_ID``. Missing
+    it releases the tool mid-plan and the reference then resolves to nothing, which is the silent
+    blindness intention-scoped focus exists to remove. Recursive for that reason: depth is
+    not bounded by the schema.
+
+    The tool id is found by matching against the *joined* id set rather than by splitting on the
+    first dot, for the reason `_property_ref` documents at length: neither half of a property key
+    is dot-free. Longest match wins. A bare property name (``{"$prop": "state"}``) names no tool
+    and contributes nothing — it stays resolvable only while something else attends its tool.
+    """
+    found: set[str] = set()
+    if isinstance(params, dict):
+        ref = params.get(_REF_PROP)
+        if isinstance(ref, str):
+            candidates = [t for t in joined if ref == t or ref.startswith(f"{t}.")]
+            if candidates:
+                found.add(max(candidates, key=len))
+        for value in params.values():
+            found |= _prop_tool_ids(value, joined)
+    elif isinstance(params, (list, tuple)):
+        for item in params:
+            found |= _prop_tool_ids(item, joined)
+    return found
+
+
+def _wait_sources(wait: SignalWait | InputWait | ConditionWait | None) -> set[str]:
+    if isinstance(wait, SignalWait):
+        return {wait.source} if wait.source else set()
+    if isinstance(wait, ConditionWait):
+        return {w.source for w in wait.watches if w.source}
+    return set()  # InputWait waits on the user, not on a tool
+
+
+def referenced_tools(activity: Activity, joined: set[str]) -> set[str] | None:
+    """The tools one activity's live intentions reference — or ``None`` for "the whole world".
+
+    ``None`` is not "nothing": an activity with no plan is about to be planned, and planning is
+    deliberately broad (the planner picks ``$prop`` over paginated scanning by reading property
+    *shapes* in the plan prompt, so narrowing it there would go dark on ADR-0023 discovery). Since
+    `reset_for_replan` clears `plan`, that same clause covers the whole replan window — which is
+    why attention needs no grace period and no history retention.
+
+    Shared by the attention policy (agent-level union) and by the Stage-2 per-activity prompt view,
+    so the two layers cannot disagree about what an activity's tools are.
+    """
+    if activity.state is ActivityState.TERMINATED:
+        return set()
+    if activity.plan is None:
+        return None
+    ids: set[str] = set()
+    for plan in [activity.plan, *(frame[0] for frame in activity.parent_frames)]:
+        for step in plan.steps:
+            # An `unfocus` step names a tool in order to STOP attending to it; counting it here
+            # would attend the tool right back and make the step a permanent no-op. Note this only
+            # gets the tool no OTHER step names: the scan covers every step of a live plan, not the
+            # un-run tail (that is what removes the need for history retention), so an `unfocus`
+            # following an `invoke` of the same tool is still overridden on the next Observe —
+            # released, then re-attended a tick later, re-baselining the adapter in between. The
+            # derived floor beats an explicit act there; see the design note's rough edges.
+            if step.next_action != UnfocusAction.name:
+                tool_id = step.params.get(TOOL_ID)
+                if isinstance(tool_id, str):
+                    ids.add(tool_id)
+            ids |= _prop_tool_ids(step.params, joined)
+        # A declared condition watches a tool the body may never touch (waiting on a reply in a
+        # messaging app while every step touches email) — not redundant with the step scan.
+        for condition in plan.pending:
+            if condition.watch.source:
+                ids.add(condition.watch.source)
+    for state in activity.pending_conditions:
+        if state.condition.watch.source:
+            ids.add(state.condition.watch.source)
+    if activity.pending_operation is not None:
+        ids.add(activity.pending_operation.invocation.tool_id)
+    ids |= _wait_sources(activity.blocked_on)
+    return ids
+
+
+class IntentionScopedFocus:
+    """Attend exactly the tools the agent's live *intentions* reference — the narrowing policy,
+    opt-in rather than default.
+
+    BDI vocabulary on purpose — this set is derived from committed plans, not from candidate goals,
+    so it is intention-scoped and not desire-scoped. The union over live activities is an eagerly
+    evaluated refcount: a tool leaves focus precisely when no live plan names it any more. Kept as
+    a recomputation rather than incremental leases because a lease has to be maintained at every
+    plan mutation site, and a missed decrement leaks cost silently while a double decrement blinds
+    a tool that is still in use — going silently blind, the failure this policy exists to
+    remove. Analysis and measurement: `docs/architecture/notes/
+    attention-scoped-to-live-intentions.md`.
+
+    Broad while nothing is planned (no activities at all, or any activity awaiting a plan), narrow
+    while executing.
+    """
+
+    def attend(self, wm: WorkingMemory) -> set[str]:
+        joined = {tool.id for tool in wm.registry.all_tools()}
+        live = [a for a in wm.activities.values() if a.state is not ActivityState.TERMINATED]
+        if not live:
+            return joined  # an idle agent stays observant (ADR-0026's judge reads the world)
+        attended: set[str] = set()
+        for activity in live:
+            referenced = referenced_tools(activity, joined)
+            if referenced is None:
+                return joined
+            attended |= referenced
+        # Intersect last, so an id left over from a departed workspace can never be re-attended.
+        return attended & joined
+
+
+class FocusAllJoined:
+    """Attend every joined tool, ignoring activities — **the default**.
+
+    Not a relic of the auto-focus-on-join fallback: attention is still reconciled every
+    Observe by the same mechanism, so perception never hinges on the model emitting a
+    `focus` step. What this policy declines to do is *narrow*. Measured, narrowing is worth
+    ~825 prompt tokens per model call and **zero** judge calls on the shipped configs — the
+    condition judge already gates on `watch.source`, and the relevance judge is opt-in and
+    off — while it introduces churn across replans, where re-attaching re-baselines an
+    adapter and a change occurring in the gap is absorbed rather than reported. That failure
+    is silent, so it is not worth cents against a benchmark result.
+
+    `IntentionScopedFocus` is the opt-in for a dynamic, many-workspace run, where the
+    broad set grows with the environment while the narrow one stays constant."""
+
+    def attend(self, wm: WorkingMemory) -> set[str]:
+        return {tool.id for tool in wm.registry.all_tools()}
+
+
+def scoped_snapshot(wm: WorkingMemory, activity: Activity) -> PerceptSnapshot:
+    """The agent's percepts narrowed to one activity's own tools — the second attention layer.
+
+    Attention is agent-level (a union over live activities, because focusing is a subscription and
+    one subscription serves everyone). A *prompt* is not: a model call fired for one activity has
+    no use for a sibling activity's tools, and with several activities in flight the union is again
+    the thing that grows. This closes that gap at the `PerceptSnapshot` boundary every call already
+    takes, which makes it **non-destructive**: `wm.properties` is untouched, so the ADR-0024 change
+    gate keeps hashing a stable agent-level world and the idle-tick relevance judge keeps reading
+    it. A destructive per-activity `_filter_` would instead make the shared store depend on which
+    activity the scheduler happened to pick, and move the change signature when nothing moved.
+
+    Deliberately *not* applied everywhere. Planning stays broad (`_infer_` reads property shapes to
+    choose `$prop` over paginated scanning), both judges stay broad (they dereference change ids
+    against these same properties, and a watch source is routinely a tool no step names), and plan
+    revalidation stays broad — its gate fires on *any* perception change, so narrowing it to the
+    plan's own tools would blind the judge to the very change that woke it. It applies where the
+    question genuinely concerns one step of one activity: `_ground_` and `_select_`.
+    """
+    joined = {tool.id for tool in wm.registry.all_tools()}
+    referenced = referenced_tools(activity, joined)
+    if referenced is None:  # unplanned -> the same breadth attention gives it
+        return PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+    return PerceptSnapshot(
+        [percept for key, percept in wm.properties.items() if key[0] in referenced],
+        [percept for percept in wm.signals if percept.source in referenced],
+    )
+
+
 class DefaultObserveStrategy:
-    """The runtime's built-in default — purely mechanical, no LLM."""
+    """The runtime's built-in default — purely mechanical, no LLM.
+
+    Owns two reconciliations of activity state against the world, both before any perception is
+    read: what the agent *attends to* and what it is *waiting for* (`_suspend_`/
+    `_resume_`, ADR-0019). Attention belongs here rather than in Situate because focusing is a
+    subscription to the environment, not a view over memory — it decides what can be perceived at
+    all, so deciding it after Observe would leave it structurally one tick behind."""
+
+    def __init__(self, focus: FocusPolicy | None = None) -> None:
+        # Defaults to attending everything joined. Narrowing to live intentions is a
+        # deliberate opt-in (`focus=IntentionScopedFocus()`), not the default: measured, it
+        # is worth ~825 prompt tokens per model call and zero judge calls, against a
+        # re-baselining risk that fails silently. A benchmark number is worth more than
+        # that saving. See the attention design note.
+        self._focus = focus or FocusAllJoined()
 
     async def observe(self, cycle: DecisionCycle) -> TickResult:
         wm = cycle.working
+        # Before the snapshot, so a tool a plan just started referencing is perceived on THIS tick
+        # rather than the next one.
+        await self._reconcile_attention(cycle)
         self._snapshot_properties(wm)
         async for source, signal in cycle.signal_sink.drain():
             wm.signals.append(Percept(source, signal, time.time()))
@@ -1117,6 +1310,29 @@ class DefaultObserveStrategy:
                     return percept
         return None
 
+    async def _reconcile_attention(self, cycle: DecisionCycle) -> None:
+        """Diff the policy's target set against what is actually focused, and close the gap.
+
+        A mechanical internal effect, the same class as the auto-focus this replaces — not an
+        external-action dispatch — so one-external-action-per-cycle (ADR-0009) is untouched.
+        Ordering is safe in the other direction too: `tool.focus()` establishes the adapter's
+        change baseline, so the `observe()` immediately below compares equal and a newly attended
+        tool emits no spurious `state_changed` on its first tick.
+        """
+        wm = cycle.working
+        attended = self._focus.attend(wm)
+        before = set(wm.focused_tools)
+        for tool_id in wm.focused_tools.keys() - attended:
+            await release(cycle, tool_id)
+        for tool_id in attended - wm.focused_tools.keys():
+            try:
+                tool = wm.registry.get(tool_id)
+            except KeyError:  # named by a plan but not (or no longer) joined
+                continue
+            await attend(cycle, tool)
+        if before != wm.focused_tools.keys():  # only on a real transition — this is THE diagnostic
+            log.info("observe: attending %s", ", ".join(sorted(wm.focused_tools)) or "(nothing)")
+
     @staticmethod
     def _snapshot_properties(wm: WorkingMemory) -> None:
         """Represent observable properties as a replace-by-(source, name) snapshot: one percept per
@@ -1309,13 +1525,14 @@ class DefaultSituateStrategy:
     if result.activity is still None. Creates an activity from any unhandled message (deduped by
     derived goal) via the internal _create_activity_ action, and adjusts wm via the internal
     working-memory actions — loads joined tools' manuals (_load_), unloads manuals no longer backed
-    by a joined tool (_unload_), and filters observable-property percepts to the joined workspaces'
-    tools (_filter_). _filter_ only prunes properties (a re-observed snapshot, safe to drop);
-    signals are retained regardless of source — they're fire-and-forget, and their retention and
-    eviction is consumption-driven, owned by the blocked-state machinery, not this prune. Focusing
-    tools is *not* done here: _focus_ is an external action, and the cycle dispatches at most one
-    external action per cycle (at Act), so a richer strategy emits focus as a plan step. Which ready
-    activity runs is delegated to a pluggable ActivitySelectionStrategy (default
+    by a joined tool (_unload_), and filters observable-property percepts to the *attended* tools
+    (_filter_). _filter_ only prunes properties (a re-observed snapshot, safe to drop); signals are
+    retained regardless of source — they're fire-and-forget, and their retention and eviction is
+    consumption-driven, owned by the blocked-state machinery, not this prune. Deciding what to
+    attend to is *not* done here: it is a subscription to the environment, reconciled in Observe
+    against the live intentions, and a plan can still override either way with an
+    explicit `focus`/`unfocus` step dispatched as the cycle's one external action (at Act). Which
+    ready activity runs is delegated to a pluggable ActivitySelectionStrategy (default
     RoundRobinActivitySelection — fair rotation over the ready set), so a richer scheduler can be
     swapped in without re-authoring the mechanical activity-creation and wm-adjustment above."""
 
@@ -1357,10 +1574,11 @@ class DefaultSituateStrategy:
     async def _adjust_working_memory(wm: WorkingMemory, cycle: DecisionCycle) -> None:
         tools = wm.registry.all_tools()
         manual_ids = {tool.manual.id for tool in tools}
-        # Relevant = the tools of the joined workspaces. focused_tools is a subset — per A&A you can
-        # only focus a tool discovered by joining its workspace (FocusAction resolves it through the
-        # registry) — so it adds nothing here. Signals ignore this set: _filter_ never drops them.
-        relevant_ids = {tool.id for tool in tools}
+        # Manuals track the joined workspaces; percepts track the narrower ATTENDED set. Only a
+        # focused tool is re-observed, so the moment attention narrows a released tool's
+        # snapshot is frozen and misleading — this is the housekeeping backstop that drops it even
+        # if `release` did not. Signals ignore this set: _filter_ never drops them.
+        relevant_ids = set(wm.focused_tools)
         load = cycle.actions.internal(LoadManualAction.name)
         unload = cycle.actions.internal(UnloadManualAction.name)
         filter_ = cycle.actions.internal(FilterPerceptionsAction.name)
@@ -2632,6 +2850,9 @@ class DefaultReasonStrategy:
         # 5) Gate hot: fire the revalidation off-cycle (RUNNING); the verdict lands a later cycle.
         # Carry the fire-time signature so Observe advances the baseline to *this* world on resolve:
         # a change landing mid-flight then earns its own reconsideration rather than being absorbed.
+        # Agent-level on purpose, unlike ground/select: the gate above fires on ANY
+        # perception change, so scoping this to the plan's own tools would hand the judge a world
+        # in which the change that woke it is invisible — it would revalidate against nothing.
         observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
         revalidate = cycle.actions.internal(RevalidateAction.name)
         await revalidate.execute(
@@ -2716,9 +2937,7 @@ class DefaultReasonStrategy:
             cycle,
             activity_id=activity.id,
             collection=collection,
-            observed=PerceptSnapshot(
-                list(cycle.working.properties.values()), list(cycle.working.signals)
-            ),
+            observed=scoped_snapshot(cycle.working, activity),
             **passthrough,
         )
         return activity.pending_inference is not None
@@ -3036,7 +3255,9 @@ class DefaultReasonStrategy:
         )
         if not unresolved:
             return resolved  # cheap path — resolved mechanically, no model call
-        observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+        # Prompt context only (the mechanical resolve above already read the whole store), so
+        # narrowing it to this activity's own tools costs nothing and is where the tokens are.
+        observed = scoped_snapshot(wm, activity)
         ground = cycle.actions.internal(GroundAction.name)
         await ground.execute(
             cycle,

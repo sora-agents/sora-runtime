@@ -382,6 +382,7 @@ async def test_situate_filters_properties_but_retains_signals(tmp_path: Path) ->
     await registry.join(_ORIGIN)
     cycle, working, semantic = _cycle(registry, tmp_path)
     await semantic.store_manual(tool.manual)
+    working.focused_tools["clock"] = tool  # attended; "stranger" is not
     keep_prop = Percept("clock", ObservableProperty("time", "10:00"), 0.0)
     drop_prop = Percept("stranger", ObservableProperty("x", 1), 0.0)
     keep_signal = Percept("stranger", Signal("blip", {}), 0.0)
@@ -393,8 +394,8 @@ async def test_situate_filters_properties_but_retains_signals(tmp_path: Path) ->
 
     await DefaultSituateStrategy().situate([a1], working, cycle, TickResult())
 
-    # The property from an unengaged source is pruned; the joined tool's property and the
-    # fire-and-forget signal (even from an unengaged source) are retained.
+    # The property from an unattended source is pruned; the attended tool's property and the
+    # fire-and-forget signal (even from an unattended source) are retained.
     assert working.properties == {("clock", "time"): keep_prop}
     assert working.signals == [keep_signal]
 

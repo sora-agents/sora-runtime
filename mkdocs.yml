@@ -119,6 +119,7 @@ nav:
       - Decision Records: architecture/adrs/README.md
       - Design Notes:
           - ARE Dynamic Scenarios: architecture/notes/are-dynamic-scenarios.md
+          - Attention Scoped to Live Intentions: architecture/notes/attention-scoped-to-live-intentions.md
           - Cross-Workspace Tool Sharing: architecture/notes/cross-workspace-tool-sharing.md
           - Jason Plan Representation: architecture/notes/jason-plan-representation.md
           - "Plan Control Structures: Collection References": architecture/notes/plan-control-structures-collection-references.md

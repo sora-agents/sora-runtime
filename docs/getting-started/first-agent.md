@@ -78,10 +78,16 @@ tools' manuals into working memory (`_load_`), unloads any no longer backed by a
 next cycle. Signals are **fire-and-forget** and are never dropped by `_filter_`: a signal may still
 matter to another (or a `blocked`) activity, so its retention/eviction is owned by the blocked-state
 machinery's fixed retention cap, not a per-cycle prune — satisfying a wait never evicts a signal
-early. As a temporary fallback the runtime auto-focuses a workspace's tools on `_join_`, so an agent
-perceives its joined tools without a `focus` step. The intended path is still intentional focusing —
-an external action (one per cycle, dispatched at Act) that a richer strategy emits as a `_focus_`
-plan step (and `_unfocus_` to narrow observation cost); that override is unaffected.
+early.
+
+Joining does not focus. What the agent *attends to* is reconciled at the top of every Observe against
+the tools its live plans actually reference — every tool a step invokes or `$prop`-references, plus
+whatever a declared condition watches — so perception never hinges on the model remembering a `focus`
+step, and a joined-but-unused tool costs no observation, no signal subscription and no prompt text.
+An activity that has no plan yet (and an agent with nothing to do) broadens to every joined tool, so
+planning still sees the whole environment. `_focus_`/`_unfocus_` remain available as plan steps for
+the case the rule doesn't cover: watching a tool whose operations your plan never calls, or dropping
+one early. See the [attention design note](../architecture/notes/attention-scoped-to-live-intentions.md).
 
 ## Running the ARE examples
 

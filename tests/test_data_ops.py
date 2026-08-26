@@ -1218,7 +1218,16 @@ async def test_the_decide_filter_data_op_plumbs_observed_state_through(tmp_path:
         next_action="filter",
         params={"in": [{"id": "e1"}], "out": "qualifying", "where": {"$decide": "todays events"}},
     )
-    activity = _activity_with_plan([step], [_history("get_current_time", {"hour": 7})])
+    # The plan names the clock. Under intention-scoped focus that is not decoration: a tool
+    # whose PROPERTY the
+    # plan needs but whose operations it never calls is exactly the case an explicit `focus` step
+    # exists for, and it is also what puts the clock in this activity's prompt view. A $decide
+    # whose referent belongs to a tool no live plan mentions is not observed in the first place.
+    activity = _activity_with_plan(
+        [Step(next_action="focus", params={"tool_id": "clock"}), step],
+        [_history("get_current_time", {"hour": 7})],
+    )
+    activity.step_index = 1  # the focus step already ran; the data-op is next
     working.activities["a"] = activity
 
     await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())

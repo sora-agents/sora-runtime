@@ -60,7 +60,7 @@ Everything here lives under `examples/are/sim/email_calendar/` and would not shi
   dynamic-environment guidance to the default planning content, **split into fragments with
   different fates**:
   - `_OBSERVE_TO_NOTICE_CHANGE` — *(retired)* was scaffolding for limitation 4 (perception gated on a
-    model-driven `focus`). Dropped now that `JoinAction` auto-focuses joined tools — see below.
+    model-driven `focus`). Dropped now that attention follows the plan's own references — see below.
   - `_RECONCILE_AGAINST_OBSERVED` — *scaffolding* for limitation 1 (no guarded/skip-if-empty step).
     Domain-neutral rule, email/calendar only in its examples. **Narrowed** by the runtime required-
     null skip (`DefaultActStrategy.bind`) but not yet droppable — it still covers the stale-but-non-
@@ -158,16 +158,34 @@ These are the seams the example works around. Each is a real runtime gap, not a 
    principled fix is efference / read-write tagging (see the foundational extensions below), which
    would let the change-gate ignore self-writes directly and drop the wasted revalidation too.
 
-4. **Observation requires focus (mitigated, not resolved).** Observable properties are snapshotted
-   only for *focused* tools. This *was* model-driven — the plan had to explicitly `focus` every tool
-   it reconciled against, and `focus` is an ordinary step the base planner treats as optional, so if
-   the model omitted one the dynamic behavior silently never triggered. **Mitigated** by
-   `JoinAction` now auto-focusing every tool of a joined workspace, so perception no longer hinges on
-   a model focus step and `_OBSERVE_TO_NOTICE_CHANGE` is retired. This is a **temporary mechanical
-   fallback**: focusing *everything* joined gives up the per-cycle observation-cost narrowing that
-   intentional focus buys. The real fix — reliable, intentional model-driven focus/unfocus that
-   attends to only the tools that matter (and *holds* that focus across a replan) — is still future
-   work; `_focus_`/`_unfocus_` remain the seam for it.
+4. **Observation requires focus (resolved).** Observable properties are snapshotted only for
+   *focused* tools. This *was* model-driven — the plan had to explicitly `focus` every tool it
+   reconciled against, and `focus` is an ordinary step the base planner treats as optional, so if
+   the model omitted one the dynamic behavior silently never triggered. An interim fallback focused
+   every tool of a joined workspace, which closed the silent failure but gave up the observation-cost
+   narrowing focus exists for. **Resolved** by
+   [design note](../../../../docs/architecture/notes/attention-scoped-to-live-intentions.md):
+   attention is reconciled at the top of every Observe to the union of the tools the live plans
+   reference — steps' `tool_id`s, `$prop` references found by walking params recursively, condition
+   `watch` sources, `blocked_on` sources — and broadens to everything joined while an activity has no
+   plan (which covers the whole replan window, since `reset_for_replan()` clears `plan`). Perception
+   no longer hinges on a model focus step; `_OBSERVE_TO_NOTICE_CHANGE` is retired.
+   `_focus_`/`_unfocus_` remain the plan-level override for a tool whose properties matter but whose
+   operations the plan never calls. The *silent-failure* half is what is resolved. The
+   observation-cost half is smaller than it looks and is **not** settled: measured, narrowing is
+   worth ~825 tokens per model call and **zero** judge calls (the condition judge already gates on
+   `watch.source`, and the relevance judge is not enabled here), because a property over 400 chars
+   already renders as a shape sketch rather than its contents. So `FocusAllJoined` is the shipped
+   default and `IntentionScopedFocus` the opt-in — see the note's measurement section. This example
+   is the natural place to turn narrowing *on* once someone wants to measure it under exogenous
+   churn, since it is the one dynamic scenario in the repo.
+
+   **What to watch on a dynamic run.** A tool can now be released and re-attended across a replan,
+   and re-attaching re-baselines the ARE adapter — so a change occurring while a tool is unattended
+   is absorbed into the new baseline rather than reported. `MailDiffInterruptPolicy` is the concrete
+   exposure: it baselines off the first non-empty inbox observation, which now happens when a plan
+   first references the mailbox rather than at join. Broaden-while-unplanned should cover it, but it
+   is the thing to verify on a real follow-up run rather than assume.
 
 5. **Observation-aware inference can bake run-specific literals.** Because the mailbox's `state`
    observable property is snapshotted into working memory in the same Observe that drains the thin

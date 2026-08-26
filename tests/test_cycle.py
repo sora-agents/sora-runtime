@@ -105,6 +105,22 @@ class _RecordingReason:
         return result
 
 
+def _joined(tool: FakeTool) -> tuple[EnvironmentRegistry, WorkspaceOrigin]:
+    """A registry with `tool`'s workspace already joined.
+
+    Observe reconciles attention against the registry before it snapshots, so a tool
+    hand-placed into focused_tools with nothing joined is released as a stale focus rather than
+    observed. That is the real invariant — focused_tools ⊆ joined — so these tests now set it up.
+    """
+    origin = WorkspaceOrigin(adapter="fake", address="fake://ws")
+    return (
+        EnvironmentRegistry(
+            adapters={origin: FakeAdapter("fake", FakeWorkspace("ws", origin, [tool]))}
+        ),
+        origin,
+    )
+
+
 def _cycle(
     tmp_path: Path,
     transport: ScriptedTransport | None = None,
@@ -171,8 +187,9 @@ async def test_observe_returns_empty_tick_result(tmp_path: Path) -> None:
 async def test_observe_emits_property_percepts_from_focused_tools(tmp_path: Path) -> None:
     prop = ObservableProperty(name="unread", value=3)
     tool = FakeTool("EmailClientApp", properties=[prop])
-    cycle, working = _cycle(tmp_path)
-    working.focused_tools["EmailClientApp"] = tool
+    registry, origin = _joined(tool)
+    cycle, working = _cycle(tmp_path, registry=registry)
+    await registry.join(origin)
 
     await DefaultObserveStrategy().observe(cycle)
 
@@ -233,8 +250,9 @@ async def test_observe_replaces_property_snapshot_not_append(tmp_path: Path) -> 
     # A property is persistent, re-observed state: re-observing the same (source, name) replaces the
     # prior percept (last value wins) rather than accumulating a growing history of stale values.
     tool = FakeTool("EmailClientApp", properties=[ObservableProperty(name="unread", value=3)])
-    cycle, working = _cycle(tmp_path)
-    working.focused_tools["EmailClientApp"] = tool
+    registry, origin = _joined(tool)
+    cycle, working = _cycle(tmp_path, registry=registry)
+    await registry.join(origin)
     strategy = DefaultObserveStrategy()
 
     await strategy.observe(cycle)
@@ -257,8 +275,9 @@ async def test_observe_snapshots_each_property_by_name(tmp_path: Path) -> None:
             ObservableProperty(name="drafts", value=1),
         ],
     )
-    cycle, working = _cycle(tmp_path)
-    working.focused_tools["EmailClientApp"] = tool
+    registry, origin = _joined(tool)
+    cycle, working = _cycle(tmp_path, registry=registry)
+    await registry.join(origin)
     strategy = DefaultObserveStrategy()
 
     await strategy.observe(cycle)

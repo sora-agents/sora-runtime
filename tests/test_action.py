@@ -44,6 +44,7 @@ from sora.action import (
     SuspendAction,
     UnfocusAction,
     UnloadManualAction,
+    attend,
     default_action_registry,
     invoke_step,
 )
@@ -364,11 +365,10 @@ async def test_join_registers_tools_and_persists_records(tmp_path: Path) -> None
     assert stored_manual.id == tool.manual.id
 
 
-async def test_join_focuses_all_workspace_tools(tmp_path: Path) -> None:
-    # Temporary mechanical fallback: joining a workspace focuses *all* its tools, so perception no
-    # longer hinges on the model emitting a focus step. Every joined tool lands in focused_tools and
-    # gets its signals wired to the cycle's own signal_sink (the eventual goal is intentional,
-    # model-driven focus — this stands in until that's reliable).
+async def test_join_does_not_focus_the_workspaces_tools(tmp_path: Path) -> None:
+    # Joining discovers, connects and persists — it does NOT attend. What the agent attends to is
+    # reconciled in Observe against the live intentions, so a joined-but-unreferenced
+    # tool costs no observation, no signal subscription and no prompt text.
     signal = Signal(name="new_email", payload={"n": 1})
     email = FakeTool("EmailClientApp", signals_on_focus=[signal])
     calendar = FakeTool("CalendarApp")
@@ -378,23 +378,21 @@ async def test_join_focuses_all_workspace_tools(tmp_path: Path) -> None:
     ack = await JoinAction().execute(registry, cycle, activity_id="a1", origin=_ORIGIN)
 
     assert ack.ok is True
-    # Every tool the workspace exposed is now focused (pre-populated from the joined set) — with no
-    # explicit _focus_ dispatch.
-    assert working.focused_tools == {"EmailClientApp": email, "CalendarApp": calendar}
-    assert email.focused is True and calendar.focused is True
-    # The subscription is the cycle's own sink — the tool replayed its signal into it.
-    drained = [item async for item in cycle.signal_sink.drain()]
-    assert drained == [("EmailClientApp", signal)]
+    assert working.focused_tools == {}
+    assert email.focused is False and calendar.focused is False
+    # No subscription was wired, so nothing replayed into the cycle's sink.
+    assert [item async for item in cycle.signal_sink.drain()] == []
 
 
-async def test_leave_after_autofocus_unfocuses_without_a_manual_focus(tmp_path: Path) -> None:
-    # Join auto-focuses, so leaving must tear that focus down even though no _focus_ was ever
-    # dispatched — the join/leave pair stays symmetric.
+async def test_leave_releases_a_reconciled_focus_with_no_manual_focus(tmp_path: Path) -> None:
+    # A focus established by the Observe reconciler rather than by an explicit _focus_ dispatch is
+    # still torn down by leave — the teardown keys on focused_tools, not on how the entry got there.
     tool = FakeTool("EmailClientApp", signals_on_focus=[Signal("new_email", {"n": 1})])
     registry, workspace = _registry_with(tool)
     cycle, working, _ = _cycle(registry, tmp_path)
     await JoinAction().execute(registry, cycle, activity_id="a1", origin=_ORIGIN)
-    assert "EmailClientApp" in working.focused_tools  # auto-focused by join, not a manual focus
+    await attend(cycle, registry.get("EmailClientApp"))
+    assert "EmailClientApp" in working.focused_tools
 
     await LeaveAction().execute(registry, cycle, activity_id="a1", workspace_id="ws")
 

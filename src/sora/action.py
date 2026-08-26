@@ -168,6 +168,31 @@ def invoke_step(tool_id: str, operation_name: str, **op_args: Any) -> Step:
     )
 
 
+async def attend(cycle: DecisionCycle, tool: Tool) -> None:
+    """Start attending to a tool: subscribe its signals and enter it into the focused set.
+
+    The single definition of what "focused" *does*, shared by the `_focus_` external action and by
+    the Observe phase's attention reconciler. Written twice, the two drift — and a
+    subscription established without the corresponding `focused_tools` entry is invisible state.
+    """
+    await tool.focus(cycle.signal_sink)
+    cycle.working.focused_tools[tool.id] = tool
+
+
+async def release(cycle: DecisionCycle, tool_id: str) -> None:
+    """Stop attending to a tool — the exact inverse of `attend`, plus the stale-snapshot drop.
+
+    Unfocusing stops re-observing this tool, so its observable-property snapshot is permanently
+    stale — drop it. Signals from the same source stay (their own store, left untouched):
+    fire-and-forget, they may still matter elsewhere (ADR-0019, same rationale as `_filter_`).
+    An absent id is a no-op, so a reconciler may release speculatively.
+    """
+    tool = cycle.working.focused_tools.pop(tool_id, None)
+    if tool is not None:
+        await tool.unfocus()
+    cycle.working.drop_properties(lambda source: source != tool_id)
+
+
 # Every predefined external action takes the uniform (registry, cycle, **kwargs) signature and reads
 # its own params out of **kwargs, rather than declaring them as explicit keyword-only args. An extra
 # required keyword-only param would break the structural-subtype relation to ExternalAction under
@@ -184,9 +209,7 @@ class FocusAction:  # predefined external action: _focus_
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
         tool_id = kwargs[TOOL_ID]
-        tool = registry.get(tool_id)
-        await tool.focus(cycle.signal_sink)
-        cycle.working.focused_tools[tool_id] = tool
+        await attend(cycle, registry.get(tool_id))
         return ActionAck(ok=True)
 
 
@@ -197,14 +220,7 @@ class UnfocusAction:  # predefined external action: _unfocus_
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        tool_id = kwargs[TOOL_ID]
-        tool = cycle.working.focused_tools.pop(tool_id, None)
-        if tool is not None:
-            await tool.unfocus()
-        # Unfocusing stops re-observing this tool, so its observable-property snapshot is
-        # permanently stale — drop it. Signals from the same source stay (their own store, left
-        # untouched): fire-and-forget, they may still matter elsewhere (same rationale as _filter_).
-        cycle.working.drop_properties(lambda source: source != tool_id)
+        await release(cycle, kwargs[TOOL_ID])
         return ActionAck(ok=True)
 
 
@@ -233,16 +249,11 @@ class JoinAction:  # predefined external action: _join_ — implies discover/con
                     last_seen_at=now,
                 )
             )
-            # Auto-focus every joined tool (same effect FocusAction performs), so perception no
-            # longer hinges on the model emitting — and holding — a `focus` step: an unfocused
-            # tool's state isn't observed, so without this a mid-task change (or the agent's own
-            # writes) silently goes unseen. This is a **temporary mechanical fallback**, not the
-            # intended design: the goal is reliable, intentional model-driven focus/unfocus that
-            # attends to only the tools that matter (bounding per-cycle observation cost).
-            # `_focus_`/`_unfocus_` stay available as that eventual path and as a manual override;
-            # leaving unfocuses these again (LeaveAction), so the join/leave pair stays symmetric.
-            await tool.focus(cycle.signal_sink)
-            cycle.working.focused_tools[tool.id] = tool
+        # Joining does NOT focus: it discovers, connects and persists. What the agent attends to
+        # is reconciled every cycle in Observe against the tools its live intentions actually
+        # reference, so a joined-but-unreferenced tool costs no observation, no signal
+        # subscription and no prompt text. `_focus_`/`_unfocus_` stay available as a plan-level
+        # override; leaving releases whatever ended up focused (LeaveAction).
         # workspace_id addresses it (for a later _leave_); tool_ids are a self-contained snapshot
         # of what was gained, legible after leave / across an agent boundary (see EXAMPLES.md).
         # the snapshot is useful for logging, e.g. saving an episode to memory
@@ -264,9 +275,7 @@ class LeaveAction:  # predefined external action: _leave_ — implies close
         # workspace must not leave a stale focus (a live signal subscription + a dangling handle)
         # behind. Read the tools before registry.leave() pops the workspace.
         for tool in registry.get_workspace(workspace_id).tools():
-            focused = cycle.working.focused_tools.pop(tool.id, None)
-            if focused is not None:
-                await focused.unfocus()
+            await release(cycle, tool.id)
         await registry.leave(workspace_id)
         return ActionAck(ok=True)
 
@@ -328,7 +337,7 @@ class FilterPerceptionsAction:  # predefined internal action: _filter_
 
     async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
         # Prune observable-property percepts to the relevant tools, in place (`tool_ids` is the
-        # relevant set — the default passes the joined workspaces' tools).
+        # relevant set — the default passes the *attended* tools, i.e. wm.focused_tools).
         tool_ids = kwargs["tool_ids"]
         cycle.working.drop_properties(lambda source: source in tool_ids)
 

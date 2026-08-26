@@ -64,10 +64,9 @@ itself off-cycle (a genuinely asynchronous signal source) is separately deferred
 Observation precondition — met by the runtime now, not the prompt. Observable properties/signals
 are only produced for a *focused* tool (``DefaultObserveStrategy``), and the follow-up path is dead
 without them (no ``state_changed`` from the inbox -> the policy never fires; no view of what the
-agent already created). ``JoinAction`` now auto-focuses every tool of a joined workspace, so this
-holds mechanically — the plan no longer has to emit a ``focus`` step. That auto-focus is a
-*temporary* fallback (the goal is reliable intentional focus/unfocus); until then
-``reconciling_plan_prompt`` no longer scaffolds it.
+agent already created). The runtime reconciles attention in Observe against the tools the live plan
+references, so this holds mechanically — the plan no longer has to emit a ``focus`` step
+for a tool it invokes, and ``reconciling_plan_prompt`` no longer scaffolds one.
 """
 
 from __future__ import annotations
@@ -287,8 +286,9 @@ def reconciling_plan_prompt(
     follow-up correction typically omits whatever didn't change). That last clause is the
     ``_THREAD_READING`` fragment — email domain knowledge quarantined here until it can move to the
     email-client Manual (ADR-0015); the first is gap-scaffolding for limitation 1. The focus-first
-    scaffolding (``_OBSERVE_TO_NOTICE_CHANGE``) is gone — ``JoinAction`` auto-focuses joined tools
-    now, so perception no longer hinges on a model focus step. Wired via ``agent.yaml``'s
-    ``procedural.plan_prompt``; the ``{"steps": [...]}`` response contract is unchanged."""
+    scaffolding (``_OBSERVE_TO_NOTICE_CHANGE``) is gone — attention follows the plan's own tool
+    references now, so perception no longer hinges on a model focus step. Wired via
+    ``agent.yaml``'s ``procedural.plan_prompt``; the ``{"steps": [...]}`` response contract is
+    unchanged."""
     system, user = default_plan_prompt(activity, tools, observed, messages)
     return system + _RECONCILE_INSTRUCTION, user
