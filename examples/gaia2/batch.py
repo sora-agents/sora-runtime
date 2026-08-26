@@ -117,6 +117,7 @@ def _jsonl_record(
     trace_id: str | None,
     awaiting_input: list[str] | None = None,
     write_counts: Any = None,
+    timeline_expired: bool = False,
 ) -> dict[str, Any]:
     """One ``output.jsonl`` line, matching ARE's ``_export_benchmark_result_jsonl`` exactly:
     ``task_id``/``trace_id``/``score`` at top level, and a ``metadata`` dict with all-None values
@@ -135,6 +136,12 @@ def _jsonl_record(
         # invisible otherwise. None when there was none, so the strip below keeps every ordinary
         # run's record byte-identical to ARE's own shape.
         "awaiting_input": awaiting_input or None,
+        # ARE's clock, not the agent, ended this run: the scenario's duration is a real-time budget
+        # (its event loop is wall-clock paced), so past it no later turn is delivered. Recorded only
+        # when True, because it invalidates this record's own score and mismatch fields rather than
+        # qualifying them — an aggregate that averages these in is measuring the host, not the
+        # agent. None otherwise, so an ordinary record stays byte-identical to ARE's own shape.
+        "timeline_expired": timeline_expired or None,
         # ARE's tool-call-count gate, recomputed offline (no judge model). Recorded only when it
         # FAILS: a failure is conclusive — the judge applies this gate before any per-event
         # matching — so it explains a zero that the rationale otherwise attributes to the
@@ -371,6 +378,7 @@ def _run_one_scenario(
         trace_id=trace_id,
         awaiting_input=result.awaiting_input,
         write_counts=result.write_counts,
+        timeline_expired=result.timeline_expired,
     )
 
 

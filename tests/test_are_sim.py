@@ -639,6 +639,62 @@ async def test_transport_submit_injects_an_ad_hoc_user_message() -> None:
 
 
 # ------------------------------------------------------------------------------------------------
+# AreSimulation.timeline_expired() — "ARE's clock ended the run", not "the agent did nothing".
+#
+# ARE's event loop sleeps one real second per tick, so a scenario's `duration` is a wall-clock
+# budget for the agent (1000s by default for a JSON benchmark scenario). Spend it on inference and
+# the environment stops mid-run: no later turn is delivered, because a Gaia2 turn is released by a
+# ConditionCheckEvent only the live loop ticks. The judge then reports the turn index never
+# advanced and the write-count gate reports the whole turn's oracle calls as missing — the same
+# output a capable agent that chose to do nothing would produce.
+# ------------------------------------------------------------------------------------------------
+
+
+def _sim_with_clock(duration: Any, passed: float) -> AreSimulation:
+    # timeline_expired() reads only env.duration and env.time_manager.time_passed(), so it needs no
+    # ARE Environment — same white-box shortcut as _sim_with_validate_result above.
+    sim = AreSimulation(SimpleNamespace())
+    sim._env = SimpleNamespace(
+        duration=duration, time_manager=SimpleNamespace(time_passed=lambda: passed)
+    )
+    sim._started = True
+    return sim
+
+
+def test_timeline_expired_mirrors_ares_own_loop_exit_test() -> None:
+    # ARE's loop runs `while time_passed() <= duration`, so equality is still *running* — the run
+    # has not expired on the tick that exactly reaches the budget. Pinned to the boundary because
+    # an off-by-one here would label an ordinary completed run as truncated, which is worse than
+    # not reporting at all: it would excuse a real agent failure.
+    assert _sim_with_clock(1000, 999.0).timeline_expired() is False
+    assert _sim_with_clock(1000, 1000.0).timeline_expired() is False
+    assert _sim_with_clock(1000, 1000.5).timeline_expired() is True
+
+
+def test_timeline_expired_is_false_when_the_scenario_runs_indefinitely() -> None:
+    # ARE reads duration=None as "no limit", so there is no budget to overrun however long it ran.
+    assert _sim_with_clock(None, 10_000.0).timeline_expired() is False
+
+
+def test_timeline_expired_is_false_before_the_simulation_starts() -> None:
+    sim = AreSimulation(SimpleNamespace())
+    assert sim.timeline_expired() is False
+
+
+def test_timeline_expired_never_raises_when_the_clock_is_unreadable() -> None:
+    # A diagnostic must never cost the run its real result: a probe that raised here would turn a
+    # scored run into an 'exception' record.
+    sim = AreSimulation(SimpleNamespace())
+    sim._env = SimpleNamespace(duration=1000, time_manager=SimpleNamespace(time_passed=_boom))
+    sim._started = True
+    assert sim.timeline_expired() is False
+
+
+def _boom() -> float:
+    raise RuntimeError("clock gone")
+
+
+# ------------------------------------------------------------------------------------------------
 # AreSimulation.validate() — surfaces ARE's in-band validation exception, preserves unscored None.
 # ------------------------------------------------------------------------------------------------
 

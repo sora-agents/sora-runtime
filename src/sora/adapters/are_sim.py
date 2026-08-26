@@ -252,6 +252,36 @@ class AreSimulation:
 
         return bool(self._env.state == EnvironmentState.PAUSED)
 
+    def timeline_expired(self) -> bool:
+        """True when ARE's event loop exited because ``scenario.duration`` was reached, rather than
+        because the scenario played out or something stopped it.
+
+        This distinction is not cosmetic. ARE's loop is **wall-clock paced** — one ``time.sleep(1)``
+        per tick, advancing simulated time by ``time_increment_in_seconds`` — so a scenario's
+        ``duration`` (1000s by default for a JSON benchmark scenario) is a real-time budget for the
+        agent, not a property of the scripted world. A model slow enough to spend that budget on
+        inference has the environment die underneath it mid-turn: later turns are never delivered,
+        because a Gaia2 turn is released by a ``ConditionCheckEvent`` that only the live event loop
+        ticks. The run then presents exactly like a competent agent that chose to do nothing —
+        ``validate()`` reports the turn index never advanced, and the write-count gate reports every
+        one of the missing turn's oracle calls as missing. Reading that as an agent failure is
+        wrong, and nothing else in the result distinguishes the two, which is why this is surfaced
+        as its own signal. Like ``is_paused``, deliberately not on the ``Simulation`` Protocol: it
+        says nothing to the adapter/transport and only concrete eval code reads it."""
+        env = self._env
+        if env is None or not self._started:
+            return False
+        duration = getattr(env, "duration", None)
+        if duration is None:  # ARE reads None as "run indefinitely" — nothing to expire
+            return False
+        try:
+            passed = env.time_manager.time_passed()
+        except Exception:  # a diagnostic must never cost the run its real result
+            return False
+        # Mirrors the loop's own exit test (`while time_passed() <= duration`), so this reports the
+        # condition ARE actually stopped on rather than an approximation of it.
+        return bool(passed > duration)
+
     def apps(self) -> list[Any]:
         return list(getattr(self._scenario, "apps", None) or [])
 

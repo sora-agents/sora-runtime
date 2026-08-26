@@ -108,6 +108,24 @@ def test_jsonl_record_success_strips_none_metadata_keeps_false_has_exception() -
     }
 
 
+def test_jsonl_record_marks_a_run_ARE_s_clock_ended() -> None:
+    # A truncated run's score is not a measurement of the agent: past scenario.duration the
+    # environment stops and later turns are never delivered, so the judge's zero and the gate's
+    # "missing" list describe turns the agent never saw. Recorded so an aggregate can exclude it
+    # rather than average in a number about the host machine's speed.
+    rec = _jsonl_record(
+        scenario_id="s5",
+        run_number=0,
+        success=False,
+        rationale="Validation called at turn -1 but nb_turns is 2",
+        exception=None,
+        trace_id=None,
+        timeline_expired=True,
+    )
+    assert rec["metadata"]["timeline_expired"] is True
+    assert rec["score"] == 0.0  # still scored as ARE scored it; the flag qualifies it, not replaces
+
+
 def test_jsonl_record_exception_carries_type_and_message() -> None:
     rec = _jsonl_record(
         scenario_id="s2",

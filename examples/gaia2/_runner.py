@@ -40,7 +40,10 @@ class RunResult:
     run ended on a question from — empty for every ordinary run. ``write_counts`` is a
     ``sora.adapters.are_sim.WriteCountCheck`` when an oracle log was available (None otherwise) —
     ARE's tool-call-count gate recomputed offline, which costs no model tokens and so is filled in
-    for *unscored* runs too."""
+    for *unscored* runs too. ``timeline_expired`` is True when ARE's event loop ran out of
+    ``scenario.duration`` — a real-time budget, since the loop is wall-clock paced — before the run
+    finished; every result below it then describes a world that stopped early, not an agent that
+    chose badly."""
 
     outcome: Any
     environment: Any
@@ -48,6 +51,7 @@ class RunResult:
     exception: Exception | None = None
     awaiting_input: list[str] = field(default_factory=list)
     write_counts: Any = None
+    timeline_expired: bool = False
 
 
 def _awaiting_input(agent: Any) -> list[str]:
@@ -63,6 +67,19 @@ def _awaiting_input(agent: Any) -> list[str]:
         for a in agent.working.activities.values()
         if a.state is ActivityState.BLOCKED and isinstance(a.blocked_on, InputWait)
     ]
+
+
+def _timeline_expired(simulation: Any) -> bool:
+    """Whether ARE's own clock, not the agent, ended the run. Tolerates a simulation that predates
+    the probe (a fake in a test) rather than requiring it on the ``Simulation`` Protocol."""
+    probe = getattr(simulation, "timeline_expired", None)
+    if probe is None:
+        return False
+    try:
+        return bool(probe())
+    except Exception:  # a diagnostic must never cost the run its real result
+        log.warning("timeline-expiry probe failed", exc_info=True)
+        return False
 
 
 def _make_stop_when(
@@ -194,4 +211,7 @@ def run_scenario(
         # scenario is still scored normally — this only records *why* it stopped short.
         awaiting_input=_awaiting_input(agent),
         write_counts=counts,
+        # Read last, and never allowed to raise: it reinterprets every field above it, so losing it
+        # to a probe failure would be worse than losing any single one of them.
+        timeline_expired=_timeline_expired(simulation),
     )

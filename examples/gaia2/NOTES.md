@@ -483,3 +483,110 @@ is dead — whatever separates the two runs is upstream of the parse (most likel
 side of `equality_checker`'s fast path each run's args landed on) and has not been
 established. Either way, no runtime A/B on a multi-turn email scenario was meaningful
 before this patch.
+
+
+## Update (2026-08-26): a Gaia2 scenario has a ~1000-second **real-time** budget
+
+**ARE's event loop is wall-clock paced, so `scenario.duration` is a real-time budget for the
+agent, not a property of the scripted world.** `Environment._event_loop` runs
+`while time_passed() <= duration`, and each iteration is `tick(); time.sleep(1)` with
+`time_increment_in_seconds = 1` — one simulated second per real second. `ScenarioImportedFromJson`
+defaults `duration = 1000`, and the Gaia2 JSON scenarios in `scenarios/` do not override it (their
+metadata carries `duration: null`, which leaves the class default standing). So **every scenario
+here gives the agent ~16 minutes of wall clock, total, across all turns.**
+
+Nothing in the runner enforced or reported this. `--max-wall-seconds` defaults to 1200, *above*
+the real limit, so it never binds; it is a backstop for a hung judge, not the budget.
+
+### How it fails, and why it reads as an agent error
+
+Discovered on `logs/aug26-run3-qwen3-30b-64k.log` (qwen3-30b served locally). Eight model calls
+totalling **930.8s** — two plan inferences at **405s** and **329s** — against a 1000s budget. The
+environment's loop exited mid-turn-0. What happened next is the trap:
+
+- The agent's remaining steps still *executed*. App methods are called directly, and
+  `@event_registered` logs the event whether or not the loop is alive, so `send_email` and the
+  final reply both landed and both appear in the trace as ordinary successes.
+- **No later turn was ever delivered.** A Gaia2 turn is released by a `ConditionCheckEvent` that
+  only the live loop ticks (`turn_conditions.wrapped_condition` counts the agent's
+  `send_message_to_user` events and calls the per-turn judge). With the loop gone, that check
+  never runs, `BaseJudge.state.turn_idx` is never incremented, and `validate()` reports
+  `Validation called at turn -1 but nb_turns is 2`.
+- The write-count gate then reports **every** oracle call of the undelivered turn as
+  `missing (oracle did, agent did not)` — here `Calendar__add_calendar_event: 1` and
+  `Calendar__delete_calendar_event: 6`.
+
+That output is indistinguishable from a competent agent that simply did nothing after turn 0. In
+this run turn 0 itself was **correct** (`turn 0: ok`), and the two calendar deletions the agent was
+"missing" belonged to a follow-up email it was never shown.
+
+**This is the second distinct upstream cause with the same output signature.** The first is the
+judge-gate rejection above (a falsy verdict calls `env.stop()`); this is the clock. Both produce
+"a whole turn's oracle writes missing", and neither is the agent. Before reading a missing turn as
+a failure, establish which one it was.
+
+### What is instrumented now
+
+- `AreSimulation.timeline_expired()` — mirrors ARE's own loop-exit test (`time_passed() > duration`,
+  so equality is still running). Not on the `Simulation` Protocol; only eval code reads it, same as
+  `is_paused()`.
+- `RunResult.timeline_expired`, printed by `run_benchmark.py` **first**, before the verdict, because
+  it reinterprets every line under it rather than adding to them. `batch.py` records it in
+  `output.jsonl` metadata when true, so an aggregate can exclude a truncated run instead of
+  averaging in a number about the host machine's speed.
+- `--scenario-duration SECONDS` overrides the budget, and announces the override in the run's own
+  output.
+
+### On raising the budget
+
+Raising the duration does not hand the agent more of the scripted world. **No event is pinned to an
+absolute timestamp** — `event_time` is `0.0` for all 46 events across the five capabilities — and
+every event but the opening user message hangs off a dependency. What an event carries is
+`event_relative_time`, a delay in seconds *after its dependency fires*, so shifting the budget does
+not shift the schedule.
+
+| capability | events | dep-free | `event_relative_time` values | duration |
+|---|---|---|---|---|
+| adaptability | 14 | 1 | 0, 1 | 1000 |
+| ambiguity | 7 | 1 | 0, 1 | 1000 |
+| execution | 10 | 1 | 0, 1 | 1000 |
+| search | 2 | 1 | 0, 1 | 1000 |
+| **time** | 13 | 1 | 0, **2, 19, 31, 65, 91, 121, 183, 221** | 1000 |
+
+Four of the five are effectively "as soon as the dependency fires" (`1.0`). In
+`adaptability/scenario_universe_21_5e0gvz` that includes the two `Emails.create_and_add_email`
+events carrying the friend's reply: they fire off the agent's own `send_message_to_user`, not at a
+time.
+
+**Time is the exception, and it matters for a slow model.** Its six
+`Calendar.add_calendar_event_by_attendee` events are released 31, 65, 91, 121, 183 and 221 seconds
+after the opening message — matching a goal that opens *"some events will be added to the calendar
+in the next four minutes ... immediately remove all the conflicting preexisting events"*. That
+cadence is measured on the same one-second-per-real-second clock, so it is 3.7 minutes of **real**
+time. A model whose plan inference takes 405s is inside a single call for that entire window and
+meets all six arrivals at once, well after "immediately". **`--scenario-duration` does not fix
+this** — the events are relative to the user message, not to the budget, so more budget only buys
+time *after* the window has already been missed. Time is the one capability where model latency
+changes what the scenario means rather than merely whether it finishes.
+
+The other residual is *simulated-clock drift*. Sim time advances one second per real second from
+the scenario's `start_time` (`2024-10-15 07:00:00` for all five), so a 3000s run leaves
+`get_current_time` ~50 minutes further along than a fast run would. The margin is usually enormous:
+`adaptability` asks for "this upcoming Saturday" and the oracle resolves it to `2024-10-19`, so the
+phrase only reinterprets once the clock passes Saturday — about **four days**, or a duration near
+330,000s. Drift bites only where a goal is phrased on a scale comparable to the run's own length.
+Either way a number produced under an overridden duration is not comparable to a published one,
+which is why the override announces itself.
+
+**The honest framing for a slow local model: it is not a Gaia2 result.** ARE's baselines assume a
+hosted model answering in seconds. At ~400s per plan inference, two plan calls consume three
+quarters of a scenario's stock lifetime, and no amount of correctness recovers turns that were
+never delivered. Report local-model runs as trajectory/behaviour checks, and keep scored numbers on
+a model fast enough to finish inside the stock budget.
+
+**Not an S-ORA defect, and the replan was right.** The 329s second plan inference was a *correct*
+recovery: the first plan's `search_contacts({"query": "Film Producer"})` returned `[]` (ARE's
+contact search is name-based, not job-based), the plan-defect check caught the dependent step
+before any write, and the replan filtered the `Contacts` property instead and found the right
+person. The cost of being right was a third of the scenario's life — a statement about the model's
+latency, not about the recovery.

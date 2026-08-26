@@ -22,6 +22,12 @@ fired), then calls ``validate()`` once — so a multi-turn scenario is scored fu
 (``--max-wall-seconds``) is the safety valve; ``--exit-when-idle`` opts back into the old
 single-turn quiet-window heuristic.
 
+The binding budget is usually neither of those: ARE's event loop sleeps one real second per tick, so
+``scenario.duration`` (1000s by default) is a **real-time** allowance for the whole run. Overrun it
+and the environment stops mid-run — later turns are never delivered, and the result then looks
+exactly like an agent that did nothing, so the run reports ``timeline_expired`` above its own
+verdict. ``--scenario-duration`` raises it; see NOTES.md for why that is safe and what it costs.
+
 Without ``--judge-model`` the run is unscored (the judge no-op), useful for a quick trajectory
 check — but on a *multi-turn* scenario it also silently stops after turn 1, because the later turns'
 events hang off ``OracleEvent``s that an agent-mode environment ignores. ``--init-turns`` wires
@@ -75,6 +81,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Custom endpoint URL for --judge-model. Optional.",
     )
     parser.add_argument(
+        "--strict-verdict-case",
+        action="store_true",
+        help=(
+            "Do NOT relax ARE's case-sensitive judge-verdict parse. ARE reads the judge's verdict "
+            "with a case-sensitive substring test for [[True]]; an OpenAI-family judge writes "
+            "[[true]], so no vote is recorded, the checker returns None, and the falsy None is "
+            "read as a rejection -- which also stops the environment at the turn gate and "
+            "withholds every later turn. The default relaxes only that comparison's case, matching "
+            "what ARE's own Llama reference judge already produces. Pass this to reproduce stock "
+            "ARE behavior."
+        ),
+    )
+    parser.add_argument(
         "--init-turns",
         action="store_true",
         help=(
@@ -82,6 +101,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "unscored, but the later turns fire unconditionally instead of being gated on a judge "
             "verdict about the earlier ones. Without this (and without --judge-model) a multi-turn "
             "scenario silently stops after turn 1. Mutually exclusive with --judge-model."
+        ),
+    )
+    parser.add_argument(
+        "--scenario-duration",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Override the scenario's own duration (default 1000 for a JSON benchmark scenario). "
+            "ARE's event loop is wall-clock paced -- one real second per tick -- so this is the "
+            "real-time budget the agent has to finish EVERY turn, and a slow model has the "
+            "environment expire mid-run rather than merely scoring badly. Raising it hands the "
+            "agent more time, not more of the scripted world: no event is pinned to an absolute "
+            "timestamp, and the scheduled ones (the Time capability releases calendar events "
+            "31-221s after the opening message) are relative to a dependency, so the override "
+            "does not move them. What it does change is how far the simulated clock drifts from "
+            "the scenario's start_time. A score obtained under an override is not comparable to "
+            "a published one."
         ),
     )
     parser.add_argument(
@@ -137,6 +174,14 @@ def main(argv: list[str] | None = None) -> None:
     print(f"loading scenario {args.scenario!r} ...", flush=True)
     scenario: Any = load_scenario(args.scenario)
 
+    if args.scenario_duration is not None:
+        # Set before attach_judge/initialize_turns: both preprocess the scenario, and
+        # Environment.run copies `duration` off it at start. Announced because it makes the run
+        # incomparable to one obtained under the stock budget, and that fact has to survive the
+        # output being pasted somewhere without the command line.
+        print(f"scenario duration: {scenario.duration}s -> {args.scenario_duration}s (overridden)")
+        scenario.duration = args.scenario_duration
+
     if args.judge_model:
         # Attach before the run: preprocess_scenario runs the scenario's OracleEvents in oracle mode
         # (deterministic, no model) to build the graph validate() later scores against.
@@ -145,6 +190,14 @@ def main(argv: list[str] | None = None) -> None:
             model=args.judge_model,
             provider=args.judge_provider,
             endpoint=args.judge_endpoint,
+            relax_verdict_case=not args.strict_verdict_case,
+        )
+        # Disclosed in the run's own output, not just the log: a score obtained with the verdict
+        # parse relaxed is not the same artifact as one obtained under stock ARE, and which of the
+        # two it is must survive being pasted somewhere without the log.
+        print(
+            "judge verdict parse: "
+            + ("stock ARE (case-sensitive)" if args.strict_verdict_case else "case-insensitive")
         )
     else:
         # No judge, so nothing else would replay the oracle — do it here (deterministic, no model)
@@ -187,6 +240,22 @@ def _print_score(result: Any, *, scored: bool) -> None:
     if result.exception is not None:  # a judge/oracle misconfig or a run-time crash
         print(f"\nGaia2 validation: n/a ({result.exception})")
         return
+
+    # Printed FIRST and unconditionally, because it reinterprets every line that follows rather
+    # than adding to them. When ARE's clock ran out mid-run, the later turns were never delivered
+    # at all — the judge reports the turn index never advanced and the gate reports the whole
+    # turn's oracle calls as missing, which is exactly what a capable agent that did nothing would
+    # produce. Nothing else in the output separates the two.
+    if getattr(result, "timeline_expired", False):
+        print(
+            "\n⏱  ARE timeline EXPIRED mid-run (scenario.duration reached in "
+            f"{result.duration:.0f}s of wall clock).\n"
+            "    ARE's event loop is wall-clock paced, so a scenario's duration is a real-time\n"
+            "    budget for the agent; past it the environment stops and no later turn is ever\n"
+            "    delivered. Read the verdict and gate below as a truncated run, not as a wrong\n"
+            "    one — a turn the agent never saw cannot have been failed. Re-run with a larger\n"
+            "    --scenario-duration, or with a faster model, before drawing any conclusion."
+        )
 
     outcome = result.outcome
     if outcome.success is None:
