@@ -320,3 +320,26 @@ async def test_a_result_that_arrives_after_the_deadline_is_discarded(tmp_path: P
 
     assert replanning is ActivityState.READY
     assert activity.plan is None or activity.plan.id != "p9"
+
+
+async def test_a_failed_then_inference_replans_rather_than_killing_the_activity(
+    tmp_path: Path,
+) -> None:
+    """A `then` is a sub-goal by another name — planned deliberatively, landing a plan — so it
+    degrades the same way. It reaches the error path more routinely than the others, because both
+    new give-up paths (the client's stall timeout and the deadline above) resolve as an error, and
+    it runs on an activity whose parent frames are intact by construction: a fired condition is only
+    pursued once the body is idle, which for a monitoring goal is precisely while a frame is
+    suspended underneath it."""
+    cycle, working, _ = _cycle(tmp_path)
+    parent = Plan(id="p1", goal="watch the calendar", steps=[_step("search"), _step("send")])
+    activity = _inferring("then", plan=parent, step_index=1)
+    working.activities["a1"] = activity
+    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('nope')"))
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.state is ActivityState.READY
+    superseded = activity.superseded
+    assert superseded is not None
+    assert superseded.plan is parent

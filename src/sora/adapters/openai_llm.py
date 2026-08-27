@@ -36,6 +36,14 @@ DEFAULT_MODEL = "gpt-5.1"
 # The SDK's own default is 600s read with two retries, so a stalled request costs up to ~30 minutes
 # of silence. Observed: a first plan inference that took ~14 minutes to return a 3,853-token
 # completion, spending a whole benchmark scenario's real-time budget before the agent had a plan.
+#
+# The one gap in the "silence, not duration" reading is the FIRST chunk: nothing has streamed yet,
+# so this does bound time-to-first-token, and two targets can legitimately exceed it there — a
+# reasoning model that stays quiet while it reasons, and a local runtime doing prompt eval over a
+# long context. Both are configuration, not code: raise `stall_timeout` (or pass None to disable it)
+# for such a target. It is left at 90s because the shipped configs do not hit it, and because the
+# cost of raising it is paid on the failure this exists to bound — a genuinely dead socket holds the
+# activity for the whole value, against a Gaia2 scenario's ~1000s real-time budget for everything.
 DEFAULT_STREAM_STALL_TIMEOUT = 90.0
 DEFAULT_CONNECT_TIMEOUT = 10.0
 
@@ -132,15 +140,21 @@ class OpenAICompatLLMClient:
         parts: list[str] = []
         usage_chunk: Any = None
         stream = await self._client.chat.completions.create(**kwargs, stream=True)
-        async for chunk in stream:
-            # The usage block rides a final chunk that carries no choices, so both are collected
-            # independently rather than assuming they arrive together.
-            if getattr(chunk, "usage", None) is not None:
-                usage_chunk = chunk
-            for choice in getattr(chunk, "choices", None) or []:
-                content = getattr(getattr(choice, "delta", None), "content", None)
-                if content:
-                    parts.append(content)
+        # `async with`, not a bare `async for`: the stall timeout above raises *mid-iteration* —
+        # that is the path it exists for — and an unclosed stream leaves the httpx response open,
+        # so its connection never returns to the pool. On a long run against a flaky endpoint that
+        # leaks until the pool is exhausted, and since `Timeout(stall_timeout, ...)` sets the pool
+        # budget to the same value, healthy calls then start timing out waiting for a connection.
+        async with stream:
+            async for chunk in stream:
+                # The usage block rides a final chunk that carries no choices, so both are collected
+                # independently rather than assuming they arrive together.
+                if getattr(chunk, "usage", None) is not None:
+                    usage_chunk = chunk
+                for choice in getattr(chunk, "choices", None) or []:
+                    content = getattr(getattr(choice, "delta", None), "content", None)
+                    if content:
+                        parts.append(content)
         text = "".join(parts)
         if self._instrument:
             log_llm_usage(_usage_of(usage_chunk, answer_chars=len(text)))

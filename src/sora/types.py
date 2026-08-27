@@ -303,6 +303,19 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # number could not say how far this condition has read in each without one silently skipping
     # entries in the other.
     derived_through: int = 0
+    # Where both marks stood before the in-flight judgement advanced them, so a judgement that
+    # ERRORS can give the change back. Advancing at fire time is right for a call that answers (a
+    # signal landing mid-flight earns its own evaluation rather than re-judging this one), but on a
+    # failure it destroys the wake outright: nothing re-opens a gate for a change already past the
+    # mark, the real verdict arriving late is dropped by the stale-id guard, and a collection that
+    # goes quiet afterwards never makes the condition eligible again.
+    fired_from_signals: int = 0
+    fired_from_derived: int = 0
+    # Bounds that rollback to ONE retry per condition. A seam that fails every time would otherwise
+    # re-open its own gate forever, buying a call per cycle for as long as the signal stays in
+    # retention — the spin the marks exist to prevent, reached from the other side. Cleared by a
+    # judgement that answers, so a later failure gets its own retry.
+    retried_after_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -383,10 +396,14 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     # pending_operation's late-ack guard. `kind` picks the landing zone: "plan" (infer ->
     # Activity.plan) or "ground" (ground -> Activity.grounded_params). See ADR-0021.
     id: str
-    # "plan" | "subgoal" | "ground" | "select" | "revalidate". "subgoal" lands like "plan" (into
-    # Activity.plan); "select" is a $decide data-op filter (ADR-0023) whose surviving subset lands
-    # into Activity.bindings[out] — carries `out`; "revalidate" is the context-adaptation
-    # plan-validity re-check (ADR-0024), landing a bool onto Activity.reconsider_verdict.
+    # "plan" | "subgoal" | "then" | "ground" | "select" | "revalidate" | "condition". "subgoal"
+    # lands like "plan" (into Activity.plan), and so does "then" — a fired condition's goal
+    # (ADR-0022), distinguished only because it installs at the declaring depth without pushing a
+    # frame; "select" is a $decide data-op filter (ADR-0023) whose surviving subset lands into
+    # Activity.bindings[out] — carries `out`; "revalidate" is the context-adaptation plan-validity
+    # re-check (ADR-0024), landing a bool onto Activity.reconsider_verdict; "condition" is the
+    # batched pending-condition judgement, landing a ConditionVerdict onto
+    # Activity.condition_verdict.
     kind: str
     requested_at: float
     out: str | None = None  # target binding name for kind=="select"; None for the others

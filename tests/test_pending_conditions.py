@@ -46,11 +46,13 @@ from sora.strategies import (
     DefaultRelevanceJudge,
     DefaultSituateStrategy,
     Strategies,
+    _eligible_conditions,
 )
 from sora.transport import MessageTransport
 from sora.types import (
     Change,
     ConditionWait,
+    InferenceResult,
     InputWait,
     ObservableProperty,
     PendingCondition,
@@ -366,6 +368,63 @@ async def test_an_already_judged_signal_does_not_wake_it_again(tmp_path: Path) -
     await cycle.strategies.observe.observe(cycle)
 
     assert activity.state is ActivityState.BLOCKED
+
+
+async def test_a_failed_judgement_gives_the_change_back_so_the_wake_is_not_lost(
+    tmp_path: Path,
+) -> None:
+    """The marks advance at FIRE time, which is right for a judgement that answers — but on one
+    that errors it silently destroys the wake.
+
+    Nothing re-opens a gate for a change already past the mark, so a condition whose one judgement
+    failed can never be told about the change that opened it: the real verdict arriving late is
+    dropped by the stale-id guard, and the collection going quiet afterwards means nothing further
+    makes it eligible. That is reachable on a healthy call — the client retries a stalled request
+    up to twice at 90s each, which can outlast the 300s deadline and expire a call that was about
+    to succeed.
+    """
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.INBOX.emails")
+    state = activity.pending_conditions[0]
+
+    await cycle.strategies.observe.observe(cycle)
+    situated = await cycle.strategies.situate.situate([activity], working, cycle, _tick())
+    await cycle.strategies.reason.reason(activity, working, cycle, situated)
+    assert state.evaluated_through == working.signals_appended  # advanced at fire time
+
+    # the call never answers and the deadline gives up on it
+    pending = activity.pending_inference
+    assert pending is not None
+    cycle.inference_sink.push(pending.id, InferenceResult(id=pending.id, error="stalled"))
+    await cycle.strategies.observe.observe(cycle)
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert _eligible_conditions(activity, working)  # the change is judgeable again
+
+
+async def test_a_second_failure_does_not_give_the_change_back_again(tmp_path: Path) -> None:
+    """The rollback is bounded to one retry per condition. A seam that fails every time would
+    otherwise re-open its own gate forever, buying a model call per cycle for as long as the signal
+    stays in retention — the same spin the marks exist to prevent, arrived at from the other side.
+    """
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.INBOX.emails")
+
+    for _ in range(2):
+        await cycle.strategies.observe.observe(cycle)
+        situated = await cycle.strategies.situate.situate([activity], working, cycle, _tick())
+        await cycle.strategies.reason.reason(activity, working, cycle, situated)
+        pending = activity.pending_inference
+        assert pending is not None
+        cycle.inference_sink.push(pending.id, InferenceResult(id=pending.id, error="stalled"))
+        await cycle.strategies.observe.observe(cycle)
+        await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert not _eligible_conditions(activity, working)
 
 
 async def test_reflect_does_not_undo_the_resume_observe_just_did(tmp_path: Path) -> None:
@@ -932,6 +991,48 @@ async def test_a_change_claimed_by_a_declared_gate_never_reaches_the_judge(
     await _settle()
 
     assert not [a for a in working.activities.values() if a.id not in {"a1", "old"}]
+
+
+async def test_a_change_on_a_watched_path_stays_claimed_whatever_direction_it_moved(
+    tmp_path: Path,
+) -> None:
+    """`kind` scopes what OPENS a gate, not what the gate is responsible for.
+
+    A watch declared `added` on a path the agent also deletes from is the exact shape `kind` was
+    introduced for — and reading that same narrowed predicate here inverts its purpose: the agent's
+    own delete stops being "someone's business" and becomes undeclared relevance, so the cost the
+    eligibility gate just stopped paying to one judge is paid to the other, and this one interrupts
+    a person. Claiming is deliberately the wider test — the docstring already accepts the false
+    negative it implies.
+    """
+    llm = FakeLLMClient(json.dumps({"relevant": False}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    judge = DefaultRelevanceJudge()
+    watch = SignalWait(
+        signal_name="state_changed",
+        source="insim:are/Emails",
+        path="folders.INBOX.emails",
+        kind="added",
+    )
+    _blocked_with_condition(working, watch)
+    done = Activity(id="old", goal="book it", context={}, state=ActivityState.TERMINATED)
+    await cycle.episodic.learn(done, "booked", succeeded=True)
+    working.signals.append(
+        Percept(
+            "insim:are/Emails",
+            Signal(
+                "state_changed",
+                {"changes": [Change(path="folders.INBOX.emails", removed=("e9",))]},
+            ),
+            0.0,
+        )
+    )
+    working.signals_appended += 1
+
+    await judge.consider(cycle)
+    await _settle()
+
+    assert llm.calls == []  # the delete is the declared gate's business, not this layer's
 
 
 async def test_judge_stops_asking_after_its_cap(tmp_path: Path) -> None:

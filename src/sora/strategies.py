@@ -587,7 +587,13 @@ class DefaultRelevanceJudge:
             claimed = any(
                 w.signal_name == signal.name
                 and (w.source is None or percept.source == w.source)
-                and watch_matches(w.path, w.kind, changes_of(signal))
+                # `path`, deliberately NOT `kind`, unlike the eligibility gate: `kind` says what may
+                # *open* a gate, not what a gate is answerable for. Narrowing here inverts the
+                # purpose it was added for — a watch declared `added` on a collection the agent also
+                # deletes from is exactly the shape `kind` exists to spare a judge call, and reading
+                # it here hands that same delete to *this* judge instead, which additionally
+                # interrupts a person. The wider test keeps the saving where it was won.
+                and path_matches(w.path, changes_of(signal))
                 for w in watches
             )
             if not claimed:
@@ -726,7 +732,13 @@ class DefaultInterruptHandler:
 # the world is untouched and a fresh attempt is free to differ. `select`/`condition`/`revalidate`
 # are absent because they already degrade in place (an empty shortlist, nothing fired, assume
 # valid) — cheaper still, since they keep the plan.
-_REPLANNABLE_INFERENCE = frozenset({"plan", "subgoal", "ground"})
+#
+# `then` belongs here for the same reason `subgoal` does — it *is* a sub-goal, planned
+# deliberatively and landing a plan, differing only in that it pushes no frame. Leaving it out was
+# worse than leaving `subgoal` out: a `then` is pursued only once the body is idle, which for the
+# monitoring goals that declare conditions means a suspended parent frame is intact underneath it
+# every time, so the residual branch's terminate destroyed an activity mid-window.
+_REPLANNABLE_INFERENCE = frozenset({"plan", "subgoal", "ground", "then"})
 
 
 def _inference_defect(kind: str, error: str) -> str:
@@ -1267,8 +1279,22 @@ class DefaultObserveStrategy:
                         # fail-soft as select/revalidate, and the same reasoning: the activity was
                         # already waiting, so keeping it waiting changes nothing, while the opposite
                         # default would invent follow-up work nobody asked for off a flaky call.
-                        # The marks were already advanced at fire time, so this does not re-fire on
-                        # the same signal; a genuinely new change gets its own evaluation.
+                        #
+                        # But "keeping it waiting" is only true if the change that opened the gate
+                        # is still judgeable, and the fire-time mark advance means it is not: the
+                        # gate cannot re-open for a change already past the mark, the real verdict
+                        # arriving late is dropped by the stale-id guard, and a collection that goes
+                        # quiet afterwards never makes the condition eligible again — so a failure
+                        # here silently loses the wake rather than deferring it. That is reachable
+                        # on a HEALTHY call, since the client retries a stalled request twice at its
+                        # own stall timeout each, which can outlast this deadline. Give the change
+                        # back, once per condition (see `retried_after_failure`).
+                        for state in activity.condition_batch:
+                            if state.retried_after_failure:
+                                continue
+                            state.retried_after_failure = True
+                            state.evaluated_through = state.fired_from_signals
+                            state.derived_through = state.fired_from_derived
                         activity.condition_verdict = ConditionVerdict()
                         activity.state = ActivityState.READY
                         log.warning(
@@ -1425,6 +1451,10 @@ class DefaultObserveStrategy:
                         activity.condition_verdict = (
                             verdict if isinstance(verdict, ConditionVerdict) else ConditionVerdict()
                         )
+                        # The seam answered, so the retry this condition is owed on a failure is
+                        # restored — the bound is one retry per failure, not one per activity life.
+                        for state in activity.condition_batch:
+                            state.retried_after_failure = False
                         activity.state = ActivityState.READY
                         log.info(
                             "observe: condition verdict fired=%s retired=%s for activity %s",
@@ -3445,7 +3475,11 @@ class DefaultReasonStrategy:
         # that lands while the call is in flight gets a higher sequence number and so earns its own
         # evaluation later; advancing on resolve instead would either re-judge the same signal (a
         # spin) or swallow one that arrived mid-flight.
+        # Keeping where they stood is what lets a judgement that ERRORS give the change back
+        # (see `PendingConditionState.fired_from_signals`); a call that answers never reads them.
         for state, _ in eligible:
+            state.fired_from_signals = state.evaluated_through
+            state.fired_from_derived = state.derived_through
             state.evaluated_through = wm.signals_appended
             state.derived_through = wm.property_changes_appended
         # Paired with the source that reported them, not flattened into a bare list: a `Change`

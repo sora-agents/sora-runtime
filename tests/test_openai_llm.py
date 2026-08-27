@@ -14,7 +14,8 @@ import pytest
 
 pytest.importorskip("openai")
 
-from openai import Timeout  # noqa: E402
+import httpx  # noqa: E402
+from openai import APITimeoutError, Timeout  # noqa: E402
 
 from sora.adapters.openai_llm import (  # noqa: E402
     DEFAULT_CONNECT_TIMEOUT,
@@ -112,26 +113,54 @@ def _chunks(response: SimpleNamespace) -> list[SimpleNamespace]:
     return out
 
 
+class _FakeStream:
+    """Models the SDK's ``AsyncStream`` contract, not just its iterability: it is an async context
+    manager that closes the underlying response. The difference is the whole point of the
+    ``stall_timeout`` path — that timeout raises *mid-iteration*, so a bare ``async for`` would
+    leave the httpx response open and never return the connection to the pool.
+
+    ``fail_after`` makes the stream raise where a stalled read does.
+    """
+
+    def __init__(self, chunks: list[SimpleNamespace], *, fail_after: int | None = None) -> None:
+        self._chunks = chunks
+        self._fail_after = fail_after
+        self.closed = False
+
+    async def __aenter__(self) -> _FakeStream:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def __aiter__(self) -> AsyncIterator[SimpleNamespace]:
+        for index, chunk in enumerate(self._chunks):
+            if self._fail_after is not None and index >= self._fail_after:
+                raise APITimeoutError(request=httpx.Request("POST", "http://test"))
+            yield chunk
+
+
 class _FakeCompletions:
-    def __init__(self, response: SimpleNamespace) -> None:
+    def __init__(self, response: SimpleNamespace, *, fail_after: int | None = None) -> None:
         self.response = response
         self.kwargs: dict[str, Any] | None = None
+        self.stream: _FakeStream | None = None
+        self._fail_after = fail_after
 
     async def create(self, **kwargs: Any) -> Any:
         self.kwargs = kwargs
         if not kwargs.get("stream"):
             return self.response
-
-        async def _iter() -> AsyncIterator[SimpleNamespace]:
-            for chunk in _chunks(self.response):
-                yield chunk
-
-        return _iter()
+        self.stream = _FakeStream(_chunks(self.response), fail_after=self._fail_after)
+        return self.stream
 
 
 class _FakeAsyncOpenAI:
-    def __init__(self, response: SimpleNamespace) -> None:
-        self.chat = SimpleNamespace(completions=_FakeCompletions(response))
+    def __init__(self, response: SimpleNamespace, *, fail_after: int | None = None) -> None:
+        self.chat = SimpleNamespace(completions=_FakeCompletions(response, fail_after=fail_after))
         self.closed = False
 
     async def close(self) -> None:
@@ -306,3 +335,34 @@ async def test_aclose_releases_the_underlying_http_client() -> None:
     client._client = fake  # type: ignore[assignment]
     await client.aclose()
     assert fake.closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_stream_closes_the_response_on_its_way_out() -> None:
+    """The stall timeout raises *while* the stream is being iterated — that is the path it exists
+    for — so the response has to be released there or every timed-out call leaks its connection.
+    A run doing thousands of calls against a flaky endpoint exhausts the pool, and since the pool
+    timeout is the same `Timeout` value, healthy calls then start failing too."""
+    client = OpenAICompatLLMClient(model="m", api_key="test")
+    fake = _FakeAsyncOpenAI(_response("hello"), fail_after=2)
+    client._client = fake  # type: ignore[assignment]
+
+    with pytest.raises(APITimeoutError):
+        await client.complete(system="s", prompt="p")
+
+    stream = fake.chat.completions.stream
+    assert stream is not None
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_completed_stream_is_closed_too() -> None:
+    client = OpenAICompatLLMClient(model="m", api_key="test")
+    fake = _FakeAsyncOpenAI(_response("hello"))
+    client._client = fake  # type: ignore[assignment]
+
+    assert await client.complete(system="s", prompt="p") == "hello"
+
+    stream = fake.chat.completions.stream
+    assert stream is not None
+    assert stream.closed is True
