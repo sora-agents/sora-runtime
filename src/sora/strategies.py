@@ -763,9 +763,9 @@ def referenced_tools(activity: Activity, joined: set[str]) -> set[str] | None:
             # would attend the tool right back and make the step a permanent no-op. Note this only
             # gets the tool no OTHER step names: the scan covers every step of a live plan, not the
             # un-run tail (that is what removes the need for history retention), so an `unfocus`
-            # following an `invoke` of the same tool is still overridden on the next Observe —
-            # released, then re-attended a tick later, re-baselining the adapter in between. The
-            # derived floor beats an explicit act there; see the design note's rough edges.
+            # following an `invoke` of the same tool still reads as referenced here. That is not the
+            # last word — once the `unfocus` step actually runs, `WorkingMemory.suppressed_tools`
+            # holds the release against this derived floor, so the explicit act wins.
             if step.next_action != UnfocusAction.name:
                 tool_id = step.params.get(TOOL_ID)
                 if isinstance(tool_id, str):
@@ -855,6 +855,14 @@ def scoped_snapshot(wm: WorkingMemory, activity: Activity) -> PerceptSnapshot:
     plan's own tools would blind the judge to the very change that woke it. It applies where the
     question genuinely concerns one step of one activity: `_ground_` and `_select_`.
     """
+    # Follows the FocusPolicy rather than deciding for itself. An agent on the broad default has
+    # declined to narrow *because* a wrongly narrowed view fails silently — the model simply reasons
+    # without the property and nothing reports a miss — so narrowing its prompts anyway would
+    # reintroduce exactly the risk the policy choice was made to avoid, one layer down and
+    # invisibly. This layer only sharpens a narrowing the agent already opted into: from the
+    # agent-level union to the one activity the call is actually about.
+    if not wm.attention_narrowed:
+        return PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
     joined = {tool.id for tool in wm.registry.all_tools()}
     referenced = referenced_tools(activity, joined)
     if referenced is None:  # unplanned -> the same breadth attention gives it
@@ -886,8 +894,10 @@ class DefaultObserveStrategy:
         wm = cycle.working
         # Before the snapshot, so a tool a plan just started referencing is perceived on THIS tick
         # rather than the next one.
-        await self._reconcile_attention(cycle)
+        attention_moved = await self._reconcile_attention(cycle)
         self._snapshot_properties(wm)
+        if attention_moved:
+            self._rebaseline(cycle)
         async for source, signal in cycle.signal_sink.drain():
             wm.signals.append(Percept(source, signal, time.time()))
             # Bumped with the append, never with the eviction: this is what a per-waiter high-water
@@ -1310,8 +1320,11 @@ class DefaultObserveStrategy:
                     return percept
         return None
 
-    async def _reconcile_attention(self, cycle: DecisionCycle) -> None:
+    async def _reconcile_attention(self, cycle: DecisionCycle) -> bool:
         """Diff the policy's target set against what is actually focused, and close the gap.
+
+        Returns whether the attended set actually moved, so the caller can re-anchor the
+        reconsideration gate against the new observation window.
 
         A mechanical internal effect, the same class as the auto-focus this replaces — not an
         external-action dispatch — so one-external-action-per-cycle (ADR-0009) is untouched.
@@ -1320,7 +1333,16 @@ class DefaultObserveStrategy:
         tool emits no spurious `state_changed` on its first tick.
         """
         wm = cycle.working
-        attended = self._focus.attend(wm)
+        joined = {tool.id for tool in wm.registry.all_tools()}
+        target = self._focus.attend(wm)
+        # Recorded from the policy's own target, *before* suppression is subtracted: "is this agent
+        # narrowing?" is a question about the policy. Deriving it from `focused_tools` instead would
+        # conflate a narrowing policy with an explicit `_unfocus_` or a tool that failed to resolve,
+        # and would switch on the per-activity prompt view for an agent that chose the broad policy.
+        wm.attention_narrowed = not joined <= target
+        # An explicit `_unfocus_` outranks the policy. The policy is a derived floor recomputed from
+        # scratch each tick; the suppression is a decision the agent took and nothing here undoes.
+        attended = target - wm.suppressed_tools
         before = set(wm.focused_tools)
         for tool_id in wm.focused_tools.keys() - attended:
             await release(cycle, tool_id)
@@ -1332,6 +1354,28 @@ class DefaultObserveStrategy:
             await attend(cycle, tool)
         if before != wm.focused_tools.keys():  # only on a real transition — this is THE diagnostic
             log.info("observe: attending %s", ", ".join(sorted(wm.focused_tools)) or "(nothing)")
+            return True
+        return False
+
+    @staticmethod
+    def _rebaseline(cycle: DecisionCycle) -> None:
+        """Re-anchor the reconsideration gate after the *observation window* moved, rather than the
+        world (ADR-0024).
+
+        The gate hashes the property store, so attending or releasing a tool moves the signature
+        with nothing in the environment having changed — and the first checkpoint after a plan lands
+        (narrowing) or a workspace is joined (broadening) would spend a revalidation call on the
+        agent's own attention. Re-anchoring reads that as "the window moved", which is what it is.
+
+        The cost is a one-tick blind spot: a genuine change landing on the same tick as an attention
+        transition is absorbed into the new baseline instead of firing. That is bounded — a
+        transition happens when a plan lands, on join/leave, and on an explicit focus/unfocus, not
+        continuously — and the alternative is a false positive on every one of those.
+        """
+        signature = cycle.change_gate.signature(cycle.working)
+        for activity in cycle.working.activities.values():
+            if activity.reconsider_baseline is not None:
+                activity.reconsider_baseline = signature
 
     @staticmethod
     def _snapshot_properties(wm: WorkingMemory) -> None:

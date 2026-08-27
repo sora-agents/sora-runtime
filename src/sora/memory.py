@@ -164,6 +164,19 @@ class WorkingMemory:  # transient, in-process, fast
     # a retention cap is deferred (front-eviction would have to adjust the cursor).
     messages_cursor: int = 0
     focused_tools: dict[str, Tool] = field(default_factory=dict)
+    # Tools an explicit `_unfocus_` released, held against the attention reconciler so a deliberate
+    # release survives it. Attention is recomputed from scratch every Observe, so without this the
+    # policy simply re-attends the tool on the next tick and `_unfocus_` is a permanent no-op —
+    # which is what the plan prompt offers the planner as a way to stop watching something early.
+    # Cleared by the opposite explicit act (`_focus_`) and by the tool leaving the world (`_leave_`)
+    # — never by a policy, so a suppression cannot be lifted by something the agent did not decide.
+    suppressed_tools: set[str] = field(default_factory=set)
+    # Whether the agent's FocusPolicy is currently narrowing attention below the joined set —
+    # written by Observe's reconciler from the policy's own target, read by `scoped_snapshot` so the
+    # per-activity prompt view narrows only for an agent that already chose to narrow. Without it
+    # the two attention layers can disagree, and the broad policy's whole point (declining to
+    # narrow, because a wrongly narrowed view fails silently) is undone one layer down.
+    attention_narrowed: bool = False
     # manuals pulled from SemanticMemory by _load_ (removed by _unload_) — distinct from
     # focused_tools: focusing a tool is an external action, loading its manual is internal.
     loaded_manuals: dict[str, Manual] = field(default_factory=dict)
@@ -291,9 +304,9 @@ PLAN_SYSTEM_PROMPT = (
     'A step with no "action" is treated as "invoke". Use only tool ids and operation names that '
     "appear in the provided tool list. You do not need `focus` steps for the tools your plan "
     "already names: the runtime attends to every tool your steps invoke or reference, for as long "
-    "as the plan is live, and stops when it is done. Emit `focus` only for a tool whose properties "
-    "or signals you need but whose operations the plan never calls, and `unfocus` only to stop "
-    "watching one early. Respect any usage protocols & safety constraints listed for a tool "
+    "as the plan is live. Emit `focus` only for a tool whose properties or signals you need but "
+    "whose operations the plan never calls, and `unfocus` only to stop watching one early. "
+    "Respect any usage protocols & safety constraints listed for a tool "
     "when choosing and ordering steps. If the goal came from the user, end the plan by invoking "
     "the user-reply tool's `send_message_to_user` operation to report the outcome — a plan that "
     "never reports back leaves the user without an answer. Put that report in its `text` param as "

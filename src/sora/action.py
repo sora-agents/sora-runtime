@@ -209,6 +209,9 @@ class FocusAction:  # predefined external action: _focus_
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
         tool_id = kwargs[TOOL_ID]
+        # An explicit focus lifts an earlier explicit unfocus: the two are the same lever, and a
+        # suppression nothing can clear would strand the tool for the rest of the run.
+        cycle.working.suppressed_tools.discard(tool_id)
         await attend(cycle, registry.get(tool_id))
         return ActionAck(ok=True)
 
@@ -220,7 +223,12 @@ class UnfocusAction:  # predefined external action: _unfocus_
     async def execute(
         self, registry: EnvironmentRegistry, cycle: DecisionCycle, **kwargs: Any
     ) -> ActionAck:
-        await release(cycle, kwargs[TOOL_ID])
+        tool_id = kwargs[TOOL_ID]
+        # Recorded, not just performed. Observe recomputes attention from scratch every tick, so a
+        # bare release would be undone by the next reconciliation — under the default policy
+        # immediately and permanently. This is what makes "stop watching this early" mean something.
+        cycle.working.suppressed_tools.add(tool_id)
+        await release(cycle, tool_id)
         return ActionAck(ok=True)
 
 
@@ -275,6 +283,10 @@ class LeaveAction:  # predefined external action: _leave_ — implies close
         # workspace must not leave a stale focus (a live signal subscription + a dangling handle)
         # behind. Read the tools before registry.leave() pops the workspace.
         for tool in registry.get_workspace(workspace_id).tools():
+            # Drop any suppression with the tool itself: the id is about to stop naming anything,
+            # and a rejoin should start from the policy's verdict rather than inherit a decision
+            # taken about a tool that no longer exists.
+            cycle.working.suppressed_tools.discard(tool.id)
             await release(cycle, tool.id)
         await registry.leave(workspace_id)
         return ActionAck(ok=True)

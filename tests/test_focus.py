@@ -16,7 +16,13 @@ from typing import Any
 import pytest
 
 from fakes import FakeAdapter, FakeTool, FakeWorkspace, ScriptedTransport
-from sora.action import default_action_registry, invoke_step
+from sora.action import (
+    FocusAction,
+    LeaveAction,
+    UnfocusAction,
+    default_action_registry,
+    invoke_step,
+)
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
@@ -406,12 +412,139 @@ async def test_an_explicit_focus_step_survives_reconciliation(tmp_path: Path) ->
 
 
 # --------------------------------------------------------------------------------------------------
+# Explicit `_unfocus_` vs. the reconciler — a decision the agent took outranks a derived floor
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_an_explicit_unfocus_survives_reconciliation(tmp_path: Path) -> None:
+    """Attention is recomputed from scratch every Observe, so without a record of the release the
+    next tick simply re-attends the tool and `_unfocus_` is a permanent no-op — which is what the
+    plan prompt offers the planner as the way to stop watching something early."""
+    wm, registry = await _joined_wm(FakeTool("a"), FakeTool("noisy"))
+    cycle = _cycle(tmp_path, registry, wm)
+    strategy = DefaultObserveStrategy()  # the broad default: it would otherwise re-attend
+    await strategy.observe(cycle)
+    assert set(wm.focused_tools) == {"a", "noisy"}
+
+    await UnfocusAction().execute(registry, cycle, tool_id="noisy")
+    await strategy.observe(cycle)
+
+    assert set(wm.focused_tools) == {"a"}
+    assert wm.suppressed_tools == {"noisy"}
+
+
+async def test_an_explicit_focus_lifts_an_earlier_unfocus(tmp_path: Path) -> None:
+    # The two are the same lever. A suppression nothing could clear would strand the tool for the
+    # rest of the run, which is the failure mode that made auto-focus-on-join attractive.
+    wm, registry = await _joined_wm(FakeTool("a"), FakeTool("noisy"))
+    cycle = _cycle(tmp_path, registry, wm)
+    strategy = DefaultObserveStrategy()
+    await UnfocusAction().execute(registry, cycle, tool_id="noisy")
+    await strategy.observe(cycle)
+    assert set(wm.focused_tools) == {"a"}
+
+    await FocusAction().execute(registry, cycle, tool_id="noisy")
+    await strategy.observe(cycle)
+
+    assert set(wm.focused_tools) == {"a", "noisy"}
+    assert wm.suppressed_tools == set()
+
+
+async def test_leaving_a_workspace_drops_its_tools_suppressions(tmp_path: Path) -> None:
+    # The id stops naming anything, so a later rejoin should start from the policy's verdict rather
+    # than inherit a decision taken about a tool that no longer exists.
+    wm, registry = await _joined_wm(FakeTool("a"), FakeTool("noisy"))
+    cycle = _cycle(tmp_path, registry, wm)
+    await UnfocusAction().execute(registry, cycle, tool_id="noisy")
+    assert wm.suppressed_tools == {"noisy"}
+
+    await LeaveAction().execute(registry, cycle, workspace_id="ws")
+
+    assert wm.suppressed_tools == set()
+
+
+# --------------------------------------------------------------------------------------------------
+# The two attention layers move together — `attention_narrowed` is read by scoped_snapshot
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_the_broad_policy_records_that_it_is_not_narrowing(tmp_path: Path) -> None:
+    wm, registry = await _joined_wm(FakeTool("a"), FakeTool("b"))
+    cycle = _cycle(tmp_path, registry, wm)
+    wm.activities["a1"] = _planned(Plan(id="p", goal="g", steps=[_step("a")]))
+
+    await DefaultObserveStrategy(focus=FocusAllJoined()).observe(cycle)
+
+    assert wm.attention_narrowed is False
+
+
+async def test_the_narrowing_policy_records_that_it_is_narrowing(tmp_path: Path) -> None:
+    wm, registry = await _joined_wm(FakeTool("a"), FakeTool("b"))
+    cycle = _cycle(tmp_path, registry, wm)
+    wm.activities["a1"] = _planned(Plan(id="p", goal="g", steps=[_step("a")]))
+
+    await DefaultObserveStrategy(focus=IntentionScopedFocus()).observe(cycle)
+
+    assert wm.attention_narrowed is True
+
+
+async def test_an_explicit_unfocus_is_not_read_as_the_policy_narrowing(tmp_path: Path) -> None:
+    """Read off `focused_tools` this would be indistinguishable from a narrowing policy, and would
+    silently switch on the per-activity prompt view for an agent that chose the broad one."""
+    wm, registry = await _joined_wm(FakeTool("a"), FakeTool("noisy"))
+    cycle = _cycle(tmp_path, registry, wm)
+    await UnfocusAction().execute(registry, cycle, tool_id="noisy")
+
+    await DefaultObserveStrategy(focus=FocusAllJoined()).observe(cycle)
+
+    assert set(wm.focused_tools) == {"a"}  # narrower than joined...
+    assert wm.attention_narrowed is False  # ...but not because the policy narrowed
+
+
+async def test_an_attention_transition_rebaselines_the_change_gate(tmp_path: Path) -> None:
+    """The ADR-0024 gate hashes the property store, so attending or releasing a tool moves the
+    signature with nothing in the world having changed. Left alone, the first checkpoint after a
+    plan lands would spend a revalidation call on the agent's own attention."""
+    wm, registry = await _joined_wm(
+        FakeTool("a", properties=[ObservableProperty("state", 1)]),
+        FakeTool("b", properties=[ObservableProperty("state", 2)]),
+    )
+    cycle = _cycle(tmp_path, registry, wm)
+    strategy = DefaultObserveStrategy(focus=IntentionScopedFocus())
+    activity = _planned(None)
+    wm.activities["a1"] = activity
+
+    await strategy.observe(cycle)  # broad: no plan yet
+    activity.reconsider_baseline = cycle.change_gate.signature(wm)
+    activity.plan = Plan(id="p", goal="g", steps=[_step("a")])
+
+    await strategy.observe(cycle)  # narrows to {"a"} — the window moved, not the world
+
+    assert set(wm.focused_tools) == {"a"}
+    assert activity.reconsider_baseline == cycle.change_gate.signature(wm)
+
+
+async def test_rebaselining_leaves_an_unbaselined_activity_alone(tmp_path: Path) -> None:
+    # A None baseline means "not yet anchored"; the checkpoint anchors it on first arrival, and
+    # filling it in early here would silently move where the plan was measured from.
+    wm, registry = await _joined_wm(FakeTool("a"), FakeTool("b"))
+    cycle = _cycle(tmp_path, registry, wm)
+    activity = _planned(Plan(id="p", goal="g", steps=[_step("a")]))
+    wm.activities["a1"] = activity
+
+    await DefaultObserveStrategy(focus=IntentionScopedFocus()).observe(cycle)
+
+    assert activity.reconsider_baseline is None
+
+
+# --------------------------------------------------------------------------------------------------
 # scoped_snapshot — the per-activity prompt view (non-destructive)
 # --------------------------------------------------------------------------------------------------
 
 
 async def test_scoped_snapshot_keeps_only_the_activitys_own_tools() -> None:
     wm, _ = await _joined_wm(FakeTool("mine"), FakeTool("theirs"))
+    wm.attention_narrowed = True  # what Observe records when the policy narrows
     wm.properties[("mine", "state")] = Percept("mine", ObservableProperty("state", 1), 0.0)
     wm.properties[("theirs", "state")] = Percept("theirs", ObservableProperty("state", 2), 0.0)
     wm.signals.append(Percept("mine", Signal("changed", {}), 0.0))
@@ -424,12 +557,28 @@ async def test_scoped_snapshot_keeps_only_the_activitys_own_tools() -> None:
     assert [p.source for p in view.signals] == ["mine"]
 
 
+async def test_scoped_snapshot_does_not_narrow_under_a_broad_focus_policy() -> None:
+    """The two attention layers move together or the default's whole argument collapses: an agent
+    on FocusAllJoined declined to narrow *because* a wrongly narrowed view fails silently, so
+    narrowing its prompts anyway would reintroduce that risk one layer down and invisibly."""
+    wm, _ = await _joined_wm(FakeTool("mine"), FakeTool("theirs"))
+    assert wm.attention_narrowed is False  # the default, and what FocusAllJoined leaves it at
+    wm.properties[("mine", "state")] = Percept("mine", ObservableProperty("state", 1), 0.0)
+    wm.properties[("theirs", "state")] = Percept("theirs", ObservableProperty("state", 2), 0.0)
+    activity = _planned(Plan(id="p", goal="g", steps=[_step("mine")]))
+
+    view = scoped_snapshot(wm, activity)
+
+    assert {p.source for p in view.properties} == {"mine", "theirs"}
+
+
 async def test_scoped_snapshot_is_non_destructive() -> None:
     # The invariant that lets this layer exist at all: the shared store must not depend on which
     # activity the scheduler picked, or the ADR-0024 change signature moves when nothing moved.
     wm, _ = await _joined_wm(FakeTool("mine"), FakeTool("theirs"))
     wm.properties[("mine", "state")] = Percept("mine", ObservableProperty("state", 1), 0.0)
     wm.properties[("theirs", "state")] = Percept("theirs", ObservableProperty("state", 2), 0.0)
+    wm.attention_narrowed = True
     before = dict(wm.properties)
     activity = _planned(Plan(id="p", goal="g", steps=[_step("mine")]))
 
@@ -440,6 +589,7 @@ async def test_scoped_snapshot_is_non_destructive() -> None:
 
 async def test_scoped_snapshot_of_an_unplanned_activity_is_the_whole_world() -> None:
     wm, _ = await _joined_wm(FakeTool("a"), FakeTool("b"))
+    wm.attention_narrowed = True
     wm.properties[("a", "state")] = Percept("a", ObservableProperty("state", 1), 0.0)
     wm.properties[("b", "state")] = Percept("b", ObservableProperty("state", 2), 0.0)
 
