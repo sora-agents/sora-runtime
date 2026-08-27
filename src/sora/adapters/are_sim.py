@@ -175,6 +175,9 @@ class AreSimulation:
         self._env: Any | None = None
         self._lock = threading.Lock()
         self._started = False
+        # Latched at stop(): ARE's clock keeps running after the environment is torn down, so the
+        # expiry verdict has to be taken at the moment the run ended, not whenever it is read.
+        self._expired: bool | None = None
 
     def start(self) -> None:
         if self._started:
@@ -206,9 +209,17 @@ class AreSimulation:
         if aui is not None:
             aui.wait_for_user_response = False
         self._started = True
+        self._expired = None
 
     def stop(self) -> None:
         if self._env is not None and self._started:
+            # Latch the expiry verdict *before* tearing the environment down. ARE's clock is a wall
+            # clock that nothing pauses -- `Environment.stop()` sets the stop event and the state
+            # but leaves `TimeManager` running -- so `time_passed()` keeps advancing afterwards. A
+            # verdict computed at read time would therefore drift True on any run whose result is
+            # read slowly enough, and the caller reads it after `validate()`, whose judge pass can
+            # itself take minutes. Sampling here makes the answer independent of when it is asked.
+            self._expired = self._probe_expired()
             self._env.stop()
         self._started = False
 
@@ -267,9 +278,22 @@ class AreSimulation:
         one of the missing turn's oracle calls as missing. Reading that as an agent failure is
         wrong, and nothing else in the result distinguishes the two, which is why this is surfaced
         as its own signal. Like ``is_paused``, deliberately not on the ``Simulation`` Protocol: it
-        says nothing to the adapter/transport and only concrete eval code reads it."""
+        says nothing to the adapter/transport and only concrete eval code reads it.
+
+        Unlike ``is_running``/``is_paused`` this deliberately does **not** guard on ``_started``.
+        Those two report *live* state and are rightly False once the run is over; this is a
+        post-mortem, and the only moment anyone asks it is after the run is over. The shipped
+        shutdown path clears ``_started`` before any caller gets to read it -- the session's
+        teardown leaves every joined workspace, which closes the ARE workspace, which calls
+        ``stop()`` -- so guarding here would make the answer unconditionally False in production
+        while still reading True in a test that never stopped the simulation."""
+        if self._expired is not None:  # latched at stop(); see there
+            return self._expired
+        return self._probe_expired()
+
+    def _probe_expired(self) -> bool:
         env = self._env
-        if env is None or not self._started:
+        if env is None:
             return False
         duration = getattr(env, "duration", None)
         if duration is None:  # ARE reads None as "run indefinitely" — nothing to expire

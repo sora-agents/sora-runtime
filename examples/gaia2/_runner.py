@@ -179,6 +179,12 @@ def run_scenario(
     except Exception as e:  # a run-time crash: record it, sweep continues (KI still propagates)
         exc = e
     duration = time.monotonic() - started
+    # Sampled here, immediately after the session's teardown, rather than in the RunResult below:
+    # everything between is scoring work (a judge pass over the oracle graph, which can take
+    # minutes), and this reads a wall clock. `AreSimulation` latches the verdict at stop() so the
+    # position no longer matters for the real adapter, but a fake or a future Simulation that does
+    # not latch still gets a value measured against the run rather than against the judge.
+    expired = _timeline_expired(simulation)
 
     outcome: Any = ValidationOutcome(success=None)
     if exc is None and getattr(scenario, "judge", None) is not None:
@@ -211,7 +217,8 @@ def run_scenario(
         # scenario is still scored normally — this only records *why* it stopped short.
         awaiting_input=_awaiting_input(agent),
         write_counts=counts,
-        # Read last, and never allowed to raise: it reinterprets every field above it, so losing it
-        # to a probe failure would be worse than losing any single one of them.
-        timeline_expired=_timeline_expired(simulation),
+        # Sampled above, right after teardown; never allowed to raise, because it reinterprets
+        # every field beside it and losing it to a probe failure would be worse than losing any
+        # single one of them.
+        timeline_expired=expired,
     )

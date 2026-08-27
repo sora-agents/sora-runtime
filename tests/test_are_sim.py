@@ -694,6 +694,68 @@ def _boom() -> float:
     raise RuntimeError("clock gone")
 
 
+def _stoppable_sim(duration: Any, clock: list[float]) -> AreSimulation:
+    """A sim whose clock keeps ticking after stop() — which is what ARE's really does.
+    `Environment.stop()` sets the stop event and the state but never pauses the TimeManager, so
+    `time_passed()` = `time.time() - real_start + offset` goes right on advancing afterwards.
+    A frozen clock is what hid both defects below."""
+    sim = AreSimulation(SimpleNamespace())
+    sim._env = SimpleNamespace(
+        duration=duration,
+        time_manager=SimpleNamespace(time_passed=lambda: clock[0]),
+        stop=lambda: None,
+    )
+    sim._started = True
+    return sim
+
+
+def test_timeline_expired_still_answers_after_the_simulation_is_stopped() -> None:
+    """The shipped path only ever asks *after* the run: the session's teardown leaves every joined
+    workspace, which closes the ARE workspace, which calls stop(). A probe that goes quiet once the
+    simulation is stopped is dead exactly where it is needed, while still reading True in a test
+    that never stopped it."""
+    clock = [5000.0]
+    sim = _stoppable_sim(1000, clock)
+    assert sim.timeline_expired() is True  # while running
+    sim.stop()
+    assert sim.timeline_expired() is True  # and after, which is when anyone actually asks
+
+
+def test_timeline_expiry_probe_does_not_guard_on_started() -> None:
+    """The probe is a post-mortem, not a liveness check — unlike is_running/is_paused, which are
+    rightly False once the run is over. stop()'s latch normally answers first, so this pins the
+    fallback directly: any path that clears `_started` without latching (a future teardown, a
+    caller stopping ARE's Environment itself) must still get the verdict rather than a flat False.
+    """
+    sim = _stoppable_sim(1000, [5000.0])
+    sim._started = False  # cleared without a latch
+    assert sim._expired is None
+
+    assert sim.timeline_expired() is True
+
+
+def test_timeline_expiry_is_latched_at_stop_not_at_read() -> None:
+    """A run that finished well inside its budget must not drift into "expired" just because its
+    result was read slowly — and the caller reads this after validate(), whose judge pass over the
+    oracle graph can take minutes against a wall clock nothing paused."""
+    clock = [10.0]
+    sim = _stoppable_sim(1000, clock)
+    sim.stop()
+    clock[0] = 99_999.0  # the judge pass, as ARE's clock sees it
+
+    assert sim.timeline_expired() is False
+
+
+def test_timeline_expiry_latched_at_stop_survives_a_later_read() -> None:
+    # The converse: a genuinely expired run stays expired no matter when the verdict is read.
+    clock = [1500.0]
+    sim = _stoppable_sim(1000, clock)
+    sim.stop()
+    clock[0] = 1500.0
+
+    assert sim.timeline_expired() is True
+
+
 # ------------------------------------------------------------------------------------------------
 # AreSimulation.validate() — surfaces ARE's in-band validation exception, preserves unscored None.
 # ------------------------------------------------------------------------------------------------
