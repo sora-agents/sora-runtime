@@ -811,6 +811,39 @@ def test_plan_prompt_steers_conditional_selection_to_a_decide_filter() -> None:
     assert "plain top-n" in lowered
 
 
+def test_plan_prompt_routes_user_phrased_names_to_a_search_operation() -> None:
+    """`eq` on a name the USER phrased is a guess wearing a mechanical comparison's clothes.
+
+    A run matched a product the user had named in their own words against the app's `state`
+    snapshot with ``op: eq``. The catalogue stores the full title and the user had shortened it,
+    so the filter bound ``[]`` — and an empty mechanical filter is indistinguishable from "no such
+    record", so the agent told the user the item did not exist while it sat in the collection. The
+    tool's own search operation was a case-insensitive substring match that would have found it,
+    and the plan never called it: this prompt had told the planner a search "is a guess that can
+    return [] even when the record is there; filtering the property cannot" — true of an id, false
+    of a name someone paraphrased, and stated flatly enough to steer both the plan and its replan.
+    """
+    lowered = PLAN_SYSTEM_PROMPT.lower()
+    # The claim that did the steering is now scoped to exact-valued fields instead of stated flat.
+    assert "for a field whose value is exact" in lowered
+    # ...and the paraphrase case is named, with the tool's own search op as what to do instead.
+    assert "a name the user phrased" in lowered
+    assert "search or lookup operation" in lowered
+    # The failure mode, so this reads as a correctness rule rather than a style preference.
+    assert "indistinguishable from the record not existing" in lowered
+    # A tool with no search op still must not fall back to `eq` — it escalates to a $decide.
+    assert "still never a mechanical `eq`" in lowered
+    # Several near-matches is the expected result, not a reason to re-tighten to `eq` downstream.
+    assert "several near-matches" in lowered
+    # `eq` keeps every field stored verbatim — including one the user happened to utter, since a
+    # city or a status they name is not thereby approximate. Guards the rule against swallowing
+    # ordinary mechanical comparisons and pushing id/status filters onto a search or a $decide.
+    assert "what flips the rule is a free-form name, not who uttered the value" in lowered
+    assert "does not make it approximate" in lowered
+    for exact in ("ids and keys", "statuses", "numbers", "dates", "booleans"):
+        assert exact in lowered, f"exact-valued field {exact!r} no longer reserved for `eq`"
+
+
 def test_plan_prompt_examples_stay_off_any_evaluated_domain() -> None:
     """The planner's worked examples must not be drawn from a domain this runtime is scored on.
 

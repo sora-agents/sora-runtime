@@ -957,6 +957,181 @@ async def test_an_unresolvable_grounding_tags_the_bundle_with_its_defect(tmp_pat
     assert superseded.defect == gap
 
 
+# -- attributing an empty binding to the step that wrote it ---------------------------------------
+#
+# The grounder describes the gap from where it stands: handed one step's params and the history but
+# never the plan, the most it can honestly report is which parameter came up short. The replanning
+# prompt then tells the planner the replacement "has to differ THERE" — and THERE landed on the step
+# that READ the empty binding. A run rewrote that reader three times, re-emitting the identical
+# filter that had written the binding empty, until the replan breaker parked the activity. The
+# runtime holds the plan the grounder does not, so it names the producer itself.
+
+
+def _read_manual() -> Manual:
+    """`get_details` declared a READ, so the irreversibility guard lets it through to grounding —
+    which is the path the run took (its dead step was a lookup, not a write)."""
+    return Manual(
+        id="shop",
+        metadata={},
+        description="",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(
+                name="get_details", description="", parameters={}, side_effecting=False
+            )
+        ],
+    )
+
+
+def _eq_filter(out: str, value: str) -> Step:
+    return Step(
+        next_action="filter",
+        params={
+            "in": {"$prop": "shop.state", "path": "products"},
+            "out": out,
+            "where": {"path": "name", "op": "eq", "value": value},
+        },
+    )
+
+
+def _shop_activity(steps: list[Step], bindings: dict[str, object]) -> Activity:
+    activity = Activity(
+        id="a",
+        goal="buy the shirt",
+        context={},
+        plan=Plan(id="p", goal="buy the shirt", steps=steps),
+        step_index=len(steps) - 1,
+    )
+    activity.bindings.update(bindings)
+    return activity
+
+
+async def _replan_defect(tmp_path: Path, activity: Activity) -> str:
+    tool = FakeTool("shop", manual=_read_manual(), invoke_results={"get_details": {"id": "p1"}})
+    spy = ScriptedProcedural(ground_unresolvable="product_id: matches is empty")
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    working.activities[activity.id] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.superseded is not None
+    return activity.superseded.defect or ""
+
+
+async def test_an_unresolvable_grounding_names_the_step_that_wrote_the_empty_binding(
+    tmp_path: Path,
+) -> None:
+    defect = await _replan_defect(
+        tmp_path,
+        _shop_activity(
+            [
+                _eq_filter("matches", "Funny Drink"),
+                invoke_step("shop", "get_details", product_id={"$bind": "matches", "path": "0.id"}),
+            ],
+            {"matches": []},
+        ),
+    )
+
+    assert "product_id: matches is empty" in defect  # the grounder's own report is kept whole
+    assert "'matches' was produced by an earlier `filter` step" in defect  # ...the producer named
+    assert '"op": "eq"' in defect and "Funny Drink" in defect  # with the predicate that missed
+    assert "matched no items in its input collection" in defect
+    # The grounder answers with a fragment, so the clause needs a sentence break of its own.
+    assert "matches is empty. The empty" in defect
+    # It INFORMS and stops: an empty collection may be the true answer, and the framing's "tell the
+    # user instead" escape has to stay reachable, so nothing here orders that step changed.
+    assert "has to change" not in defect
+
+
+async def test_bindings_with_one_root_are_attributed_to_it_once(tmp_path: Path) -> None:
+    """A `filter` and a `take` off its result are two dead bindings with a single cause. Describing
+    that step once per binding reads as two independent defects — noise in a message whose whole
+    point is to say what to write differently."""
+    defect = await _replan_defect(
+        tmp_path,
+        _shop_activity(
+            [
+                _eq_filter("matches", "Funny Drink"),
+                Step(next_action="take", params={"in": {"$bind": "matches"}, "out": "top", "n": 1}),
+                invoke_step(
+                    "shop",
+                    "get_details",
+                    product_id={"$bind": "matches", "path": "0.id"},
+                    variant_id={"$bind": "top", "path": "0.id"},
+                ),
+            ],
+            {"matches": [], "top": []},
+        ),
+    )
+
+    assert defect.count("earlier `filter` step") == 1
+    assert "The empty 'matches' and 'top' were produced by" in defect
+
+
+async def test_the_origin_walks_back_past_a_filter_that_only_relayed_the_emptiness(
+    tmp_path: Path,
+) -> None:
+    """The run's SECOND replan, reduced. `exact` was written by a $decide filter — but that filter
+    was fed `matches`, already empty from the `eq`. Naming the $decide would misattribute by exactly
+    one link, which is the defect this exists to fix, so the walk continues to the `eq`."""
+    relay = Step(
+        next_action="filter",
+        params={"in": {"$bind": "matches"}, "out": "exact", "where": {"$decide": "priced at $25"}},
+    )
+    defect = await _replan_defect(
+        tmp_path,
+        _shop_activity(
+            [
+                _eq_filter("matches", "Funny Drink"),
+                relay,
+                invoke_step("shop", "get_details", product_id={"$bind": "exact", "path": "0.id"}),
+            ],
+            {"matches": [], "exact": []},
+        ),
+    )
+
+    assert '"op": "eq"' in defect and "Funny Drink" in defect  # the root, not the relay
+    assert "$decide" not in defect
+    assert "every binding derived from it was empty in consequence" in defect
+
+
+async def test_a_binding_no_step_of_this_plan_wrote_is_left_undescribed(tmp_path: Path) -> None:
+    """A binding carried in rather than produced here (a sub-goal element, a caller's) has no
+    producer to name. Degrading to silence keeps the grounder's own report — what shipped before."""
+    defect = await _replan_defect(
+        tmp_path,
+        _shop_activity(
+            [invoke_step("shop", "get_details", product_id={"$bind": "matches", "path": "0.id"})],
+            {"matches": []},
+        ),
+    )
+
+    assert defect == "product_id: matches is empty"
+
+
+async def test_an_unresolvable_that_is_not_about_an_empty_binding_is_passed_through(
+    tmp_path: Path,
+) -> None:
+    """Only a binding the failing step actually DEREFERENCES is attributed. A gap the grounder
+    reported about something else must not collect a clause about an unrelated empty binding."""
+    defect = await _replan_defect(
+        tmp_path,
+        _shop_activity(
+            [
+                _eq_filter("unrelated", "Funny Drink"),
+                invoke_step("shop", "get_details", product_id={"$decide": "the product"}),
+            ],
+            {"unrelated": []},
+        ),
+    )
+
+    assert defect == "product_id: matches is empty"
+
+
 # -- a param the operation does not take ----------------------------------------------------------
 #
 # A real run planned get_contacts({"offset": 0, "limit": 100}). The manual declares only `offset`;

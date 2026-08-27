@@ -157,6 +157,38 @@ async def test_the_defect_tells_the_planner_what_was_empty_and_what_to_do(tmp_pa
     assert "whole collection" in defect  # names the way out
 
 
+async def test_the_defect_names_the_step_that_produced_the_empty_binding(tmp_path: Path) -> None:
+    """The guard's own message described the emptiness from the reader's side too — "an earlier step
+    of this plan produced EMPTY" names no step. The producer is identified by its action and its own
+    params rather than by index: it has already run, so it is absent from the discarded plan's
+    rendered tail, and that tail is renumbered from 0 — an index here would point elsewhere."""
+    cycle, working = await _cycle(tmp_path)
+    activity = _activity(
+        working,
+        [
+            Step(
+                next_action="filter",
+                params={
+                    "in": {"$prop": "t.state", "path": "contacts"},
+                    "out": "friend_contact",
+                    "where": {"path": "name", "op": "eq", "value": "Ake"},
+                },
+            ),
+            invoke_step("t", "delete_op", event_id="evt-1"),
+            invoke_step("t", "delete_op", to=_use("friend_contact")),
+        ],
+        bindings={"friend_contact": []},
+    )
+    activity.step_index = 1  # the filter has run; the delete is next
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    defect = str(activity.replan_trail[0])
+    assert "'friend_contact' was produced by an earlier `filter` step" in defect
+    assert '"op": "eq"' in defect and "Ake" in defect  # the predicate that matched nothing
+    assert "whole collection" in defect  # the shared remedy hint still closes the message
+
+
 async def test_a_read_step_is_not_gated_by_the_guard(tmp_path: Path) -> None:
     """Only writes. Continuing a doomed plan through a read costs a cycle; nothing is lost that
     cannot be redone, and the plan may still be rewritten before it reaches a write."""

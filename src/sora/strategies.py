@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -1000,13 +1001,21 @@ class DefaultObserveStrategy:
                         # but tagged with the defect, because unlike a reconsideration this plan was
                         # not merely overtaken by events: the value it reaches for is not there, and
                         # a replacement that reaches for it the same way fails the same way.
-                        activity.reset_for_replan(defect=res.unresolvable)
+                        # Only for `ground`: a $decide filter's gap is about its predicate, and an
+                        # empty `in` there is already an answer rather than a defect, so there is
+                        # nothing to re-attribute.
+                        defect = (
+                            _with_empty_binding_origin(activity, res.unresolvable)
+                            if kind == "ground"
+                            else res.unresolvable
+                        )
+                        activity.reset_for_replan(defect=defect)
                         activity.state = ActivityState.READY
                         log.warning(
                             "observe: %s for activity %s resolved nothing (%s) -> replan",
                             kind,
                             activity.id,
-                            res.unresolvable,
+                            defect,
                         )
                     elif res.error is not None and kind == "select":
                         # A $decide filter is a transform, not control flow: a transient model or
@@ -1944,6 +1953,145 @@ def _dereferenced_bindings(step: Step) -> set[str]:
     return names
 
 
+# --- attributing an empty binding to the step that produced it ------------------------------------
+# An empty binding is evidence about the step that WROTE it, not the step that tripped over it, and
+# the two defect channels both used to describe it from the reader's side. Grounding does so for a
+# reason it cannot help: it is handed one step's params and the history, never the plan, so the most
+# it can honestly report is which parameter came up short. The replanning prompt then says the
+# replacement "has to differ THERE" — and THERE resolved to the reader. A run showed the cost: the
+# planner rewrote the invoke that read the binding, re-emitted the identical `eq` filter that had
+# written it empty, and bound empty again, three times until the replan breaker parked the activity.
+#
+# The runtime holds the plan that the grounder does not, so it names the producer mechanically —
+# no prose parsing, no second model call. It only INFORMS: the empty collection may be the true
+# answer ("that record really is absent"), and the existing framing's "tell the user instead" escape
+# has to stay reachable, so nothing here instructs the planner to change that step.
+#
+# The producing step is deliberately identified by its action and its own params rather than by
+# index. It has already RUN, so it is absent from the discarded plan's rendered tail — and
+# render_superseded_plan renumbers that tail from 0 precisely so a listed step is not misread as an
+# executed one. An index quoted here would point at a different step than the one meant.
+
+
+def _binding_source(step: Step) -> str | None:
+    """The binding a data-op step reads its input collection from, when that is where its input came
+    from. Only a ``$bind`` input continues a chain of emptiness: a ``$prop``/``$from``/literal input
+    is where the chain ends, and ``collect`` reads an operation rather than a collection.
+
+    Attribution therefore stops at a ``filter`` whose own ``$prop``/``$from`` input was already
+    empty, describing that step's predicate when the source it read was the cause. The outcome
+    wording stays true and the replan prompt still carries the history showing the upstream
+    miss, but the clause points one step downstream. Closing that needs the operation history
+    (for ``$from``) and ``WorkingMemory`` (for ``$prop``) threaded into
+    :func:`_empty_binding_origin`, which today is given only the activity."""
+    source = step.params.get("in")
+    if isinstance(source, dict):
+        name = source.get(_REF_BIND)
+        if isinstance(name, str):
+            return name
+    return None
+
+
+def _executed_steps(activity: Activity) -> list[Step]:
+    """The activity's already-run steps in execution order, flattened across the frame stack: each
+    suspended parent's executed prefix (it ran before the sub-plan was spliced in), then the live
+    frame's. Whatever wrote a binding is in here — a binding exists only because a step ran."""
+    steps: list[Step] = []
+    for parent, index, _ in activity.parent_frames:
+        steps.extend(parent.steps[:index])
+    if activity.plan is not None:
+        steps.extend(activity.plan.steps[: activity.step_index])
+    return steps
+
+
+def _root_empty_producer(
+    executed: list[Step], name: str, empty: frozenset[str]
+) -> tuple[Step, bool] | None:
+    """``(the step an empty binding originates in, whether the chain was walked)``, else ``None``.
+
+    A data-op fed an input binding that was ALREADY empty is only passing the emptiness along;
+    naming it would misattribute by one link, which is the same defect this exists to fix. So the
+    walk continues through such producers to the first one whose own input was not empty — the
+    ``$decide`` filter over an empty ``eq`` result names the ``eq``. ``seen`` guards a plan that
+    writes two bindings from each other rather than trusting it cannot."""
+    seen: set[str] = set()
+    producer: Step | None = None
+    walked = False
+    while name not in seen:
+        seen.add(name)
+        wrote = next((s for s in reversed(executed) if s.params.get("out") == name), None)
+        if wrote is None:
+            break
+        walked = producer is not None
+        producer = wrote
+        source = _binding_source(wrote)
+        if source is None or source not in empty:
+            break
+        name = source
+    return None if producer is None else (producer, walked)
+
+
+def _and_list(names: list[str]) -> str:
+    quoted = [repr(name) for name in names]
+    return quoted[0] if len(quoted) == 1 else f"{', '.join(quoted[:-1])} and {quoted[-1]}"
+
+
+def _empty_binding_origin(activity: Activity, names: list[str], empty: frozenset[str]) -> str:
+    """The clause naming where the empty bindings came from, or ``""`` when none can be attributed
+    (a binding no step of this plan wrote — a sub-goal element, or one carried in). Silence is the
+    right degradation: the defect without it is what shipped before.
+
+    Bindings sharing one root are named in ONE clause. A `filter` then a `take` off its result are
+    two dead bindings with a single cause, and describing that step twice reads as two independent
+    defects — noise in a message whose whole point is to say what to write differently."""
+    executed = _executed_steps(activity)
+    grouped: dict[int, tuple[Step, bool, list[str]]] = {}
+    for name in names:
+        found = _root_empty_producer(executed, name, empty)
+        if found is None:
+            continue
+        step, walked = found
+        origin, seen, bound = grouped.get(id(step), (step, False, []))
+        grouped[id(step)] = (origin, seen or walked, [*bound, name])
+    clauses: list[str] = []
+    for step, walked, bound in grouped.values():
+        # `in`/`out` are the plumbing; what discriminates the step is the rest (a `where`, a `by`).
+        params = {key: value for key, value in step.params.items() if key not in ("in", "out")}
+        # A step with nothing left to show (a `distinct` over whole items) gets no empty `{}` — the
+        # dash-clause is there to quote the part that missed, not to prove one was looked for.
+        shown = f" — {json.dumps(params, default=str)} —" if params else ","
+        outcome = (
+            "matched no items in its input collection"
+            if step.next_action == "filter"
+            else "produced an empty result"
+        )
+        derived = "; every binding derived from it was empty in consequence" if walked else ""
+        clauses.append(
+            f" The empty {_and_list(bound)} {'was' if len(bound) == 1 else 'were'} produced by an "
+            f"earlier `{step.next_action}` step of this plan{shown} which {outcome}{derived}."
+        )
+    return "".join(clauses)
+
+
+def _with_empty_binding_origin(activity: Activity, defect: str) -> str:
+    """Append the origin clause to a grounder-authored defect, for the empty bindings the step it
+    failed on actually reads. Computed from the plan rather than read out of the grounder's prose:
+    the names are already in ``bindings``, so parsing a model's sentence for them would be a
+    fragility with nothing to buy it."""
+    plan = activity.plan
+    if plan is None or not 0 <= activity.step_index < len(plan.steps):
+        return defect
+    empty = frozenset(name for name, value in activity.bindings.items() if _is_empty(value))
+    dead = sorted(_dereferenced_bindings(plan.steps[activity.step_index]) & empty)
+    origin = _empty_binding_origin(activity, dead, empty) if dead else ""
+    if not origin:
+        return defect
+    # The grounder is asked for "<which parameter, and what was missing>" and answers with a
+    # fragment ("product_id: matches is empty"), not a sentence — close it, or the two run together.
+    head = defect.rstrip()
+    return head + ("" if head.endswith((".", "!", "?", ":", ";")) else ".") + origin
+
+
 # Shared tail of both defect strings: what the planner should do about it. The corrections are the
 # same whichever token carried the dead reference, and naming them is what makes the retry differ.
 _REPLAN_HINT = (
@@ -2021,6 +2169,9 @@ def _unsatisfiable_reference(activity: Activity) -> str | None:
     if plan is None:
         return None
     empty = {name for name, value in activity.bindings.items() if _is_empty(value)}
+    # Captured before the forward scan starts discarding rewritten names: attribution asks what is
+    # empty NOW, which is what the producer walk has to chase through.
+    empty_now = frozenset(empty)
     refreshed: set[str] = set()
     frames = [(plan, activity.step_index)]
     frames += [(parent, index + 1) for parent, index, _ in reversed(activity.parent_frames)]
@@ -2032,7 +2183,8 @@ def _unsatisfiable_reference(activity: Activity) -> str | None:
                 return (
                     f"step {index} ({step.next_action}) reads {', '.join(repr(n) for n in dead)}, "
                     "which an earlier step of this plan produced EMPTY — nothing matched it, so "
-                    f"that step cannot work and the plan cannot finish as written. {_REPLAN_HINT}"
+                    "that step cannot work and the plan cannot finish as written."
+                    f"{_empty_binding_origin(activity, dead, empty_now)} {_REPLAN_HINT}"
                 )
             for ref in _dereferenced_operations(step):
                 spent = _spent_operation_read(ref, activity.history, refreshed)
