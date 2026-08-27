@@ -9,6 +9,7 @@ end reaches episodic memory, and the user hears about it.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -253,3 +254,69 @@ async def test_a_dead_channel_does_not_mask_what_was_being_reported(tmp_path: Pa
     cycle, _, _ = _cycle(tmp_path)
     cycle.communication = _DeadTransport()
     await _report_to_user(cycle, "I got stuck.")  # must not raise
+
+
+# --------------------------------------------------------------------------------------------------
+# an inference that never comes back at all
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_an_inference_that_never_returns_is_given_up_on(tmp_path: Path) -> None:
+    """The failure mode ADR-0021's stale guard cannot see: it is identity-based, so it discards a
+    LATE result but never notices an ABSENT one. Nothing is pushed here at all — the activity's
+    only way out of RUNNING is the deadline. On the run that motivated this, one plan inference
+    held the agent for ~14 minutes and cost it the scenario's whole real-time budget."""
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("plan")  # requested_at=0.0 — long expired against the host clock
+    working.activities["a1"] = activity
+
+    await DefaultObserveStrategy(inference_deadline=1.0).observe(cycle)
+
+    assert activity.pending_inference is None
+    assert activity.state is ActivityState.READY  # degraded to a replan, not stranded, not killed
+
+
+async def test_a_call_still_within_its_deadline_is_left_alone(tmp_path: Path) -> None:
+    """The watchdog must not become a latency budget: a thinking model legitimately spends tens of
+    seconds, and expiring a call that was about to succeed buys a replan nobody needed."""
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("plan")
+    activity.pending_inference = PendingInference(id="inf-1", kind="plan", requested_at=time.time())
+    working.activities["a1"] = activity
+
+    await DefaultObserveStrategy(inference_deadline=300.0).observe(cycle)
+
+    assert activity.pending_inference is not None
+    assert activity.state is ActivityState.RUNNING
+
+
+async def test_the_deadline_can_be_disabled(tmp_path: Path) -> None:
+    """An interactive session may want to wait indefinitely; `None` is not "use the default"."""
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("plan")
+    working.activities["a1"] = activity
+
+    await DefaultObserveStrategy(inference_deadline=None).observe(cycle)
+
+    assert activity.pending_inference is not None
+    assert activity.state is ActivityState.RUNNING
+
+
+async def test_a_result_that_arrives_after_the_deadline_is_discarded(tmp_path: Path) -> None:
+    """Nothing cancels the underlying call — an LLM call cannot be cut mid-generation — so the
+    expired request may still answer. It must not resurrect an activity that has already moved on,
+    which is exactly what the existing stale-inference guard is for; the deadline reuses it rather
+    than adding a second rule."""
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("plan")
+    working.activities["a1"] = activity
+
+    await DefaultObserveStrategy(inference_deadline=1.0).observe(cycle)
+    replanning = activity.state
+    cycle.inference_sink.push(
+        "inf-1", InferenceResult(id="inf-1", value=Plan(id="p9", goal="late", steps=[_step("go")]))
+    )
+    await DefaultObserveStrategy(inference_deadline=1.0).observe(cycle)
+
+    assert replanning is ActivityState.READY
+    assert activity.plan is None or activity.plan.id != "p9"

@@ -50,6 +50,7 @@ from sora.types import (
     CompletedOperation,
     ConditionVerdict,
     ConditionWait,
+    InferenceResult,
     InputWait,
     OperationInvocation,
     PendingConditionState,
@@ -183,6 +184,13 @@ def _eligible_conditions(
 # consequence than it used to — losing a signal loses not just the fact that an event happened but
 # the only record of *where*, which no later snapshot can reconstruct.
 _SIGNAL_RETENTION = 256
+
+# How long an in-flight infer/ground may say nothing before Observe gives up on it. Generous by
+# design: it is a watchdog for a seam that has stopped answering, not a latency budget — a thinking
+# model legitimately spends tens of seconds, and expiring a call that was about to succeed buys a
+# replan nobody needed. The client-side stall timeout is the tighter, better-informed bound (it can
+# tell a quiet socket from a slow one); this one exists because not every failure reaches it.
+DEFAULT_INFERENCE_DEADLINE = 300.0
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -910,13 +918,21 @@ class DefaultObserveStrategy:
     subscription to the environment, not a view over memory — it decides what can be perceived at
     all, so deciding it after Observe would leave it structurally one tick behind."""
 
-    def __init__(self, focus: FocusPolicy | None = None) -> None:
+    def __init__(
+        self,
+        focus: FocusPolicy | None = None,
+        *,
+        inference_deadline: float | None = DEFAULT_INFERENCE_DEADLINE,
+    ) -> None:
         # Defaults to attending everything joined. Narrowing to live intentions is a
         # deliberate opt-in (`focus=IntentionScopedFocus()`), not the default: measured, it
         # is worth ~825 prompt tokens per model call and zero judge calls, against a
         # re-baselining risk that fails silently. A benchmark number is worth more than
         # that saving. See the attention design note.
         self._focus = focus or FocusAllJoined()
+        # None disables the watchdog entirely — for a deliberately unbounded interactive session,
+        # or a debugger sitting on a breakpoint inside the client.
+        self._inference_deadline = inference_deadline
 
     async def observe(self, cycle: DecisionCycle) -> TickResult:
         wm = cycle.working
@@ -965,6 +981,8 @@ class DefaultObserveStrategy:
                         # the error the trace just says failed with no cause (e.g. a schema error).
                         log.warning("observe: resolved %s -> FAILED: %s", op, _truncate(ack.result))
                     break
+        # Before the drain, so an expiry raised here is applied by the very same Observe.
+        self._expire_stalled_inferences(cycle)
         await self._resolve_inferences(cycle)
         await self._suspend_on_completion_signal(cycle, just_resolved)
         await self._resume_on_signal(cycle)
@@ -983,6 +1001,53 @@ class DefaultObserveStrategy:
             # double-duty bug). A normal message (no InputWait) is turned into a goal as before.
             wm.messages_cursor = len(wm.messages)
         return TickResult()
+
+    def _expire_stalled_inferences(self, cycle: DecisionCycle) -> None:
+        """Give up on an inference that has been in flight too long, as though the call had failed.
+
+        The provider seam can go quiet in ways no client setting reaches — a proxy that accepts a
+        request and never answers, a retry loop inside an SDK, a process paused mid-call — and the
+        activity waiting on it is `RUNNING` with no other way out: ADR-0021's stale-inference guard
+        is identity-based, so it discards a *late* result but never notices an absent one. On the
+        run that motivated this, one plan inference held the agent for ~14 minutes and cost it the
+        whole scenario.
+
+        Deliberately expressed as a synthetic errored `InferenceResult` rather than a second
+        recovery path: every `kind` already has a considered degradation (replan for plan/subgoal/
+        ground, fail-soft for select/condition/revalidate), and a deadline has no business
+        inventing a different one. Nothing cancels the underlying call — an LLM call cannot be cut
+        mid-generation — so if it does eventually answer, the id no longer matches the live
+        `pending_inference` and the existing guard drops it, exactly as it drops any other stale
+        result.
+
+        This is *infrastructure* time, so the host wall-clock is the right one and
+        `requested_at`'s `time.time()` needs no domain clock: it measures how long a request has
+        been outstanding on this machine, never how far a simulated world has moved.
+        """
+        if self._inference_deadline is None:
+            return
+        now = time.time()
+        for activity in cycle.working.activities.values():
+            pending = activity.pending_inference
+            if pending is None or activity.state is not ActivityState.RUNNING:
+                continue
+            waited = now - pending.requested_at
+            if waited < self._inference_deadline:
+                continue
+            log.warning(
+                "observe: %s for activity %s exceeded %.0fs (waited %.0fs) -> giving up",
+                pending.kind,
+                activity.id,
+                self._inference_deadline,
+                waited,
+            )
+            cycle.inference_sink.push(
+                pending.id,
+                InferenceResult(
+                    id=pending.id,
+                    error=f"inference stalled: no result after {waited:.0f}s",
+                ),
+            )
 
     @staticmethod
     async def _resolve_inferences(cycle: DecisionCycle) -> None:

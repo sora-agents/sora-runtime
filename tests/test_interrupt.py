@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 import pytest
@@ -177,7 +178,7 @@ def _inferring(activity_id: str, *, inf_id: str, kind: str) -> Activity:
         goal="g",
         context={},
         state=ActivityState.RUNNING,
-        pending_inference=PendingInference(id=inf_id, kind=kind, requested_at=0.0),
+        pending_inference=PendingInference(id=inf_id, kind=kind, requested_at=time.time()),
     )
 
 

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -773,7 +774,7 @@ def _inferring_activity(activity_id: str, inf_id: str) -> Activity:
         goal="plan something",
         context={},
         state=ActivityState.RUNNING,
-        pending_inference=PendingInference(id=inf_id, kind="plan", requested_at=0.0),
+        pending_inference=PendingInference(id=inf_id, kind="plan", requested_at=time.time()),
     )
 
 
