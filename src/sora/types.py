@@ -61,6 +61,13 @@ class SignalWait:  # what a `blocked` activity is waiting for — see Activity.b
     signal_name: str
     source: str | None = None  # tool id the signal must come from; None matches any source
     path: str | None = None  # scope to part of the property; None matches any (today's behavior)
+    # WHICH WAY the watched collection had to move — one of Change's three tuples, or None for any.
+    # A watch scoped only by path cannot tell an agent's own write from the world's: on the run that
+    # motivated this, an agent watching `events` for additions had its own delete land on that exact
+    # path, opening its own gate. Direction is the field that separates them, and the planner
+    # already states it in prose (`when: "one or more events are added"`) — lifting it into a
+    # mechanical field is the same move `completes_on:` makes for a completion signal.
+    kind: str | None = None  # "added" | "removed" | "updated"
 
 
 def path_matches(wait_path: str | None, changes: list[Change]) -> bool:
@@ -79,13 +86,48 @@ def path_matches(wait_path: str | None, changes: list[Change]) -> bool:
     living under `contacts.contact_1` — and numerically-suffixed ids are exactly what these paths
     are built from, so that is a systematic false wake, not an edge case.
     """
-    if wait_path is None or not changes:
-        return True
-    return any(
+    return watch_matches(wait_path, None, changes)
+
+
+def _path_matches_one(wait_path: str, change: Change) -> bool:
+    return (
         change.path == ""
         or change.path == wait_path
         or change.path.startswith(f"{wait_path}.")
         or wait_path.startswith(f"{change.path}.")
+    )
+
+
+def _kind_matches_one(wait_kind: str, change: Change) -> bool:
+    """Did `change` move the watched collection in the declared direction?
+
+    Fails OPEN on the coarse form, matching `path_matches`' own discipline and the `Change` contract
+    that consumers must accept an adapter that cannot identify individual items. A change with all
+    three tuples empty means "something under here moved" — a WoT property observation or an MCP
+    `resources/updated` carries no more than that — so narrowing it away would make a `kind`-scoped
+    watch permanently deaf on those adapters. A redundant evaluation costs one model call; a missed
+    wake is the failure this whole mechanism exists to prevent.
+    """
+    moved = {"added": change.added, "removed": change.removed, "updated": change.updated}
+    if not any(moved.values()):
+        return True  # coarse form: direction unknown, so it cannot be excluded
+    return bool(moved.get(wait_kind))
+
+
+def watch_matches(wait_path: str | None, wait_kind: str | None, changes: list[Change]) -> bool:
+    """Does a signal's change summary satisfy a watch scoped by path and/or direction?
+
+    Conjunctive per `Change`, not per field: one change must satisfy both scopes. Checking them
+    independently would let an addition somewhere else pair up with a deletion on the watched path
+    and open the gate — precisely the self-write the `kind` scope exists to exclude.
+    """
+    if not changes:
+        return True  # an adapter reporting nothing is indistinguishable from one reporting all
+    if wait_path is None and wait_kind is None:
+        return True
+    return any(
+        (wait_path is None or _path_matches_one(wait_path, change))
+        and (wait_kind is None or _kind_matches_one(wait_kind, change))
         for change in changes
     )
 

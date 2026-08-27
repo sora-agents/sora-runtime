@@ -150,6 +150,33 @@ def test_pending_condition_parses_from_planner_json() -> None:
     assert (cond.when, cond.then, cond.until) == ("they reply", "rebook", "it happened")
 
 
+def test_a_watch_can_declare_which_way_the_collection_must_move() -> None:
+    cond = pending_from_raw(
+        {
+            "watch": {"signal": "state_changed", "source": "t1", "path": "events", "kind": "added"},
+            "when": "one or more events are added",
+            "then": "clear the conflicts",
+        }
+    )
+    assert cond is not None
+    assert cond.watch.kind == "added"
+
+
+def test_an_unrecognized_direction_degrades_to_no_narrowing() -> None:
+    # The same choice the rest of this parser makes, and the safe direction for a scope whose only
+    # job is to skip model calls: a typo must not produce a watch nothing can ever satisfy.
+    for kind in ("appended", "", None, 7):
+        cond = pending_from_raw(
+            {
+                "watch": {"signal": "state_changed", "path": "events", "kind": kind},
+                "when": "they reply",
+                "then": "rebook",
+            }
+        )
+        assert cond is not None
+        assert cond.watch.kind is None
+
+
 def test_condition_without_a_watch_is_dropped() -> None:
     # A gate is REQUIRED. Without one the condition would have to be evaluated against every signal
     # the agent ever sees — the unbounded keep-alive this design exists to reject, wearing a field

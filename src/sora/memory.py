@@ -536,22 +536,25 @@ PLAN_SYSTEM_PROMPT = (
     "'let me know when', 'once they reply') and turn EACH such clause into one entry. Do not leave "
     "a condition in prose: a clause you mention but do not encode here is silently lost the moment "
     "the last step completes. Each entry is:\n"
-    '  {"watch": {"signal": "<signal name>", "source": "<tool id>", "path": "<dotted path>"}, '
+    '  {"watch": {"signal": "<signal name>", "source": "<tool id>", "path": "<dotted path>", '
+    '"kind": "added" | "removed" | "updated"}, '
     '"when": "<what must have happened>", "then": "<what to do about it>", '
     '"until": "<when to stop waiting>"}\n'
     '"watch" is REQUIRED and is a cheap mechanical filter, not the judgement: name the signal and '
     "the tool that would carry the news, and use `path` to point at the part of that tool's "
     "observable state that would move — it is what stops every unrelated event from waking this "
-    "goal, INCLUDING the agent's own writes, which usually land somewhere different from what it "
-    "is waiting on. `when` is the actual judgement, in plain language. `then` is a goal, phrased "
-    "like the original goal — the runtime plans it fresh when the moment comes, so do not write "
-    "steps here. `until` bounds the wait.\n"
+    "goal. `kind` says WHICH WAY it has to move, and matters most when this goal also WRITES to "
+    "what it watches: an agent that watches a collection for additions and deletes from that same "
+    "collection will otherwise wake itself on every delete it makes. Set it whenever `when` names "
+    "a direction, and omit it when any change is genuinely interesting. `when` is the actual "
+    "judgement, in plain language. `then` is a goal, phrased like the original goal — the runtime "
+    "plans it fresh when the moment comes, so do not write steps here. `until` bounds the wait.\n"
     'Example — goal: "Book the Rembrandt restoration slot for the 14th and tell the conservator; '
     "if she can't make it, rebook for whatever day she suggests.\" The second clause is a pending "
     "condition, not a step:\n"
     '  {"steps": [ ... book the slot, message the conservator, report to the user ... ],\n'
     '   "pending": [{"watch": {"signal": "state_changed", "source": "<messaging tool id>", '
-    '"path": "folders.INBOX.messages"},\n'
+    '"path": "folders.INBOX.messages", "kind": "added"},\n'
     '     "when": "the conservator replies that the 14th does not work, or proposes another day",\n'
     '     "then": "Rebook the Rembrandt restoration slot for the day she proposes, clearing '
     'whatever is already booked then",\n'
@@ -1134,11 +1137,18 @@ def pending_from_raw(raw: dict[str, Any]) -> PendingCondition | None:
     if not when.strip() or not then.strip():
         return None
     until = raw.get("until")
+    # An unrecognized `kind` degrades to no narrowing rather than to a watch nothing can satisfy:
+    # the same choice the rest of this parser makes, and the safe direction for a scope whose only
+    # job is to skip model calls.
+    kind = watch.get("kind")
+    if kind not in ("added", "removed", "updated"):
+        kind = None
     return PendingCondition(
         watch=SignalWait(
             signal_name=signal_name,
             source=watch.get("source"),
             path=watch.get("path"),
+            kind=kind,
         ),
         when=when,
         then=then,

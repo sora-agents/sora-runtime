@@ -14,7 +14,7 @@ carries its **own** high-water mark over a monotonic counter that the retention 
 
 from __future__ import annotations
 
-from sora.types import Change, Signal, changes_of, path_matches
+from sora.types import Change, Signal, changes_of, path_matches, watch_matches
 
 # --------------------------------------------------------------------------------------------------
 # path_matches — the bidirectional prefix
@@ -115,3 +115,43 @@ def test_change_carries_identities_not_values() -> None:
     # The thin-signal rule, pinned structurally: a Change has nowhere to put a value even if an
     # adapter wanted to. The snapshot stays in wm.properties and this says where to look inside it.
     assert {f for f in Change.__dataclass_fields__} == {"path", "added", "removed", "updated"}
+
+
+# --------------------------------------------------------------------------------------------------
+# watch_matches — the direction scope on top of the path scope
+# --------------------------------------------------------------------------------------------------
+
+
+def test_direction_separates_the_agents_own_write_from_the_worlds() -> None:
+    """The whole reason `kind` exists. An agent watching a collection for additions and deleting
+    from that same collection lands its own write on the exact path it watches, so `path` alone
+    cannot tell the two apart — and the gate it opens costs a model call to conclude nothing."""
+    own_delete = [Change(path="events", removed=("e1",))]
+    world_add = [Change(path="events", added=("e2",))]
+    assert path_matches("events", own_delete)  # indistinguishable on path alone
+    assert not watch_matches("events", "added", own_delete)
+    assert watch_matches("events", "added", world_add)
+
+
+def test_direction_is_conjunctive_with_the_path_on_one_change() -> None:
+    """Checking the two scopes independently would let an addition somewhere else pair up with a
+    deletion on the watched path — exactly the self-write the direction scope exists to exclude."""
+    changes = [Change(path="events", removed=("e1",)), Change(path="contacts", added=("c1",))]
+    assert not watch_matches("events", "added", changes)
+
+
+def test_direction_degrades_open_on_a_coarse_change() -> None:
+    """`Change`'s contract is that adapters degrade rather than fail — a WoT observation or an MCP
+    resources/updated reports "something under here moved" and no more. Narrowing that away would
+    make a kind-scoped watch permanently deaf on those adapters; a redundant evaluation costs one
+    call, a missed wake is the failure the whole mechanism exists to prevent."""
+    assert watch_matches("events", "added", [Change(path="events")])
+    assert watch_matches("events", "added", [Change()])
+    assert watch_matches("events", "added", [])
+
+
+def test_an_unscoped_watch_is_unchanged_by_the_new_field() -> None:
+    # Every completion-signal wait leaves kind unset, so this is the path they all take.
+    changes = [Change(path="events", removed=("e1",))]
+    assert watch_matches("events", None, changes)
+    assert watch_matches(None, None, changes)

@@ -57,8 +57,8 @@ from sora.types import (
     SignalWait,
     Step,
     changes_of,
-    path_matches,
     walk_path,
+    watch_matches,
 )
 
 # The dotted-path walker lives in sora.types now (shared with the data-ops in sora.action, which
@@ -132,10 +132,16 @@ def _eligible_conditions(
     """The conditions whose gate has opened on a signal they have not already judged.
 
     This is the whole cost control: a condition is only ever evaluated against a change that
-    mechanically matched its declared watch — name, source, and path — so the unrelated events an
-    agent observes never reach a model. On the run that motivated this, that filter turns four
-    observed signals into one evaluation (two fail on `source`, and the agent's own outbound write
-    fails on `path` because it lands somewhere different from what the condition watches).
+    mechanically matched its declared watch — name, source, path, and direction — so the unrelated
+    events an agent observes never reach a model.
+
+    `path` alone is not enough, and assuming it was cost a run: the note here used to claim an
+    agent's own outbound write "lands somewhere different from what the condition watches", which
+    holds for an agent that watches an inbox and writes to a sent folder, and fails completely for
+    one that watches a collection it also deletes from. There the write lands on the *exact*
+    watched path, opens the gate, and buys a model call to be told that a deletion is not an
+    addition. `SignalWait.kind` is what separates the two, and it degrades open (see
+    `_kind_matches_one`), so a watch stays correct on an adapter that cannot report direction.
     """
     eligible: list[tuple[PendingConditionState, Percept]] = []
     for state in activity.pending_conditions:
@@ -520,7 +526,7 @@ class DefaultRelevanceJudge:
             claimed = any(
                 w.signal_name == signal.name
                 and (w.source is None or percept.source == w.source)
-                and path_matches(w.path, changes_of(signal))
+                and watch_matches(w.path, w.kind, changes_of(signal))
                 for w in watches
             )
             if not claimed:
@@ -1325,7 +1331,7 @@ class DefaultObserveStrategy:
             if percept.payload.name == wait.signal_name and (
                 wait.source is None or percept.source == wait.source
             ):
-                if path_matches(wait.path, changes_of(percept.payload)):
+                if watch_matches(wait.path, wait.kind, changes_of(percept.payload)):
                     return percept
         return None
 
