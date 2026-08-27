@@ -468,8 +468,11 @@ Why it survives in a high-profile benchmark, given that it is *not* model-specif
 by `attach_judge` by default and logged when it fires. It relaxes *only* that
 comparison's case — prompts, checkers and vote tallying are untouched — so it restores
 the parse ARE's own prompts and unit tests intend rather than lowering the bar.
-`run_benchmark.py`
-prints which parse a run used and takes `--strict-verdict-case` to reproduce stock ARE.
+Both `run_benchmark.py` and
+`batch.py` print which parse a run used and take `--strict-verdict-case` to reproduce stock ARE;
+a sweep also records it per row in `output.jsonl` (`metadata.verdict_parse`), on every scored
+record including the default — a row that does not say which parse produced it cannot be compared
+with one produced by stock ARE.
 
 **When reporting numbers, say which parse was used.** A score obtained with the parse
 relaxed is a different artifact from one obtained under stock ARE, and the distinction

@@ -7,6 +7,7 @@ here.
 from __future__ import annotations
 
 import json
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,6 +20,7 @@ from examples.gaia2.batch import (
     _pass_at_1,
     _resolve_model_label,
     _score_status,
+    _verdict_parse,
     aggregate,
 )
 
@@ -124,6 +126,43 @@ def test_jsonl_record_marks_a_run_ARE_s_clock_ended() -> None:
     )
     assert rec["metadata"]["timeline_expired"] is True
     assert rec["score"] == 0.0  # still scored as ARE scored it; the flag qualifies it, not replaces
+
+
+def test_jsonl_record_states_how_judge_verdicts_were_parsed() -> None:
+    """Scoring provenance, not an optional diagnostic. The default relaxes ARE's case-sensitive
+    verdict parse, so a sweep's scores come from a patched judge and cannot be compared with one
+    produced by stock ARE — a record that does not say which it was is uninterpretable on its own.
+    """
+    rec = _jsonl_record(
+        scenario_id="s1",
+        run_number=0,
+        success=True,
+        rationale=None,
+        exception=None,
+        trace_id=None,
+        verdict_parse="case-insensitive",
+    )
+    assert rec["metadata"]["verdict_parse"] == "case-insensitive"
+
+    strict = _jsonl_record(
+        scenario_id="s1",
+        run_number=0,
+        success=True,
+        rationale=None,
+        exception=None,
+        trace_id=None,
+        verdict_parse="stock",
+    )
+    assert strict["metadata"]["verdict_parse"] == "stock"
+
+
+def test_verdict_parse_follows_the_flag_and_is_absent_without_a_judge() -> None:
+    # Nothing scored an unscored run, so there were no verdicts to parse either way.
+    assert _verdict_parse(Namespace(judge_model=None, strict_verdict_case=False)) is None
+    assert (
+        _verdict_parse(Namespace(judge_model="m", strict_verdict_case=False)) == "case-insensitive"
+    )
+    assert _verdict_parse(Namespace(judge_model="m", strict_verdict_case=True)) == "stock"
 
 
 def test_jsonl_record_exception_carries_type_and_message() -> None:

@@ -463,10 +463,13 @@ def attach_judge(
     remaining turns. Use ``initialize_turns`` when the later turns are wanted without that gate.
 
     ``relax_verdict_case`` (default on) applies ``relax_judge_verdict_case`` first — see there for
-    why: without it an OpenAI-family judge's ``[[true]]`` is discarded, which both mis-scores the
-    event and, because the same verdict gates turn release, silently truncates the scenario. It is
-    on by default because a run scored without it is not interpretable, and it logs when it fires so
-    no run is patched silently. Pass False to reproduce stock ARE behavior exactly."""
+    why. Not a per-model quirk: ARE's own engines lowercase ``True``/``False`` in *every* response
+    on their way out of ``chat_completion``, so the ``[[True]]``-family checkers cannot return a
+    verdict for **any** judge model, and the unparsed result is read as a rejection — which both
+    mis-scores the event and, because the same verdict gates turn release, silently truncates the
+    scenario. It is on by default because a run scored without it is not interpretable, and it logs
+    when it fires so no run is patched silently. Pass False to reproduce stock ARE behavior
+    exactly."""
     from are.simulation.agents.are_simulation_agent_config import LLMEngineConfig
     from are.simulation.scenarios.scenario_imported_from_json.utils import preprocess_scenario
     from are.simulation.validation.configs import GraphPerEventJudgeConfig, create_judge_engine

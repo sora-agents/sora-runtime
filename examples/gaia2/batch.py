@@ -107,6 +107,13 @@ def _resolve_model_label(label: str | None, config_path: str) -> str | None:
     return label
 
 
+def _verdict_parse(args: argparse.Namespace) -> str | None:
+    """How this scored record's judge verdicts were parsed, or None when nothing scored it."""
+    if not args.judge_model:
+        return None
+    return "stock" if args.strict_verdict_case else "case-insensitive"
+
+
 def _jsonl_record(
     *,
     scenario_id: str,
@@ -118,6 +125,7 @@ def _jsonl_record(
     awaiting_input: list[str] | None = None,
     write_counts: Any = None,
     timeline_expired: bool = False,
+    verdict_parse: str | None = None,
 ) -> dict[str, Any]:
     """One ``output.jsonl`` line, matching ARE's ``_export_benchmark_result_jsonl`` exactly:
     ``task_id``/``trace_id``/``score`` at top level, and a ``metadata`` dict with all-None values
@@ -142,6 +150,13 @@ def _jsonl_record(
         # qualifying them — an aggregate that averages these in is measuring the host, not the
         # agent. None otherwise, so an ordinary record stays byte-identical to ARE's own shape.
         "timeline_expired": timeline_expired or None,
+        # Scoring provenance, recorded on every scored record — including the default. Unlike the
+        # diagnostics around it this is not "extra information about an ordinary run": the default
+        # relaxes ARE's verdict parse, so a sweep's scores are obtained under a patched judge, and
+        # a record that does not say so cannot be compared with one produced by stock ARE. Same
+        # reasoning as run_benchmark printing it: which of the two this is must survive the record
+        # being read without the log beside it. None on an unscored run — there were no verdicts.
+        "verdict_parse": verdict_parse,
         # ARE's tool-call-count gate, recomputed offline (no judge model). Recorded only when it
         # FAILS: a failure is conclusive — the judge applies this gate before any per-event
         # matching — so it explains a zero that the rationale otherwise attributes to the
@@ -254,6 +269,12 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
     config_dir = os.path.join(args.output_dir, "standard", args.capability)
     os.makedirs(config_dir, exist_ok=True)
 
+    if args.judge_model:
+        # Said once at the top of the sweep as well as per record: an operator watching the run
+        # should not have to open output.jsonl to learn the scores are being produced under a
+        # patched ARE.
+        print(f"judge verdict parse: {_verdict_parse(args)}")
+
     records: list[dict[str, Any]] = []
     # Stream each record to output.jsonl as it's produced (and flush): a long sweep spends real
     # model tokens, so an abort partway through (a bad scenario, Ctrl-C) must leave a valid partial
@@ -319,6 +340,7 @@ def _run_one_scenario(
                 model=args.judge_model,
                 provider=args.judge_provider,
                 endpoint=args.judge_endpoint,
+                relax_verdict_case=not args.strict_verdict_case,
             )
         else:
             # Replays the oracle so an unscored sweep still reports ARE's tool-call-count gate;
@@ -379,6 +401,7 @@ def _run_one_scenario(
         awaiting_input=result.awaiting_input,
         write_counts=result.write_counts,
         timeline_expired=result.timeline_expired,
+        verdict_parse=_verdict_parse(args),
     )
 
 
@@ -438,6 +461,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--judge-provider", metavar="PROVIDER", help="LiteLLM provider for the judge."
     )
     parser.add_argument("--judge-endpoint", metavar="URL", help="Custom endpoint for the judge.")
+    parser.add_argument(
+        "--strict-verdict-case",
+        action="store_true",
+        help=(
+            "Do NOT relax ARE's case-sensitive judge-verdict parse (see run_benchmark for the "
+            "defect). The default relaxes it, and every scored record says which of the two it "
+            "was; pass this to score a sweep under stock ARE."
+        ),
+    )
     parser.add_argument(
         "--init-turns",
         action="store_true",
