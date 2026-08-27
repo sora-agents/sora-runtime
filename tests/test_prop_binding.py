@@ -128,12 +128,16 @@ def test_prop_collection_without_a_path_reports_the_envelope_defect() -> None:
     assert "add a 'path'" in defect
 
 
-def test_unobserved_prop_collection_defect_names_focus_as_the_fix() -> None:
+def test_unobserved_prop_collection_defect_names_a_correction_that_can_work() -> None:
+    """Deliberately NOT "add a focus step": the runtime already attends to every tool a live plan
+    names, so focusing cannot make an unlisted property appear. Prescribing it buys a replan that
+    repeats the same reference — the one outcome a defect message exists to prevent."""
     props = _props(("Calendar", "state", {"events": []}))
     collection, defect = _resolve_collection({"$prop": "Contacts.state"}, [], None, props)
     assert collection is None
     assert defect is not None
-    assert "focus" in defect
+    assert "focus" not in defect
+    assert "join" in defect  # the reachable correction when the tool is absent entirely
     assert "Calendar.state" in defect  # the planner is told what *is* observed
 
 
@@ -204,15 +208,17 @@ def test_a_half_folded_bad_tail_is_reported_against_the_composed_route() -> None
 
 
 def test_a_folded_reference_to_an_unobserved_tool_is_still_the_missing_source_defect() -> None:
-    """A folded token whose HEAD does not resolve is a different question from a bad tail: the fix
-    is to focus the tool, not to correct the route."""
+    """A folded token whose HEAD does not resolve is a different question from a bad tail: the tool
+    is not being observed at all, so the answer is to reference one that is — not to correct the
+    route into a property that was never there."""
     props = _props(("Calendar", "state", {"events": []}))
 
     collection, defect = _resolve_collection({"$prop": "Contacts.state.nope"}, [], None, props)
 
     assert collection is None
     assert defect is not None
-    assert "focus" in defect
+    assert "names no observed property" in defect
+    assert "Calendar.state" in defect
 
 
 def test_mechanical_subgoal_fans_out_over_a_prop_collection() -> None:

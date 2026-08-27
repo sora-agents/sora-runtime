@@ -2253,10 +2253,17 @@ def _collection_defect(
                 "qualify it as '<tool_id>.<property_name>' so it names exactly one."
             )
         observed = ", ".join(sorted(f"{s}.{p}" for (s, p) in props))
+        # Deliberately does NOT prescribe a 'focus' step. The runtime already attends to every tool
+        # a live plan names, so a focus step cannot conjure a property that is not in this list —
+        # the name is wrong, or its tool's workspace was never joined. Sending the planner to add a
+        # focus step buys a replan that repeats the same reference, which is the one outcome a
+        # defect message exists to prevent.
         return (
             f"{name!r} names no observed property; currently observed: "
-            f"{observed or 'none — no tool is focused'}. A property is readable only while its "
-            "tool is focused — add a 'focus' step for that tool before referencing it."
+            f"{observed or 'none — no tool is being observed'}. Reference one of those, qualified "
+            "as '<tool_id>.<property_name>'. If the property you want belongs to a tool that is "
+            "not listed, its workspace has not been joined — plan a 'join' step first, or reach "
+            "the value through an operation instead."
         )
     if value is _MISSING:
         ran = sorted({c.invocation.operation_name for c in history})
