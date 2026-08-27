@@ -442,7 +442,12 @@ PLAN_SYSTEM_PROMPT = (
     "`in`/`not_in` take a list) or "
     '{"$decide": "<predicate in words>"} when keeping an item needs judgement — costly, since '
     "every item goes to the model, so narrow with an operation or a mechanical comparison "
-    "wherever you can. For `in`/`not_in`, "
+    "wherever you can. A `$decide` predicate is judged against the world as it is NOW: a $prop "
+    "snapshot is current state, never a history, so a predicate that asks how things were BEFORE "
+    "something happened cannot be answered and will silently get the wrong items. Phrase the rule "
+    "against what is currently true plus the identities the change itself reported — 'overlaps one "
+    "of the newly added events and is not itself one of them', never 'overlapped the calendar as "
+    "it existed immediately before that addition'. For `in`/`not_in`, "
     "`value` may itself be a reference to ANOTHER collection to test membership against — "
     '{"path": "<field>", "op": "not_in", "value": {"$from": "<op>"} | {"$bind": "<name>"}, '
     '"value_path": "<field to read from each item of that collection>"}: '
