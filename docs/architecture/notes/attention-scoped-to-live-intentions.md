@@ -154,9 +154,12 @@ saving is exactly zero.
 **`FocusAllJoined` is the default; `IntentionScopedFocus` is the opt-in.** Settled on the
 measurement above: the narrowing is worth cents, and its cost is a failure that does not announce
 itself. A benchmark result is worth more than that saving, and a silently absorbed change would be
-attributed to the agent rather than to the policy. Turning narrowing on is one argument —
-`DefaultObserveStrategy(focus=IntentionScopedFocus())` — and is what a dynamic, many-workspace run
-should use, where the broad set grows with the environment while the narrow one stays constant.
+attributed to the agent rather than to the policy. Turning narrowing on is one line of
+`agent.yaml` — `strategies.focus: intention-scoped` (or a dotted path to a custom `FocusPolicy`;
+`all-joined` names the default explicitly) — and is what a dynamic, many-workspace run should use,
+where the broad set grows with the environment while the narrow one stays constant. In code the
+same seam is `DefaultObserveStrategy(focus=IntentionScopedFocus())`; the policy is a sub-strategy of
+Observe, so bootstrap passes it as a keyword rather than resolving it as a phase of its own.
 
 Note what does **not** revert with it. Attention is still reconciled at the top of every Observe, so
 perception no longer hinges on the model emitting and holding a `focus` step — that is the
@@ -175,34 +178,60 @@ That last risk is why the small win does not carry the default. The run that wou
 flipping it is a dynamic, many-workspace scenario with exogenous churn on tools the plan does not
 name — the one row above where a call is actually saved — with the relevance judge enabled.
 
-The per-activity prompt view (`scoped_snapshot`, at `_ground_` and `_select_`) is **not** reverted
-with the policy. It is non-destructive, it never narrows the data being operated on — the mechanical
-resolve reads the whole store, and a data-op's collection is passed separately — and it only trims
-ambient property context from two prompts. It carries none of the subscription-layer risk, so it
-keeps the part of the saving that costs nothing.
+The per-activity prompt view (`scoped_snapshot`, at `_ground_` and `_select_`) **moves with the
+policy**, and this is load-bearing rather than tidy. It is non-destructive, it never narrows the
+data being operated on — the mechanical resolve reads the whole store, and a data-op's collection is
+passed separately — and it only trims ambient property context from two prompts. But "the risk it
+carries is smaller" is not the same as "it carries none": a model that reasons without a property it
+never saw produces a wrong answer, not an error, which is the same silent shape the broad default
+was chosen to avoid. An agent on `FocusAllJoined` has declined to narrow; narrowing its prompts
+anyway would reintroduce that risk one layer down, where nothing in the configuration mentions it.
+
+So Observe records the policy's verdict on `WorkingMemory.attention_narrowed` and `scoped_snapshot`
+reads it: broad policy, whole snapshot; narrowing policy, the firing activity's own tools. The flag
+is taken from the policy's *target set* before an explicit `_unfocus_` is subtracted — read off
+`focused_tools` instead it would confuse "the policy narrows" with "the agent released one tool",
+and switch the view on for an agent that chose neither.
 
 ## Known rough edges
 
-* **An `unfocus` step is a no-op whenever another step of the same plan names the tool.** The
-  exclusion in `referenced_tools` stops an `unfocus` step's own `tool_id` from re-attending the
-  tool, but the scan covers *all* steps, so an earlier `invoke` re-attends it on the next Observe:
-
-  ```
-  plan: [invoke mail.read, unfocus mail, invoke cal.add]
-  attended after the unfocus step: ['cal', 'mail']
-  ```
-
-  The tool is released and re-attended a tick later, re-baselining the adapter in between. This is
-  the no-history-retention property working as designed, but it means the derived floor silently
-  overrides an explicit deliberative act.
-* **Out-of-band focus does not survive.** A `FocusAction` dispatched outside any plan — by
-  application code or a custom strategy — is released on the next Observe. Attention is derived from
-  plans, so a focus with no owning intention has no release condition either; giving it one is the
-  unsolved part.
+* **Out-of-band focus does not survive, while out-of-band unfocus does.** Under a narrowing policy
+  a `FocusAction` dispatched outside any plan — by application code or a custom strategy — is
+  released on the next Observe: attention is derived from plans, so a focus with no owning intention
+  has no release condition either, and giving it one is the unsolved part. `_unfocus_` is
+  deliberately *not* symmetric with it (see below): the asymmetry is that releasing has an obvious
+  terminating condition and pinning does not, so a persistent release leaks nothing while a
+  persistent pin leaks cost with no way to notice.
 * **A bare `{"$prop": "state"}`** names no tool, contributes nothing to attention, and can become
   unresolvable later in a plan even though it resolved when the plan was written. Mitigated by the
   plan prompt asking for qualified names, and by an unresolvable reference reporting a defect rather
   than failing silently.
+
+## Two things the reconciler owes the rest of the runtime
+
+Recomputing attention every tick is what makes the policy impossible to drift out of sync, but a set
+recomputed from scratch also forgets, and two places downstream noticed.
+
+**An explicit `_unfocus_` has to be remembered, or it is a no-op.** The next reconciliation simply
+recomputes the tool back in — under `FocusAllJoined` immediately and permanently, so the `unfocus`
+the plan prompt offers the planner ("to stop watching one early") did nothing at all. `UnfocusAction`
+therefore records the id in `WorkingMemory.suppressed_tools`, which the reconciler subtracts from the
+policy's target. A decision the agent took outranks a floor the runtime derived. It is cleared by the
+opposite explicit act (`_focus_`) and by the tool leaving the world (`_leave_`) — never by a policy,
+so nothing the agent did not decide can lift it. This also settles the earlier rough edge where a
+plan's own `unfocus` step was overridden by an `invoke` of the same tool elsewhere in the plan: the
+derivation still re-attends the tool, but once the `unfocus` step actually *runs*, the suppression
+wins.
+
+**An attention change moves the ADR-0024 change signature, and must not be read as the world
+moving.** `PerceptionSignatureGate` hashes the property store, so attending or releasing a tool moves
+the signature with nothing exogenous having happened — and since the baseline is anchored while the
+activity is still unplanned (and therefore broad), the first checkpoint after a plan lands would
+otherwise spend a revalidation call on the agent's own narrowing. Observe re-anchors every anchored
+baseline on a tick where the attended set actually changed. The cost is a one-tick blind spot: a
+genuine change landing on the same tick as a transition is absorbed into the new baseline. That is
+bounded — transitions happen when a plan lands, on join/leave, and on an explicit focus/unfocus, not
+continuously — and the alternative is a false positive on every one of them.
 
 ## The option not yet taken
 
