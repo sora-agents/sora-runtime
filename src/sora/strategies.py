@@ -100,16 +100,37 @@ def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
             )
 
 
-def _body_exhausted(activity: Activity) -> bool:
-    """Has the whole intention stack run out — the same test Reflect uses to decide completion?
+def _conditions_hold_frame(activity: Activity) -> bool:
+    """Work this activity's conditions still owe, which popping to the parent would skip past.
 
-    A just-exhausted *sub*-plan is not exhausted work: parent frames are still waiting to pop, so
-    the activity has more body to run and must not go back to waiting on its conditions.
+    A condition is declared by a plan but outlives its steps — `until` bounds the wait, not the
+    body — so an exhausted sub-plan whose conditions are still live has not finished with its
+    frame. Popping there resumes the parent at the step after the sub-goal, which on the run that
+    motivated this was the message telling the user everything was done, sent while the monitoring
+    window was still open. The unapplied verdict and the fired queue hold the frame for the same
+    reason: both are committed work this frame owes, and the parent must not run ahead of them.
+    """
+    return bool(
+        activity.pending_conditions
+        or activity.condition_fired
+        or activity.condition_verdict is not None
+    )
+
+
+def _body_exhausted(activity: Activity) -> bool:
+    """Has the activity run out of body to execute *now*?
+
+    Deliberately not "is the activity finished": a just-exhausted sub-plan usually has parent
+    frames waiting to pop, and until they do it still has body left. The exception is a frame its
+    own conditions hold (`_conditions_hold_frame`) — Reason will not pop past that, so there is no
+    next step to run and a fired `then` may start. Both callers ask this to decide exactly that, so
+    what they need is "is the intention stack idle". Reflect's completion test is separately
+    stricter and still demands an empty stack.
     """
     return (
         activity.plan is not None
         and activity.step_index >= len(activity.plan.steps)
-        and not activity.parent_frames
+        and (not activity.parent_frames or _conditions_hold_frame(activity))
     )
 
 
@@ -1143,14 +1164,21 @@ class DefaultObserveStrategy:
                             activity.id,
                             render_plan(inferred),
                         )
-                    elif kind == "subgoal":
+                    elif kind in ("subgoal", "then"):
                         # A mid-plan sub-goal's synthesized sub-plan: push the parent frame (its
                         # plan + the sub-goal's step_index) and enter the sub-plan, so Reason
                         # advances it and pops back to the parent when it exhausts (ADR-0022). It
                         # lands like a top-level plan, only onto a stacked frame not the activity.
-                        frame = (activity.plan, activity.step_index, activity.history_mark)
-                        activity.parent_frames.append(frame)  # type: ignore[arg-type]  # plan set mid-plan
-                        sub_plan: Plan = res.value  # type: ignore[assignment]  # kind=="subgoal" => Plan
+                        #
+                        # A fired condition's `then` ("then") lands the same way but pushes NO
+                        # frame: it only ever starts once the body is idle, so the plan it replaces
+                        # has nothing left to return to, and a watch fires as many times as the
+                        # world moves — a stack that grew once per firing would walk a healthy
+                        # monitor into the depth cap for doing its job.
+                        if kind == "subgoal":
+                            frame = (activity.plan, activity.step_index, activity.history_mark)
+                            activity.parent_frames.append(frame)  # type: ignore[arg-type]  # plan set mid-plan
+                        sub_plan: Plan = res.value  # type: ignore[assignment]  # both kinds => Plan
                         activity.plan = sub_plan
                         activity.step_index = 0
                         # The sub-plan collects only what it runs itself, not what the parent left
@@ -1159,7 +1187,11 @@ class DefaultObserveStrategy:
                         # Re-anchor the gate to the sub-plan's own infer-time world (ADR-0024).
                         activity.reconsider_baseline = baseline
                         activity.state = ActivityState.READY
-                        log.info("observe: entered sub-plan for activity %s", activity.id)
+                        log.info(
+                            "observe: entered %s for activity %s",
+                            "sub-plan" if kind == "subgoal" else "a fired condition's `then`",
+                            activity.id,
+                        )
                         log.debug(
                             "observe: sub-plan for activity %s (nested under %d frame(s))\n%s",
                             activity.id,
@@ -2915,7 +2947,7 @@ class DefaultReasonStrategy:
             plan = activity.plan
             assert plan is not None  # set above, and by every branch that continues this loop
             if activity.step_index >= len(plan.steps):
-                if activity.parent_frames:
+                if activity.parent_frames and not _conditions_hold_frame(activity):
                     # Sub-plan exhausted: pop the frame and resume the parent at the step *after*
                     # its sub-goal, then loop to read it (or pop again if that frame is exhausted).
                     parent_plan, parent_index, parent_mark = activity.parent_frames.pop()
@@ -2923,7 +2955,20 @@ class DefaultReasonStrategy:
                     activity.step_index = parent_index + 1
                     activity.history_mark = parent_mark  # the parent collects over its own span
                     continue
-                return result  # top-level plan exhausted -> no step this cycle
+                if activity.pending_conditions and not (
+                    activity.condition_fired or activity.condition_verdict is not None
+                ):
+                    # Nothing left to run and nothing owed: wait on the watches. Reaching here with
+                    # an open gate is impossible — the head of reason() fires the judgement first
+                    # and returns — so this cannot re-block over a signal that is still unjudged.
+                    activity.state = ActivityState.BLOCKED
+                    activity.blocked_on = ConditionWait(watches=_condition_watches(activity))
+                    log.info(
+                        "reason: no body left on %s; waiting on %d pending condition(s)",
+                        activity.id,
+                        len(activity.pending_conditions),
+                    )
+                return result  # nothing more to run this cycle
             step = plan.steps[activity.step_index]
             if step.next_action == SUBGOAL:
                 outcome = await self._subgoal(step, activity, wm, cycle)
@@ -3197,6 +3242,13 @@ class DefaultReasonStrategy:
         is a goal, planned fresh when the moment comes, which is the whole reason `then` is prose
         rather than steps. That reuse is also why a fired condition costs a second call and a
         non-firing one costs none: the judgement and the planning stay separate concerns.
+
+        Firing is recorded the moment the verdict lands, but pursued only once the body is idle
+        (the same rule the queued-fire path in `reason` applies). A `then` that preempts an
+        unfinished plan abandons every step it never reached: on the run that motivated this, a
+        four-step fan-out of deletes had executed one when that delete opened the gate it was
+        watching, and the remaining three never ran. Nothing is lost by waiting — the fire sits in
+        `condition_fired` and Reflect keeps the activity READY for it (see its own comment).
         """
         verdict = activity.condition_verdict or ConditionVerdict()
         activity.condition_verdict = None
@@ -3223,7 +3275,7 @@ class DefaultReasonStrategy:
         # discard judgements already paid for and unrecoverable: the marks advanced at fire time, so
         # the signal that opened the other gates can no longer make them eligible.
         activity.condition_fired.extend(fired)
-        if activity.condition_fired:
+        if activity.condition_fired and _body_exhausted(activity):
             return await self._pursue_fired_condition(activity, wm, cycle, result)
         # Nothing fired. If the body is finished, go back to waiting rather than falling through to
         # Reflect, which would otherwise see an exhausted plan and terminate the activity outright.
@@ -3242,13 +3294,21 @@ class DefaultReasonStrategy:
         and pursuing a second while the first one's sub-plan is still running would nest it inside
         its predecessor — inverting the order and walking the activity toward the recursion breaker
         for reasons that have nothing to do with the goals themselves. The queue is therefore only
-        drained when the intention stack is otherwise idle (see `reason`).
+        drained when the intention stack is otherwise idle (both callers check `_body_exhausted`).
+
+        `from_condition` marks the step as a `then` rather than an authored sub-goal, which changes
+        two things downstream: it is exempt from the ancestor-overlap breaker, and it installs
+        without pushing a frame (see `_subgoal`).
         """
         state = activity.condition_fired.pop(0)
         log.info("reason: pending condition fired on %s -> %r", activity.id, state.condition.then)
         step = Step(
             next_action=SUBGOAL,
-            params={"goal": state.condition.then, "mode": "deliberative"},
+            params={
+                "goal": state.condition.then,
+                "mode": "deliberative",
+                "from_condition": True,
+            },
         )
         await self._subgoal(step, activity, wm, cycle)
         return result
@@ -3267,7 +3327,13 @@ class DefaultReasonStrategy:
         mode = step.params.get("mode", "deliberative")
         if mode == "deliberative":
             goal = step.params["goal"]
-            halt = self._deliberation_would_loop(activity, goal)
+            # A `then` (see `_pursue_fired_condition`) restates the goal that declared it — the
+            # planner is told to phrase it "like the original goal" — so containment in an ancestor
+            # is its shape, not a failure to reduce, and the overlap check reads it as recursion
+            # every time. Its reduction is in the data: it is planned against a change that did not
+            # exist when the ancestor was. The depth cap still applies, as the coarse backstop.
+            from_condition = bool(step.params.get("from_condition"))
+            halt = self._deliberation_would_loop(activity, goal, check_overlap=not from_condition)
             if halt is not None:
                 # Refuse to recurse: pause to await the user's guidance instead of spending another
                 # (and another...) _infer_ on a sub-goal that isn't reducing. Set BLOCKED directly,
@@ -3289,7 +3355,8 @@ class DefaultReasonStrategy:
                 tools=catalog,
                 observed=observed,
                 messages=list(wm.messages),
-                kind="subgoal",
+                # "then" lands like a sub-plan but at the same depth (Observe pushes no frame).
+                kind="then" if from_condition else "subgoal",
                 goal=goal,
                 # A sub-plan has its own assumptions; baseline the gate against the world it is
                 # synthesized in, so entering a sub-goal re-anchors reconsideration (ADR-0024).
@@ -3361,20 +3428,28 @@ class DefaultReasonStrategy:
             )
         return None
 
-    def _deliberation_would_loop(self, activity: Activity, goal: str) -> str | None:
+    def _deliberation_would_loop(
+        self, activity: Activity, goal: str, *, check_overlap: bool = True
+    ) -> str | None:
         """Whether firing a deliberative sub-goal for ``goal`` now would be runaway recursion rather
         than progress — the reason string if so (for the log and the await-input prompt), else
         ``None``. Two mechanical checks: the intention stack is already ``max_subgoal_depth`` deep,
         or ``goal``'s tokens are largely contained in a sub-goal still suspended above it (an
-        elaborated re-statement, not a reduction)."""
+        elaborated re-statement, not a reduction).
+
+        ``check_overlap=False`` keeps only the depth cap, for a goal whose containment in an
+        ancestor carries no information — a fired condition's ``then`` (see ``_subgoal``)."""
         depth = len(activity.parent_frames)
         if depth >= self._max_subgoal_depth:
             return (
                 f"sub-goal recursion reached the depth cap ({depth} >= {self._max_subgoal_depth})"
             )
-        for ancestor in _ancestor_subgoal_goals(activity):
-            if _goal_token_overlap(goal, ancestor) >= _SUBGOAL_GOAL_OVERLAP:
-                return "sub-goal goal repeats an ancestor's without reducing to concrete actions"
+        if check_overlap:
+            for ancestor in _ancestor_subgoal_goals(activity):
+                if _goal_token_overlap(goal, ancestor) >= _SUBGOAL_GOAL_OVERLAP:
+                    return (
+                        "sub-goal goal repeats an ancestor's without reducing to concrete actions"
+                    )
         return None
 
     async def _ground(

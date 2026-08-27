@@ -506,10 +506,11 @@ async def test_a_fired_condition_pursues_its_then_as_a_subgoal(tmp_path: Path) -
 
     await cycle.strategies.reason.reason(activity, working, cycle, _tick())
 
-    # Pursued through the ordinary deliberative sub-goal path — `then` is a goal, planned fresh when
-    # the moment comes, which is why it is prose rather than steps.
+    # Pursued through the deliberative sub-goal path — `then` is a goal, planned fresh when the
+    # moment comes, which is why it is prose rather than steps. It goes out under its own kind
+    # ("then", not "subgoal") because it installs at the same depth; see test_condition_frames.py.
     assert activity.pending_inference is not None
-    assert activity.pending_inference.kind == "subgoal"
+    assert activity.pending_inference.kind == "then"
 
 
 async def test_nothing_fired_goes_back_to_waiting(tmp_path: Path) -> None:
@@ -652,7 +653,7 @@ async def test_a_parked_verdict_survives_reflect_and_reaches_its_then(tmp_path: 
     await cycle.strategies.reason.reason(activity, working, cycle, situated)
 
     assert activity.pending_inference is not None
-    assert activity.pending_inference.kind == "subgoal"
+    assert activity.pending_inference.kind == "then"
 
 
 async def test_an_empty_parked_verdict_still_ends_up_blocked(tmp_path: Path) -> None:
@@ -792,7 +793,7 @@ async def test_firing_one_branch_can_retire_its_exclusive_sibling(tmp_path: Path
     # The winner — and only the winner — is being pursued. Worth pinning because the loser's `then`
     # is destructive: a branch retired in the same breath must not also be acted on.
     assert activity.pending_inference is not None
-    assert activity.pending_inference.kind == "subgoal"
+    assert activity.pending_inference.kind == "then"
     planned = "\n".join(prompt for _, prompt in llm.calls)
     assert taken.then in planned
     assert overtaken.then not in planned

@@ -431,8 +431,11 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # other infer fires when `plan is None`, and a reset clears the whole stack with the plan.
         # Seeding it (rather than adding a flag) keeps the PlanPrompt Protocol unchanged, so an
         # existing custom prompt keeps working and gains the ancestor chain for free.
+        # kind=="then" is the exception: Observe installs a fired condition's `then` at the current
+        # depth without pushing, so seeding a frame here would describe a stack position the plan
+        # will never occupy — and name the exhausted body it replaces as its parent.
         frames = list(activity.parent_frames)
-        if goal is not None and activity.plan is not None:
+        if goal is not None and activity.plan is not None and kind != "then":
             frames.append((activity.plan, activity.step_index, activity.history_mark))
         target = (
             activity
