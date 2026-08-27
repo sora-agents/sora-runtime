@@ -6,7 +6,7 @@ extraction helpers over ``SimpleNamespace`` fakes, plus ``complete`` over an inj
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,7 +14,11 @@ import pytest
 
 pytest.importorskip("openai")
 
+from openai import Timeout  # noqa: E402
+
 from sora.adapters.openai_llm import (  # noqa: E402
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_STREAM_STALL_TIMEOUT,
     OpenAICompatLLMClient,
     _text_of,
     _usage_of,
@@ -95,14 +99,34 @@ def test_usage_of_tolerates_a_missing_usage_block() -> None:
 # ── complete() over an injected fake SDK ──────────────────────────────────────────────────────
 
 
+def _chunks(response: SimpleNamespace) -> list[SimpleNamespace]:
+    """The same content re-shaped as a chat-completions *stream*: one delta chunk per character, so
+    a test that asserts on the joined text also proves the client accumulates rather than reading
+    one blob, plus the trailing usage-only chunk (no choices) that ``stream_options`` asks for."""
+    text = _text_of(response)
+    out = [
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=ch))], usage=None)
+        for ch in text
+    ]
+    out.append(SimpleNamespace(choices=[], usage=response.usage))
+    return out
+
+
 class _FakeCompletions:
     def __init__(self, response: SimpleNamespace) -> None:
         self.response = response
         self.kwargs: dict[str, Any] | None = None
 
-    async def create(self, **kwargs: Any) -> SimpleNamespace:
+    async def create(self, **kwargs: Any) -> Any:
         self.kwargs = kwargs
-        return self.response
+        if not kwargs.get("stream"):
+            return self.response
+
+        async def _iter() -> AsyncIterator[SimpleNamespace]:
+            for chunk in _chunks(self.response):
+                yield chunk
+
+        return _iter()
 
 
 class _FakeAsyncOpenAI:
@@ -141,6 +165,71 @@ async def test_complete_maps_system_and_prompt_to_chat_messages_and_returns_the_
         {"role": "system", "content": "be terse"},
         {"role": "user", "content": "hi"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_the_call_streams_by_default_and_joins_the_deltas() -> None:
+    # Streaming is what turns the configured read timeout into a *stall* detector: chunks keep
+    # resetting it, so a slow-but-healthy thinking model is no longer indistinguishable from a
+    # socket that died. Assert the flag actually goes out, not just that the text comes back.
+    client = OpenAICompatLLMClient(model="m", api_key="test")
+    fake = _FakeAsyncOpenAI(_response("the answer"))
+    client._client = fake  # type: ignore[assignment]
+
+    assert await client.complete(system="s", prompt="p") == "the answer"
+    kwargs = fake.chat.completions.kwargs
+    assert kwargs is not None
+    assert kwargs["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_can_be_turned_off_for_an_endpoint_that_cannot_do_it() -> None:
+    # The escape hatch for an OpenAI-compatible server whose streaming is broken or absent; the
+    # single-shot path must keep working unchanged.
+    client = OpenAICompatLLMClient(model="m", api_key="test", stream=False)
+    fake = _FakeAsyncOpenAI(_response("the answer"))
+    client._client = fake  # type: ignore[assignment]
+
+    assert await client.complete(system="s", prompt="p") == "the answer"
+    kwargs = fake.chat.completions.kwargs
+    assert kwargs is not None
+    assert "stream" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_usage_is_only_requested_when_it_will_be_used() -> None:
+    # A streamed response carries no usage block unless `stream_options` asks for it — but a
+    # compat server that does not know the field rejects the whole request, so an uninstrumented
+    # run must not pay that compatibility cost for a number it would discard.
+    plain = OpenAICompatLLMClient(model="m", api_key="test")
+    plain._client = _FakeAsyncOpenAI(_response("hi"))  # type: ignore[assignment]
+    await plain.complete(system="s", prompt="p")
+    assert "stream_options" not in (plain._client.chat.completions.kwargs or {})  # type: ignore[attr-defined]
+
+    metered = OpenAICompatLLMClient(model="m", api_key="test", instrument=True)
+    metered._client = _FakeAsyncOpenAI(_response("hi"))  # type: ignore[assignment]
+    await metered.complete(system="s", prompt="p")
+    kwargs = metered._client.chat.completions.kwargs  # type: ignore[attr-defined]
+    assert kwargs["stream_options"] == {"include_usage": True}
+
+
+def test_a_stall_timeout_is_configured_rather_than_left_to_the_sdk_default() -> None:
+    # The SDK's own default is a 600s read timeout with two retries — up to ~30 minutes of silence,
+    # which once cost a whole benchmark scenario. Connect keeps its own, shorter budget: a slow TLS
+    # handshake is a different failure from a request that is never answered.
+    client = OpenAICompatLLMClient(model="m", api_key="test")
+    timeout = client._client.timeout
+    assert isinstance(timeout, Timeout)
+    assert timeout.read == DEFAULT_STREAM_STALL_TIMEOUT
+    assert timeout.connect == DEFAULT_CONNECT_TIMEOUT
+
+
+def test_the_stall_timeout_can_be_disabled() -> None:
+    # An endpoint that legitimately buffers a whole answer before sending anything needs the SDK
+    # default back; `None` restores it rather than forcing a number that would cut the call short.
+    client = OpenAICompatLLMClient(model="m", api_key="test", stall_timeout=None)
+    timeout = client._client.timeout
+    assert not isinstance(timeout, Timeout) or timeout.read != DEFAULT_STREAM_STALL_TIMEOUT
 
 
 @pytest.mark.asyncio

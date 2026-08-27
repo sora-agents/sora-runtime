@@ -19,13 +19,25 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, Timeout
 
 from sora.llm import LLMUsage, log_llm_usage
 
 # Only a fallback: the model id is a configuration value (a ctor arg, wired from agent.yaml), never
 # baked in — swapping models/providers must not require a code change.
 DEFAULT_MODEL = "gpt-5.1"
+
+# Seconds of SILENCE tolerated on a streaming completion, not a cap on how long it may take: with
+# `stream=True` the SDK's read timeout applies between chunks, so a legitimately long call keeps
+# resetting it while a stalled connection does not. That distinction is why streaming has to come
+# first — on a single-shot call the same setting would be a duration cap, and capping duration is
+# what makes a thinking model's slow-but-healthy answer indistinguishable from a dead socket.
+#
+# The SDK's own default is 600s read with two retries, so a stalled request costs up to ~30 minutes
+# of silence. Observed: a first plan inference that took ~14 minutes to return a 3,853-token
+# completion, spending a whole benchmark scenario's real-time budget before the agent had a plan.
+DEFAULT_STREAM_STALL_TIMEOUT = 90.0
+DEFAULT_CONNECT_TIMEOUT = 10.0
 
 
 class OpenAICompatLLMClient:
@@ -36,6 +48,12 @@ class OpenAICompatLLMClient:
     ``base_url`` are config values — passed in — so OpenAI, Gemini's compat endpoint, and a local
     runtime differ only by configuration. The response's message content is returned as the plain
     string the reasoning path parses.
+
+    The call streams by default and carries an explicit inter-chunk timeout, so a connection that
+    goes quiet surfaces as an error in tens of seconds instead of consuming the SDK's 600s read
+    timeout twice over. Streaming is what makes that timeout mean "stalled" rather than "slow" —
+    see ``DEFAULT_STREAM_STALL_TIMEOUT``. Retries stay the SDK's to own (the ``LLMClient``
+    non-ownership contract); this only bounds how long each attempt may say nothing.
 
     ``instrument`` (default off, wired from the ``llm:`` config block) opts a run into per-call
     token accounting: the client emits a ``sora.llm`` usage record (via ``log_llm_usage``). Where
@@ -53,6 +71,8 @@ class OpenAICompatLLMClient:
         base_url: str | None = None,
         max_tokens: int | None = None,
         instrument: bool = False,
+        stream: bool = True,
+        stall_timeout: float | None = DEFAULT_STREAM_STALL_TIMEOUT,
     ) -> None:
         # api_key/base_url=None let the SDK resolve them from the environment (OPENAI_API_KEY /
         # OPENAI_BASE_URL) — only pass them to override. max_tokens defaults to unset: reasoning
@@ -71,10 +91,22 @@ class OpenAICompatLLMClient:
             client_kwargs["api_key"] = "not-needed"
         if base_url is not None:
             client_kwargs["base_url"] = base_url
+        if stall_timeout is not None:
+            # Explicit per-phase timeout rather than a scalar: a scalar would apply the same budget
+            # to connect, and a slow TLS handshake is not the failure being bounded here.
+            client_kwargs["timeout"] = Timeout(
+                stall_timeout,
+                connect=DEFAULT_CONNECT_TIMEOUT,
+            )
         self._client = AsyncOpenAI(**client_kwargs)
         self.model = model  # public: bootstrap's metered wrapper reports it in the run trace
         self._max_tokens = max_tokens
         self._instrument = instrument
+        # Streaming is the default because it is what makes the timeout above a stall detector.
+        # `stream: false` is the escape hatch for an OpenAI-compatible endpoint whose streaming is
+        # broken or absent (some local runtimes); on that path the timeout reverts to a duration
+        # cap, so a target that needs it usually wants `stall_timeout: null` as well.
+        self._stream = stream
 
     async def complete(self, *, system: str, prompt: str) -> str:
         kwargs: dict[str, Any] = {
@@ -86,10 +118,32 @@ class OpenAICompatLLMClient:
         }
         if self._max_tokens is not None:
             kwargs["max_completion_tokens"] = self._max_tokens
-        response = await self._client.chat.completions.create(**kwargs)
-        text = _text_of(response)
+        if not self._stream:
+            response = await self._client.chat.completions.create(**kwargs)
+            text = _text_of(response)
+            if self._instrument:
+                log_llm_usage(_usage_of(response, answer_chars=len(text)))
+            return text
         if self._instrument:
-            log_llm_usage(_usage_of(response, answer_chars=len(text)))
+            # Only asked for when it will be used: a chunked response carries no usage block unless
+            # this is set, and an OpenAI-compatible server that does not know the field would reject
+            # the request outright. Uninstrumented runs never send it.
+            kwargs["stream_options"] = {"include_usage": True}
+        parts: list[str] = []
+        usage_chunk: Any = None
+        stream = await self._client.chat.completions.create(**kwargs, stream=True)
+        async for chunk in stream:
+            # The usage block rides a final chunk that carries no choices, so both are collected
+            # independently rather than assuming they arrive together.
+            if getattr(chunk, "usage", None) is not None:
+                usage_chunk = chunk
+            for choice in getattr(chunk, "choices", None) or []:
+                content = getattr(getattr(choice, "delta", None), "content", None)
+                if content:
+                    parts.append(content)
+        text = "".join(parts)
+        if self._instrument:
+            log_llm_usage(_usage_of(usage_chunk, answer_chars=len(text)))
         return text
 
     async def aclose(self) -> None:
