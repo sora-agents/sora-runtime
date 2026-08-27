@@ -84,6 +84,11 @@ class FakeTool:
     def observe(self) -> list[ObservableProperty]:
         return list(self._properties)
 
+    def set_properties(self, properties: Sequence[ObservableProperty]) -> None:
+        """Move the tool's observable state between ticks — an adapter whose world changed. Pushes
+        no signal, which is exactly the case the derived-change path exists to recover."""
+        self._properties = list(properties)
+
 
 class ScriptedTransport:
     """Satisfies MessageTransport: ``receive()`` drains a preset inbound list (so a second tick

@@ -42,12 +42,106 @@ class Change:  # WHERE an observable property moved — see Signal.payload["chan
     updated: tuple[str, ...] = ()
 
 
+# How deep the change diff walks before reporting a subtree coarsely. A property value nests a few
+# levels before reaching the collections that actually matter (an app -> folders -> folder ->
+# emails), and beyond that the extra precision is not worth walking a large structure on every
+# observe — the coarse Change is still a correct answer, just a less specific one.
+_DIFF_MAX_DEPTH = 6
+
+
+def identities(value: Any) -> dict[str, Any] | None:
+    """Read a container as {identity: item}, or None if it isn't one we can identify items in.
+
+    A dict is already keyed. A list of dicts is keyed by each item's own id-ish field — which is
+    what makes "this email appeared" expressible at all. A list of scalars has no identity to
+    report, so it degrades to the coarse form rather than inventing positional ids that would
+    change meaning whenever anything is inserted.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        keyed: dict[str, Any] = {}
+        for item in value:
+            if not isinstance(item, dict):
+                return None
+            ident = (
+                item.get("id") or item.get("uid") or item.get("event_id") or item.get("email_id")
+            )
+            if not isinstance(ident, str | int):
+                return None
+            keyed[str(ident)] = item
+        return keyed
+    return None
+
+
+def diff_values(previous: Any, current: Any, path: str = "", depth: int = 0) -> list[Change]:
+    """Locate what moved between two snapshots of one observable property, as identities not values.
+
+    Recurses while both sides are containers whose items can be identified, so the reported path is
+    as specific as the data allows — ``folders.INBOX.emails`` rather than the whole app. That
+    specificity is the entire point: it is what lets a waiter tell an inbound message from the
+    agent's own outbound one without any reasoning about self-causation, since they land in
+    different folders.
+
+    Degrades rather than fails at every step. An unidentifiable container, a type change, or the
+    depth limit all produce a coarse ``Change`` naming the deepest path known to have moved —
+    "something under here changed" — which consumers must accept.
+    """
+    if previous == current:
+        return []
+    if depth >= _DIFF_MAX_DEPTH:
+        return [Change(path=path)]
+    prev_items, curr_items = identities(previous), identities(current)
+    if prev_items is None or curr_items is None:
+        return [Change(path=path)]
+    added = tuple(k for k in curr_items if k not in prev_items)
+    removed = tuple(k for k in prev_items if k not in curr_items)
+    shared = [k for k in curr_items if k in prev_items and curr_items[k] != prev_items[k]]
+    changes: list[Change] = []
+    if added or removed:
+        changes.append(Change(path=path, added=added, removed=removed, updated=tuple(shared)))
+    for key in shared:
+        child = f"{path}.{key}" if path else key
+        nested = diff_values(prev_items[key], curr_items[key], child, depth + 1)
+        # A leaf that changed value has no sub-structure to name; report the leaf itself as moved
+        # so the path still points somewhere useful rather than vanishing from the summary.
+        changes.extend(nested or [Change(path=child)])
+    if not changes:
+        # Both sides identifiable and same keys, but unequal — a value-only change somewhere we
+        # could not localize. Report the level itself rather than nothing.
+        changes.append(Change(path=path, updated=tuple(shared)))
+    return changes
+
+
 @dataclass(frozen=True)
 class Signal:
     name: str
     payload: dict[
         str, Any
     ]  # may carry "changes": list[Change] — never the changed values themselves
+
+
+@dataclass(frozen=True)
+class PropertyChange:
+    """WHAT MOVED in a re-observed property, derived by the runtime rather than announced by a tool.
+
+    The recovery path for a dropped signal. A signal is transient: an adapter that fails to push one
+    — or has no signal facility at all — leaves a waiter with nothing, and no later snapshot can
+    reconstruct the event, because `properties` answers "what is true now" and never "what just
+    moved". Diffing the re-observed value against the one last seen reconstructs exactly the missing
+    half, which is the same move AgentSpeak's belief revision makes when it derives belief-change
+    events by comparing new percepts against the belief base.
+
+    Deliberately NOT a `Signal`, and deliberately not stored in `WorkingMemory.signals`. ADR-0004
+    keeps properties and signals apart by lifecycle, and a derived delta is neither: it is a
+    statement *about* a property, inferred here, not an event the environment announced. Collapsing
+    the two would put runtime-invented events in front of every consumer that renders observed
+    signals. Carrying identities only (never values) is what keeps ADR-0004's non-duplication rule
+    intact — a delta is not in the snapshot at all, so nothing is duplicated by naming it.
+    """
+
+    name: str  # the observable property that moved
+    changes: tuple[Change, ...]
 
 
 @dataclass(frozen=True)
@@ -132,15 +226,24 @@ def watch_matches(wait_path: str | None, wait_kind: str | None, changes: list[Ch
     )
 
 
-def changes_of(signal: Signal) -> list[Change]:
-    """The `changes` a signal carries, tolerating adapters that emit none or emit plain dicts.
+def changes_of(payload: Signal | PropertyChange) -> list[Change]:
+    """The `changes` a percept payload carries, whether a tool announced them or the runtime derived
+    them, tolerating adapters that emit none or emit plain dicts.
 
-    Payloads cross a serialization boundary (a persisted percept, a JSON-shaped adapter), so a
-    `changes` entry may arrive as a dict rather than a Change; normalize instead of trusting the
+    Takes either payload because every consumer downstream of a matched wait wants the same answer
+    from both — a `PropertyChange` exists precisely to stand in for the signal that never came, so a
+    caller forced to branch on which log the percept came from would be re-deriving that equivalence
+    at each site, and the first one to forget reintroduces the blindness this recovers from.
+
+    Signal payloads cross a serialization boundary (a persisted percept, a JSON-shaped adapter), so
+    a `changes` entry may arrive as a dict rather than a Change; normalize instead of trusting the
     producer. An unparseable entry degrades to the coarse form rather than raising — a malformed
-    delta must not be able to break a wait that would otherwise have matched.
+    delta must not be able to break a wait that would otherwise have matched. A PropertyChange is
+    built here in-process and already holds Changes, so it needs none of that.
     """
-    raw = signal.payload.get("changes") if isinstance(signal.payload, dict) else None
+    if isinstance(payload, PropertyChange):
+        return list(payload.changes)
+    raw = payload.payload.get("changes") if isinstance(payload.payload, dict) else None
     if not isinstance(raw, list):
         return []
     out: list[Change] = []
@@ -195,6 +298,11 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # would let the first condition to advance it blind every other reader of that broadcast log.
     condition: PendingCondition
     evaluated_through: int = 0
+    # The same mark over the second, derived log (WorkingMemory.property_changes_appended). Two
+    # counters rather than one shared sequence: the logs are appended to independently, so a single
+    # number could not say how far this condition has read in each without one silently skipping
+    # entries in the other.
+    derived_through: int = 0
 
 
 @dataclass(frozen=True)

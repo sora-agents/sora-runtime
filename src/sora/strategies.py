@@ -54,10 +54,13 @@ from sora.types import (
     InputWait,
     OperationInvocation,
     PendingConditionState,
+    PropertyChange,
     RelevanceCandidate,
     SignalWait,
     Step,
     changes_of,
+    diff_values,
+    path_matches,
     walk_path,
     watch_matches,
 )
@@ -97,7 +100,11 @@ def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
                 continue
             known.add(condition)
             activity.pending_conditions.append(
-                PendingConditionState(condition=condition, evaluated_through=wm.signals_appended)
+                PendingConditionState(
+                    condition=condition,
+                    evaluated_through=wm.signals_appended,
+                    derived_through=wm.property_changes_appended,
+                )
             )
 
 
@@ -170,6 +177,10 @@ def _eligible_conditions(
         match = DefaultObserveStrategy._match_signal(
             wm, state.condition.watch, since=state.evaluated_through
         )
+        if match is None:
+            match = DefaultObserveStrategy._match_derived(
+                wm, state.condition.watch, since=state.derived_through
+            )
         if match is not None:
             eligible.append((state, match))
     return eligible
@@ -185,12 +196,33 @@ def _eligible_conditions(
 # the only record of *where*, which no later snapshot can reconstruct.
 _SIGNAL_RETENTION = 256
 
+# Bound on retained derived changes. Deliberately larger than `_SIGNAL_RETENTION` and deliberately
+# a separate number: the two logs are sized against different windows. A signal accrues per
+# environment event, a derived change per observation cycle in which anything moved -- so on a tool
+# whose property churns, this log fills at tick rate (~11/s on a live scenario) rather than at event
+# rate. What an entry must survive is the gap between its append and the cycle the watching activity
+# is free to judge it, which is bounded by how long an inference can occupy that activity
+# (`DEFAULT_INFERENCE_DEADLINE`). 1024 covers ~90s of worst-case single-property churn, which clears
+# a slow thinking-model call; sizing it to the full deadline would not help, since under that much
+# churn the newest-win policy retains the churn and evicts the real change regardless -- that regime
+# needs the property excluded from derivation, not a bigger buffer.
+_DERIVED_RETENTION = 1024
+
 # How long an in-flight infer/ground may say nothing before Observe gives up on it. Generous by
 # design: it is a watchdog for a seam that has stopped answering, not a latency budget — a thinking
 # model legitimately spends tens of seconds, and expiring a call that was about to succeed buys a
 # replan nobody needed. The client-side stall timeout is the tighter, better-informed bound (it can
 # tell a quiet socket from a slow one); this one exists because not every failure reaches it.
 DEFAULT_INFERENCE_DEADLINE = 300.0
+
+# Cycles between per-tool observation summaries (DEBUG only). The question this answers is the one a
+# `[cycle N]` trace structurally cannot: cycle numbers alone say how many ticks ran, never WHEN, so
+# a run whose ticks were bunched at the end of a window is indistinguishable from one that ticked
+# evenly through it — and those two readings of a missed change (never looked / looked and lost it)
+# call for completely different fixes. Counts plus elapsed wall time separate them. Periodic rather
+# than per-cycle because Observe runs at ~11/s on a live scenario, where a line per tick buries the
+# trace it is meant to explain.
+_OBSERVATION_HEARTBEAT = 100
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -933,6 +965,10 @@ class DefaultObserveStrategy:
         # None disables the watchdog entirely — for a deliberately unbounded interactive session,
         # or a debugger sitting on a breakpoint inside the client.
         self._inference_deadline = inference_deadline
+        # DEBUG-only diagnostic state, reset at each heartbeat; see _OBSERVATION_HEARTBEAT.
+        self._observed: dict[str, int] = {}
+        self._heartbeat_cycles = 0
+        self._heartbeat_wall = time.time()
 
     async def observe(self, cycle: DecisionCycle) -> TickResult:
         wm = cycle.working
@@ -942,12 +978,17 @@ class DefaultObserveStrategy:
         self._snapshot_properties(wm)
         if attention_moved:
             self._rebaseline(cycle)
+        signals_before = wm.signals_appended
         async for source, signal in cycle.signal_sink.drain():
             wm.signals.append(Percept(source, signal, time.time()))
             # Bumped with the append, never with the eviction: this is what a per-waiter high-water
             # mark is measured against, so it has to survive the retention trim below.
             wm.signals_appended += 1
             log.info("observe: signal %s from %s", signal.name, source)
+        self._count_observations(wm, cycle)
+        # After the drain, because this reads the signals that just landed to avoid deriving a
+        # duplicate of a change the adapter did announce.
+        self._derive_property_changes(wm, wm.signals_appended - signals_before)
         just_resolved: list[tuple[Activity, OperationInvocation]] = []
         async for invocation_id, ack in cycle.result_sink.drain():
             # Unambiguous 1:1 match: the invoke's own result resolves its activity automatically to
@@ -990,6 +1031,8 @@ class DefaultObserveStrategy:
         # passes above before it's ever subject to eviction (bound orphan growth; newest win).
         if len(wm.signals) > _SIGNAL_RETENTION:
             del wm.signals[:-_SIGNAL_RETENTION]
+        if len(wm.property_changes) > _DERIVED_RETENTION:
+            del wm.property_changes[:-_DERIVED_RETENTION]
         received_message = False
         async for message in cycle.communication.receive():
             wm.messages.append(message)
@@ -1001,6 +1044,103 @@ class DefaultObserveStrategy:
             # double-duty bug). A normal message (no InputWait) is turned into a goal as before.
             wm.messages_cursor = len(wm.messages)
         return TickResult()
+
+    def _count_observations(self, wm: WorkingMemory, cycle: DecisionCycle) -> None:
+        """Per-tool observation counts and the wall-clock rate, summarized every
+        `_OBSERVATION_HEARTBEAT` cycles.
+
+        Purely diagnostic — it decides nothing and is skipped entirely unless someone is listening
+        at DEBUG, because the counting runs on the hot path. A tool appears here once per cycle it
+        was focused for, which is exactly once per cycle its properties were read, so a gap in the
+        count is a gap in perception and not merely a quiet log.
+        """
+        if not log.isEnabledFor(logging.DEBUG):
+            return
+        for tool_id in wm.focused_tools:
+            self._observed[tool_id] = self._observed.get(tool_id, 0) + 1
+        self._heartbeat_cycles += 1
+        if self._heartbeat_cycles < _OBSERVATION_HEARTBEAT:
+            return
+        elapsed = time.time() - self._heartbeat_wall
+        log.debug(
+            "observe: %d cycles in %.1fs (%.1f/s) through cycle %d; observed %s",
+            self._heartbeat_cycles,
+            elapsed,
+            self._heartbeat_cycles / elapsed if elapsed > 0 else 0.0,
+            cycle.cycle_count,
+            ", ".join(f"{tool}={n}" for tool, n in sorted(self._observed.items())),
+        )
+        self._observed.clear()
+        self._heartbeat_cycles = 0
+        self._heartbeat_wall = time.time()
+
+    @staticmethod
+    def _derive_property_changes(wm: WorkingMemory, arrived: int) -> None:
+        """Recover the changes no adapter announced, by diffing each re-observed property.
+
+        A signal is transient: pushed once, and if it never lands there is nothing left to find,
+        because the property snapshot answers "what is true now" and never "what just moved". On the
+        run that motivated this, six calendar events were added, four `state_changed` signals
+        arrived, and the two the agent never heard about were sitting in its own snapshot the whole
+        time — visible, and read by nothing. Diffing against the value last seen reconstructs
+        exactly the missing half, the way AgentSpeak's belief revision derives belief-change
+        events by comparing new percepts against the belief base.
+
+        Deliberately a *safety net over* the adapter's signal, not a replacement for it. The signal
+        stays the fast path (it can say things a diff cannot infer, and it arrives without waiting
+        for a snapshot to move), and an adapter with no signal facility at all now gets change
+        detection for free.
+
+        Two rules do the real work:
+
+        A property seen for the FIRST time reports nothing. It has not changed; it has only just
+        become visible, and treating its whole value as an addition would open every gate watching
+        it the instant attention arrived — exactly what `tool.focus()` establishing an adapter-side
+        baseline already avoids on the signal path.
+
+        A change the adapter DID signal this tick is not derived again. That is the cost control:
+        an adapter refreshes the property and pushes the signal in one breath (ADR-0004 requires
+        that order), so both land in the same Observe, and a derived twin would double every
+        watching condition's judge calls while carrying nothing new. Dedup is per (source, path)
+        rather than per source, so an adapter that reported one change and dropped another in the
+        same tick still has the dropped one recovered. `arrived` is how many signals this Observe
+        just drained, which is what scopes that check to the current tick.
+        """
+        signalled: set[tuple[str, str]] = set()
+        for percept in wm.signals[len(wm.signals) - arrived :] if arrived else []:
+            for change in changes_of(percept.payload):
+                signalled.add((percept.source, change.path))
+        for (source, name), percept in wm.properties.items():
+            current = percept.payload.value
+            key = (source, name)
+            if key not in wm.property_baseline:
+                wm.property_baseline[key] = current
+                continue
+            previous = wm.property_baseline[key]
+            if previous == current:
+                continue
+            wm.property_baseline[key] = current
+            # `path_matches` both ways, as everywhere else: a signal reported above or below the
+            # derived path still covers it, so a coarse announcement suppresses the fine twin.
+            changes = tuple(
+                change
+                for change in diff_values(previous, current)
+                if not any(
+                    src == source and path_matches(path, [change]) for src, path in signalled
+                )
+            )
+            if not changes:
+                continue
+            wm.property_changes.append(
+                Percept(source, PropertyChange(name=name, changes=changes), time.time())
+            )
+            wm.property_changes_appended += 1
+            log.info(
+                "observe: derived change on %s.%s from %s (no signal)",
+                source,
+                name,
+                ", ".join(change.path or "<root>" for change in changes),
+            )
 
     def _expire_stalled_inferences(self, cycle: DecisionCycle) -> None:
         """Give up on an inference that has been in flight too long, as though the call had failed.
@@ -1430,6 +1570,33 @@ class DefaultObserveStrategy:
             ):
                 if watch_matches(wait.path, wait.kind, changes_of(percept.payload)):
                     return percept
+        return None
+
+    @staticmethod
+    def _match_derived(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> Percept | None:
+        """The first DERIVED change satisfying `wait`, or None — `_match_signal` over the other log,
+        minus one field: a derived change has no signal name, because no tool named it, so source,
+        path and direction gate it and `signal_name` cannot.
+
+        That makes this match strictly WIDER than the declared watch, and the widening is
+        deliberate. This path exists because an announcement went missing, and a safety net that can
+        itself miss is not one — insisting on a name nothing produced would satisfy no watch at all.
+        It is the same trade the rest of this machinery already makes: `path_matches` matches
+        bidirectionally and `_kind_matches_one` degrades open, both because a redundant evaluation
+        costs one judge call answered "no" while a missed wake costs the run. The cost control the
+        gate exists for survives intact — source, path and `kind` still gate it, so the agent's own
+        write on the watched path is told apart from the world's exactly as it is on the signal
+        path.
+        """
+        # As in _match_signal: the cap front-evicts, so this is a sequence number, not a list index.
+        first_seq = wm.property_changes_appended - len(wm.property_changes)
+        for offset, percept in enumerate(wm.property_changes):
+            if first_seq + offset < since:
+                continue
+            if wait.source is not None and percept.source != wait.source:
+                continue
+            if watch_matches(wait.path, wait.kind, list(percept.payload.changes)):
+                return percept
         return None
 
     async def _reconcile_attention(self, cycle: DecisionCycle) -> bool:
@@ -3280,6 +3447,7 @@ class DefaultReasonStrategy:
         # spin) or swallow one that arrived mid-flight.
         for state, _ in eligible:
             state.evaluated_through = wm.signals_appended
+            state.derived_through = wm.property_changes_appended
         # Paired with the source that reported them, not flattened into a bare list: a `Change`
         # names the path that moved but not the tool it moved on, and the judgement needs both to
         # dereference the ids back into records (see ProceduralMemory.render_changes).

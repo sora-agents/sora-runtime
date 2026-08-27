@@ -155,6 +155,21 @@ class WorkingMemory:  # transient, in-process, fast
     # would blind all the others. Adding it here rather than to Percept keeps a sequence number off
     # the property half of the store, where it would be meaningless.
     signals_appended: int = 0
+    # Changes the runtime DERIVED by diffing a re-observed property against `property_baseline`,
+    # for the changes an adapter never announced. A third store rather than a third kind on an
+    # existing one: `signals` means the environment said something happened, and a derived delta is
+    # an inference drawn here, so mixing them would put runtime-invented events in front of every
+    # consumer that renders observed signals (ADR-0004 keeps the two halves apart by lifecycle).
+    # Same append-log shape and the same retention cap as `signals`, for the same reason — a
+    # broadcast log with independent readers, each keeping its own high-water mark.
+    property_changes: list[Percept] = field(default_factory=list)
+    property_changes_appended: int = 0
+    # The value each property held when it was last diffed — the store `properties` deliberately
+    # isn't. Kept OUTSIDE `properties` so it survives `drop_properties`: `_unfocus_`/`_filter_`
+    # prune the snapshot, and a baseline pruned alongside it would make the next re-observation
+    # compare against nothing, silently fold everything that moved while unattended into a fresh
+    # baseline, and report no change at all. Surviving is what lets a refocus report what it missed.
+    property_baseline: dict[tuple[str, str], Any] = field(default_factory=dict)
     # inbound agent-to-agent communication — kept distinct
     messages: list[Message] = field(default_factory=list)
     # Count of messages already routed (turned into an activity goal by Situate, or claimed as

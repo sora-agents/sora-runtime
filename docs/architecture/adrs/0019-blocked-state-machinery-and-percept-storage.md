@@ -83,7 +83,9 @@ the matched signal — `wm.signals` is a shared, append-only log any number of a
 may still read, so the same signal instance can satisfy more than one wait; only the fixed retention
 cap ever removes an entry (see Signal lifecycle). The trim runs *after* both passes each tick, so a
 signal that just arrived this tick is matched before it's ever a candidate for eviction. A failed op
-does not suspend (Reflect terminates it). Both passes are in `DefaultObserveStrategy` and fully
+does not suspend (Reflect terminates it). Only an announced signal resumes a wait: a property change the
+runtime derived rather than the environment announced can open a pending condition's gate but never resumes
+`blocked_on` (see [ADR-0004](0004-tool-usage-interface.md)). Both passes are in `DefaultObserveStrategy` and fully
 mechanical — no LLM, no planner.
 
 **Revision (2026-07-22):** the original version of this decision evicted the matched signal on both
