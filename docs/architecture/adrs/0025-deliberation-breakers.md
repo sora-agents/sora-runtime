@@ -81,6 +81,9 @@ of its own.
   sub-goal whose tokens are largely contained in an ancestor's is re-stating it, not reducing it.
   Containment (`|A∩B| / min`), not Jaccard — the observed regress *elaborates* the same goal, piling
   on qualifiers, which grows the union and sinks Jaccard while the core token set stays contained.
+  One class of sub-goal is **exempt**: a pending condition's `then`, which restates the goal that
+  declared it by construction and whose reduction lives in the data rather than the wording
+  ([ADR-0027](0027-achievement-and-maintenance-goals.md)). The depth cap still applies to it.
 
 ADR-0022 recorded this behavior as intent and deferred the wiring to
 [ADR-0020](0020-hard-interrupt-and-await-input.md). This ADR records what was actually built, which
@@ -231,7 +234,9 @@ replan breaker; the breaker asks the user.
   runs to its dereference and fails there, as before.
 * Token-overlap containment is a heuristic and will occasionally refuse a legitimate sub-goal that
   is genuinely a narrower restatement of its parent. Pausing rather than terminating is what makes
-  that recoverable.
+  that recoverable. One such class proved *structural* rather than occasional — a pending condition's
+  `then` restates its declaring goal every time, scoring 0.94 on the run that found it — and is
+  exempted above per [ADR-0027](0027-achievement-and-maintenance-goals.md).
 
 ## Pros and Cons of the Options
 
@@ -285,3 +290,6 @@ replan breaker; the breaker asks the user.
   distinction.
 * Keeps Act mechanistic per [ADR-0017](0017-parameter-grounding-in-reason.md): the guard is a Reason
   decision.
+* Refined by [ADR-0027](0027-achievement-and-maintenance-goals.md) — a pending condition's `then` is
+  exempt from goal token-overlap containment (the depth cap is unchanged), and a maintenance plan
+  refused for want of a domain clock escalates to this ADR's shared terminus.

@@ -286,7 +286,9 @@ live** — not when it pops. Lifting at entry satisfies both requirements at onc
 outlives the plan that noticed it (which is the point — a deliberative sub-goal is usually where the
 agent first learns a branch exists, having just sent the mail, and its frame pops long before any
 reply), *and* it is already watching while the body still runs, which is what the early-reply case
-below needs. Lifting is idempotent, so it can simply run every cycle. Requiring the root planner to
+below needs. That pop-and-keep-watching rule is the **achievement** sub-goal's; a *maintenance*
+sub-goal holds its frame until its conditions retire — see
+[ADR-0027](0027-achievement-and-maintenance-goals.md). Lifting is idempotent, so it can simply run every cycle. Requiring the root planner to
 foresee every branch before synthesizing a body would put the declaration in the one place least
 likely to know.
 
@@ -305,8 +307,10 @@ other; Reason sees conditions whose gate opened past their mark and fires **one*
 all of them — *given these `Change` records, which `when`s hold, is any `until` now satisfied, and
 if a `when` holds, the plan for its `then`* — off-cycle on `pending_inference`/`inference_sink`
 unchanged ([ADR-0021](0021-llm-calls-as-async-internal-actions.md)). **Resolution:** a holding
-`when` pushes its `then` as a frame — the deliberative sub-goal path, triggered rather than
-positional; a satisfied `until` drops the condition; if nothing holds and conditions remain,
+`when` starts its `then` as a sub-plan — the deliberative sub-goal path, triggered rather than
+positional, though at the declaring depth rather than on a pushed frame, since a watch fires as many
+times as the world moves ([ADR-0027](0027-achievement-and-maintenance-goals.md)); a satisfied
+`until` drops the condition; if nothing holds and conditions remain,
 `_suspend_` back to `BLOCKED` with marks advanced, so the same signal is never evaluated twice.
 
 Conditions are live from plan entry, not only after the body, so a gate that opens mid-body is
@@ -464,7 +468,10 @@ rejected; it is a separate, labeled future decision, not part of this ADR.
   against every terminated activity, which is the cost this layer exists to avoid.
 * Lifting conditions out of popped frames means an activity's watch set grows with its sub-goal
   depth, and nothing prunes it but `until` — so a deep activity accumulates gates that each widen
-  the chance of a false opening.
+  the chance of a false opening. Worse than stated here: `until` is judged only inside the batched
+  evaluation, which runs only when a change makes a condition eligible, so a condition whose watched
+  collection goes quiet never retires at all. Closed by
+  [ADR-0027](0027-achievement-and-maintenance-goals.md)'s retirement pass.
 
 ## Pros and Cons of the Options
 
@@ -525,3 +532,8 @@ rejected; it is a separate, labeled future decision, not part of this ADR.
 * Complemented by [ADR-0026](0026-undeclared-relevance-recovery.md) — a change that opens no declared
   gate here is that ADR's entire input, handled by amending a terminated activity rather than
   resuming one. Declared resumes; undeclared amends.
+* Refined by [ADR-0027](0027-achievement-and-maintenance-goals.md) — this ADR's single frame-
+  completion rule (steps exhausted ⇒ pop) is the **achievement** sub-goal's; a maintenance sub-goal
+  holds its frame until its conditions retire. That ADR also adds the retirement pass this one's
+  consequences call for, and places a fired `then` at the declaring depth rather than on a pushed
+  frame. Nothing else here is reopened.
