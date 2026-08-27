@@ -297,6 +297,17 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # messages_cursor takes, correct there because a message must create an activity at most once)
     # would let the first condition to advance it blind every other reader of that broadcast log.
     condition: PendingCondition
+    # Which FRAME declared this condition, as the chain of (plan id, sub-goal step index) that
+    # reaches it — `()` for the top-level plan. Lifting copies conditions off every live frame onto
+    # the activity and thereby erases where each came from, which is exactly what a maintenance
+    # frame's completion rule needs back (ADR-0027): only the conditions a frame declared ITSELF
+    # hold it, or a condition declared by the top-level plan pins an unrelated sub-plan open and the
+    # parent's own remaining steps never run. The chain, not the declaring plan's id: a fired
+    # condition's `then` REPLACES the body at the declaring depth (it pushes no frame), so an
+    # attribution naming the plan would release the frame after the first firing — the motivating
+    # run's failure exactly — while the frame's chain is unchanged by that swap. A sibling sub-goal
+    # pushed at another step of the same parent differs in the index, so it is a different frame.
+    declared_by: tuple[tuple[str, int], ...] = ()
     evaluated_through: int = 0
     # The same mark over the second, derived log (WorkingMemory.property_changes_appended). Two
     # counters rather than one shared sequence: the logs are appended to independently, so a single
@@ -537,6 +548,29 @@ WAIT = "wait"
 # Reason handles it internally (mechanical fan-out or a mid-plan _infer_) and never dispatches it as
 # an ExternalAction, so it too is a pseudo-action like WAIT, not a registered action name.
 SUBGOAL = "subgoal"
+
+# A `subgoal` step's completion criterion (ADR-0027), under the "goal_kind" key of its params.
+# ACHIEVEMENT names a state of the world: its steps are an attempt at reaching it, so the frame pops
+# when they run out. MAINTENANCE names something to keep doing while its conditions are relevant:
+# its steps were the FIRST ITERATION, and the frame lives until every condition it declared has
+# retired. Orthogonal to "mode", which says how the sub-plan is produced, not when it is finished.
+GOAL_KIND_ACHIEVEMENT = "achievement"
+GOAL_KIND_MAINTENANCE = "maintenance"
+GOAL_KINDS = frozenset({GOAL_KIND_ACHIEVEMENT, GOAL_KIND_MAINTENANCE})
+
+
+def goal_kind_of(step: Step) -> str:
+    """The completion criterion a ``subgoal`` step declares, defaulting to ``achievement``.
+
+    Anything unrecognized reads as ``achievement`` too, and that direction is deliberate: the label
+    is a model output with nothing verifying it, and a mislabelled maintenance goal holds its frame
+    — and its parent's remaining steps — until something retires a condition, while a mislabelled
+    achievement goal merely ends early. The parser drops an unknown value at the boundary; this is
+    the same degradation for a step built by hand or restored from an older store.
+    """
+    kind = step.params.get("goal_kind")
+    return kind if isinstance(kind, str) and kind in GOAL_KINDS else GOAL_KIND_ACHIEVEMENT
+
 
 # Keys under which an `invoke` Step carries its routing in Step.params (and in InvokeAction's
 # kwargs), before Act binds them into an OperationInvocation.

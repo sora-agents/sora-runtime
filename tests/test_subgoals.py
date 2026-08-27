@@ -58,6 +58,7 @@ from sora.types import (
     Plan,
     Step,
     SupersededPlan,
+    goal_kind_of,
 )
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
@@ -941,8 +942,43 @@ def test_step_from_raw_defaults_missing_action_to_invoke() -> None:
     assert step.params["tool_id"] == "realestate"
 
 
+def test_step_from_raw_keeps_a_declared_goal_kind() -> None:
+    """ADR-0027's one-bit distinction: `mode` says how the sub-plan is produced, `goal_kind` says
+    when the sub-goal is finished — orthogonal, so a mechanical fan-out can serve either."""
+    step = step_from_raw(
+        {
+            "action": "subgoal",
+            "goal": "watch the calendar for four minutes",
+            "mode": "deliberative",
+            "goal_kind": "maintenance",
+        }
+    )
+    assert step.params["goal_kind"] == "maintenance"
+    assert goal_kind_of(step) == "maintenance"
+
+
+def test_an_unrecognized_goal_kind_degrades_to_achievement() -> None:
+    """The label is a model output and nothing verifies it, so an unknown value falls back to the
+    kind that cannot hold a frame open forever — never to maintenance."""
+    raw = {"action": "subgoal", "goal": "watch the calendar", "goal_kind": "ongoing"}
+    step = step_from_raw(raw)
+    assert "goal_kind" not in step.params  # dropped rather than carried into a frame
+    assert goal_kind_of(step) == "achievement"
+
+
+def test_an_undeclared_goal_kind_reads_as_achievement() -> None:
+    step = step_from_raw({"action": "subgoal", "goal": "book the restoration slot"})
+    assert goal_kind_of(step) == "achievement"
+
+
 def test_plan_prompt_documents_subgoal_steps() -> None:
     assert "subgoal" in PLAN_SYSTEM_PROMPT
+
+
+def test_plan_prompt_documents_the_goal_kind() -> None:
+    """A distinction the planner has to declare has to be described to the planner."""
+    assert "goal_kind" in PLAN_SYSTEM_PROMPT
+    assert "maintenance" in PLAN_SYSTEM_PROMPT
 
 
 async def test_subgoal_prompt_is_told_it_is_a_subgoal_without_mutating_the_activity(

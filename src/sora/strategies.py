@@ -41,6 +41,8 @@ from sora.llm import log_llm_discarded
 from sora.memory import PerceptSnapshot, render_plan, render_steps, step_from_raw
 from sora.perception import Percept
 from sora.types import (
+    GOAL_KIND_ACHIEVEMENT,
+    GOAL_KIND_MAINTENANCE,
     OPERATION_NAME,
     SUBGOAL,
     TOOL_ID,
@@ -60,6 +62,7 @@ from sora.types import (
     Step,
     changes_of,
     diff_values,
+    goal_kind_of,
     path_matches,
     walk_path,
     watch_matches,
@@ -88,11 +91,16 @@ def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
     lifted yet" from "lifted and then retired", and `Plan.pending` is a frozen skeleton that still
     declares what retirement removed — so without `retired_conditions` a satisfied `until` would be
     undone by the very next lift, putting the condition back on watch for good.
+
+    Each lifted condition records the frame that declared it (`declared_by`), because lifting is
+    precisely what erases that and a maintenance frame's completion rule needs it back — see
+    `_conditions_hold_frame`. A condition two frames declare identically is attributed to the
+    innermost one, which is the frame reading it as its own.
     """
     frames = [activity.plan, *(plan for plan, _, _ in activity.parent_frames)]
     known = {state.condition for state in activity.pending_conditions}
     known |= activity.retired_conditions
-    for plan in frames:
+    for depth, plan in enumerate(frames):
         if plan is None:
             continue
         for condition in plan.pending:
@@ -102,27 +110,70 @@ def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
             activity.pending_conditions.append(
                 PendingConditionState(
                     condition=condition,
+                    declared_by=_frame_key(activity, depth),
                     evaluated_through=wm.signals_appended,
                     derived_through=wm.property_changes_appended,
                 )
             )
 
 
-def _conditions_hold_frame(activity: Activity) -> bool:
-    """Work this activity's conditions still owe, which popping to the parent would skip past.
+def _frame_key(activity: Activity, depth: int = 0) -> tuple[tuple[str, int], ...]:
+    """Identity of the frame ``depth`` levels above the current one: the chain of (plan id, sub-goal
+    step index) that reaches it, `()` for the top-level plan. See `PendingConditionState`."""
+    frames = activity.parent_frames[: len(activity.parent_frames) - depth]
+    return tuple((plan.id, index) for plan, index, _ in frames)
 
-    A condition is declared by a plan but outlives its steps — `until` bounds the wait, not the
-    body — so an exhausted sub-plan whose conditions are still live has not finished with its
-    frame. Popping there resumes the parent at the step after the sub-goal, which on the run that
-    motivated this was the message telling the user everything was done, sent while the monitoring
-    window was still open. The unapplied verdict and the fired queue hold the frame for the same
-    reason: both are committed work this frame owes, and the parent must not run ahead of them.
+
+def _frame_goal_kind(activity: Activity) -> str:
+    """The completion criterion declared for the frame the activity is currently executing.
+
+    Read off the `subgoal` step that pushed it — the same place `_ancestor_subgoal_goals` reads a
+    frame's goal from — rather than stored on the frame, so nothing has to migrate and a step's
+    params stay the one declaration. The top-level plan is nobody's sub-goal and is always an
+    achievement goal: it has no frame to hold, and an exhausted body with live conditions blocks
+    there anyway.
+
+    Only a frame has a kind, so a `goal_kind` on a MECHANICAL sub-goal reads as nothing: that
+    fan-out splices into the plan in place and pushes no frame of its own, and declares no
+    `pending` either (the conditions belong to the plan it was spliced into). Maintenance is served
+    by
+    such a fan-out from inside its own sub-plan — the frame that carries the kind — not by
+    labelling the fan-out step itself.
     """
-    return bool(
-        activity.pending_conditions
-        or activity.condition_fired
-        or activity.condition_verdict is not None
-    )
+    if not activity.parent_frames:
+        return GOAL_KIND_ACHIEVEMENT
+    parent_plan, index, _mark = activity.parent_frames[-1]
+    if index >= len(parent_plan.steps):  # defensive: a frame whose parent was replanned under it
+        return GOAL_KIND_ACHIEVEMENT
+    return goal_kind_of(parent_plan.steps[index])
+
+
+def _conditions_hold_frame(activity: Activity) -> bool:
+    """Work this frame still owes, which popping to the parent would skip past (ADR-0027).
+
+    Two independent reasons, and only the second is a goal-kind question:
+
+    * **Committed work** — a queued `condition_fired` or a verdict nothing has applied yet. Both
+      kinds of goal owe it: the judgement is already paid for and the `then` runs at this depth, so
+      the parent must not run ahead of them.
+    * **A maintenance goal's own live conditions** — its steps were the first iteration, so it is
+      finished only when every condition it declared has retired. On the motivating run, popping
+      resumed the parent at the message telling the user everything was done, sent while the
+      monitoring window was still open.
+
+    An **achievement** frame is never held by a condition: ADR-0022's contingency case (send the
+    mail, pop, keep watching) is exactly a condition meant to outlive the frame that declared it,
+    and it keeps watching from the activity after the pop. The stopgap this replaced held every
+    frame by every live condition, which broke that case in one direction and, because lifting
+    erases provenance, let a condition declared by the top-level plan pin an unrelated sub-plan
+    open in the other.
+    """
+    if activity.condition_fired or activity.condition_verdict is not None:
+        return True
+    if _frame_goal_kind(activity) != GOAL_KIND_MAINTENANCE:
+        return False
+    key = _frame_key(activity)
+    return any(state.declared_by == key for state in activity.pending_conditions)
 
 
 def _body_exhausted(activity: Activity) -> bool:

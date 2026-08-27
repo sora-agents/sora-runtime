@@ -107,6 +107,8 @@ Step(next_action="subgoal",
 
 Reaching it moves the activity to `RUNNING` with `pending_inference` (`kind="subgoal"`), exactly like the initial plan infer — but at `step_index > 0`. When it resolves, `(plan, step_index)` is pushed onto `parent_frames` and the synthesized sub-plan becomes the active frame: e.g. `remove_saved_apartment` for the two duplicates it now sees, then a `send_email` to each of the two relatives with a summary tailored to what was saved. This is where a uniform mechanical fan-out would be wrong — the removals and emails are heterogeneous and their contents depend on run-time state — so the count and shape come from the model reading real data, not from a template. (A cached sub-plan for this sub-goal can also be retrieved first, a sub-plan library keyed by the sub-goal's goal.)
 
+**Maintenance sub-goal** — the same `subgoal` step with `"goal_kind": "maintenance"` ([ADR-0027](docs/architecture/adrs/0027-achievement-and-maintenance-goals.md)). `mode` says how the sub-plan is produced; `goal_kind` says when the sub-goal is *finished*. An achievement sub-goal (the default, and what the two examples above are) is done when its steps run out. A maintenance one — *"for the next four minutes, whenever events are added, delete the preexisting events they overlap"* — treats those steps as the first iteration: its frame stays, the activity blocks on the `ConditionWait` covering its declared conditions, and the parent resumes only once every condition that sub-plan declared has retired via its `until`.
+
 ## Connecting via the ARE MCP server
 
 ARE ships an MCP server that exposes any scenario's app tools as standard MCP tools. S-ORA connects using its built-in MCP adapter — no custom adapter code is needed for operations:

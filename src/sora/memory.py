@@ -30,6 +30,9 @@ from sora.manual import (
     WorkspaceRecord,
 )
 from sora.types import (
+    GOAL_KIND_ACHIEVEMENT,
+    GOAL_KINDS,
+    SUBGOAL,
     Change,
     CompletedOperation,
     ConditionVerdict,
@@ -315,7 +318,7 @@ PLAN_SYSTEM_PROMPT = (
     '  {"action": "focus", "tool_id": "<id>"}\n'
     '  {"action": "unfocus", "tool_id": "<id>"}\n'
     '  {"action": "subgoal", "goal": "<what to achieve>", "mode": "mechanical" | "deliberative", '
-    "...}\n"
+    '"goal_kind": "achievement" | "maintenance", ...}\n'
     'A step with no "action" is treated as "invoke". Use only tool ids and operation names that '
     "appear in the provided tool list. You do not need `focus` steps for the tools your plan "
     "already names: the runtime attends to every tool your steps invoke or reference, for as long "
@@ -444,6 +447,19 @@ PLAN_SYSTEM_PROMPT = (
     'judgement rather than a uniform template, use "mode": "deliberative" with just the "goal" — '
     "the runtime plans "
     "that sub-goal separately when it is reached.\n"
+    'A `subgoal` step MAY also carry "goal_kind": "achievement" | "maintenance" (default '
+    '"achievement"). It answers a different question from "mode": "mode" says how the sub-plan is '
+    'produced, "goal_kind" says WHEN the sub-goal is finished, so either kind can be planned '
+    "either way. An ACHIEVEMENT sub-goal names something to get DONE, and it is finished once its "
+    'steps have run — that is nearly every sub-goal. Use "maintenance" when the goal instead names '
+    'a WINDOW to keep watching over ("for the next hour, whenever a loan request arrives, check it '
+    'against the exhibition calendar"): there the steps are only the FIRST pass, and read as an '
+    "achievement goal the runtime would take that first pass for the whole job and run straight on "
+    "to whatever follows the sub-goal — the report telling the user it is all done — while the "
+    "window is still open. Keep the window itself in the sub-goal's `goal` text, and give that "
+    "sub-goal's own plan a `pending` condition whose `until` says when the window closes: that "
+    "`until` is the only thing that ends a maintenance sub-goal, and one that declares no such "
+    "condition ends as soon as its steps do.\n"
     "To NARROW or RESHAPE a collection before you act on it — keep only the qualifying items, "
     "dedupe, sort, take the top few, gather per-item results, or reduce to a single number — emit "
     "one data-op step per transform (they compose in order, one per step; do NOT do it all at "
@@ -1110,11 +1126,23 @@ def step_from_raw(raw: dict[str, Any]) -> Step:
     operation_name land under the routing keys; every other action (including a ``subgoal``, whose
     nested ``template`` dict is preserved verbatim for the fan-out to instantiate later) keeps its
     remaining keys as ``params``. Shared by ``_parse_plan_steps`` and the mechanical fan-out so both
-    read the same step grammar."""
+    read the same step grammar.
+
+    The one value checked here is a sub-goal's ``goal_kind`` (ADR-0027): an unrecognized one is
+    dropped rather than carried into a frame, so it reads as ``achievement`` — the direction that
+    cannot hold a frame, and its parent's remaining steps, open indefinitely. Dropped, not raised,
+    for the same reason a malformed ``pending`` entry is: the body is what does the work."""
     action = raw.get("action", InvokeAction.name)
     if action == InvokeAction.name:
         return invoke_step(raw["tool_id"], raw["operation_name"], **raw.get("params", {}))
     params = {k: v for k, v in raw.items() if k != "action"}
+    if action == SUBGOAL and "goal_kind" in params and params["goal_kind"] not in GOAL_KINDS:
+        log.warning(
+            "plan: sub-goal %r declared an unknown goal_kind %r; reading it as %s",
+            params.get("goal"),
+            params.pop("goal_kind"),
+            GOAL_KIND_ACHIEVEMENT,
+        )
     return Step(next_action=action, params=params)
 
 
