@@ -78,6 +78,34 @@ def _reconsideration_for(value: str) -> ReconsiderationPolicy:
     return policy
 
 
+# Attention narrowing (no ADR — see docs/architecture/notes/attention-scoped-to-live-intentions.md).
+# Named by a short alias or a dotted path under ``strategies.focus``. Deliberately absent from
+# _DEFAULT_STRATEGIES: the default lives on DefaultObserveStrategy itself (FocusAllJoined), so an
+# agent that names nothing here gets it without bootstrap having an opinion, and a custom
+# ObserveStrategy that takes no policy stays constructible.
+_FOCUS_POLICIES = {
+    "all-joined": "sora.strategies.FocusAllJoined",
+    "intention-scoped": "sora.strategies.IntentionScopedFocus",
+}
+
+
+def _observe_strategy_for(config: AgentConfig) -> Any:
+    """Build the Observe strategy, passing ``strategies.focus`` when one is named.
+
+    A FocusPolicy is a sub-strategy of Observe rather than a phase of its own — the same shape as
+    ``change_gate`` on the cycle — so it cannot ride the no-arg ``import_object(...)()`` path the
+    other four phases use, which is what made the narrowing policy unreachable from agent.yaml.
+    Passed as a keyword only when named, so naming one against a strategy that cannot take it
+    raises rather than being silently dropped: an agent that asked to narrow and did not is a
+    silent cost regression, and one that asked for the opposite is a silent blindness.
+    """
+    observe = import_object(config.strategies.get("observe", _DEFAULT_STRATEGIES["observe"]))
+    focus = config.strategies.get("focus")
+    if focus is None:
+        return observe()
+    return observe(focus=import_object(_FOCUS_POLICIES.get(focus, focus))())
+
+
 _DEFAULT_LLM_CLIENT = "sora.adapters.anthropic_llm.AnthropicLLMClient"
 
 # Built-in workspace-adapter / transport "kinds" — the config↔code contract. Each is the string a
@@ -385,7 +413,7 @@ def build_agent(config_path: str, *, simulation: Any | None = None) -> Agent:
     episodic = EpisodicMemory(backend_for(config.memory["episodic"]))
 
     strategies = Strategies(
-        observe=import_object(config.strategies.get("observe", _DEFAULT_STRATEGIES["observe"]))(),
+        observe=_observe_strategy_for(config),
         reflect=import_object(config.strategies.get("reflect", _DEFAULT_STRATEGIES["reflect"]))(),
         situate=import_object(config.strategies.get("situate", _DEFAULT_STRATEGIES["situate"]))(),
         reason=reason_strategy_for(config),  # required — no default

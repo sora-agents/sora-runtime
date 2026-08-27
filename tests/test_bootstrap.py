@@ -21,6 +21,7 @@ import pytest
 from sora.bootstrap import (
     _DEFAULT_STRATEGIES,
     AgentConfig,
+    _observe_strategy_for,
     _reconsideration_for,
     adapter_for,
     backend_for,
@@ -36,7 +37,10 @@ from sora.memory import FileMemoryBackend
 from sora.strategies import (
     BeforeEachOp,
     BeforeWrites,
+    DefaultObserveStrategy,
     DefaultReasonStrategy,
+    FocusAllJoined,
+    IntentionScopedFocus,
     NoneReconsideration,
     PerceptionSignatureGate,
 )
@@ -136,6 +140,47 @@ def test_reconsideration_for_resolves_a_dotted_path() -> None:
 def test_default_change_gate_resolves_to_perception_signature_gate() -> None:
     gate = import_object(_DEFAULT_STRATEGIES["change_gate"])()
     assert isinstance(gate, PerceptionSignatureGate)
+
+
+# strategies.focus — the FocusPolicy is a sub-strategy of Observe, so it cannot ride the no-arg
+# import_object(...)() path the five phases use. Without this it was unreachable from agent.yaml.
+
+
+def _focus_config(**strategies: str) -> AgentConfig:
+    return AgentConfig(name="a", strategies=strategies, memory={}, workspaces=[])
+
+
+def test_observe_defaults_to_the_broad_focus_policy_when_none_is_named() -> None:
+    # The default lives on DefaultObserveStrategy, not in bootstrap: an agent that names nothing
+    # gets it without bootstrap having an opinion about attention.
+    observe = _observe_strategy_for(_focus_config())
+    assert isinstance(observe, DefaultObserveStrategy)
+    assert isinstance(observe._focus, FocusAllJoined)
+
+
+def test_a_named_focus_policy_reaches_the_observe_strategy() -> None:
+    observe = _observe_strategy_for(_focus_config(focus="sora.strategies.IntentionScopedFocus"))
+    assert isinstance(observe._focus, IntentionScopedFocus)
+
+
+def test_a_focus_policy_can_be_named_by_its_short_alias() -> None:
+    observe = _observe_strategy_for(_focus_config(focus="intention-scoped"))
+    assert isinstance(observe._focus, IntentionScopedFocus)
+    broad = _observe_strategy_for(_focus_config(focus="all-joined"))
+    assert isinstance(broad._focus, FocusAllJoined)
+
+
+def test_naming_a_focus_policy_an_observe_strategy_cannot_take_raises() -> None:
+    """Rather than being silently dropped. An agent that asked to narrow and did not is a silent
+    cost regression; one that asked for the opposite is silently blind."""
+    with pytest.raises(TypeError):
+        _observe_strategy_for(
+            _focus_config(observe="tests.test_bootstrap._NoPolicyObserve", focus="intention-scoped")
+        )
+
+
+class _NoPolicyObserve:
+    def __init__(self) -> None: ...
 
 
 # --------------------------------------------------------------------------------------------------
