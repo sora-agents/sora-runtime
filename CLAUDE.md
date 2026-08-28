@@ -76,6 +76,7 @@ General habits, not tied to one file — the kind of thing that's easy to reintr
 | `Agent`/`DecisionCycle` construction or wiring | [0013](docs/architecture/adrs/0013-shared-instances-narrow-dependencies.md) |
 | `WorkingMemory` / the Observe phase | [0012](docs/architecture/adrs/0012-percepts-vs-messages.md), [0019](docs/architecture/adrs/0019-blocked-state-machinery-and-percept-storage.md) |
 | Focus/attention (`FocusPolicy`, `focused_tools`, `_filter_`'s relevant set, per-call `PerceptSnapshot` scoping) | *(no ADR — deliberately)* [design note](docs/architecture/notes/attention-scoped-to-live-intentions.md) |
+| Data-ops (`filter`/`distinct`/`sort`/`take`/`collect`/`reduce`), the `where` predicate grammar, `SEEDED_BINDINGS` | [0023](docs/architecture/adrs/0023-structured-value-data-ops.md) + [design note](docs/architecture/notes/mechanical-predicates-over-model-filters.md) *(composition, `overlaps`, fired-change bindings)* |
 | Blocked state (`_suspend_`/`_resume_`), signal storage/eviction, `completion_signal` | [0019](docs/architecture/adrs/0019-blocked-state-machinery-and-percept-storage.md) |
 | Hard interrupt (`interrupt()`, `InterruptHandler`/`InterruptPolicy`, `InputWait`, phase-boundary checkpoints) | [0020](docs/architecture/adrs/0020-hard-interrupt-and-await-input.md) |
 | Async LLM calls (`_infer_`/`_ground_` off-cycle, `pending_inference`, `inference_sink`, stale-inference discard) | [0021](docs/architecture/adrs/0021-llm-calls-as-async-internal-actions.md) |

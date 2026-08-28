@@ -24,6 +24,14 @@ if TYPE_CHECKING:
     )
 
 
+# Bindings the RUNTIME seeds, as against the ones a data-op step writes. They carry the ids a
+# watched change reported — a fact about the world, not an intermediate result of the plan being
+# executed — which is why `reset_for_replan` keeps them where it drops every other binding, and why
+# the plan prompt may render them without repeating the lie that made ordinary bindings unrenderable
+# there. Reserved: a plan's own `out` must not name one, or the next firing overwrites it.
+SEEDED_BINDINGS = ("fired_added_ids", "fired_removed_ids", "fired_updated_ids")
+
+
 class ActivityState(Enum):
     RUNNING = "running"
     BLOCKED = "blocked"
@@ -222,8 +230,14 @@ class Activity:
         # superseded bundle above is what recovers the lost work instead.
         self.parent_frames.clear()
         # Drop the pipeline's intermediate bindings too: they were produced by (and are only
-        # meaningful within) the plan being discarded.
+        # meaningful within) the plan being discarded. The runtime-seeded ones are the exception,
+        # and by that same rule rather than against it: no plan produced them, so no plan's
+        # discarding makes them untrue. Clearing them would also make the replan unrecoverable —
+        # the next plan's `$bind` would resolve to nothing, be reported as a defect, and replan
+        # again, on a reference the runtime had told it to use.
+        seeded = {name: self.bindings[name] for name in SEEDED_BINDINGS if name in self.bindings}
         self.bindings.clear()
+        self.bindings.update(seeded)
         # Reconsideration baseline/verdict are coupled to the discarded plan (ADR-0024): drop them
         # so the next plan re-baselines against its own starting world rather than a stale one.
         self.reconsider_baseline = None

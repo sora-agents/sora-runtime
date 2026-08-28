@@ -639,6 +639,10 @@ class EvaluateConditionsAction:  # predefined internal action: _evaluate_conditi
 # rejected (ADR-0022 option (a)). Reason passes the resolved list as `collection` and the op's other
 # params as kwargs; the op is a pure transform except FilterAction's $decide escalation.
 _REF_DECIDE = "$decide"  # mirrors sora.strategies / ADR-0017's soft reference token
+# Boolean composition keys for a `filter` predicate. Plain names, not `$`-prefixed: the `$` tokens
+# mark a *reference* to be resolved before evaluation, and these are structure the evaluator walks.
+_COMPOSE_ALL = "all"
+_COMPOSE_ANY = "any"
 
 
 def pluck(element: Any, path: str | None) -> Any:
@@ -660,18 +664,86 @@ def _dedup_key(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)
 
 
+def _overlaps(element: Any, where: dict[str, Any]) -> bool:
+    """Does the element's own ``[start_path, end_path]`` interval meet any interval in ``against``?
+
+    The two-sided sibling of ``between``: ``between`` compares one value against one fixed pair,
+    this compares one *pair* against a whole collection of them. ``against`` arrives already
+    resolved and projected by Reason into ``[start, end]`` pairs, exactly as an ``in`` membership
+    set arrives projected to keys — so this stays a literal comparison with no reference
+    resolution, and no per-member alias to scope.
+
+    Half-open by default (``boundaries: "exclusive"``): two intervals that merely touch at a
+    boundary do NOT overlap, which is what a calendar means by a conflict. ``"inclusive"`` makes a
+    shared endpoint count. Nothing here is calendar-specific — intervals are ordered values of any
+    comparable type, and ISO-8601 timestamps happen to compare correctly as strings.
+
+    Every unusable input is a non-match rather than a crash or a blanket keep, matching the ordered
+    ops: an element missing either end, a malformed pair, a null bound, an incomparable type. That
+    direction is deliberate — this predicate's output feeds delete fan-outs, where failing *open*
+    would act on the whole collection. An ``against`` that could not be read at all is caught in
+    Reason as a plan defect (``_operand_defect``), since silently matching nothing is a confident
+    wrong answer about the world."""
+    start = pluck(element, where.get("start_path", ""))
+    end = pluck(element, where.get("end_path", ""))
+    intervals = where.get("against")
+    if start is None or end is None or not isinstance(intervals, (list, tuple)):
+        return False
+    inclusive = where.get("boundaries") == "inclusive"
+    for interval in intervals:
+        if not (isinstance(interval, (list, tuple)) and len(interval) == 2):
+            continue
+        other_start, other_end = interval
+        if other_start is None or other_end is None:
+            continue
+        try:
+            if (
+                (start <= other_end and end >= other_start)
+                if inclusive
+                else (start < other_end and end > other_start)
+            ):
+                return True
+        except TypeError:
+            continue  # incomparable types -> non-match, never a crash (like lt/le/gt/ge)
+    return False
+
+
 def _matches(element: Any, where: Any) -> bool:
     """Evaluate a mechanical ``filter`` predicate against one element: ``{"path", "op", "value"}``
-    with op in eq/ne/lt/le/gt/ge/between/in/not_in. ``in``/``not_in`` test membership of the
-    element's ``path`` value in ``value`` (a literal list, or — resolved upstream in Reason — the
-    projected keys of another collection named by a reference). A ``$decide`` predicate never gets
-    here (FilterAction escalates it). No predicate keeps everything. A membership set that isn't a
-    list is treated as empty: ``in`` matches nothing, ``not_in`` keeps everything (fails open, so a
-    malformed exclusion set never silently drops the whole collection)."""
+    with op in eq/ne/lt/le/gt/ge/between/in/not_in/overlaps. ``in``/``not_in`` test membership of
+    the element's ``path`` value in ``value`` (a literal list, or — resolved upstream in Reason —
+    the projected keys of another collection named by a reference); ``overlaps`` tests the
+    element's own interval against a collection of them (see ``_overlaps``). A ``$decide``
+    predicate never gets here (FilterAction escalates it). No predicate keeps everything. A
+    membership set that isn't a list is treated as empty: ``in`` matches nothing, ``not_in`` keeps
+    everything (fails open, so a malformed exclusion set never silently drops the whole
+    collection).
+
+    A predicate may instead COMPOSE others under ``all`` (conjunction) or ``any`` (disjunction),
+    recursively. Composition is what makes the mechanical path reach predicates that previously had
+    to escalate whole: the real ones are rarely a single clause — "not one of the newly added
+    events AND overlapping one of them" is two — and one un-mechanical clause used to drag the
+    entire predicate to a model call over the whole collection. A malformed or EMPTY clause list
+    matches nothing rather than vacuously everything: ``all([])`` is true in logic, but this
+    predicate's consumers fan out over what it keeps, so the failure that acts on the whole
+    collection is the one worth refusing. Reason reports either as a plan defect
+    (``_composition_defect``) rather than leaving it as a silent empty result."""
     if not isinstance(where, dict):
         return True
-    actual = pluck(element, where.get("path", ""))
+    if _COMPOSE_ALL in where:
+        clauses = where[_COMPOSE_ALL]
+        if not isinstance(clauses, list) or not clauses:
+            return False
+        return all(_matches(element, clause) for clause in clauses)
+    if _COMPOSE_ANY in where:
+        clauses = where[_COMPOSE_ANY]
+        if not isinstance(clauses, list) or not clauses:
+            return False
+        return any(_matches(element, clause) for clause in clauses)
     op = where.get("op", "eq")
+    if op == "overlaps":
+        return _overlaps(element, where)
+    actual = pluck(element, where.get("path", ""))
     value = where.get("value")
     if op == "eq":
         return bool(actual == value)

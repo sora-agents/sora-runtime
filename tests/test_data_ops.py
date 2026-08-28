@@ -546,6 +546,306 @@ async def test_filter_eq_against_a_resolved_none_still_runs(tmp_path: Path) -> N
 
 
 # --------------------------------------------------------------------------------------------------
+# filter — boolean composition (all/any) and the `overlaps` range join
+#
+# Both exist to keep predicates OFF the $decide path. A real rule is rarely one clause, and before
+# composition a single awkward clause dragged the whole predicate to a model call over every item.
+# `overlaps` is the two-sided sibling of `between`: one item's range against a whole collection of
+# them, resolved once in Reason like an `in` set, so no per-member alias reaches the evaluator.
+# --------------------------------------------------------------------------------------------------
+
+BOOKINGS = [
+    {"id": "b1", "starts_at": "2026-05-01T09:00", "ends_at": "2026-05-01T10:00", "room": "blue"},
+    {"id": "b2", "starts_at": "2026-05-01T10:00", "ends_at": "2026-05-01T11:00", "room": "blue"},
+    {"id": "b3", "starts_at": "2026-05-01T10:30", "ends_at": "2026-05-01T11:30", "room": "red"},
+    {"id": "b4", "starts_at": "2026-05-01T12:00", "ends_at": "2026-05-01T13:00", "room": "blue"},
+]
+
+
+async def test_filter_all_requires_every_clause(tmp_path: Path) -> None:
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "kept",
+            "where": {
+                "all": [
+                    {"path": "room", "op": "eq", "value": "blue"},
+                    {"path": "starts_at", "op": "ge", "value": "2026-05-01T10:00"},
+                ]
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert [e["id"] for e in activity.bindings["kept"]] == ["b2", "b4"]
+
+
+async def test_filter_any_requires_one_clause(tmp_path: Path) -> None:
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "kept",
+            "where": {
+                "any": [
+                    {"path": "room", "op": "eq", "value": "red"},
+                    {"path": "id", "op": "eq", "value": "b1"},
+                ]
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert [e["id"] for e in activity.bindings["kept"]] == ["b1", "b3"]
+
+
+async def test_filter_composition_nests(tmp_path: Path) -> None:
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "kept",
+            "where": {
+                "all": [
+                    {"path": "room", "op": "eq", "value": "blue"},
+                    {
+                        "any": [
+                            {"path": "id", "op": "eq", "value": "b1"},
+                            {"path": "id", "op": "eq", "value": "b4"},
+                        ]
+                    },
+                ]
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert [e["id"] for e in activity.bindings["kept"]] == ["b1", "b4"]
+
+
+async def test_filter_composition_resolves_references_inside_clauses(tmp_path: Path) -> None:
+    # A composed clause is not a second-class one: its operand resolves exactly as a lone clause's
+    # would. Without the recursion the reference dict would reach `_matches` intact, every
+    # comparison against it would raise TypeError, and the conjunction would keep nothing.
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "kept",
+            "where": {
+                "all": [
+                    {"path": "room", "op": "eq", "value": "blue"},
+                    {"path": "id", "op": "not_in", "value": {"$from": "already_done"}},
+                ]
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("already_done", ["b1", "b2"])])
+    assert [e["id"] for e in activity.bindings["kept"]] == ["b4"]
+
+
+async def test_filter_empty_or_malformed_composition_is_a_defect_not_a_blanket_keep(
+    tmp_path: Path,
+) -> None:
+    """An empty conjunction is vacuously TRUE in logic, which here would hand the whole collection
+    to whatever fans out over it — one external action per item. The evaluator refuses both shapes
+    and Reason reports them, so neither silently acts on everything nor silently acts on nothing."""
+    malformed: list[dict[str, object]] = [{"all": []}, {"any": []}, {"all": "not a list"}]
+    for where in malformed:
+        step = Step(
+            next_action="filter",
+            params={"in": BOOKINGS, "out": "kept", "where": where},
+        )
+        activity = await _run_one_dataop(tmp_path, step, [])
+
+        assert "kept" not in activity.bindings, where
+        assert activity.plan is None, where
+        assert activity.replan_trail[-1] is not None, where
+
+
+async def test_filter_overlaps_is_half_open_by_default(tmp_path: Path) -> None:
+    # b2 ends exactly when the probe starts and b4 starts after it ends: neither is a clash. Only
+    # b3, which genuinely straddles the probe's range, is kept.
+    probe = [{"starts_at": "2026-05-01T11:00", "ends_at": "2026-05-01T12:00"}]
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "clashing",
+            "where": {
+                "op": "overlaps",
+                "start_path": "starts_at",
+                "end_path": "ends_at",
+                "against": {"$from": "the_new_one"},
+                "against_start_path": "starts_at",
+                "against_end_path": "ends_at",
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("the_new_one", probe)])
+    assert [e["id"] for e in activity.bindings["clashing"]] == ["b3"]
+
+
+async def test_filter_overlaps_inclusive_counts_a_shared_endpoint(tmp_path: Path) -> None:
+    probe = [{"starts_at": "2026-05-01T11:00", "ends_at": "2026-05-01T12:00"}]
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "touching",
+            "where": {
+                "op": "overlaps",
+                "start_path": "starts_at",
+                "end_path": "ends_at",
+                "against": {"$from": "the_new_one"},
+                "against_start_path": "starts_at",
+                "against_end_path": "ends_at",
+                "boundaries": "inclusive",
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("the_new_one", probe)])
+    assert [e["id"] for e in activity.bindings["touching"]] == ["b2", "b3", "b4"]
+
+
+async def test_filter_overlaps_matches_any_member_of_the_against_collection(tmp_path: Path) -> None:
+    # The existential: one item is kept if it clashes with AT LEAST ONE of several ranges. This is
+    # what the general-quantifier design would have needed an alias grammar for; here the whole
+    # collection resolves once and `_matches` loops over literals.
+    probes = [
+        {"starts_at": "2026-05-01T09:30", "ends_at": "2026-05-01T09:45"},
+        {"starts_at": "2026-05-01T12:30", "ends_at": "2026-05-01T12:45"},
+    ]
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "clashing",
+            "where": {
+                "op": "overlaps",
+                "start_path": "starts_at",
+                "end_path": "ends_at",
+                "against": {"$from": "the_new_ones"},
+                "against_start_path": "starts_at",
+                "against_end_path": "ends_at",
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("the_new_ones", probes)])
+    assert [e["id"] for e in activity.bindings["clashing"]] == ["b1", "b4"]
+
+
+async def test_filter_overlaps_unresolvable_against_replans(tmp_path: Path) -> None:
+    """`overlaps` fails CLOSED — nothing overlaps an unreadable collection — so an empty binding
+    would read downstream as "no clashes", a real and actionable answer about the world."""
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "clashing",
+            "where": {
+                "op": "overlaps",
+                "start_path": "starts_at",
+                "end_path": "ends_at",
+                "against": {"$from": "never_ran"},
+                "against_start_path": "starts_at",
+                "against_end_path": "ends_at",
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+
+    assert "clashing" not in activity.bindings
+    assert activity.plan is None
+    assert activity.replan_trail[-1] is not None
+
+
+async def test_filter_overlaps_without_a_collection_is_a_defect(tmp_path: Path) -> None:
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "clashing",
+            "where": {
+                "op": "overlaps",
+                "start_path": "starts_at",
+                "end_path": "ends_at",
+                "against": "2026-05-01T11:00",
+                "against_start_path": "starts_at",
+                "against_end_path": "ends_at",
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+
+    assert "clashing" not in activity.bindings
+    assert activity.plan is None
+
+
+async def test_filter_overlaps_bad_against_paths_warn_before_narrowing_silently(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The sibling of the membership value_path trap: the collection RESOLVES, but its ends project
+    # to None, so nothing can overlap and the filter quietly keeps nothing.
+    probe = [{"from": "2026-05-01T09:30", "to": "2026-05-01T12:45"}]
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "clashing",
+            "where": {
+                "op": "overlaps",
+                "start_path": "starts_at",
+                "end_path": "ends_at",
+                "against": {"$from": "the_new_one"},
+                "against_start_path": "starts_at",  # the probe calls them from/to
+                "against_end_path": "ends_at",
+            },
+        },
+    )
+    with caplog.at_level(logging.WARNING, logger="sora.strategies"):
+        activity = await _run_one_dataop(tmp_path, step, [_history("the_new_one", probe)])
+
+    assert activity.bindings["clashing"] == []
+    assert any("overlaps" in record.message for record in caplog.records)
+
+
+async def test_composed_overlaps_semi_join_needs_no_model_call(tmp_path: Path) -> None:
+    """The whole point, end to end: "the existing items that clash with the ones just added, not
+    counting those additions themselves" is an anti-join AND an existential range join — three
+    clauses that previously escalated together to one $decide over the entire collection. Composed,
+    it runs inline with no LLM configured at all (`_run_one_dataop` builds a model-free cycle)."""
+    added = [{"id": "b3", "starts_at": "2026-05-01T10:30", "ends_at": "2026-05-01T11:30"}]
+    step = Step(
+        next_action="filter",
+        params={
+            "in": BOOKINGS,
+            "out": "to_cancel",
+            "where": {
+                "all": [
+                    {
+                        "path": "id",
+                        "op": "not_in",
+                        "value": {"$from": "just_added"},
+                        "value_path": "id",
+                    },
+                    {
+                        "op": "overlaps",
+                        "start_path": "starts_at",
+                        "end_path": "ends_at",
+                        "against": {"$from": "just_added"},
+                        "against_start_path": "starts_at",
+                        "against_end_path": "ends_at",
+                    },
+                ]
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [_history("just_added", added)])
+    # b2 (10:00-11:00) straddles the new 10:30 start; b1 ends at 10:00 and b4 starts at 12:00, so
+    # neither clashes; b3 is excluded as one of the additions rather than kept as its own clash.
+    assert [e["id"] for e in activity.bindings["to_cancel"]] == ["b2"]
+
+
+# --------------------------------------------------------------------------------------------------
 # filter — $decide predicate escalates to one off-cycle model call
 # --------------------------------------------------------------------------------------------------
 
@@ -907,6 +1207,18 @@ async def test_reset_for_replan_clears_bindings(tmp_path: Path) -> None:
     activity.bindings["stale"] = [1, 2, 3]
     activity.reset_for_replan()
     assert activity.bindings == {}
+
+
+async def test_reset_for_replan_keeps_the_runtime_seeded_bindings(tmp_path: Path) -> None:
+    """The exception is by the clearing rule, not against it: no plan produced these, so no plan's
+    discarding makes them untrue. Clearing them would also make the replan unrecoverable — the next
+    plan's `$bind` resolves to nothing, is reported as a defect, and replans again, on a reference
+    the runtime itself told it to use."""
+    activity = Activity(id="a", goal="g", context={})
+    activity.bindings["stale"] = [1, 2, 3]
+    activity.bindings["fired_added_ids"] = ["e9"]
+    activity.reset_for_replan()
+    assert activity.bindings == {"fired_added_ids": ["e9"]}
 
 
 # --------------------------------------------------------------------------------------------------

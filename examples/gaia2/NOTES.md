@@ -630,3 +630,42 @@ stock ARE spends merely stat-ing it, so the mirror is cheaper than the status qu
 cache. Scores are unaffected (same bytes, same tree); timings are not, so **runs before this date
 are not timing-comparable**, and runs before it on time-sensitive scenarios were scored against a
 handicap that had nothing to do with the agent.
+
+## Update (2026-08-28): $decide filters were 77% of a run's input, and most of it was set arithmetic
+
+Cost attribution for `logs/aug28-run1-time-gpt-5.5.log` (28 calls, 727,818 input / 22,920 output),
+bucketed by prompt size, since the three call sites have distinct signatures:
+
+| call site | n | input tokens | share |
+|---|---|---|---|
+| `$decide` data-op filters | 9 | 559,170 | **76.8%** |
+| plan | 6 | 123,733 | 17.0% |
+| condition / retirement judges | 13 | 44,915 | 6.2% |
+
+A model-backed filter serializes the entire collection — ~410 calendar events, ~62k input tokens
+per call. Splitting the nine by what they actually asked:
+
+- **four asked only "which items were just added"** — ~248k tokens, ~34% of the whole run's input,
+  spent re-deriving a *one-element* set that the triggering signal reported verbatim as
+  `Change(path='events', added=('ec416b6f...',), ...)`;
+- four were the overlap semi-join against those added items;
+- one fused both and kept nothing.
+
+Two runtime gaps forced all of it, and both are now closed — see
+[the design note](../../docs/architecture/notes/mechanical-predicates-over-model-filters.md). The
+reference grammar (`$from`/`$bind`/`$prop`/`$decide`) could not address a *change*, so the added
+set had no mechanical route; and a predicate was a single flat clause, so an expressible clause
+(the `not_in` anti-join, which already worked) had to escalate alongside an inexpressible one (the
+interval comparison). The fixes are boolean `all`/`any` composition, a closed-form `overlaps` range
+join, and three runtime-seeded bindings — `fired_added_ids` / `fired_removed_ids` /
+`fired_updated_ids` — written when a `pending` condition fires and rendered into the plan prompt.
+A firing round that cost two 62k `$decide` calls now costs none.
+
+Note the two zero-step fan-outs (cycles 3195 and 3642) were **correct**: the run's signals show
+exactly four added and four removed ids, so by then everything overlapping was already deleted. A
+guard skipping a round whose newly-added set adds nothing would have suppressed a right answer —
+the waste was that reaching it cost ~187k tokens, which is what the mechanical path removes.
+
+**`PLAN_SYSTEM_PROMPT` changed, so Gaia2 numbers do not compare across this date.** The worked
+example added to it uses a neutral booking/`starts_at`/`ends_at` domain rather than the scenario's
+own fields, to avoid teaching the prompt the benchmark it is measured on.

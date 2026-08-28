@@ -20,6 +20,7 @@ from urllib.parse import quote
 # the plain dicts the backend hands back. manual.py / environment.py only import their sora deps
 # under TYPE_CHECKING, so importing them here introduces no cycle.
 from sora.action import InvokeAction, invoke_step
+from sora.activity import SEEDED_BINDINGS
 from sora.environment import WorkspaceOrigin
 from sora.manual import (
     Manual,
@@ -499,7 +500,20 @@ PLAN_SYSTEM_PROMPT = (
     "`value_path` there: the referenced value IS the operand. Whichever way you write it, the "
     "operand has to end up being something the op can compare against — a single value for "
     "lt/le/gt/ge, a two-element pair for `between`. A reference to a whole record, or to nothing, "
-    "does not compare and is rejected as a plan defect rather than silently matching no item,\n"
+    "does not compare and is rejected as a plan defect rather than silently matching no item. "
+    "A `where` may also COMBINE clauses instead of being one: "
+    '{"all": [<clause>, ...]} (every clause must hold) or {"any": [<clause>, ...]} (at least one '
+    "must), nesting freely. Most real rules have two or three parts, and one awkward part is NOT a "
+    "reason to make the WHOLE predicate a $decide — compose the mechanical clauses instead. An "
+    "empty clause list is rejected as a defect rather than quietly keeping everything. There is "
+    "one further op, for ranges rather than points: "
+    '{"op": "overlaps", "start_path": "<field>", "end_path": "<field>", "against": '
+    '{"$bind": "<name>"} | {"$from": "<op>"}, "against_start_path": "<field>", '
+    '"against_end_path": "<field>"} keeps items whose own [start, end] range overlaps that of AT '
+    "LEAST ONE item in the referenced collection. It is half-open: ranges that merely touch at a "
+    'boundary do NOT overlap — add "boundaries": "inclusive" if a shared endpoint should count. '
+    "Any ordered values work (ISO-8601 timestamps compare correctly as text), so a clash rule "
+    "between two sets of ranges never needs a $decide,\n"
     '  {"action": "distinct", "in": ..., "out": "<name>", "by": "<field>"}  drop duplicates (omit '
     "`by` to dedupe whole items),\n"
     '  {"action": "sort", "in": ..., "out": "<name>", "by": "<field>", "desc": true|false},\n'
@@ -521,6 +535,23 @@ PLAN_SYSTEM_PROMPT = (
     '`qualifying` binding -> a mechanical sub-goal whose "in" is {"$bind": "qualifying"}. To act '
     "on values a tool produced per item (e.g. a condition score per gallery), map with a "
     "mechanical sub-goal, then `collect` its results before filtering or reducing them.\n"
+    "When the goal you are planning was triggered by a `pending` condition FIRING, the runtime has "
+    "ALREADY extracted the ids that change reported, into three bindings shown in this prompt "
+    "under 'Ids reported by the change that triggered this goal': `fired_added_ids`, "
+    "`fired_removed_ids`, `fired_updated_ids`. Reference them directly. Do NOT write a $decide to "
+    "work out what just changed — the answer is already in hand, and re-deriving it sends the "
+    "whole collection to a model to do set membership. Never use those three names for your own "
+    "`out`. An `op: not_in` against an EMPTY one excludes nothing, so pair an exclusion clause "
+    "with a positive clause under `all` rather than leaning on it alone.\n"
+    "So 'whenever a booking is added, cancel the existing bookings that clash with it' is fully "
+    "mechanical — no $decide and no model call: `filter` the collection down to the added items "
+    'with {"path": "<id field>", "op": "in", "value": {"$bind": "fired_added_ids"}} -> `filter` it '
+    'again with {"all": [{"path": "<id field>", "op": "not_in", "value": '
+    '{"$bind": "fired_added_ids"}}, {"op": "overlaps", "start_path": "<start field>", "end_path": '
+    '"<end field>", "against": {"$bind": "<the added ones>"}, "against_start_path": '
+    '"<start field>", "against_end_path": "<end field>"}]} -> a mechanical sub-goal over THAT '
+    "result. Reach for the same shape whenever a rule joins a collection against the items that "
+    "just changed.\n"
     "For a plain top-N selection, `sort` + `take` is the right tool — and it stays right even when "
     "ties on the sort key are possible, AS LONG AS the goal does not dictate how to break them "
     "(any of the tied items is an acceptable pick). Do NOT reach for a $decide just because a tie "
@@ -1091,6 +1122,8 @@ def default_plan_prompt(
         f"Available tools and their operations:\n{render_tools(tools)}\n\n"
         f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
         f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
+        f"Ids reported by the change that triggered this goal:\n"
+        f"{render_seeded_bindings(activity.bindings)}\n\n"
         f"Results of operations already executed:\n"
         f"{render_history(activity.history, _HISTORY_RENDER_PLAN)}\n\n"
         f"Recent instructions from the user:\n{render_messages(messages or [])}"
@@ -1667,6 +1700,23 @@ def render_bindings(bindings: dict[str, Any], *, budget: int = _BINDINGS_CHAR_BU
         (name, None, _one_line(json.dumps(value, default=str))) for name, value in bindings.items()
     ]
     return "\n".join(_fit_to_budget(entries, budget))
+
+
+def render_seeded_bindings(bindings: dict[str, Any]) -> str:
+    """The runtime-seeded bindings only (``SEEDED_BINDINGS``) — the one binding view the *plan*
+    prompt may carry.
+
+    ``render_bindings`` explains why ordinary bindings are kept out of that prompt: a replan
+    discards them, so listing them would be a lie. These are the exception by that same rule rather
+    than against it — the runtime, not the discarded plan, produced them, and `reset_for_replan`
+    keeps them. Showing them is not optional dressing: a reference the planner cannot see is a
+    reference it will not use, and the fallback it reaches for instead is a ``$decide`` filter that
+    re-derives the change from the whole collection, at one model call over every record.
+    """
+    present = {name: bindings[name] for name in SEEDED_BINDINGS if name in bindings}
+    if not present:
+        return "(none — this goal was not triggered by a watched change)"
+    return render_bindings(present)
 
 
 def _render_operation_schema(manual: Manual | None, operation_name: str) -> str:

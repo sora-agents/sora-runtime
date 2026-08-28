@@ -37,7 +37,7 @@ from sora.action import (
     pluck,
     release,
 )
-from sora.activity import Activity, ActivityState
+from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
 from sora.llm import log_llm_discarded
 from sora.memory import PerceptSnapshot, render_plan, render_steps, step_from_raw
 from sora.perception import Percept
@@ -3389,6 +3389,109 @@ def _operand_defect(where: dict[str, Any], written: Any, operand: Any) -> str | 
     return None
 
 
+# Mirrors sora.action's predicate grammar — the evaluator there walks these, the resolver here
+# fills them in. Kept as constants on both sides rather than imported, for the same reason
+# `_REF_DECIDE` is: the two modules share a wire format, not an implementation.
+_COMPOSE_ALL = "all"
+_COMPOSE_ANY = "any"
+_OP_OVERLAPS = "overlaps"
+
+
+def _composition_defect(key: str, clauses: Any) -> str | None:
+    """Why an ``all``/``any`` composition cannot be walked at all.
+
+    Both failures are silent and both are dangerous in the same direction. A non-list has no
+    clauses to evaluate; an EMPTY list is worse, because an empty conjunction is vacuously *true*
+    in logic — written naively it would keep the whole collection, and a filter's output is
+    routinely fanned out into one external action per item. The evaluator therefore matches nothing
+    for either, and this reports it rather than let the step write an empty binding that reads
+    downstream as a fact about the world."""
+    if not isinstance(clauses, list):
+        return (
+            f"the {key!r} predicate's clauses are {_shape_of(clauses)}, not a list of predicates "
+            f"to combine — nothing can be evaluated and the filter keeps nothing at all. Write "
+            f"{key!r} as a list, each entry its own clause."
+        )
+    if not clauses:
+        return (
+            f"the {key!r} predicate has an empty clause list, so it selects nothing. If there is "
+            "only one condition, write that comparison directly instead of composing it; if a "
+            "clause was meant to come from an earlier step, produce it first."
+        )
+    return None
+
+
+def _resolve_overlaps_against(
+    where: dict[str, Any],
+    history: list[CompletedOperation],
+    bindings: dict[str, Any],
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> tuple[Any, str | None]:
+    """Resolve an ``overlaps`` clause's ``against`` into plain ``[start, end]`` pairs.
+
+    The third projection shape, alongside the membership set and the bare operand — and the reason
+    ``overlaps`` needs no per-member alias grammar. ``against`` names a *collection*, so it resolves
+    once here exactly as an ``in`` set does, and the two paths that read each member's interval are
+    applied at resolution time. What reaches ``_matches`` is a literal list of pairs, which keeps
+    the "resolve once in Reason, compare literals in the evaluator" invariant that every other op
+    already relies on; deferring a reference to evaluation time instead would need a second
+    resolution regime for one op's benefit.
+
+    An unreadable ``against`` fails *closed* (nothing overlaps nothing), so it is reported rather
+    than swallowed, like every other operand here."""
+    against = where.get("against")
+    if _is_reference(against):
+        if _REF_DECIDE in against:
+            return where, (
+                f"an 'overlaps' predicate's 'against' cannot be a $decide reference "
+                f"({against[_REF_DECIDE]!r}) — the comparison runs mechanically, so the intervals "
+                "have to be known before it. Produce that collection in an earlier step and "
+                "reference the binding it wrote."
+            )
+        resolved_members, defect = _resolve_collection(against, history, bindings, properties)
+        if defect is not None:
+            return where, defect
+        members = resolved_members or []
+    elif isinstance(against, list):
+        members = against
+    else:
+        return where, (
+            f"the 'overlaps' predicate's 'against' is {_shape_of(against)}, not a collection of "
+            "intervals to compare with — the comparison then fails for every element and the "
+            "filter keeps nothing at all. Give it a reference to the collection whose items carry "
+            "the other interval, plus 'against_start_path'/'against_end_path' naming its two ends."
+        )
+    start_path = where.get("against_start_path", "")
+    end_path = where.get("against_end_path", "")
+    projected = [[pluck(m, start_path), pluck(m, end_path)] for m in members]
+    # The sibling of the membership-set warning below: a member whose ends do not project to
+    # comparable values can never overlap anything, so it drops out of the comparison silently and
+    # the filter quietly narrows more than the plan asked. The usual cause is a path naming a field
+    # the records don't carry (-> None) or pointing at a nested object. An empty collection stays
+    # silent — `_resolve_collection` already logged why, and genuinely nothing-was-added is a real
+    # and common answer here.
+    if members and any(
+        end is None or isinstance(end, (dict, list)) for pair in projected for end in pair
+    ):
+        bad = sum(
+            1 for pair in projected if any(e is None or isinstance(e, (dict, list)) for e in pair)
+        )
+        log.warning(
+            "filter: 'overlaps' against-collection has %d/%d member(s) with an end that projected "
+            "to a non-scalar or None (against_start_path=%r, against_end_path=%r); those can never "
+            "overlap anything — check the two paths",
+            bad,
+            len(projected),
+            start_path,
+            end_path,
+        )
+    resolved = {
+        k: v for k, v in where.items() if k not in ("against_start_path", "against_end_path")
+    }
+    resolved["against"] = projected
+    return resolved, None
+
+
 def _resolve_predicate_value(
     params: dict[str, Any],
     history: list[CompletedOperation],
@@ -3429,28 +3532,65 @@ def _resolve_predicate_value(
     projection (a ``value_path`` that plucks to ``None`` or a non-scalar for every member) is the
     neighbouring trap the warning below guards, and fails open the same way."""
     where = params.get("where")
+    if not isinstance(where, dict):
+        return params, None  # no predicate
+    resolved, defect = _resolve_predicate_clause(where, history, bindings, properties)
+    if defect is not None:
+        return params, defect
+    return ({**params, "where": resolved} if resolved is not where else params), None
+
+
+def _resolve_predicate_clause(
+    where: Any,
+    history: list[CompletedOperation],
+    bindings: dict[str, Any],
+    properties: dict[tuple[str, str], Percept] | None = None,
+) -> tuple[Any, str | None]:
+    """One clause of a predicate, resolved — the recursive worker behind
+    ``_resolve_predicate_value``, and where that function's documented shapes are actually applied.
+
+    Recursive because a predicate composes. ``all``/``any`` hold child clauses, each resolving its
+    own operand exactly as a lone clause would, and a defect anywhere is a defect for the *whole*
+    predicate: a conjunction with one dead clause selects nothing, and a disjunction with one
+    silently drops whatever that clause was meant to catch. Composition resolves nothing itself —
+    it is structure the evaluator walks — so all that is checked of it here is that it can be
+    walked."""
     if not isinstance(where, dict) or _REF_DECIDE in where:
-        return params, None  # no predicate, or a soft one escalated whole rather than resolved
+        return where, None  # not a clause, or a soft one escalated whole rather than resolved
+    for key in (_COMPOSE_ALL, _COMPOSE_ANY):
+        if key not in where:
+            continue
+        clauses = where[key]
+        if (composition_defect := _composition_defect(key, clauses)) is not None:
+            return where, composition_defect
+        resolved_clauses: list[Any] = []
+        for clause in clauses:
+            got, clause_defect = _resolve_predicate_clause(clause, history, bindings, properties)
+            if clause_defect is not None:
+                return where, clause_defect
+            resolved_clauses.append(got)
+        return {**where, key: resolved_clauses}, None
+    if where.get("op") == _OP_OVERLAPS:
+        return _resolve_overlaps_against(where, history, bindings, properties)
     written = where.get("value")  # what the plan wrote, kept for the defect messages
     value: Any = written
     if isinstance(value, (list, tuple)) and any(_is_reference(v) for v in value):
         items, list_defect = _resolve_operand_items(value, history, bindings, properties)
         if list_defect is not None:
-            return params, list_defect
+            return where, list_defect
         where = {**where, "value": items}
-        params = {**params, "where": where}
         value = items
     if not _is_reference(value):
         # A literal, or a list whose members just resolved: nothing left to resolve, but the shape
         # still has to be one the op can compare against — an uncomparable operand is as dead
         # written out as it is referenced.
-        return params, _operand_defect(where, written, value)
+        return where, _operand_defect(where, written, value)
     if _REF_DECIDE in value:
         # A soft reference in the *operand* position, which no prompt documents and no op can
         # evaluate: the comparison itself is mechanical. It used to resolve to an empty membership
         # set (silently fails open) or a raw dict (silently excludes everything), so say what to
         # write instead rather than let either happen.
-        return params, (
+        return where, (
             f"a filter predicate's 'value' cannot be a $decide reference "
             f"({value[_REF_DECIDE]!r}) — the comparison runs mechanically, so the operand has to "
             "be known before it. Compute it in an earlier step and reference that binding, or "
@@ -3460,15 +3600,15 @@ def _resolve_predicate_value(
         try:
             operand: Any = _resolve_ref(value, history, bindings, properties)
         except (KeyError, IndexError, TypeError, ValueError):
-            return params, _path_defect(value, history, bindings, properties)
+            return where, _path_defect(value, history, bindings, properties)
         if operand is _MISSING:
-            return params, _collection_defect(value, operand, history, properties)
+            return where, _collection_defect(value, operand, history, properties)
         if (shape_defect := _operand_defect(where, written, operand)) is not None:
-            return params, shape_defect
-        return {**params, "where": {**where, "value": operand}}, None
+            return where, shape_defect
+        return {**where, "value": operand}, None
     resolved_members, defect = _resolve_collection(value, history, bindings, properties)
     if defect is not None:
-        return params, defect
+        return where, defect
     members = resolved_members or []
     projected = [pluck(m, where.get("value_path", "")) for m in members]
     # A membership set is compared element-by-element against a scalar key, so only scalar members
@@ -3492,7 +3632,7 @@ def _resolve_predicate_value(
         )
     resolved_where = {k: v for k, v in where.items() if k != "value_path"}
     resolved_where["value"] = projected
-    return {**params, "where": resolved_where}, None
+    return resolved_where, None
 
 
 def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
@@ -3916,11 +4056,18 @@ class DefaultReasonStrategy:
         # spin) or swallow one that arrived mid-flight.
         # Keeping where they stood is what lets a judgement that ERRORS give the change back
         # (see `PendingConditionState.fired_from_signals`); a call that answers never reads them.
-        for state, _ in eligible:
+        for state, percept in eligible:
             state.fired_from_signals = state.evaluated_through
             state.fired_from_derived = state.derived_through
             state.evaluated_through = wm.signals_appended
             state.derived_through = wm.property_changes_appended
+            # Keep the change that opened this gate, for the `then` plan to reference mechanically
+            # (see `_pursue_fired_condition`). Recorded here because this is the last moment it is
+            # in hand: the judgement is off-cycle, and by the time its verdict is applied the tick
+            # that carried the change has passed.
+            state.fired_changes = tuple(
+                (percept.source, change) for change in changes_of(percept.payload)
+            )
         # Paired with the source that reported them, not flattened into a bare list: a `Change`
         # names the path that moved but not the tool it moved on, and the judgement needs both to
         # dereference the ids back into records (see ProceduralMemory.render_changes).
@@ -4005,9 +4152,30 @@ class DefaultReasonStrategy:
         `from_condition` marks the step as a `then` rather than an authored sub-goal, which changes
         two things downstream: it is exempt from the ancestor-overlap breaker, and it installs
         without pushing a frame (see `_subgoal`).
+
+        The firing's own change is seeded into `SEEDED_BINDINGS` first, so the `then` plan can name
+        the ids that just moved *mechanically*. Without it the runtime holds the answer — the watch
+        gate matched on those very ids — and offers the planner no way to reach it: the reference
+        grammar addresses history, bindings and properties, none of which is a change. What a plan
+        wrote instead was a `$decide` filter re-deriving the added set from the whole property, one
+        model call over every record in the collection to recover a set the signal had already
+        reported verbatim. On the run that motivated this that was four of nine such calls and
+        about a third of the entire run's input tokens, for set membership.
         """
         state = activity.condition_fired.pop(0)
         log.info("reason: pending condition fired on %s -> %r", activity.id, state.condition.then)
+        # All three kinds, always, even when empty: a plan referencing a kind that did not occur
+        # should read "nothing was removed", not hit an unresolvable reference and replan. Ordered
+        # and de-duplicated, since a batch may carry several changes on the same path. Note an
+        # empty set still fails open under `not_in` (it excludes nothing) — the plan prompt tells
+        # the planner to pair such an exclusion with a positive clause for exactly that reason.
+        seeded: dict[str, list[Any]] = {name: [] for name in SEEDED_BINDINGS}
+        for _source, change in state.fired_changes:
+            for name, moved in zip(
+                SEEDED_BINDINGS, (change.added, change.removed, change.updated), strict=True
+            ):
+                seeded[name].extend(m for m in moved if m not in seeded[name])
+        activity.bindings.update(seeded)
         step = Step(
             next_action=SUBGOAL,
             params={

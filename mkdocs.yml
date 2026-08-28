@@ -122,6 +122,7 @@ nav:
           - Attention Scoped to Live Intentions: architecture/notes/attention-scoped-to-live-intentions.md
           - Cross-Workspace Tool Sharing: architecture/notes/cross-workspace-tool-sharing.md
           - Jason Plan Representation: architecture/notes/jason-plan-representation.md
+          - Mechanical Predicates over Model Filters: architecture/notes/mechanical-predicates-over-model-filters.md
           - "Plan Control Structures: Collection References": architecture/notes/plan-control-structures-collection-references.md
           - Reasoning Strategy Extension: architecture/notes/reasoning-strategy-extension.md
           - Restore Drift Reconciliation: architecture/notes/restore-drift-reconciliation.md

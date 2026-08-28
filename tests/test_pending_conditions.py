@@ -18,6 +18,7 @@ signal.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -574,6 +575,87 @@ async def test_a_fired_condition_pursues_its_then_as_a_subgoal(tmp_path: Path) -
     # ("then", not "subgoal") because it installs at the same depth; see test_condition_frames.py.
     assert activity.pending_inference is not None
     assert activity.pending_inference.kind == "then"
+
+
+async def test_fire_time_records_the_change_that_opened_the_gate(tmp_path: Path) -> None:
+    """Recorded next to the marks, and for the same reason: the judgement runs off-cycle, so by the
+    cycle its verdict is applied and a `then` is planned, the tick carrying the change is gone."""
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=0)
+    activity.pending_conditions = [state]
+    working.activities[activity.id] = activity
+    _signal(working, "folders.INBOX.emails")
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert state.fired_changes == (
+        ("insim:are/Emails", Change(path="folders.INBOX.emails", added=("e9",))),
+    )
+
+
+async def test_a_fired_condition_seeds_the_changed_ids_for_its_then_plan(tmp_path: Path) -> None:
+    """The `then` planner's mechanical route to "what just moved". Without it the runtime holds the
+    ids — its own watch gate matched on them — and the reference grammar reaches history, bindings
+    and properties, none of which is a change; so a plan's only way to name them was a `$decide`
+    filter re-deriving the set from the whole collection, at one model call over every record."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=0)
+    state.fired_changes = (
+        (
+            "insim:are/Emails",
+            Change(path="folders.INBOX.emails", added=("e9", "e10"), removed=("e1",)),
+        ),
+    )
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.bindings["fired_added_ids"] == ["e9", "e10"]
+    assert activity.bindings["fired_removed_ids"] == ["e1"]
+    # Seeded even when empty: a plan asking what was removed should read "nothing", not hit an
+    # unresolvable reference and replan.
+    assert activity.bindings["fired_updated_ids"] == []
+
+    # And the half that is easy to leave out: seeded but never shown is the same as absent, because
+    # the planner will not reference what it cannot see. Ordinary bindings stay out of the plan
+    # prompt (a replan discards them, so listing them would lie); these survive it, so they are
+    # rendered — the seam this closes is exactly the kind that passes every phase-local test.
+    await asyncio.sleep(0)  # let the background _infer_ task run
+    _system, prompt = llm.calls[-1]
+    assert "Ids reported by the change that triggered this goal" in prompt
+    assert "e10" in prompt
+
+
+async def test_seeded_ids_come_from_the_condition_pursued_not_the_whole_batch(
+    tmp_path: Path,
+) -> None:
+    # Why `fired_changes` is per condition rather than one field on the activity: a verdict fires
+    # plural, only one is pursued while the body is busy, and a batch-wide field would plan the
+    # second against a change it never fired on.
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    first = PendingConditionState(condition=_condition(), evaluated_through=99)
+    first.fired_changes = (("insim:are/Emails", Change(path="p", added=("e9",))),)
+    second = PendingConditionState(
+        condition=_other_condition("chase the other thread"), evaluated_through=99
+    )
+    second.fired_changes = (("insim:are/Emails", Change(path="p", added=("e42",))),)
+    activity.pending_conditions = [first, second]
+    activity.condition_batch = [first, second]
+    activity.condition_verdict = _verdict(fired=(0, 1))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.bindings["fired_added_ids"] == ["e9"]
 
 
 async def test_nothing_fired_goes_back_to_waiting(tmp_path: Path) -> None:
