@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
 
 from sora.action import (
@@ -111,10 +112,88 @@ def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
                 PendingConditionState(
                     condition=condition,
                     declared_by=_frame_key(activity, depth),
+                    # The anchor a relative `until` is measured from, taken now because now is when
+                    # the waiting starts — and taken from the watched workspace's own clock, since
+                    # host wall-clock is a different clock entirely (ADR-0027 §5).
+                    declared_at=_domain_now(wm, condition.watch.source),
                     evaluated_through=wm.signals_appended,
                     derived_through=wm.property_changes_appended,
                 )
             )
+
+
+def _clock_for_source(view: EnvironmentView, source: str | None) -> DomainClock | None:
+    """The domain clock an `until` watching ``source`` is answered against: the clock of the
+    workspace owning that tool, or None when there isn't one to ask (ADR-0027 §5).
+
+    Three ways to get None, and they are one answer on purpose — none of them may fall back to
+    `time.time()`: the watch names no source (so no workspace is determinate), the source is not a
+    joined tool, or its workspace cannot tell domain time. Note what the per-workspace scoping
+    buys: because each watch names one source, each `until` resolves against exactly one clock, so
+    the "which of two disagreeing clocks" case ADR-0027 calls a plan defect cannot arise in the
+    data at all."""
+    if source is None:
+        return None
+    workspace = view.workspace_of(source)
+    return workspace.clock if workspace is not None else None
+
+
+def _domain_now(wm: WorkingMemory, source: str | None) -> datetime | None:
+    clock = _clock_for_source(wm.registry, source)
+    return clock.now() if clock is not None else None
+
+
+def _unclosable_window(activity: Activity, sub_plan: Plan, wm: WorkingMemory) -> str | None:
+    """Plan validation for a maintenance sub-goal whose window nothing could ever close — the
+    defect string for a replan, or None when the plan is fine (ADR-0027 §6).
+
+    A maintenance sub-goal is finished when every condition it declared has retired, and nothing
+    else ends it. So an `until` that asks about time, watching a workspace that cannot tell domain
+    time, is not a slow plan: it is a frame — and every remaining step of the parent, including the
+    report the user is waiting for — held open silently and forever. Refusing it costs a replan;
+    accepting it costs the run.
+
+    Refused **at the plan**, not at the moment the wait would go quiet, for two reasons. The
+    planner is still holding the goal here, so the correction reaches the only party that can act
+    on it; and by the time the window would have mattered the agent has already run the body and
+    told nobody anything is wrong. It is the ordinary ADR-0025 replan path from there: the defect
+    rides the `superseded` bundle into the next planning prompt, and a planner that writes past it
+    twice trips the runaway-replan breaker into await-input — which is the honest end state, since
+    what the agent is actually missing is the ability to tell the time here.
+
+    Only **maintenance**, and only a bound the runtime can see. An achievement frame pops when its
+    steps run out and its condition keeps watching from the activity afterwards (ADR-0022's
+    contingency case), so no clock is load-bearing there. An event-shaped `until` is the retirement
+    judge's question and needs no clock either. What is left is exactly the intersection this
+    checks."""
+    plan = activity.plan
+    if plan is None or activity.step_index >= len(plan.steps):
+        return None  # no sub-goal step to read a kind off — nothing to validate against
+    step = plan.steps[activity.step_index]
+    if step.next_action != SUBGOAL or goal_kind_of(step) != GOAL_KIND_MAINTENANCE:
+        return None
+    goal = step.params.get("goal")
+    for condition in sub_plan.pending:
+        until = condition.until
+        if until is None or not until.is_time_bounded:
+            continue  # event-shaped: the judge can answer it without a clock
+        source = condition.watch.source
+        if source is None:
+            return (
+                f"the maintenance sub-goal {goal!r} is bounded by a window in time "
+                f"({until.text!r}), but its condition's watch names no `source`, so there is "
+                "no workspace whose clock could tell when that window closes — name the tool the "
+                "watch is on, or bound the window by an observable event instead"
+            )
+        if _clock_for_source(wm.registry, source) is None:
+            return (
+                f"the maintenance sub-goal {goal!r} is bounded by a window in time "
+                f"({until.text!r}), but {source!r}'s workspace has no domain clock, so "
+                "nothing could ever tell that the window has closed and the sub-goal would never "
+                "finish — bound it by an observable event instead, or say that this environment "
+                "provides no way to tell the time"
+            )
+    return None
 
 
 def _frame_key(activity: Activity, depth: int = 0) -> tuple[tuple[str, int], ...]:
@@ -298,6 +377,7 @@ _RETIREMENT_BACKOFF = 5
 if TYPE_CHECKING:
     from sora.activity import Activity
     from sora.cycle import DecisionCycle
+    from sora.environment import DomainClock, EnvironmentView
     from sora.manual import Manual
     from sora.memory import WorkingMemory
     from sora.perception import Message
@@ -1127,6 +1207,11 @@ class DefaultObserveStrategy:
         # After the resume pass, so an activity a signal just woke counts as one that can advance
         # and stands the sweep down — and so a condition the gate is about to re-judge for free is
         # never also paid for here.
+        # Ahead of the judged sweep, and unthrottled by it: a window the clock has already closed
+        # costs nothing to notice, so it must neither buy a model call nor wait behind that sweep's
+        # backoff (which can hold one activity off for many minutes — long enough to over-run a
+        # four-minute maintenance window by four times its own length).
+        await self._retire_expired_conditions(cycle)
         await self._retire_quiet_conditions(cycle)
         # Trim last: a signal that just arrived this tick must survive to be matched by the two
         # passes above before it's ever subject to eviction (bound orphan growth; newest win).
@@ -1495,10 +1580,22 @@ class DefaultObserveStrategy:
                         # has nothing left to return to, and a watch fires as many times as the
                         # world moves — a stack that grew once per firing would walk a healthy
                         # monitor into the depth cap for doing its job.
+                        sub_plan: Plan = res.value  # type: ignore[assignment]  # both kinds => Plan
                         if kind == "subgoal":
+                            # Validate before entering, so a sub-goal that could never end is never
+                            # half-installed and the superseded bundle the replan reads is the
+                            # PARENT plan (the one still holding the goal) rather than a frame that
+                            # was pushed only to be torn down again.
+                            window = _unclosable_window(activity, sub_plan, cycle.working)
+                            if window is not None:
+                                log.warning(
+                                    "observe: plan defect for activity %s — %s", activity.id, window
+                                )
+                                activity.reset_for_replan(defect=window)
+                                activity.state = ActivityState.READY
+                                break  # this activity claimed the result; it just refused it
                             frame = (activity.plan, activity.step_index, activity.history_mark)
                             activity.parent_frames.append(frame)  # type: ignore[arg-type]  # plan set mid-plan
-                        sub_plan: Plan = res.value  # type: ignore[assignment]  # both kinds => Plan
                         activity.plan = sub_plan
                         activity.step_index = 0
                         # The sub-plan collects only what it runs itself, not what the parent left
@@ -1680,16 +1777,16 @@ class DefaultObserveStrategy:
         * **Observe retires, Reason pops.** This drops the retired conditions and releases the
           wait; the pop that follows is Reason's, which owns plan advancement everywhere else.
 
-        What it answers today is an **event-shaped** `until` ("the Film Production Day has taken
-        place"), which is judged from the observed world. A **time-bounded** one ("four minutes
-        after the get_current_time result") is offered to the same judge for now and will usually
-        come back unretired, because the judge is shown no clock — deliberately: the only time this
-        module can reach is `time.time()`, and answering a domain question with host wall-clock is
-        the silent wrong answer ADR-0027 §5 exists to prevent. A time-bounded `until` wants
-        resolving *mechanically*, before this call, against the clock of the workspace owning its
-        `watch.source`; that resolver is the piece this pass is shaped to receive, and it is what
-        makes the common case cost nothing. Until it lands the backoff is what keeps the
-        unanswerable case cheap rather than what makes it correct.
+        What it answers is an **event-shaped** `until` ("the Film Production Day has taken place"),
+        judged from the observed world. A **time-bounded** one is a comparison, not a judgement,
+        and `_retire_expired_conditions` has already resolved it against the workspace's clock
+        before this runs — which is what keeps the common case free. What still reaches here is the
+        residue that comparison could not place: a bound with no clock behind its watch, a
+        wall-clock reading with no zone, a duration anchored on an event. The judge is shown no
+        clock even so, deliberately: the only time this module could pass it is `time.time()`, and
+        answering a domain question with host wall-clock is the silent wrong answer ADR-0027 §5
+        exists to prevent. For that residue the backoff keeps the unanswerable case cheap rather
+        than making it correct.
 
         The call itself is spawned off-cycle and its result parked, like every model call in the
         runtime — but deliberately *not* through `_infer_`/`pending_inference`, which would move the
@@ -1784,7 +1881,72 @@ class DefaultObserveStrategy:
         self._retirement_result = (activity.id, judged, retired)
 
     async def _apply_retirement(self, cycle: DecisionCycle) -> None:
-        """Consume a parked retirement verdict: drop what retired, then release the wait.
+        """Consume a parked retirement verdict — the judged sweep's half of `_drop_retired`, plus
+        the backoff bookkeeping a verdict that retired nothing earns."""
+        parked, self._retirement_result = self._retirement_result, None
+        assert parked is not None  # guarded by the caller
+        activity_id, judged, indices = parked
+        activity = cycle.working.activities.get(activity_id)
+        if activity is None or activity.state is ActivityState.TERMINATED:
+            return
+        if not indices:
+            # Back off: the same answer is what the next call would most likely buy too.
+            checked, misses, seen = self._retirement_marks.get(activity_id, (time.time(), 0, 0))
+            self._retirement_marks[activity_id] = (checked, misses + 1, seen)
+            return
+        await self._drop_retired(cycle, activity, [judged[i] for i in indices if i < len(judged)])
+
+    async def _retire_expired_conditions(self, cycle: DecisionCycle) -> None:
+        """Retire every condition whose `until` the workspace's own clock says is spent (ADR-0027).
+
+        The cheap half of retirement, and the common case the ADR says must not be taxed: a
+        time-bounded `until` is a comparison, not a judgement, so it never reaches a model. That is
+        also why this pass is unlike its judged sibling in every dimension — it sweeps **all**
+        activities, **every** tick, with no idle gate, no one-in-flight rule and no backoff. Those
+        exist to ration model calls; there is nothing here to ration, and a maintenance window
+        noticed late is a window the agent kept working past.
+
+        What makes it correct rather than merely cheap is which clock it reads. The bound is
+        measured against the clock of the workspace owning the watch — never `time.time()`, whose
+        answer under a simulation is off by decades (ADR-0027 §5). Anything the runtime cannot
+        place on that timeline — an event-shaped `until`, a wall-clock reading with no zone, a
+        duration anchored on something that has not happened yet, or a watch whose workspace cannot
+        tell domain time at all — is left untouched here and falls through to the judged sweep.
+        Erring that way is deliberate: retiring early ends a window that is still open, which is
+        precisely the failure this machinery was built to fix.
+        """
+        for activity in list(cycle.working.activities.values()):
+            if activity.state is ActivityState.TERMINATED or not activity.pending_conditions:
+                continue
+            expired = [
+                state
+                for state in activity.pending_conditions
+                if self._has_expired(cycle.working, state)
+            ]
+            if expired:
+                await self._drop_retired(cycle, activity, expired)
+
+    @staticmethod
+    def _has_expired(wm: WorkingMemory, state: PendingConditionState) -> bool:
+        until = state.condition.until
+        if until is None:
+            return False  # no stopping clause at all — nothing for a clock to answer
+        deadline = until.deadline(state.declared_at)
+        if deadline is None:
+            # Either event-shaped (the judge's question, not the clock's), or a declared bound with
+            # no anchor because the workspace could not tell domain time when it was lifted.
+            return False
+        now = _domain_now(wm, state.condition.watch.source)
+        if now is None or now.tzinfo is None or deadline.tzinfo is None:
+            # No clock to ask, or one answering with a naive instant — which names no point two
+            # clocks could be compared on. Either way this is not the pass that guesses.
+            return False
+        return now >= deadline
+
+    async def _drop_retired(
+        self, cycle: DecisionCycle, activity: Activity, retiring: list[PendingConditionState]
+    ) -> None:
+        """Drop retired conditions off an activity, then release the wait they were holding.
 
         Releasing is the half that is easy to leave out and impossible to notice missing. An
         activity BLOCKED on a `ConditionWait` is resumed by exactly one thing — a signal making one
@@ -1796,31 +1958,25 @@ class DefaultObserveStrategy:
         work the frame already accepted and paid a judgement for, and ADR-0027 holds both kinds of
         frame open for it. Retirement ends the *watching*, not a firing that already happened.
         """
-        parked, self._retirement_result = self._retirement_result, None
-        assert parked is not None  # guarded by the caller
-        activity_id, judged, indices = parked
-        activity = cycle.working.activities.get(activity_id)
-        if activity is None or activity.state is ActivityState.TERMINATED:
-            return
-        checked, misses, seen = self._retirement_marks.get(activity_id, (time.time(), 0, 0))
-        if not indices:
-            # Back off: the same answer is what the next call would most likely buy too.
-            self._retirement_marks[activity_id] = (checked, misses + 1, seen)
-            return
         # Identity, not equality: PendingConditionState is mutable (its marks advance), so it is
         # unhashable, and two conditions can compare equal while being distinct waiters. A state the
-        # eligibility gate retired while this call was in flight is simply no longer found.
-        retired = {id(judged[i]) for i in indices if i < len(judged)}
+        # eligibility gate retired while a judgement was in flight is simply no longer found.
+        retired = {id(state) for state in retiring}
         activity.pending_conditions = [
             state for state in activity.pending_conditions if id(state) not in retired
         ]
         # Remember WHAT retired: the declaration survives on the frozen `Plan.pending`, so the next
         # lift would otherwise put the condition straight back on watch, undoing this for good.
-        activity.retired_conditions.update(judged[i].condition for i in indices if i < len(judged))
-        self._retirement_marks[activity_id] = (checked, 0, len(activity.pending_conditions))
+        activity.retired_conditions.update(state.condition for state in retiring)
+        # Reset the miss counter — a set that actually moved earns a prompt look at what is left —
+        # but leave "last judged at" where it was. 0.0 (never) for an activity the judged sweep has
+        # not seen: a free mechanical retirement is not a judgement, and recording it as one would
+        # push that activity's first judged sweep an interval into the future.
+        checked, _misses, _seen = self._retirement_marks.get(activity.id, (0.0, 0, 0))
+        self._retirement_marks[activity.id] = (checked, 0, len(activity.pending_conditions))
         log.info(
-            "observe: retired %d quiet condition(s) on %s; %d left",
-            len(retired),
+            "observe: retired %d condition(s) on %s; %d left",
+            len(retiring),
             activity.id,
             len(activity.pending_conditions),
         )

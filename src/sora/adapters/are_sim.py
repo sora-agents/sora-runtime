@@ -31,6 +31,7 @@ import time
 import typing
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import UnionType
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, Union
@@ -46,7 +47,7 @@ from sora.perception import Message
 from sora.types import ObservableProperty, OperationAck, Signal, diff_values
 
 if TYPE_CHECKING:
-    from sora.environment import Tool, Workspace, WorkspaceOrigin
+    from sora.environment import DomainClock, Tool, Workspace, WorkspaceOrigin
     from sora.manual import ManualSource, ToolRecord, WorkspaceRecord
 
 _T = TypeVar("_T")
@@ -74,6 +75,11 @@ class Simulation(Protocol):
     def start(self) -> None: ...
     def stop(self) -> None: ...
     def is_running(self) -> bool: ...  # scenario timeline still advancing (the eval done-signal)
+    # DOMAIN time — what the SCENARIO says it is, which is not what `time.time()` says (ADR-0027
+    # §5). It belongs on this Protocol rather than behind `environment()` because the workspace's
+    # `DomainClock` is part of the runtime surface, and a fake simulation has to be able to supply
+    # one.
+    def now(self) -> datetime: ...
     def apps(self) -> list[Any]: ...
     def run(self, fn: Callable[[], _T]) -> _T: ...  # serialize S-ORA's own concurrent app calls
 
@@ -236,6 +242,21 @@ class AreSimulation:
         # Mirrors the loop's own exit test (`while time_passed() <= duration`), so this reports the
         # condition ARE actually stopped on rather than an approximation of it.
         return bool(passed > duration)
+
+    def now(self) -> datetime:
+        """The scenario's own clock, not the host's (ADR-0027 §5).
+
+        `TimeManager.time()` is `start_time + time_passed()`, and `start()` above is what makes
+        `start_time` the scenario's rather than the epoch — so this is the same instant the apps'
+        own `get_current_time` reports, reached without spending an external action on an invoke.
+        Before `start()` there is no environment and therefore no domain time: host wall-clock is
+        the only remaining answer and it is the wrong one, so this raises rather than returning it.
+
+        Epoch seconds in, an aware instant out. ARE keeps time as a bare float, which names an
+        instant unambiguously; the timezone attached here is UTC because a rendering has to pick
+        one, and comparisons happen on the instant either way."""
+        assert self._env is not None, "start() the simulation before reading its clock"
+        return datetime.fromtimestamp(self._env.time_manager.time(), tz=UTC)
 
     def apps(self) -> list[Any]:
         return list(getattr(self._scenario, "apps", None) or [])
@@ -1027,12 +1048,28 @@ class _AreTool:
         raise last
 
 
+class _SimulationClock:  # satisfies sora.environment.DomainClock
+    """Reads domain time off the running simulation. A thin object rather than the ``Simulation``
+    itself so the workspace exposes exactly one method to the runtime, and so a simulation that has
+    not started yet fails where the clock is *read* rather than where the workspace is built."""
+
+    def __init__(self, simulation: Simulation) -> None:
+        self._sim = simulation
+
+    def now(self) -> datetime:
+        return self._sim.now()
+
+
 class _AreWorkspace:
     def __init__(
         self, ws_id: str, origin: WorkspaceOrigin, tools: list[Tool], simulation: Simulation
     ) -> None:
         self.id = ws_id
         self.origin = origin
+        # The one adapter that genuinely needs this seam: its environment's clock starts at the
+        # scenario's own start_time and advances on the simulation's terms, so answering an `until`
+        # from host wall-clock here is the 1 Jan 1970 bug ADR-0027 §5 records.
+        self.clock: DomainClock | None = _SimulationClock(simulation)
         self._tools = tools
         self._sim = simulation
 

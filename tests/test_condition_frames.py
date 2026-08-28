@@ -56,6 +56,7 @@ from sora.types import (
     Signal,
     SignalWait,
     Step,
+    Until,
 )
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
@@ -118,7 +119,7 @@ def _condition() -> PendingCondition:
         watch=_CALENDAR,
         when="one or more calendar events are added",
         then=_THEN,
-        until="four minutes after the get_current_time result",
+        until=Until(text="four minutes after the get_current_time result"),
     )
 
 
@@ -132,7 +133,7 @@ def _other() -> PendingCondition:
         watch=SignalWait(signal_name="state_changed", source="insim:are/Email"),
         when="the conservator replies",
         then=_OTHER_THEN,
-        until="the restoration slot has taken place",
+        until=Until(text="the restoration slot has taken place"),
     )
 
 

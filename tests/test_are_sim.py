@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, TypedDict
 
@@ -27,7 +28,7 @@ from sora.adapters.are_sim import (
     relax_judge_verdict_case,
 )
 from sora.environment import WorkspaceOrigin
-from sora.manual import Manual
+from sora.manual import Manual, ToolRecord, WorkspaceRecord
 from sora.perception import Message, NotificationQueueSink
 
 # ------------------------------------------------------------------------------------------------
@@ -151,6 +152,9 @@ class FakeSimulation:
         self._apps = apps
         self.started = False
         self.stopped = False
+        # A scenario year, deliberately nowhere near host wall-clock: a test that passed only
+        # because the two agreed would prove nothing about the seam.
+        self.domain_now = datetime(2024, 10, 15, 9, 0, tzinfo=UTC)
 
     def start(self) -> None:
         self.started = True
@@ -160,6 +164,9 @@ class FakeSimulation:
 
     def is_running(self) -> bool:
         return self.started and not self.stopped
+
+    def now(self) -> datetime:
+        return self.domain_now
 
     def apps(self) -> list[Any]:
         return list(self._apps)
@@ -178,6 +185,63 @@ def _origin() -> WorkspaceOrigin:
 
 def _adapter(sim: FakeSimulation, **kw: Any) -> AreInProcessWorkspaceAdapter:
     return AreInProcessWorkspaceAdapter(workspace_id="are", origin=_origin(), simulation=sim, **kw)
+
+
+# ------------------------------------------------------------------------------------------------
+# The domain clock (ADR-0027 §5)
+# ------------------------------------------------------------------------------------------------
+
+
+def test_simulation_time_is_the_scenarios_own_clock_not_the_hosts() -> None:
+    """`TimeManager.time()` is `start_time + time_passed()`, and `start()` is what makes start_time
+    the scenario's — so this is the instant the apps' own `get_current_time` reports, reached with
+    no invoke and therefore no external action spent. Answering from `time.time()` instead is the
+    1 Jan 1970-during-a-2024-scenario bug the adapter already carries a comment about."""
+    sim = AreSimulation(scenario=SimpleNamespace())
+    sim._env = SimpleNamespace(time_manager=SimpleNamespace(time=lambda: 1_728_982_800.0))
+
+    assert sim.now() == datetime(2024, 10, 15, 9, 0, tzinfo=UTC)
+
+
+def test_reading_the_clock_before_the_simulation_starts_is_an_error_not_wall_clock() -> None:
+    """There is no domain time yet, and host wall-clock is the one answer that must never be
+    substituted for it — so this fails loudly rather than quietly returning the wrong year."""
+    sim = AreSimulation(scenario=SimpleNamespace())
+    with pytest.raises(AssertionError):
+        sim.now()
+
+
+async def test_the_workspace_carries_the_simulations_clock() -> None:
+    sim = FakeSimulation([FakeEmailApp()])
+    workspace = (await _adapter(sim).discover())[0]
+
+    assert workspace.clock is not None
+    assert workspace.clock.now() == sim.domain_now
+    sim.domain_now = datetime(2024, 10, 15, 13, 30, tzinfo=UTC)
+    assert workspace.clock.now() == sim.domain_now  # live, not latched at discovery
+
+
+async def test_a_reconnected_workspace_still_has_a_clock() -> None:
+    """`connect()` rebuilds from records rather than discovery, and a restored workspace that lost
+    its clock would silently turn every time-bounded `until` into a plan defect."""
+    sim = FakeSimulation([FakeEmailApp()])
+    tools = (await _adapter(sim).discover())[0].tools()
+    record = ToolRecord(
+        id=tools[0].id,
+        workspace_id="are",
+        manual_id="EmailClientApp",
+        address=None,
+        discovered_at=0.0,
+        last_seen_at=0.0,
+    )
+    workspace = await _adapter(sim).connect(
+        WorkspaceRecord(id="are", origin=_origin(), discovered_at=0.0, last_seen_at=0.0),
+        [record],
+        {"EmailClientApp": tools[0].manual},
+    )
+
+    assert workspace.clock is not None
+    assert workspace.clock.now() == sim.domain_now
 
 
 # ------------------------------------------------------------------------------------------------

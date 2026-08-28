@@ -15,11 +15,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from sora.environment import HostClock
 from sora.manual import Manual, OperationSpecification
 from sora.types import OperationAck
 
 if TYPE_CHECKING:
-    from sora.environment import Tool, Workspace, WorkspaceOrigin
+    from sora.environment import DomainClock, Tool, Workspace, WorkspaceOrigin
     from sora.manual import ToolRecord, WorkspaceRecord
     from sora.perception import SignalSink
     from sora.transport import MessageTransport
@@ -112,6 +113,10 @@ class _RuntimeIOWorkspace:  # satisfies the Workspace Protocol
     def __init__(self, ws_id: str, origin: WorkspaceOrigin, tools: list[Tool]) -> None:
         self.id = ws_id
         self.origin = origin
+        # The agent's own I/O channel runs on the host, so host wall-clock is its domain time.
+        # It is nobody's `watch.source` today, but a workspace that answered None would read as
+        # "cannot tell the time" — which of these two is not true here.
+        self.clock: DomainClock | None = HostClock()
         self._tools = tools
 
     def tools(self) -> list[Tool]:

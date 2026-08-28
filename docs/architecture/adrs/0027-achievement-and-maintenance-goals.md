@@ -142,7 +142,7 @@ at the scenario's `start_time` *and can run at a different rate* — so the two 
 into one "now". `are_sim.py` already carries a comment recording the silent wrong-answer bug from
 exactly that confusion (an agent told it was 1 Jan 1970 during a 2024-10-15 scenario).
 
-Domain time is reached through a **`Clock` Protocol on the workspace**, defaulting to host
+Domain time is reached through a **`DomainClock` Protocol on the workspace**, defaulting to host
 wall-clock, which the ARE adapter implements off the `Environment`'s `time_manager`.
 
 * **Per workspace, not per agent.** A simulated workspace's clock is not merely offset from
@@ -154,6 +154,29 @@ wall-clock, which the ARE adapter implements off the `Environment`'s `time_manag
   against one of them.
 * **An instant, not a rendering.** The Protocol returns an absolute instant; comparisons happen on
   the instant, and a timezone is for display only, never in the comparison path.
+* **The bound is declared, not inferred.** `until` gains a second, optional form:
+  `{"text": "<the clause>", "seconds": <how long the window lasts>}` beside the plain string it has
+  always been. A plain string means **event-shaped** and reaches the retirement judge, which is both
+  the safe default and every plan written before this existed; `seconds` is the planner *saying*
+  that the clause is a deadline and how long the window runs, counted from the moment the wait
+  begins. This is the same move `watch` makes for the signal log — *where to look* and *when to
+  stop* are the only parts of a condition a protocol can answer, so they are the only parts given a
+  structure. It adds no predicate DSL and no event algebra, so ADR-0022's rationale is applied here,
+  not excepted.
+
+  The alternative — recognizing the bound in the prose downstream — was implemented first and
+  rejected on its failure modes rather than on its polish. A recognizer has to guess whether a
+  timestamp in a sentence is the bound or a noun in it ("until the 2024-10-15T09:00Z meeting has
+  been rescheduled" retires while the meeting sits unrescheduled), and whether the word "deadline"
+  names one ("until the submission deadline has passed" is event-shaped, but a recognizer reading it
+  as timed refuses a sound plan under §6 below). Both errors are silent and both are expensive, in
+  opposite directions. The planner wrote the clause and already knows which it meant; asking it is
+  strictly better information, and a wrong `seconds` is then a visible plan defect rather than an
+  emergent parser behaviour.
+* **Relative only.** A `seconds` window needs no clock at plan time; an absolute instant would
+  require *telling the planner what time it is*, which is a second clock seam and re-baselines every
+  planning prompt. A clause naming an absolute moment therefore stays event-shaped and is judged.
+  Adding an `instant` field later is a one-field change if a case demands it.
 * **Not observed, and not polled.** ARE's `SystemApp` keeps no time in `get_state()`
   (`get_current_time` computes from `time_manager` on call), so there is nothing for poll-on-observe
   to publish — and if there were, a monotonically-advancing property would push `state_changed` on
@@ -164,7 +187,8 @@ wall-clock, which the ARE adapter implements off the `Environment`'s `time_manag
 
 ### 6. No clock is a plan defect, and ultimately a question for the user
 
-A maintenance goal with a time-bounded `until`, in a workspace with no domain clock, cannot
+A maintenance goal with a time-bounded `until` — one that *declares* a `seconds` window, per §5 —
+in a workspace with no domain clock, cannot
 terminate — it would hold its frame silently forever. It is **refused at plan validation** with a
 named defect, feeding ADR-0025's replan path; repeated refusal escalates to that ADR's shared
 terminus, await-input. The agent is missing a required capability, and the honest thing is to say
@@ -199,8 +223,13 @@ here for its precision, not its machinery.
   the parent's next step is by construction *what to do after monitoring* — but it means a long
   `until` stalls the parent by design, and a mis-planned `until` stalls it indefinitely until
   retirement or the user intervenes.
+* **A declared bound is a model output and nothing verifies it**, the same exposure as `goal_kind`
+  above and mitigated the same way: a planner that writes a `seconds` for "two weeks after the
+  exhibition opens" retires a live window early. The judged sweep still runs over everything not
+  mechanically retired, so a *missing* bound costs only a model call; only a *wrong* one is harmful,
+  and it is at least visible in the plan.
 * **A defaulting clock fails silently in the direction this ADR exists to prevent.** An adapter for
-  a simulated environment that does not implement `Clock` gets host wall-clock, which is exactly the
+  a simulated environment that does not implement `DomainClock` gets host wall-clock, which is exactly the
   1970-vs-2024 bug. Plan-time rejection catches an *absent* clock, not a *wrong* one.
 * Conditions still have no bound other than `until`. An activity blocked on a condition that has
   been quiet for a very long time is indistinguishable from a healthy monitor; periodically asking

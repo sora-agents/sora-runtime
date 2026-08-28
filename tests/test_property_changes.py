@@ -55,6 +55,7 @@ from sora.types import (
     Signal,
     SignalWait,
     Step,
+    Until,
 )
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
@@ -118,7 +119,7 @@ def _blocked_on(working: WorkingMemory, watch: SignalWait = _WATCH) -> Activity:
         watch=watch,
         when="one or more events are added",
         then="Resolve the conflict",
-        until="the four minutes are up",
+        until=Until(text="the four minutes are up"),
     )
     activity = Activity(
         id="a1",
@@ -333,7 +334,9 @@ async def test_a_new_condition_ignores_the_derived_backlog(tmp_path: Path) -> No
             goal="g",
             steps=[Step("wait", {})],
             pending=(
-                PendingCondition(watch=_WATCH, when="events added", then="handle", until="done"),
+                PendingCondition(
+                    watch=_WATCH, when="events added", then="handle", until=Until(text="done")
+                ),
             ),
         ),
         step_index=1,

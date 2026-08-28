@@ -43,6 +43,7 @@ from sora.types import (
     Step,
     SupersededPlan,
     UnresolvableGrounding,
+    Until,
     walk_path,
 )
 
@@ -459,7 +460,9 @@ PLAN_SYSTEM_PROMPT = (
     "window is still open. Keep the window itself in the sub-goal's `goal` text, and give that "
     "sub-goal's own plan a `pending` condition whose `until` says when the window closes: that "
     "`until` is the only thing that ends a maintenance sub-goal, and one that declares no such "
-    "condition ends as soon as its steps do.\n"
+    'condition ends as soon as its steps do. When the window is a stretch of time ("for the next '
+    "hour\"), say so with `until`'s object form described below — the runtime can then end the "
+    "sub-goal off the environment's own clock rather than by repeated judgement.\n"
     "To NARROW or RESHAPE a collection before you act on it — keep only the qualifying items, "
     "dedupe, sort, take the top few, gather per-item results, or reduce to a single number — emit "
     "one data-op step per transform (they compose in order, one per step; do NOT do it all at "
@@ -570,7 +573,8 @@ PLAN_SYSTEM_PROMPT = (
     '  {"watch": {"signal": "<signal name>", "source": "<tool id>", "path": "<dotted path>", '
     '"kind": "added" | "removed" | "updated"}, '
     '"when": "<what must have happened>", "then": "<what to do about it>", '
-    '"until": "<when to stop waiting>"}\n'
+    '"until": "<when to stop waiting>" | {"text": "<when to stop waiting>", '
+    '"seconds": <how long the window lasts>}}\n'
     '"watch" is REQUIRED and is a cheap mechanical filter, not the judgement: name the signal and '
     "the tool that would carry the news, and use `path` to point at the part of that tool's "
     "observable state that would move — it is what stops every unrelated event from waking this "
@@ -579,7 +583,17 @@ PLAN_SYSTEM_PROMPT = (
     "collection will otherwise wake itself on every delete it makes. Set it whenever `when` names "
     "a direction, and omit it when any change is genuinely interesting. `when` is the actual "
     "judgement, in plain language. `then` is a goal, phrased like the original goal — the runtime "
-    "plans it fresh when the moment comes, so do not write steps here. `until` bounds the wait.\n"
+    "plans it fresh when the moment comes, so do not write steps here.\n"
+    "`until` bounds the wait, and has two forms. Write a plain string when what ends the wait is "
+    'an EVENT — something that has to happen in the world ("the restoration slot has taken '
+    'place"). Write the object form when what ends it is a STRETCH OF TIME, and put that stretch '
+    "in `seconds`: the runtime then closes the window by looking at the environment's own clock, "
+    "with no further judgement. `seconds` is counted from the moment the agent STARTS waiting, so "
+    'use it only when the window begins then — "for the next 30 minutes" is '
+    '{"text": "30 minutes have passed", "seconds": 1800}, but "two weeks after the exhibition '
+    'opens" is not a stretch that starts now, so write it as a plain string and let it be judged '
+    "as an event. Never guess a `seconds` you were not given; a wrong one stops the agent watching "
+    "while the thing it is watching for can still happen.\n"
     'Example — goal: "Book the Rembrandt restoration slot for the 14th and tell the conservator; '
     "if she can't make it, rebook for whatever day she suggests.\" The second clause is a pending "
     "condition, not a step:\n"
@@ -1179,7 +1193,7 @@ def pending_from_raw(raw: dict[str, Any]) -> PendingCondition | None:
         return None
     if not when.strip() or not then.strip():
         return None
-    until = raw.get("until")
+    until = _until_from_raw(raw.get("until"))
     # An unrecognized `kind` degrades to no narrowing rather than to a watch nothing can satisfy:
     # the same choice the rest of this parser makes, and the safe direction for a scope whose only
     # job is to skip model calls.
@@ -1195,8 +1209,32 @@ def pending_from_raw(raw: dict[str, Any]) -> PendingCondition | None:
         ),
         when=when,
         then=then,
-        until=until if isinstance(until, str) and until.strip() else None,
+        until=until,
     )
+
+
+def _until_from_raw(raw: Any) -> Until | None:
+    """An ``until`` as the planner may write it: a bare string (event-shaped — the judge answers
+    it, which is what every plan did before bounds existed), or ``{"text": ..., "seconds": N}``
+    declaring that the clause is a deadline and how long the window is (ADR-0027 §5).
+
+    A malformed or non-positive ``seconds`` **drops the bound and keeps the text**, rather than
+    dropping the clause or raising. That is the same degradation the rest of this parser makes, and
+    it is the safe direction twice over: the condition still ends (the judge is asked, as before),
+    and a window that was meant to be bounded is never closed early by a number nobody can read.
+    Zero is excluded for the same reason — a bound that expires at the instant it is declared would
+    retire the condition before its first sweep."""
+    if isinstance(raw, str):
+        return Until(text=raw) if raw.strip() else None
+    if not isinstance(raw, dict):
+        return None
+    text = raw.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    seconds = raw.get("seconds")
+    if isinstance(seconds, bool) or not isinstance(seconds, int | float):
+        return Until(text=text)
+    return Until(text=text, seconds=float(seconds)) if seconds > 0 else Until(text=text)
 
 
 def _parse_plan_pending(text: str) -> tuple[PendingCondition, ...]:
@@ -1546,7 +1584,7 @@ def render_pending(pending: tuple[PendingCondition, ...]) -> str:
         lines.append(f"   when  {condition.when}")
         lines.append(f"   then  {condition.then}")
         if condition.until is not None:
-            lines.append(f"   until {condition.until}")
+            lines.append(f"   until {condition.until.text}")
     return "\n".join(lines)
 
 
@@ -2197,7 +2235,7 @@ class ProceduralMemory:
             return ConditionVerdict()
         snapshot = observed or PerceptSnapshot()
         listed = "\n".join(
-            f"{i}. when: {c.when}\n   until: {c.until or '(no explicit bound)'}"
+            f"{i}. when: {c.when}\n   until: {c.until.text if c.until else '(no explicit bound)'}"
             for i, c in enumerate(conditions)
         )
         user = (
@@ -2244,7 +2282,7 @@ class ProceduralMemory:
             return ()
         snapshot = observed or PerceptSnapshot()
         listed = "\n".join(
-            f"{i}. when: {c.when}\n   until: {c.until or '(no explicit bound)'}"
+            f"{i}. when: {c.when}\n   until: {c.until.text if c.until else '(no explicit bound)'}"
             for i, c in enumerate(conditions)
         )
         user = (
@@ -2323,7 +2361,7 @@ class ProceduralMemory:
                     watch=SignalWait(**cond["watch"]),
                     when=cond["when"],
                     then=cond["then"],
-                    until=cond.get("until"),
+                    until=_until_from_raw(cond.get("until")),
                 )
                 for cond in (data.get("pending") or ())
             ),

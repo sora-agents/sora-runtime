@@ -49,6 +49,7 @@ from sora.types import (
     Plan,
     SignalWait,
     Step,
+    Until,
 )
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
@@ -107,7 +108,7 @@ def _monitoring() -> PendingCondition:
         watch=_CALENDAR,
         when="one or more calendar events are added",
         then="delete every overlapping preexisting calendar event",
-        until="four minutes after the get_current_time result",
+        until=Until(text="four minutes after the get_current_time result"),
     )
 
 
@@ -116,7 +117,7 @@ def _contingency() -> PendingCondition:
         watch=_EMAIL,
         when="the conservator replies",
         then="tell the user the conservator has replied",
-        until="the restoration slot has taken place",
+        until=Until(text="the restoration slot has taken place"),
     )
 
 

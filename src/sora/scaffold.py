@@ -75,7 +75,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sora.environment import Tool, Workspace, WorkspaceOrigin
+from sora.environment import DomainClock, HostClock, Tool, Workspace, WorkspaceOrigin
 from sora.manual import Manual, MarkdownManualParser, ToolRecord, WorkspaceRecord
 from sora.perception import SignalSink
 from sora.types import ObservableProperty, OperationAck
@@ -109,6 +109,8 @@ class ClockWorkspace:  # satisfies sora.environment.Workspace
     def __init__(self, ws_id: str, origin: WorkspaceOrigin) -> None:
         self.id = ws_id
         self.origin = origin
+        # An un-simulated, in-process environment: host wall-clock IS its domain time.
+        self.clock: DomainClock | None = HostClock()
         self._tools: list[Tool] = [ClockTool()]
 
     def tools(self) -> list[Tool]:

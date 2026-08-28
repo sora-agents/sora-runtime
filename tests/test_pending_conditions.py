@@ -61,6 +61,7 @@ from sora.types import (
     Signal,
     SignalWait,
     Step,
+    Until,
 )
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
@@ -112,7 +113,7 @@ def _condition(watch: SignalWait = _INBOX) -> PendingCondition:
         watch=watch,
         when="the attendee replies that the date does not work",
         then="Rebook for the day the attendee proposes",
-        until="the booking has taken place",
+        until=Until(text="the booking has taken place"),
     )
 
 
@@ -149,7 +150,10 @@ def test_pending_condition_parses_from_planner_json() -> None:
     )
     assert cond is not None
     assert cond.watch == SignalWait("state_changed", "t1", "folders.INBOX.emails")
-    assert (cond.when, cond.then, cond.until) == ("they reply", "rebook", "it happened")
+    assert (cond.when, cond.then) == ("they reply", "rebook")
+    # A bare string means event-shaped: the clause survives verbatim for the judge, and declares no
+    # bound the clock could close (ADR-0027 §5).
+    assert cond.until == Until(text="it happened")
 
 
 def test_a_watch_can_declare_which_way_the_collection_must_move() -> None:
@@ -589,7 +593,9 @@ async def test_nothing_fired_goes_back_to_waiting(tmp_path: Path) -> None:
 
 
 def _other_condition(then: str) -> PendingCondition:
-    return PendingCondition(watch=_INBOX, when="a team member replies", then=then, until="never")
+    return PendingCondition(
+        watch=_INBOX, when="a team member replies", then=then, until=Until(text="never")
+    )
 
 
 async def test_every_fired_condition_is_pursued_not_just_the_first(tmp_path: Path) -> None:
@@ -1170,7 +1176,7 @@ def test_render_plan_shows_declared_conditions() -> None:
                 watch=SignalWait("state_changed", "t1", "folders.INBOX.emails"),
                 when="he replies that he cannot make it",
                 then="rebook for the date he proposes",
-                until="the day has passed",
+                until=Until(text="the day has passed"),
             ),
         ),
     )

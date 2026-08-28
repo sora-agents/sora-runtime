@@ -17,7 +17,7 @@ import json
 from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Any
 
-from sora.environment import Tool, Workspace, WorkspaceOrigin
+from sora.environment import DomainClock, Tool, Workspace, WorkspaceOrigin
 from sora.manual import Manual, OperationSpecification, ToolRecord, WorkspaceRecord
 from sora.perception import Message, SignalSink
 from sora.types import ObservableProperty, OperationAck, Signal
@@ -141,10 +141,20 @@ def plan_json(*steps: dict[str, Any]) -> str:
 class FakeWorkspace:
     # Method returns are typed as the Protocol types (list[Tool], not list[FakeTool]) so the fake
     # structurally satisfies Workspace — list is invariant, so a concrete element type would not.
-    def __init__(self, ws_id: str, origin: WorkspaceOrigin, tools: list[Tool]) -> None:
+    def __init__(
+        self,
+        ws_id: str,
+        origin: WorkspaceOrigin,
+        tools: list[Tool],
+        clock: DomainClock | None = None,
+    ) -> None:
         self.id = ws_id
         self.origin = origin
         self._tools = tools
+        # No domain clock by default — the honest answer for a workspace that models nothing about
+        # time, and the case ADR-0027 §6's plan validation exists for. A test that needs one passes
+        # it (HostClock, or a clock it can move on its own).
+        self.clock = clock
         self.closed = False
 
     def tools(self) -> list[Tool]:

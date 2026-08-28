@@ -36,6 +36,7 @@ from mcp.types import (
     TextContent,
 )
 
+from sora.environment import HostClock
 from sora.manual import (
     Manual,
     ManualSource,
@@ -47,7 +48,7 @@ from sora.manual import (
 from sora.types import ObservableProperty, OperationAck, Signal
 
 if TYPE_CHECKING:
-    from sora.environment import Tool, Workspace, WorkspaceOrigin
+    from sora.environment import DomainClock, Tool, Workspace, WorkspaceOrigin
     from sora.manual import ToolRecord, WorkspaceRecord
     from sora.perception import SignalSink
 
@@ -461,6 +462,13 @@ class _McpWorkspace:
     ) -> None:
         self.id = ws_id
         self.origin = origin
+        # MCP describes tools, not time: the protocol carries no notion of a server-side clock, so
+        # the server's environment runs on the same wall-clock this process does unless it says
+        # otherwise, and it has no way to say otherwise. A server fronting a *simulation* is
+        # therefore the case this default gets wrong (ADR-0027's own negative consequence) — that
+        # adapter owes its own DomainClock, which is exactly what the in-process ARE adapter
+        # supplies.
+        self.clock: DomainClock | None = HostClock()
         self._tools = tools
         self._stack = stack
 

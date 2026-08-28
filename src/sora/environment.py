@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -26,6 +27,42 @@ class Tool(Protocol):
     def observe(self) -> list[ObservableProperty]: ...
 
 
+class DomainClock(Protocol):
+    """Domain time in one workspace — the "now" a pending condition's `until` is answered against
+    (ADR-0027 §5).
+
+    Deliberately *not* the runtime's own clock. Every `time.time()` in the runtime is **host**
+    wall-clock and correct as infrastructure timing: a percept's `observed_at`, an invocation's
+    `invoked_at`, the inference watchdog, how often the retirement sweep asks. Domain time is what
+    the *environment* says it is, and under a simulation it starts somewhere else entirely and can
+    run at a different rate. Merging the two is a silent wrong answer rather than an error — ARE
+    told an agent it was 1 Jan 1970 throughout a scenario set in October 2024, so every date the
+    agent derived from "today" was computed against the wrong epoch.
+
+    Per workspace, not per agent: a simulated workspace's clock is not merely offset from
+    wall-clock, and two workspaces may legitimately disagree about what time it is.
+
+    Returns an **instant**. A timezone is for rendering and never enters the comparison path, so an
+    implementation returns an aware datetime and callers compare instants.
+    """
+
+    def now(self) -> datetime: ...
+
+
+@dataclass(frozen=True)
+class HostClock:
+    """Domain time *is* host wall-clock — the right answer for every environment that isn't
+    pretending, and what an adapter reaches for when it has no separate notion of time.
+
+    Note what it cannot protect against (ADR-0027's own negative consequence): an adapter for a
+    *simulated* environment that leaves this in place gets the 1970-vs-2024 bug back. Plan-time
+    validation catches an **absent** clock, never a wrong one — so a simulating adapter owes its
+    own implementation, and `None` is the honest answer for a workspace that simply cannot say."""
+
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+
 @dataclass(frozen=True)
 class WorkspaceOrigin:
     """The part of a WorkspaceRecord only the adapter can know: how to (re)connect."""
@@ -42,6 +79,11 @@ class Workspace(Protocol):
 
     id: str  # matches WorkspaceRecord.id / ToolRecord.workspace_id
     origin: WorkspaceOrigin
+    # Domain time here, or None when this workspace cannot tell it (see DomainClock). Not the
+    # runtime's clock and never a fallback to it: a maintenance sub-goal whose `until` asks about
+    # time while watching a clock-less workspace could never terminate, so it is refused at plan
+    # validation rather than answered from host wall-clock.
+    clock: DomainClock | None
 
     def tools(self) -> list[Tool]: ...
 
@@ -86,6 +128,8 @@ class EnvironmentView(Protocol):
 
     def get_workspace(self, workspace_id: str) -> Workspace: ...
 
+    def workspace_of(self, tool_id: str) -> Workspace | None: ...
+
     def all_tools(self) -> list[Tool]: ...
 
     def joined_workspaces(self) -> list[Workspace]: ...
@@ -111,6 +155,19 @@ class EnvironmentRegistry:
 
     def get_workspace(self, workspace_id: str) -> Workspace:
         return self._workspaces[workspace_id]
+
+    def workspace_of(self, tool_id: str) -> Workspace | None:
+        """The workspace a tool was joined from, or None if no joined workspace owns that id.
+
+        The reverse of the per-workspace id lists `leave()` already keeps, read off the same map so
+        the two can't disagree. What needs it is the domain clock: an `until` resolves against the
+        clock of the workspace owning the condition's `watch.source`, and a tool id is all a watch
+        names. Returns None rather than raising — an unknown source is an ordinary answer here (the
+        tool may have left since the condition was declared), not a programming error."""
+        for workspace_id, tool_ids in self._workspace_tools.items():
+            if tool_id in tool_ids:
+                return self._workspaces.get(workspace_id)
+        return None
 
     def all_tools(self) -> list[Tool]:
         return list(self._tools.values())

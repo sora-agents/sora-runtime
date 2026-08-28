@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 
@@ -276,17 +277,67 @@ class InputWait:  # a `blocked` activity awaiting the user's next instruction (s
 
 @dataclass(frozen=True)
 class PendingCondition:  # what would make an exhausted plan relevant again — see Plan.pending
-    # AgentSpeak's trigger, pointed forward. Only the gate is typed: `when`/`then`/`until` are prose
-    # because their consumer is _infer_, which already takes prose goals — so this adds no condition
-    # language, no predicate DSL and no event algebra to the plan. *Where to look* is the only part
-    # a protocol can answer, so it is the only part given a structure, and it is also the part that
-    # has to be cheap. `watch` is required: a condition with no gate degenerates into evaluating
+    # AgentSpeak's trigger, pointed forward. `when`/`then` are prose because their consumer is
+    # _infer_, which already takes prose goals — so this adds no condition language, no predicate
+    # DSL and no event algebra to the plan. Structure appears only where a protocol can actually
+    # answer: *where to look* (`watch`) and *when to stop* (`until`'s optional bound, see Until),
+    # which are also the two parts that have to be cheap; everything else stays a judgement.
+    # `watch` is required: a condition with no gate degenerates into evaluating
     # every condition against every signal, which is the unbounded keep-alive this design rejected.
     # Firing does not consume a condition — `until` is what ends it — so "whenever X" needs no flag.
     watch: SignalWait
     when: str
     then: str
-    until: str | None = None
+    until: Until | None = None
+
+
+@dataclass(frozen=True)
+class Until:
+    """A pending condition's stopping clause: prose for the judge, plus the one part of it a
+    protocol can answer (ADR-0027 §5).
+
+    ``text`` is always present and is the whole clause — the retirement judge's consumer, and what
+    a human reads in a trace. ``seconds`` is the planner's optional *declaration* that this clause
+    is a deadline rather than an event, and how long the window is; when it is set the runtime
+    closes the window by comparison against the watched workspace's clock, at no model cost.
+
+    The bound is **declared, never inferred**. An earlier design read it back out of the prose with
+    a recognizer, which had to guess whether a timestamp appearing in a sentence was the bound or a
+    noun in it ("until the 2024-10-15T09:00Z meeting has been rescheduled") and whether the word
+    "deadline" named one — guessing wrong either retires a live window early or refuses a sound
+    plan. The planner wrote the clause and already knows which it meant, so it says so. This is the
+    same move ``watch`` makes for the signal log: *where to look* and *when to stop* are the only
+    parts of a condition a protocol can answer, so they are the only parts given a structure — no
+    predicate DSL, no event algebra, exactly as ADR-0022 requires.
+
+    Absent ``seconds`` means event-shaped, which is both the safe default and the pre-existing
+    behaviour: the judge answers it.
+
+    Relative only, and deliberately: an absolute instant would require the planner to be told
+    domain time, which is a second clock seam and re-baselines every plan prompt. A clause naming
+    an absolute moment stays event-shaped and reaches the judge.
+    """
+
+    text: str
+    # Measured from when the WAIT BEGINS — the moment the condition is lifted onto the activity,
+    # not when the plan was written. A plan is a reusable skeleton that may be retrieved long after
+    # it was authored, so plan time is not a moment this bound could mean.
+    seconds: float | None = None
+
+    @property
+    def is_time_bounded(self) -> bool:
+        """Whether this clause asks about the clock at all — the question plan validation puts to
+        it (ADR-0027 §6), and exact rather than heuristic now that the planner declares it."""
+        return self.seconds is not None
+
+    def deadline(self, declared_at: datetime | None) -> datetime | None:
+        """The instant this bound expires, or None when it cannot be placed on a timeline.
+
+        A bound with no anchor is not "expired now", it is unanswerable — retiring on a missing
+        anchor closes a window that is still open, which is the failure ADR-0027 exists for."""
+        if self.seconds is None or declared_at is None:
+            return None
+        return declared_at + timedelta(seconds=self.seconds)
 
 
 @dataclass
@@ -308,6 +359,12 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # run's failure exactly — while the frame's chain is unchanged by that swap. A sibling sub-goal
     # pushed at another step of the same parent differs in the index, so it is a different frame.
     declared_by: tuple[tuple[str, int], ...] = ()
+    # DOMAIN time when this condition was lifted onto the activity, read off the clock of the
+    # workspace owning its watch — the anchor a relative `until` ("four minutes after ...") is
+    # measured from, and the reason that measurement is not `time.time()` (ADR-0027 §5). None when
+    # that workspace cannot tell domain time, which leaves a relative bound unresolvable rather
+    # than resolving it against the wrong clock.
+    declared_at: datetime | None = None
     evaluated_through: int = 0
     # The same mark over the second, derived log (WorkingMemory.property_changes_appended). Two
     # counters rather than one shared sequence: the logs are appended to independently, so a single
