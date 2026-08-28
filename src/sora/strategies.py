@@ -275,6 +275,26 @@ DEFAULT_INFERENCE_DEADLINE = 300.0
 # trace it is meant to explain.
 _OBSERVATION_HEARTBEAT = 100
 
+# How long the retire-only condition sweep waits before re-judging one activity's quiet conditions,
+# and how far it backs off after a judgement that retired nothing (the interval doubles per miss,
+# topping out at 2**_RETIREMENT_BACKOFF times the base). Backoff is not a refinement here but the
+# thing that makes the sweep affordable: an activity BLOCKED on a condition makes *every* tick idle,
+# so the eligibility that schedules this never lapses on its own, and a fixed interval would keep
+# paying for the same "still waiting" answer for as long as the agent lives. A miss counter resets
+# whenever a condition is declared or retired, so a set that actually moves is checked promptly
+# again. What the backoff does not solve — an activity waiting on a healthy-looking condition that
+# has been quiet for a very long time — is a question for the user, and deliberately not answered
+# here (ADR-0027's last open consequence).
+#
+# Wall-clock on purpose, and this is emphatically NOT the clock an `until` is answered against.
+# This paces how often the runtime *asks*, which is infrastructure timing like the inference
+# watchdog above; the `until` itself is a question about **domain** time, which reaches the runtime
+# through the workspace and never through `time.time()` (ADR-0027 §5). A tick count would be the
+# wrong unit for the pacing anyway: tick rate varies by two orders of magnitude between an
+# interactive session and a simulation loop.
+DEFAULT_RETIREMENT_INTERVAL = 30.0
+_RETIREMENT_BACKOFF = 5
+
 if TYPE_CHECKING:
     from sora.activity import Activity
     from sora.cycle import DecisionCycle
@@ -1018,6 +1038,7 @@ class DefaultObserveStrategy:
         focus: FocusPolicy | None = None,
         *,
         inference_deadline: float | None = DEFAULT_INFERENCE_DEADLINE,
+        retirement_interval: float | None = DEFAULT_RETIREMENT_INTERVAL,
     ) -> None:
         # Defaults to attending everything joined. Narrowing to live intentions is a
         # deliberate opt-in (`focus=IntentionScopedFocus()`), not the default: measured, it
@@ -1028,6 +1049,19 @@ class DefaultObserveStrategy:
         # None disables the watchdog entirely — for a deliberately unbounded interactive session,
         # or a debugger sitting on a breakpoint inside the client.
         self._inference_deadline = inference_deadline
+        # Retire-only sweep over quiet pending conditions (ADR-0027 §4). ON by default — retirement
+        # is required machinery, not an optimization: without it a condition whose watched
+        # collection goes quiet is never re-judged and holds its activity BLOCKED for good. `None`
+        # switches it off the way `inference_deadline=None` disables the watchdog. Per-activity
+        # pacing state is (last judged at, consecutive misses, conditions seen at that check); one
+        # judgement is in flight at a time, parked in a one-slot mailbox and applied on-cycle.
+        self._retirement_interval = retirement_interval
+        self._retirement_marks: dict[str, tuple[float, int, int]] = {}
+        self._retirement_in_flight = False
+        self._retirement_result: tuple[str, list[PendingConditionState], tuple[int, ...]] | None = (
+            None
+        )
+        self._retirement_tasks: set[asyncio.Task[None]] = set()
         # DEBUG-only diagnostic state, reset at each heartbeat; see _OBSERVATION_HEARTBEAT.
         self._observed: dict[str, int] = {}
         self._heartbeat_cycles = 0
@@ -1090,6 +1124,10 @@ class DefaultObserveStrategy:
         await self._resolve_inferences(cycle)
         await self._suspend_on_completion_signal(cycle, just_resolved)
         await self._resume_on_signal(cycle)
+        # After the resume pass, so an activity a signal just woke counts as one that can advance
+        # and stands the sweep down — and so a condition the gate is about to re-judge for free is
+        # never also paid for here.
+        await self._retire_quiet_conditions(cycle)
         # Trim last: a signal that just arrived this tick must survive to be matched by the two
         # passes above before it's ever subject to eviction (bound orphan growth; newest win).
         if len(wm.signals) > _SIGNAL_RETENTION:
@@ -1619,6 +1657,182 @@ class DefaultObserveStrategy:
                 continue
             if self._match_signal(wm, activity.blocked_on) is not None:
                 await resume.execute(cycle, activity_id=activity.id)
+
+    async def _retire_quiet_conditions(self, cycle: DecisionCycle) -> None:
+        """Garbage-collect pending conditions whose watch has gone quiet (ADR-0027 §4).
+
+        The hole this fills: `until` was judged in exactly one place, the batched condition
+        evaluation, which runs only when an observed change makes a condition *eligible*. So the
+        one condition guaranteed never to be re-judged was the one nothing ever moves against —
+        and it held its activity BLOCKED for good. Reachable for a contingency condition,
+        load-bearing for a maintenance sub-goal, whose frame lives exactly as long as its `until`.
+
+        Three properties, each of which is the decision rather than an implementation detail:
+
+        * **Retire only, never fire.** A pass that could also fire would duplicate the eligibility
+          gate's job and reopen the cost question that gate settled — and it would be firing on no
+          evidence, since its premise is that nothing arrived. Enforced in `judge_retirement`, not
+          merely asked for in the prompt.
+        * **Idle-scheduled** (ADR-0026's cadence). A READY activity is one Situate will select on
+          this very tick, so the sweep stands down; Reflect only ever demotes between here and
+          there, so "nothing is READY at the end of Observe" is exactly "Situate will select
+          nothing". Being conservative in that direction costs at most a deferral to the next tick.
+        * **Observe retires, Reason pops.** This drops the retired conditions and releases the
+          wait; the pop that follows is Reason's, which owns plan advancement everywhere else.
+
+        What it answers today is an **event-shaped** `until` ("the Film Production Day has taken
+        place"), which is judged from the observed world. A **time-bounded** one ("four minutes
+        after the get_current_time result") is offered to the same judge for now and will usually
+        come back unretired, because the judge is shown no clock — deliberately: the only time this
+        module can reach is `time.time()`, and answering a domain question with host wall-clock is
+        the silent wrong answer ADR-0027 §5 exists to prevent. A time-bounded `until` wants
+        resolving *mechanically*, before this call, against the clock of the workspace owning its
+        `watch.source`; that resolver is the piece this pass is shaped to receive, and it is what
+        makes the common case cost nothing. Until it lands the backoff is what keeps the
+        unanswerable case cheap rather than what makes it correct.
+
+        The call itself is spawned off-cycle and its result parked, like every model call in the
+        runtime — but deliberately *not* through `_infer_`/`pending_inference`, which would move the
+        activity to RUNNING. The activity is BLOCKED and must stay blocked: a garbage collection
+        pass is not a reason to make an activity look like it is doing something, and RUNNING is
+        mutually exclusive with `blocked_on`. So this follows `DefaultRelevanceJudge`'s shape — the
+        background task only ever sets a field, and every mutation of working memory happens here,
+        on-cycle.
+        """
+        if self._retirement_interval is None:
+            return
+        # Apply first, and only apply: a tick that lands a verdict does not also fire the next one.
+        if self._retirement_result is not None:
+            await self._apply_retirement(cycle)
+            return
+        if self._retirement_in_flight:
+            return
+        activity = self._retirement_candidate(cycle.working)
+        if activity is None:
+            return
+        judged = list(activity.pending_conditions)
+        _checked, misses, _seen = self._retirement_marks.get(activity.id, (0.0, 0, 0))
+        # Marked at fire time, not on resolve, so a slow call cannot be re-fired underneath itself.
+        self._retirement_marks[activity.id] = (time.time(), misses, len(judged))
+        # Agent-level, like both other judges and unlike a `_ground_`/`_select_` call: retirement
+        # asks whether waiting is over, and the evidence for that ("the slot has taken place") is
+        # routinely on a tool the waiting activity never touches.
+        observed = PerceptSnapshot(
+            list(cycle.working.properties.values()), list(cycle.working.signals)
+        )
+        self._retirement_in_flight = True
+        log.info(
+            "observe: judging retirement of %d quiet condition(s) on %s",
+            len(judged),
+            activity.id,
+        )
+        _spawn_tracked(
+            self._retirement_tasks, self._judge_retirement(cycle, activity, judged, observed)
+        )
+
+    def _retirement_candidate(self, wm: WorkingMemory) -> Activity | None:
+        """The one activity to sweep this tick, or None.
+
+        One per tick, longest-unchecked first. The sweep's whole cost argument is that it comes out
+        of slack, and N calls fired together on a single idle tick is not slack — nor would it stay
+        one call per activity, since an agent that accumulates watches is exactly the one this runs
+        for most often.
+        """
+        if len(self._retirement_marks) > len(wm.activities):
+            # Pacing state for an activity working memory no longer holds. Bounded rather than
+            # correctness-critical, but this dict is keyed by a per-run id and the runtime is meant
+            # to stay up indefinitely.
+            self._retirement_marks = {
+                key: mark for key, mark in self._retirement_marks.items() if key in wm.activities
+            }
+        if any(a.state is ActivityState.READY for a in wm.activities.values()):
+            return None  # something can advance; the sweep never competes with it
+        assert self._retirement_interval is not None  # guarded by the caller
+        now = time.time()
+        due: list[tuple[float, Activity]] = []
+        for activity in wm.activities.values():
+            if activity.state is ActivityState.TERMINATED or not activity.pending_conditions:
+                continue
+            checked, misses, seen = self._retirement_marks.get(activity.id, (0.0, 0, 0))
+            if len(activity.pending_conditions) > seen:
+                misses = 0  # a condition declared since the last check deserves a prompt look
+            if checked and now - checked < self._retirement_interval * 2 ** min(
+                misses, _RETIREMENT_BACKOFF
+            ):
+                continue
+            due.append((checked, activity))
+        if not due:
+            return None
+        return min(due, key=lambda entry: entry[0])[1]
+
+    async def _judge_retirement(
+        self,
+        cycle: DecisionCycle,
+        activity: Activity,
+        judged: list[PendingConditionState],
+        observed: PerceptSnapshot,
+    ) -> None:
+        try:
+            retired = await cycle.procedural.judge_retirement(
+                activity, [state.condition for state in judged], observed
+            )
+        except Exception:  # noqa: BLE001 — a failed sweep means "keep waiting", not a crash
+            log.warning("observe: retirement judgement failed on %s", activity.id, exc_info=True)
+            retired = ()
+        finally:
+            self._retirement_in_flight = False
+        self._retirement_result = (activity.id, judged, retired)
+
+    async def _apply_retirement(self, cycle: DecisionCycle) -> None:
+        """Consume a parked retirement verdict: drop what retired, then release the wait.
+
+        Releasing is the half that is easy to leave out and impossible to notice missing. An
+        activity BLOCKED on a `ConditionWait` is resumed by exactly one thing — a signal making one
+        of its conditions eligible — so an activity whose last condition just retired has nothing
+        left that could ever wake it, and Situate only ever selects a READY activity. Retiring
+        without resuming would swap one permanent block for another.
+
+        A queued `condition_fired` is deliberately not scrubbed when its condition retires: that is
+        work the frame already accepted and paid a judgement for, and ADR-0027 holds both kinds of
+        frame open for it. Retirement ends the *watching*, not a firing that already happened.
+        """
+        parked, self._retirement_result = self._retirement_result, None
+        assert parked is not None  # guarded by the caller
+        activity_id, judged, indices = parked
+        activity = cycle.working.activities.get(activity_id)
+        if activity is None or activity.state is ActivityState.TERMINATED:
+            return
+        checked, misses, seen = self._retirement_marks.get(activity_id, (time.time(), 0, 0))
+        if not indices:
+            # Back off: the same answer is what the next call would most likely buy too.
+            self._retirement_marks[activity_id] = (checked, misses + 1, seen)
+            return
+        # Identity, not equality: PendingConditionState is mutable (its marks advance), so it is
+        # unhashable, and two conditions can compare equal while being distinct waiters. A state the
+        # eligibility gate retired while this call was in flight is simply no longer found.
+        retired = {id(judged[i]) for i in indices if i < len(judged)}
+        activity.pending_conditions = [
+            state for state in activity.pending_conditions if id(state) not in retired
+        ]
+        # Remember WHAT retired: the declaration survives on the frozen `Plan.pending`, so the next
+        # lift would otherwise put the condition straight back on watch, undoing this for good.
+        activity.retired_conditions.update(judged[i].condition for i in indices if i < len(judged))
+        self._retirement_marks[activity_id] = (checked, 0, len(activity.pending_conditions))
+        log.info(
+            "observe: retired %d quiet condition(s) on %s; %d left",
+            len(retired),
+            activity.id,
+            len(activity.pending_conditions),
+        )
+        if not isinstance(activity.blocked_on, ConditionWait):
+            return
+        if activity.pending_conditions:
+            # Still waiting, on less. Re-derive the wait so `blocked_on` keeps describing what the
+            # activity is actually waiting for — what a diagnostic renders and a harness inspects.
+            activity.blocked_on = ConditionWait(watches=_condition_watches(activity))
+            return
+        resume = cycle.actions.internal(ResumeAction.name)
+        await resume.execute(cycle, activity_id=activity.id)
 
     @staticmethod
     def _completion_signal(wm: WorkingMemory, invocation: OperationInvocation) -> str | None:

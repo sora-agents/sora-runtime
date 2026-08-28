@@ -1790,6 +1790,28 @@ def _parse_condition_verdict(text: str, count: int) -> ConditionVerdict:
     return ConditionVerdict(fired=_indices("fired"), retired=_indices("retired"))
 
 
+# --- pending conditions: the retire-only sweep over a watch that has gone quiet — ADR-0027 -------
+
+RETIREMENT_SYSTEM_PROMPT = (
+    "You are deciding whether an agent should STOP waiting on conditions it declared.\n"
+    "The agent finished a piece of work and is watching in case something specific happens. "
+    "Nothing has moved on any of these watches for a while, and this is a periodic check that they "
+    "are still worth waiting on. It is NOT a report that something occurred.\n"
+    "You are given the original goal, a numbered list of conditions, and the agent's current view "
+    "of its environment. Each condition has a `when` (what the agent is waiting for) and, "
+    "optionally, an `until` (when it should stop waiting).\n"
+    "For each condition decide only whether it is RETIRED: its `until` is now satisfied, so the "
+    "waiting is over. A condition with no `until` is retired only if waiting has become "
+    "pointless — what it waits for can no longer happen at all.\n"
+    "Do NOT decide whether any `when` has come true. That is judged elsewhere, from the change "
+    "itself, and nothing you are given here is evidence that an awaited event happened.\n"
+    "Default to keeping a condition. Retiring one the agent is still owed drops a commitment "
+    "silently and unrecoverably; keeping one too long costs only another check.\n"
+    'Respond with ONLY a JSON object {"retired": [<indices>]} — 0-based indices into the numbered '
+    "list, no prose, no fences. Use an empty list when every condition is still worth waiting on."
+)
+
+
 # --- undeclared relevance: does a change bear on work that already finished? — ADR-0026 ----------
 
 RELEVANCE_SYSTEM_PROMPT = (
@@ -2190,6 +2212,52 @@ class ProceduralMemory:
         )
         text = await self._llm.complete(system=CONDITION_SYSTEM_PROMPT, prompt=user)
         return _parse_condition_verdict(text, len(conditions))
+
+    async def judge_retirement(
+        self,
+        activity: Activity,
+        conditions: Sequence[PendingCondition],
+        observed: PerceptSnapshot | None = None,
+    ) -> tuple[int, ...]:
+        """Which of an activity's *quiet* conditions have outlived their `until` (ADR-0027 §4)?
+
+        The sibling of ``evaluate_conditions``, and deliberately not a mode of it. That one is
+        woken by a change and asks two questions about it; this one is woken by the **absence** of
+        any change and asks one. Folding them together would put a "nothing happened" prompt on the
+        firing path, where a model handed a `when` and no evidence is exactly the shape that
+        invents a firing — so the two prompts stay apart and this one returns retirements only.
+
+        There is no `changes` argument for the same reason: the input to this judgement is the
+        world as it currently stands, not an event, because the case it exists for is the one where
+        no event ever arrives. What it can answer without a domain clock is an event-shaped `until`
+        ("the Film Production Day has taken place"); a time-bounded one is answered here too for
+        now, but wants resolving mechanically against the workspace's clock at no model cost.
+
+        Retire-only is enforced at the boundary, not merely asked for: a `fired` in the reply is
+        dropped, so a model that answers the wrong question cannot make the agent redo work.
+        """
+        if self._llm is None:
+            raise RuntimeError(
+                "ProceduralMemory has no LLM configured; cannot judge condition retirement."
+            )
+        if not conditions:
+            return ()
+        snapshot = observed or PerceptSnapshot()
+        listed = "\n".join(
+            f"{i}. when: {c.when}\n   until: {c.until or '(no explicit bound)'}"
+            for i, c in enumerate(conditions)
+        )
+        user = (
+            f"Original goal: {activity.goal}\n"
+            f"Conditions:\n{listed}\n"
+            f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
+            f"Recently observed signals:\n{render_signals(snapshot.signals)}"
+        )
+        log.debug(
+            "observe: retirement system prompt\n%s\nUser prompt\n%s", RETIREMENT_SYSTEM_PROMPT, user
+        )
+        text = await self._llm.complete(system=RETIREMENT_SYSTEM_PROMPT, prompt=user)
+        return _parse_condition_verdict(text, len(conditions)).retired
 
     async def judge_relevance(
         self,
