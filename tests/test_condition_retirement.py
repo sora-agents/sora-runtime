@@ -132,7 +132,10 @@ def _blocked_on(activity: Activity, *conditions: PendingCondition) -> Activity:
     return activity
 
 
-def _maintenance(pending: tuple[PendingCondition, ...]) -> Activity:
+def _maintenance(
+    pending: tuple[PendingCondition, ...],
+    parent_pending: tuple[PendingCondition, ...] = (),
+) -> Activity:
     """A spent maintenance sub-plan: its steps ran (they were the first iteration), its frame is
     held open by the condition it declared, and the parent still owes the user a report."""
     parent = Plan(
@@ -145,6 +148,7 @@ def _maintenance(pending: tuple[PendingCondition, ...]) -> Activity:
             ),
             Step("wait", {}),
         ],
+        pending=parent_pending,
     )
     plan = Plan(id="sub", goal="clear the conflicts", steps=[Step("wait", {})], pending=pending)
     activity = Activity(id="a1", goal="clear the conflicts", context={}, plan=plan)
@@ -289,6 +293,62 @@ async def test_retirement_releases_the_maintenance_frame_it_was_holding(tmp_path
     assert result.step is not None
 
 
+async def test_retirement_releases_the_frame_even_while_another_frames_condition_lives(
+    tmp_path: Path,
+) -> None:
+    """Releasing has to ask what still holds *this frame*, not whether any condition survives.
+
+    A frame is held only by the conditions it declared, so the moment a maintenance frame's own
+    condition retires the frame is free — but an unrelated contingency the top-level plan declared
+    keeps `pending_conditions` non-empty. Gating the resume on emptiness leaves the activity BLOCKED
+    on a `ConditionWait` only a signal could lift, Situate never selects it, Reason never pops, and
+    the parent's report to the user never runs: the exact block ADR-0027 exists to end."""
+    llm = FakeLLMClient(_verdict(retired=[0]))
+    cycle, working = _cycle(tmp_path, llm)
+    activity = _maintenance((_monitoring(),), parent_pending=(_contingency(),))
+    _lift_pending_conditions(activity, working)
+    activity.state = ActivityState.BLOCKED
+    activity.blocked_on = ConditionWait(watches=(_CALENDAR, _EMAIL))
+    working.activities[activity.id] = activity
+
+    await _sweep(cycle)
+
+    assert [state.condition.then for state in activity.pending_conditions] == [
+        _contingency().then
+    ]  # the contingency outlives the frame that never declared it
+    resumed = activity.state  # a local, so the assert does not narrow the attribute for mypy
+    assert resumed is ActivityState.READY
+    assert activity.blocked_on is None
+
+    result = await cycle.strategies.reason.reason(activity, working, cycle, TickResult())
+
+    assert activity.parent_frames == []  # window closed -> the parent resumes
+    assert result.step is not None
+
+
+async def test_a_frame_its_own_condition_still_holds_keeps_waiting(tmp_path: Path) -> None:
+    """The other direction of the same gate, and the reason it cannot simply become "resume
+    whenever anything retired": a maintenance frame with a second live condition of its own is
+    still monitoring, and popping it would resume the parent mid-window."""
+    llm = FakeLLMClient(_verdict(retired=[1]))
+    cycle, working = _cycle(tmp_path, llm)
+    second = PendingCondition(
+        watch=_CALENDAR, when="an event is moved", then="reconcile it", until=Until(text="later")
+    )
+    activity = _maintenance((_monitoring(), second))
+    _lift_pending_conditions(activity, working)
+    activity.state = ActivityState.BLOCKED
+    activity.blocked_on = ConditionWait(watches=(_CALENDAR,))
+    working.activities[activity.id] = activity
+
+    await _sweep(cycle)
+
+    assert len(activity.pending_conditions) == 1
+    still_blocked = activity.state
+    assert still_blocked is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, ConditionWait)
+
+
 async def test_a_spent_top_level_activity_finishes_once_its_last_contingency_retires(
     tmp_path: Path,
 ) -> None:
@@ -348,6 +408,30 @@ async def test_the_sweep_is_paced(tmp_path: Path) -> None:
         await _settle()
 
     assert len(llm.calls) == 1
+
+
+async def test_a_newly_declared_condition_resets_the_backoff_for_good(tmp_path: Path) -> None:
+    """The backoff answers "the last look bought nothing, so the next one probably won't either" —
+    a premise a *new* condition invalidates, since nothing has ever looked at it. Zeroing only a
+    local leaves the stored count untouched, and the stored count is what the next mark is built
+    from: the fresh condition gets one prompt look and then inherits the full accumulated
+    backoff — up to sixteen minutes — instead of the base interval."""
+    llm = FakeLLMClient(_verdict(retired=[]))
+    observe = DefaultObserveStrategy(retirement_interval=3600.0)
+    cycle, working = _cycle(tmp_path, llm, observe=observe)
+    activity = _blocked_on(Activity(id="a1", goal="clear the conflicts", context={}), _monitoring())
+    working.activities[activity.id] = activity
+
+    await _sweep(cycle)  # a verdict that retires nothing is what earns the backoff
+
+    assert observe._retirement_marks[activity.id][1] == 1
+
+    activity.pending_conditions.append(
+        PendingConditionState(condition=_contingency(), evaluated_through=0)
+    )
+    await cycle.strategies.observe.observe(cycle)
+
+    assert observe._retirement_marks[activity.id][1] == 0
 
 
 async def test_the_sweep_can_be_switched_off(tmp_path: Path) -> None:

@@ -98,7 +98,10 @@ def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
     `_conditions_hold_frame`. A condition two frames declare identically is attributed to the
     innermost one, which is the frame reading it as its own.
     """
-    frames = [activity.plan, *(plan for plan, _, _ in activity.parent_frames)]
+    # Innermost-first, because that is how `_frame_key` counts `depth`. `parent_frames` is a stack
+    # stored outermost-first, so walking it in storage order would pair every plan past the first
+    # with another frame's key.
+    frames = [activity.plan, *(plan for plan, _, _ in reversed(activity.parent_frames))]
     known = {state.condition for state in activity.pending_conditions}
     known |= activity.retired_conditions
     for depth, plan in enumerate(frames):
@@ -1851,8 +1854,14 @@ class DefaultObserveStrategy:
             if activity.state is ActivityState.TERMINATED or not activity.pending_conditions:
                 continue
             checked, misses, seen = self._retirement_marks.get(activity.id, (0.0, 0, 0))
-            if len(activity.pending_conditions) > seen:
-                misses = 0  # a condition declared since the last check deserves a prompt look
+            if misses and len(activity.pending_conditions) > seen:
+                # A condition declared since the last check deserves a prompt look — the backoff's
+                # premise ("the last look bought nothing") says nothing about one never looked at.
+                # Persisted, not just local: the stored count is what the next mark is built from,
+                # so a local reset makes the look prompt exactly once and then restores the whole
+                # accumulated backoff.
+                misses = 0
+                self._retirement_marks[activity.id] = (checked, misses, seen)
             if checked and now - checked < self._retirement_interval * 2 ** min(
                 misses, _RETIREMENT_BACKOFF
             ):
@@ -1954,6 +1963,14 @@ class DefaultObserveStrategy:
         left that could ever wake it, and Situate only ever selects a READY activity. Retiring
         without resuming would swap one permanent block for another.
 
+        There are therefore **two** ways a retirement releases the wait, and only the first is
+        "nothing left to watch". A frame is held solely by the conditions it declared
+        (`_conditions_hold_frame`), so retiring a maintenance frame's own condition frees the frame
+        — Reason can pop it and run the parent's remaining steps — even while an unrelated
+        contingency declared one level up is still being watched, and keeps `pending_conditions`
+        non-empty. Gating the resume on emptiness alone leaves exactly that activity blocked for
+        good, which is the failure the frame rule was written to end, one layer down.
+
         A queued `condition_fired` is deliberately not scrubbed when its condition retires: that is
         work the frame already accepted and paid a judgement for, and ADR-0027 holds both kinds of
         frame open for it. Retirement ends the *watching*, not a firing that already happened.
@@ -1982,7 +1999,8 @@ class DefaultObserveStrategy:
         )
         if not isinstance(activity.blocked_on, ConditionWait):
             return
-        if activity.pending_conditions:
+        freed_frame = bool(activity.parent_frames) and not _conditions_hold_frame(activity)
+        if activity.pending_conditions and not freed_frame:
             # Still waiting, on less. Re-derive the wait so `blocked_on` keeps describing what the
             # activity is actually waiting for — what a diagnostic renders and a harness inspects.
             activity.blocked_on = ConditionWait(watches=_condition_watches(activity))

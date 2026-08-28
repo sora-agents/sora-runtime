@@ -334,10 +334,16 @@ class Until:
         """The instant this bound expires, or None when it cannot be placed on a timeline.
 
         A bound with no anchor is not "expired now", it is unanswerable — retiring on a missing
-        anchor closes a window that is still open, which is the failure ADR-0027 exists for."""
+        anchor closes a window that is still open, which is the failure ADR-0027 exists for. A
+        number no calendar can hold is the same answer for the same reason, and is caught here
+        rather than trusted to the parser because `Until` is also rebuilt from stored plans: the
+        arithmetic runs inside Observe, and an escaping OverflowError ends the run."""
         if self.seconds is None or declared_at is None:
             return None
-        return declared_at + timedelta(seconds=self.seconds)
+        try:
+            return declared_at + timedelta(seconds=self.seconds)
+        except (OverflowError, ValueError):
+            return None  # past timedelta's range, past year 9999, or not a number at all
 
 
 @dataclass

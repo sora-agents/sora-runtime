@@ -467,3 +467,37 @@ async def test_the_agents_own_delete_does_not_open_the_gate_it_watches(tmp_path:
     _observed(working, Change(path="events", added=("3fa4a347",)))  # the world's addition
 
     assert len(_eligible_conditions(activity, working)) == 1
+
+
+def test_a_lifted_condition_is_attributed_to_its_own_frame_two_levels_down() -> None:
+    """Attribution has to survive nesting, not just one parent. Lifting walks the frame stack, which
+    is stored outermost-first, while `_frame_key` counts *outwards from the current frame* — read in
+    the same order the two disagree, and every key past the first lands on the wrong plan.
+
+    Both consequences are what `declared_by` exists to prevent: a top-level condition pinning an
+    unrelated middle frame open forever, and that frame's own condition read as the top-level
+    plan's — always an achievement goal, so it holds nothing and the frame pops out from under its
+    own window."""
+    working = WorkingMemory(registry=EnvironmentRegistry(adapters={}))
+    middle_condition = replace(_condition(), when="a slot moves", then="reconcile the calendar")
+    top = Plan(
+        id="top",
+        goal="run the studio day",
+        steps=[Step("wait", {}), Step("subgoal", {"goal": "watch the calendar"}), Step("wait", {})],
+        pending=(_other(),),
+    )
+    middle = Plan(
+        id="middle",
+        goal="watch the calendar",
+        steps=[Step("subgoal", {"goal": "clear the conflicts", "goal_kind": "maintenance"})],
+        pending=(middle_condition,),
+    )
+    inner = Plan(id="inner", goal="clear the conflicts", steps=[Step("wait", {})])
+    activity = Activity(id="a1", goal="clear the conflicts", context={}, plan=inner)
+    activity.parent_frames.extend([(top, 1, 0), (middle, 0, 0)])
+
+    _lift_pending_conditions(activity, working)
+
+    by_then = {state.condition.then: state.declared_by for state in activity.pending_conditions}
+    assert by_then[_OTHER_THEN] == ()  # declared two frames up, by the top-level plan
+    assert by_then["reconcile the calendar"] == (("top", 1),)  # the middle frame's own key

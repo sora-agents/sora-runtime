@@ -173,6 +173,32 @@ def test_an_unreadable_bound_keeps_the_clause_and_falls_back_to_the_judge() -> N
         assert cond.until == Until(text="in a while"), seconds
 
 
+def test_a_bound_no_timeline_could_hold_is_unreadable_too() -> None:
+    """A number can be positive and still name no instant. `timedelta` tops out around 8.6e13
+    seconds and the datetime it is added to tops out at year 9999, so a window the planner writes
+    as 1e15 seconds — or as the bare `Infinity` token, which `json.loads` accepts — raises
+    OverflowError rather than producing a deadline.
+
+    That matters far past tidiness: the arithmetic runs in `_retire_expired_conditions`, inside
+    Observe, and `Agent.run` puts no `except` around `tick()`. One out-of-range number from one
+    plan would end the whole run, and re-raise on every tick after. It is unreadable in exactly the
+    sense the rest of this parser means, so it degrades the same way — the text survives, the bound
+    does not, and the judge is asked."""
+    for seconds in (float("inf"), float("-inf"), float("nan"), 1e15, 10**18):
+        cond = pending_from_raw({**_RAW, "until": {"text": "in a while", "seconds": seconds}})
+        assert cond is not None, seconds
+        assert cond.until == Until(text="in a while"), seconds
+
+
+def test_an_out_of_range_bound_is_unanswerable_rather_than_fatal() -> None:
+    """Belt and braces on the seam itself: `Until` is also rebuilt from stored plans, so the parser
+    is not the only way one is constructed. An instant no calendar can represent is the same answer
+    as no anchor at all — unanswerable, which means "keep waiting", never "expired now"."""
+    declared = datetime(2024, 10, 15, 12, 0, tzinfo=UTC)
+    assert Until(text="in a while", seconds=1e15).deadline(declared) is None
+    assert Until(text="in a while", seconds=float("inf")).deadline(declared) is None
+
+
 def test_an_until_with_no_text_is_no_until_at_all() -> None:
     for raw in ({"seconds": 1800}, {"text": "   "}, "", "   ", 17, None):
         cond = pending_from_raw({**_RAW, "until": raw})

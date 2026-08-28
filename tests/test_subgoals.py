@@ -18,6 +18,7 @@ See ADR-0022. Grounding of an expanded step's remaining references is the ordina
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -36,6 +37,7 @@ from sora.memory import (
     ProceduralMemory,
     SemanticMemory,
     WorkingMemory,
+    _parse_plan_steps,
     step_from_raw,
 )
 from sora.perception import Message
@@ -964,6 +966,36 @@ def test_an_unrecognized_goal_kind_degrades_to_achievement() -> None:
     step = step_from_raw(raw)
     assert "goal_kind" not in step.params  # dropped rather than carried into a frame
     assert goal_kind_of(step) == "achievement"
+
+
+def test_a_goal_kind_that_is_not_even_a_string_degrades_the_same_way() -> None:
+    """The label is a model output, so it is not reliably a *string* either — `["maintenance"]` and
+    `{"kind": ...}` are exactly what a model emits when it over-structures a field. Membership
+    testing an unhashable value against the frozenset raises TypeError, which `_parse_plan_steps`
+    turns into ValueError, throwing away a perfectly good plan body over an optional label. That is
+    the opposite of the degradation this promises, and `goal_kind_of` already guards the same value
+    with an isinstance check on the read side."""
+    for kind in (["maintenance"], {"kind": "maintenance"}, 3, None):
+        raw = {"action": "subgoal", "goal": "watch the calendar", "goal_kind": kind}
+        step = step_from_raw(raw)
+        assert "goal_kind" not in step.params, kind
+        assert goal_kind_of(step) == "achievement", kind
+
+
+def test_a_plan_body_survives_an_unusable_goal_kind() -> None:
+    """The consequence that makes the above worth a test of its own: the body is what does the
+    work, so a label nobody can read must never take the steps down with it."""
+    plan = json.dumps(
+        {
+            "steps": [
+                {"action": "subgoal", "goal": "watch the calendar", "goal_kind": ["maintenance"]},
+                {"tool_id": "realestate", "operation_name": "search_apartments"},
+            ]
+        }
+    )
+    steps = _parse_plan_steps(plan)
+    assert [step.next_action for step in steps] == ["subgoal", "invoke"]
+    assert "goal_kind" not in steps[0].params
 
 
 def test_an_undeclared_goal_kind_reads_as_achievement() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -1150,13 +1151,20 @@ def step_from_raw(raw: dict[str, Any]) -> Step:
     if action == InvokeAction.name:
         return invoke_step(raw["tool_id"], raw["operation_name"], **raw.get("params", {}))
     params = {k: v for k, v in raw.items() if k != "action"}
-    if action == SUBGOAL and "goal_kind" in params and params["goal_kind"] not in GOAL_KINDS:
-        log.warning(
-            "plan: sub-goal %r declared an unknown goal_kind %r; reading it as %s",
-            params.get("goal"),
-            params.pop("goal_kind"),
-            GOAL_KIND_ACHIEVEMENT,
-        )
+    if action == SUBGOAL and "goal_kind" in params:
+        # `isinstance` first, and not merely for tidiness: membership-testing an unhashable value
+        # (a model that over-structures the field into `["maintenance"]`) raises TypeError, which
+        # `_parse_plan_steps` reports as a ValueError — discarding a usable body over an optional
+        # label. `goal_kind_of` guards the same value the same way on the read side.
+        kind = params["goal_kind"]
+        if not isinstance(kind, str) or kind not in GOAL_KINDS:
+            del params["goal_kind"]  # dropped here, not inside the log call, so it happens
+            log.warning(
+                "plan: sub-goal %r declared an unusable goal_kind %r; reading it as %s",
+                params.get("goal"),
+                kind,
+                GOAL_KIND_ACHIEVEMENT,
+            )
     return Step(next_action=action, params=params)
 
 
@@ -1213,6 +1221,13 @@ def pending_from_raw(raw: dict[str, Any]) -> PendingCondition | None:
     )
 
 
+# A century, which is not a monitoring window — it is "forever" written as a number. The cap is not
+# a policy on how long an agent may watch something; it is the range in which `Until.deadline` can
+# actually produce an instant. `timedelta` stops near 8.6e13 seconds and the datetime it is added to
+# stops at year 9999, and that arithmetic runs inside Observe, where an OverflowError ends the run.
+_MAX_UNTIL_SECONDS = 100 * 365 * 24 * 3600
+
+
 def _until_from_raw(raw: Any) -> Until | None:
     """An ``until`` as the planner may write it: a bare string (event-shaped — the judge answers
     it, which is what every plan did before bounds existed), or ``{"text": ..., "seconds": N}``
@@ -1223,7 +1238,9 @@ def _until_from_raw(raw: Any) -> Until | None:
     it is the safe direction twice over: the condition still ends (the judge is asked, as before),
     and a window that was meant to be bounded is never closed early by a number nobody can read.
     Zero is excluded for the same reason — a bound that expires at the instant it is declared would
-    retire the condition before its first sweep."""
+    retire the condition before its first sweep. So are non-finite and out-of-range values, which
+    are unreadable in the same sense: positive, and still naming no instant that arithmetic could
+    reach (`_MAX_UNTIL_SECONDS`)."""
     if isinstance(raw, str):
         return Until(text=raw) if raw.strip() else None
     if not isinstance(raw, dict):
@@ -1234,7 +1251,11 @@ def _until_from_raw(raw: Any) -> Until | None:
     seconds = raw.get("seconds")
     if isinstance(seconds, bool) or not isinstance(seconds, int | float):
         return Until(text=text)
-    return Until(text=text, seconds=float(seconds)) if seconds > 0 else Until(text=text)
+    if isinstance(seconds, float) and not math.isfinite(seconds):
+        return Until(text=text)  # tested before the range, so a huge int never reaches float()
+    if not 0 < seconds <= _MAX_UNTIL_SECONDS:
+        return Until(text=text)
+    return Until(text=text, seconds=float(seconds))
 
 
 def _parse_plan_pending(text: str) -> tuple[PendingCondition, ...]:
