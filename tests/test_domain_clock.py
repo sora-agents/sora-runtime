@@ -569,3 +569,112 @@ async def test_a_watch_with_no_source_names_no_clock_and_is_refused(tmp_path: Pa
     assert activity.superseded is not None
     defect = activity.superseded.defect
     assert defect is not None and "source" in defect
+
+
+# ------------------------------------------------------------------------------------------------
+# A window survives being re-declared: the bound is stated once, and the runtime carries it
+# ------------------------------------------------------------------------------------------------
+#
+# A relative `until` can only be written honestly at the moment the waiting starts. Any plan
+# produced *later* — a replan mid-window, a sub-plan inferred a few cycles in — is looking at a
+# window that is already open, was never told how much of it is left, and is (rightly) instructed
+# never to guess a `seconds`. So it writes an event-shaped string instead, the clock exit vanishes,
+# and the only remaining way out is a judge told to default to keeping. That is a window that never
+# closes, which is what these cover.
+
+
+async def test_a_declared_deadline_is_remembered_for_its_watch(tmp_path: Path) -> None:
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    _cycle_, working, registry = _cycle(tmp_path, clock=clock)
+    await registry.join(_ORIGIN)
+    plan = Plan(id="p", goal="watch", steps=[Step("wait", {})], pending=(_monitoring(),))
+    activity = Activity(id="a", goal="watch", context={}, plan=plan)
+
+    _lift_pending_conditions(activity, working)
+
+    assert activity.window_deadlines[_CALENDAR] == datetime(2024, 10, 15, 9, 4, tzinfo=UTC)
+
+
+async def test_a_replan_that_cannot_restate_the_bound_inherits_it(tmp_path: Path) -> None:
+    """The run that motivated this: the first plan bounds the window at four minutes, dies on an
+    unrelated defect, and the replan — now describing "the REMAINING time" — can only write an
+    event-shaped `until`. The deadline is the same instant either way, and the runtime knows it."""
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    cycle, working, registry = _cycle(tmp_path, clock=clock)
+    await registry.join(_ORIGIN)
+    first = Plan(id="p", goal="watch", steps=[Step("wait", {})], pending=(_monitoring(),))
+    activity = Activity(id="a", goal="watch", context={}, plan=first)
+    _lift_pending_conditions(activity, working)
+
+    activity.reset_for_replan(defect="unrelated")
+    activity.pending_conditions.clear()  # the replanned plan re-declares its own
+    clock.advance(100)
+    restated = _monitoring(Until(text="the user's original four-minute window has ended"))
+    activity.plan = Plan(id="p2", goal="watch", steps=[Step("wait", {})], pending=(restated,))
+    _lift_pending_conditions(activity, working)
+
+    state = activity.pending_conditions[0]
+    assert state.condition.until is not None and state.condition.until.seconds is None
+    # Inherited from the FIRST declaration, so the window still ends 4 minutes after it opened —
+    # not 4 minutes after the replan, which would silently extend it every time a plan is dropped.
+    assert state.inherited_deadline == datetime(2024, 10, 15, 9, 4, tzinfo=UTC)
+
+    activity.state = ActivityState.BLOCKED
+    activity.blocked_on = ConditionWait(watches=(_CALENDAR,))
+    working.activities["a"] = activity
+    clock.advance(141)  # 9:04:01 — past the inherited deadline
+    await cycle.strategies.observe.observe(cycle)
+
+    assert activity.pending_conditions == []
+
+
+async def test_a_declared_bound_always_beats_an_inherited_one(tmp_path: Path) -> None:
+    """Inheritance fills a hole; it never overrides. A plan that states its own window means it,
+    including a plan that deliberately shortens or lengthens what an earlier one declared."""
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    _cycle_, working, registry = _cycle(tmp_path, clock=clock)
+    await registry.join(_ORIGIN)
+    activity = Activity(id="a", goal="watch", context={})
+    activity.window_deadlines[_CALENDAR] = datetime(2024, 10, 15, 9, 4, tzinfo=UTC)
+    ten = _monitoring(Until(text="ten minutes have passed", seconds=600.0))
+    activity.plan = Plan(id="p", goal="watch", steps=[Step("wait", {})], pending=(ten,))
+
+    _lift_pending_conditions(activity, working)
+
+    state = activity.pending_conditions[0]
+    assert state.inherited_deadline is None
+    assert activity.window_deadlines[_CALENDAR] == datetime(2024, 10, 15, 9, 10, tzinfo=UTC)
+
+
+async def test_an_unrelated_watch_inherits_nothing(tmp_path: Path) -> None:
+    """The identity is the watch itself, not the activity — two windows on one activity are two
+    windows, and one closing must not close the other."""
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    _cycle_, working, registry = _cycle(tmp_path, clock=clock)
+    await registry.join(_ORIGIN)
+    activity = Activity(id="a", goal="watch", context={})
+    activity.window_deadlines[_CALENDAR] = datetime(2024, 10, 15, 9, 4, tzinfo=UTC)
+    other = PendingCondition(
+        watch=SignalWait(signal_name="state_changed", source="realestate", path="emails"),
+        when="mail arrives",
+        then="read it",
+        until=Until(text="the reply has come"),
+    )
+    activity.plan = Plan(id="p", goal="watch", steps=[Step("wait", {})], pending=(other,))
+
+    _lift_pending_conditions(activity, working)
+
+    assert activity.pending_conditions[0].inherited_deadline is None
+
+
+async def test_the_remembered_deadline_survives_a_replan(tmp_path: Path) -> None:
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    _cycle_, working, registry = _cycle(tmp_path, clock=clock)
+    await registry.join(_ORIGIN)
+    plan = Plan(id="p", goal="watch", steps=[Step("wait", {})], pending=(_monitoring(),))
+    activity = Activity(id="a", goal="watch", context={}, plan=plan)
+    _lift_pending_conditions(activity, working)
+
+    activity.reset_for_replan()
+
+    assert activity.window_deadlines[_CALENDAR] == datetime(2024, 10, 15, 9, 4, tzinfo=UTC)

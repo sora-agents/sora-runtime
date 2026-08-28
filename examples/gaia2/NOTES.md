@@ -669,3 +669,56 @@ the waste was that reaching it cost ~187k tokens, which is what the mechanical p
 **`PLAN_SYSTEM_PROMPT` changed, so Gaia2 numbers do not compare across this date.** The worked
 example added to it uses a neutral booking/`starts_at`/`ends_at` domain rather than the scenario's
 own fields, to avoid teaching the prompt the benchmark it is measured on.
+
+### Confirmed on two runs (2026-08-28, later)
+
+`aug28-run7-time-gpt-5.5` and `aug28-run6-time-kimi-2.5` are the first runs on the widened
+predicate. Model-backed filters went **9 → 1** (gpt-5.5) and **9 → 0** (kimi-2.5); total input
+tokens on the gpt-5.5 arm went 727k → 378k. Both models reached for the new grammar unprompted,
+gpt-5.5 writing the composed form three firings running:
+
+```
+filter  where {"path": "event_id", "op": "in", "value": {"$bind": "fired_added_ids"}}
+filter  where {"all": [{"path": "event_id", "op": "not_in", "value": {"$bind": "fired_added_ids"}},
+                       {"op": "overlaps", "start_path": "start_datetime", "end_path": "end_datetime",
+                        "against": {"$bind": "newly_added_events"}, ...}]}
+```
+
+Neither run finished cleanly, for two reasons that are **not** the predicate work.
+
+**1. A maintenance window that could not close (gpt-5.5).** The run was still ticking at cycle 9100
+on the retire-only sweep, its condition never retiring. Four separate plans declared the window's
+bound as `{"text": "four minutes have passed", "seconds": 240}` — and every one of them wrote it on
+the **sub-goal step**, where nothing read it. That is not a slip: the prompt said to give the
+sub-goal's own plan a `pending` condition, and a *mechanical* sub-goal has no plan (it splices its
+fan-out into the caller's), while a *deliberative* one's sub-plan is written cycles later, when the
+window is already open and its `seconds` can no longer be stated honestly. The step was the only
+place left. So the step-level block is now read, and the prompt says to put it there. Two smaller
+guards behind it: a resolved deadline is remembered per `watch` and inherited by a later condition
+on the same watch that cannot resolve one (a replan mid-window describes "the REMAINING time" and
+correctly refuses to guess a `seconds`), and an inherited deadline applies even when the replan
+drops the `until` entirely.
+
+Worth keeping in view: without a clock exit, the only way out is the retirement judge, which is
+instructed to *default to keeping*. An unbounded window therefore does not fail — it runs until the
+scenario clock kills it.
+
+**2. A type the tool could not take (kimi-2.5).** `get_calendar_event` returns `start_datetime` as
+an epoch **float**; `get_calendar_events_from_to` declares it a **string** in `YYYY-MM-DD HH:MM:SS`.
+The plan piped one into the other and ARE raised. A failed op terminates the activity, so the run
+died there, mid-window, on the first firing. Note the tool's own output does not round-trip into its
+own input — the sibling `start_strftime` is `"Saturday, 2024-10-19 22:00:00"`, which is not that
+format either — so no reference could have filled that parameter. Now checked before dispatch
+against the declared schema and reported as a plan defect naming the format and the producing
+reference, so it replans instead of dying. Nothing is coerced: `"1729375200.0"` would satisfy the
+type and still be the wrong argument. gpt-5.5 never hit this at all, because the mechanical `$prop`
++ `overlaps` path needs no datetime round-trip.
+
+**Observability.** Mechanical filters logged nothing, so a predicate matching zero items looked
+exactly like a collection that was empty to begin with — both end in "fanned out to 0 step(s)", and
+neither is an error. That gap was tolerable while filters mostly escalated to the model, which at
+least printed its item count; moving them onto the mechanical path is what made it load-bearing.
+They now log `kept N of M`.
+
+**`PLAN_SYSTEM_PROMPT` changed again on this date** (where a maintenance sub-goal's `until` goes),
+so the same non-comparability applies.

@@ -812,7 +812,15 @@ class FilterAction:  # predefined data-op: _filter_
                 ),
             )
             return
-        activity.bindings[out] = [e for e in collection if _matches(e, where)]
+        kept = [e for e in collection if _matches(e, where)]
+        activity.bindings[out] = kept
+        # Mechanical filters used to be the silent branch — only the model-backed one above logged,
+        # and it at least printed its item count. Now that composition and `overlaps` route most
+        # predicates here, that asymmetry hides the failure this layer is most prone to: a predicate
+        # that matches NOTHING looks downstream exactly like a collection that legitimately had
+        # nothing in it ("fanned out to 0 step(s)"), and neither is an error. The count is the only
+        # thing that separates a correct empty result from a wrong one, so it is worth a line.
+        log.info("data-op: filter %r kept %d of %d (mechanical)", out, len(kept), len(collection))
 
     async def _call(
         self,

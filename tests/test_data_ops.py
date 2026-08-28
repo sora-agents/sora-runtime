@@ -1640,3 +1640,27 @@ async def test_a_transient_select_failure_still_degrades_to_an_empty_binding(
 
     assert activity.bindings["qualifying"] == []
     assert activity.plan is not None  # not a replan
+
+
+async def test_a_mechanical_filter_reports_how_much_it_kept(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A predicate that matches nothing is downstream-indistinguishable from a collection that was
+    empty to begin with — both end in a sub-goal that "fanned out to 0 step(s)", and neither is an
+    error. The model-backed branch has always logged its item count; the mechanical one did not,
+    which stopped mattering only while predicates mostly escalated. Now that composition and
+    `overlaps` keep them here, the count is the only thing separating a correct empty result from a
+    silently wrong one."""
+    step = Step(
+        next_action="filter",
+        params={
+            "in": [{"v": 2}, {"v": 9}],
+            "out": "kept",
+            "where": {"path": "v", "op": "gt", "value": 5},
+        },
+    )
+    with caplog.at_level(logging.INFO, logger="sora.action"):
+        activity = await _run_one_dataop(tmp_path, step, [])
+
+    assert activity.bindings["kept"] == [{"v": 9}]
+    assert "data-op: filter 'kept' kept 1 of 2 (mechanical)" in caplog.text

@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 from sora.types import SupersededPlan  # constructed at run time by reset_for_replan
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from sora.types import (
         CompletedOperation,
         ConditionVerdict,
@@ -90,6 +92,13 @@ class Activity:
     # is usually where the agent first learns a branch exists (it sent the mail; now a reply may
     # come). Transient run state, like history/bindings: the durable copy is Plan.pending.
     pending_conditions: list[PendingConditionState] = field(default_factory=list)
+    # Deadlines already resolved for a `watch`, so a window survives being re-declared. A relative
+    # `until` can only be stated honestly at the moment the waiting starts; a plan written midway
+    # through an open window cannot restate it, and a replan is exactly that. Keyed by `watch`
+    # because the same watch IS the same window — a mechanical identity, not a resemblance. Kept
+    # across `reset_for_replan` for the same reason SEEDED_BINDINGS are: no plan produced this, so
+    # no plan's discarding makes it untrue.
+    window_deadlines: dict[SignalWait, datetime] = field(default_factory=dict)
     # A resolved condition evaluation parked for Reason's next pass — the pending-condition
     # counterpart to reconsider_verdict. Holds indices into the eligible list the call was made
     # about, so Reason re-derives that list to apply it. Transient run state.

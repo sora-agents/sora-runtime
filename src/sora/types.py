@@ -401,6 +401,19 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # change it never fired on. `_eligible_conditions` yields one percept per condition, so this is
     # also strictly more precise than the batch-wide union the judge sees.
     fired_changes: tuple[tuple[str, Change], ...] = ()
+    # A deadline this condition did not declare but INHERITED, because an earlier condition on the
+    # same `watch` declared one and the window it bounds is still the same window (ADR-0027 §5).
+    # Set only by the lift, only from `Activity.window_deadlines`, and only when this condition's
+    # own `until` yields no instant of its own — a declared bound always wins over an inherited one.
+    #
+    # It exists because a window's bound is expressible exactly once: `seconds` is counted from the
+    # moment waiting starts, so a plan written midway through an open window ("for the REMAINING
+    # time in the four-minute window") cannot honestly restate it, and a planner told never to guess
+    # a `seconds` correctly writes a plain string instead. That is the right call at plan time and
+    # the wrong outcome at run time — the clock exit disappears and the window can only be closed by
+    # a judge instructed to default to keeping, i.e. never. The runtime knows the instant the
+    # planner cannot re-derive, so it carries it rather than asking.
+    inherited_deadline: datetime | None = None
 
 
 @dataclass(frozen=True)

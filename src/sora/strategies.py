@@ -39,7 +39,13 @@ from sora.action import (
 )
 from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
 from sora.llm import log_llm_discarded
-from sora.memory import PerceptSnapshot, render_plan, render_steps, step_from_raw
+from sora.memory import (
+    PerceptSnapshot,
+    pending_from_raw,
+    render_plan,
+    render_steps,
+    step_from_raw,
+)
 from sora.perception import Percept
 from sora.types import (
     GOAL_KIND_ACHIEVEMENT,
@@ -56,6 +62,7 @@ from sora.types import (
     InferenceResult,
     InputWait,
     OperationInvocation,
+    PendingCondition,
     PendingConditionState,
     PropertyChange,
     RelevanceCandidate,
@@ -112,17 +119,82 @@ def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
                 continue
             known.add(condition)
             activity.pending_conditions.append(
-                PendingConditionState(
-                    condition=condition,
-                    declared_by=_frame_key(activity, depth),
-                    # The anchor a relative `until` is measured from, taken now because now is when
-                    # the waiting starts — and taken from the watched workspace's own clock, since
-                    # host wall-clock is a different clock entirely (ADR-0027 §5).
-                    declared_at=_domain_now(wm, condition.watch.source),
-                    evaluated_through=wm.signals_appended,
-                    derived_through=wm.property_changes_appended,
-                )
+                _lifted(condition, activity, wm, _frame_key(activity, depth))
             )
+
+
+def _lifted(
+    condition: PendingCondition,
+    activity: Activity,
+    wm: WorkingMemory,
+    declared_by: tuple[tuple[str, int], ...],
+) -> PendingConditionState:
+    """Build the run state for one newly-lifted condition, remembering or inheriting its deadline.
+
+    The anchor a relative `until` is measured from is taken NOW, because now is when the waiting
+    starts — and from the watched workspace's own clock, since host wall-clock is a different clock
+    entirely (ADR-0027 §5).
+
+    On top of that, a resolved deadline is remembered per `watch` and handed to a later condition on
+    the same watch that cannot resolve one of its own. That asymmetry is the point: a declared bound
+    always wins, and inheritance only ever fills a hole. It closes the case where a window outlives
+    the plan that declared it — a replan mid-window is told (rightly) never to guess a `seconds` it
+    was not given, so it writes an event-shaped string, and the clock exit the first plan had is
+    gone. Inheriting is not a guess: it is the bound the planner itself gave for this same watch.
+    """
+    declared_at = _domain_now(wm, condition.watch.source)
+    deadline = condition.until.deadline(declared_at) if condition.until else None
+    if deadline is not None:
+        activity.window_deadlines[condition.watch] = deadline
+    return PendingConditionState(
+        condition=condition,
+        declared_by=declared_by,
+        declared_at=declared_at,
+        inherited_deadline=(
+            activity.window_deadlines.get(condition.watch) if deadline is None else None
+        ),
+        evaluated_through=wm.signals_appended,
+        derived_through=wm.property_changes_appended,
+    )
+
+
+def _lift_step_conditions(step: Step, activity: Activity, wm: WorkingMemory) -> None:
+    """Lift any `pending` a SUB-GOAL STEP declares, at the moment that step is reached.
+
+    A plan declares conditions; a sub-goal step is not a plan, so this looks like the wrong home for
+    one. It is the only home a maintenance sub-goal has. Its window has to be bounded by an `until`,
+    and the two places the planner could otherwise put it are both unreachable: a MECHANICAL
+    sub-goal has no plan of its own at all (it splices its fan-out into the caller's plan), and a
+    DELIBERATIVE one's sub-plan is written a later cycle, by which point the window has already been
+    open for a while and its `seconds` can no longer be stated honestly. So the planner writes it
+    here — the last point where "for the next four minutes" is still literally true — and before
+    this it was read by nobody and dropped without a word.
+
+    Attributed to the frame the STEP lives in, not to a frame of its own. That is right in both
+    modes and for the same reason: neither pushes a frame the condition could belong to at the
+    moment it is declared, and a maintenance sub-goal is supposed to hold its caller open until the
+    window closes, which is exactly what attributing it here does.
+
+    Lifting is idempotent against the same dedup set the plan-level lift uses, so re-reaching the
+    step (a mechanical fan-out re-reads `step_index`) cannot double-declare a window.
+    """
+    raw = step.params.get("pending")
+    if not isinstance(raw, list):
+        return
+    known = {state.condition for state in activity.pending_conditions} | activity.retired_conditions
+    for entry in raw:
+        condition = pending_from_raw(entry) if isinstance(entry, dict) else None
+        if condition is None or condition in known:
+            continue
+        known.add(condition)
+        log.info(
+            "reason: sub-goal step declares a pending condition -> %r (until %r)",
+            condition.when,
+            condition.until.text if condition.until else None,
+        )
+        activity.pending_conditions.append(
+            _lifted(condition, activity, wm, _frame_key(activity, 0))
+        )
 
 
 def _clock_for_source(view: EnvironmentView, source: str | None) -> DomainClock | None:
@@ -1938,9 +2010,11 @@ class DefaultObserveStrategy:
     @staticmethod
     def _has_expired(wm: WorkingMemory, state: PendingConditionState) -> bool:
         until = state.condition.until
-        if until is None:
-            return False  # no stopping clause at all — nothing for a clock to answer
-        deadline = until.deadline(state.declared_at)
+        # An inherited deadline is consulted even when this condition declares no `until` at all: a
+        # replan that drops the clause entirely is the same lost bound as one that restates it
+        # event-shaped, and neither makes the window it was given eternal.
+        declared = until.deadline(state.declared_at) if until else None
+        deadline = declared or state.inherited_deadline
         if deadline is None:
             # Either event-shaped (the judge's question, not the clock's), or a declared bound with
             # no anchor because the workspace could not tell domain time when it was lifted.
@@ -4199,6 +4273,7 @@ class DefaultReasonStrategy:
         re-reads it. An empty collection expands to nothing and the sub-goal simply vanishes; one
         that could not be *read* is a plan defect instead -> replan (``_SUBGOAL_DEFECT``)."""
         mode = step.params.get("mode", "deliberative")
+        _lift_step_conditions(step, activity, wm)
         if mode == "deliberative":
             goal = step.params["goal"]
             # A `then` (see `_pursue_fired_condition`) restates the goal that declared it — the
@@ -4374,6 +4449,15 @@ class DefaultReasonStrategy:
                 log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
                 activity.reset_for_replan(defect=defect)
                 return None
+            mistyped = _mistyped_params(manual, routing[OPERATION_NAME], resolved, op_params)
+            if mistyped:
+                # Same defect class as `undeclared` above, one line down the same schema: the name
+                # was right and the value is not something the operation can take. Checked after
+                # grounding for the same reason, so a value the grounder produced is covered too.
+                defect = f"{routing[OPERATION_NAME]}: {'; '.join(mistyped)}"
+                log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
+                activity.reset_for_replan(defect=defect)
+                return None
             if resolved == op_params:
                 return step  # no references -> unchanged, reuse the original Step
             return replace(step, params={**routing, **resolved})
@@ -4517,6 +4601,85 @@ def _undeclared_params(
     if not isinstance(declared, dict):
         return []
     return sorted(key for key in params if key not in declared)
+
+
+# What each JSON-Schema `type` accepts, as Python. `bool` is excluded from the numeric rows on
+# purpose: it IS an `int` to Python, and a tool asking for a count that is handed True has been
+# mis-planned, not satisfied. Types outside this table (unions, `null`, anything an adapter invents)
+# are absent rather than empty — absent means "no opinion", which is how the check fails open.
+_JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int, float),  # 3.0 for an integer param is a JSON-round-trip artefact, not a defect
+    "number": (int, float),
+    "boolean": (bool,),
+    "array": (list, tuple),
+    "object": (dict,),
+}
+
+
+def _mistyped_params(
+    manual: Manual | None,
+    operation_name: str,
+    params: dict[str, Any],
+    raw: dict[str, Any],
+) -> list[str]:
+    """Params whose resolved value contradicts the type its schema declares, for a planner.
+
+    The sibling of `_undeclared_params`, and it exists for the identical reason: the wire raises
+    (ARE answers `Argument 'start_datetime' must be of type <class 'str'>, got <class 'float'>`), a
+    failed op terminates the activity, and so a plan that is otherwise right dies on a conversion.
+    It is a plan defect in the same sense too — the schema was in the catalog and the step wrote
+    past it. The motivating run piped `get_calendar_event`'s epoch-float `start_datetime` straight
+    into `get_calendar_events_from_to`, which declares a `YYYY-MM-DD HH:MM:SS` STRING; the run died
+    there, mid-maintenance-window, on the first firing.
+
+    Nothing is coerced. Turning 1729375200.0 into "1729375200.0" would satisfy the type and still be
+    the wrong argument — the operation wants a formatted date, and only the planner can know that.
+    Reporting it is the whole fix: the replan gets a defect naming the format and picks the field
+    that already carries it.
+
+    Fails open at every step where the schema is less than explicit — no manual, no spec, no
+    declared `properties`, a `type` this table has no row for, a value of None (that is
+    `_null_required_params`' question). A false positive here would refuse a call that WOULD have
+    worked, which is strictly worse than the failure being guarded against.
+
+    Names the reference a bad value came from, not just the parameter it landed in: the value is one
+    hop from its producer and the producer is what has to change.
+    """
+    spec = manual.operation(operation_name) if manual is not None else None
+    if spec is None:
+        return []
+    declared = spec.parameters.get("properties")
+    if not isinstance(declared, dict):
+        return []
+    problems = []
+    for key, value in params.items():
+        schema = declared.get(key)
+        if not isinstance(schema, dict) or value is None:
+            continue
+        declared_type = schema.get("type")
+        # A union (`["string", "null"]`) is a list, and an unhashable one — so this reads the type
+        # before looking it up, rather than after. A union means the schema has more than one
+        # opinion, which is no single opinion to check against.
+        accepted = _JSON_TYPES.get(declared_type) if isinstance(declared_type, str) else None
+        if accepted is None:
+            continue
+        # `bool` is an `int` to Python, so the isinstance below would wave True through for a
+        # declared number. Decide it first, in both directions.
+        if isinstance(value, bool):
+            if accepted == (bool,):
+                continue
+        elif isinstance(value, accepted):
+            continue
+        origin = raw.get(key)
+        came_from = f" (from {origin!r})" if isinstance(origin, dict) else ""
+        described = schema.get("description")
+        wants = f", which wants {described}" if isinstance(described, str) and described else ""
+        problems.append(
+            f"{key!r} must be {declared_type} but got {type(value).__name__} "
+            f"{value!r}{came_from}{wants}"
+        )
+    return problems
 
 
 def _null_required_params(

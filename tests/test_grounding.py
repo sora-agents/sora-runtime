@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
 from sora.action import default_action_registry, invoke_step
@@ -42,6 +43,7 @@ from sora.strategies import (
     DefaultSituateStrategy,
     Strategies,
     TickResult,
+    _mistyped_params,
     _null_required_params,
     _undeclared_params,
     resolve_references,
@@ -1289,3 +1291,121 @@ def test_every_undeclared_param_is_reported_not_just_the_first() -> None:
         "limit",
         "page",
     ]
+
+
+# --------------------------------------------------------------------------------------------------
+# A value the operation's schema cannot take is a PLAN defect, not a failed call
+# --------------------------------------------------------------------------------------------------
+# The sibling of the undeclared-parameter guard, one line down the same schema. A run died on
+# exactly this: a Calendar record's epoch-float `start_datetime` piped straight into an operation
+# declaring a `YYYY-MM-DD HH:MM:SS` string. The wire raised, and a failed op terminates the
+# activity — so an otherwise-correct plan lost its whole maintenance window to a conversion.
+# Nothing is coerced: "1729375200.0" would satisfy the type and still be the wrong argument.
+
+
+def _manual_with_types(tool_id: str, op: str, properties: dict[str, Any]) -> Manual:
+    return Manual(
+        id=tool_id,
+        metadata={},
+        description="",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(name=op, description="", parameters={"properties": properties})
+        ],
+    )
+
+
+def test_a_float_where_a_string_is_declared_is_reported() -> None:
+    manual = _manual_with_types(
+        "cal",
+        "events_from_to",
+        {"start_datetime": {"type": "string", "description": "in the format YYYY-MM-DD HH:MM:SS"}},
+    )
+
+    problems = _mistyped_params(manual, "events_from_to", {"start_datetime": 1729375200.0}, {})
+
+    assert len(problems) == 1
+    assert "must be string but got float" in problems[0]
+    # The format the operation wants, lifted from its own description — without it the planner is
+    # told the value is wrong but not what a right one would look like.
+    assert "YYYY-MM-DD HH:MM:SS" in problems[0]
+
+
+def test_the_reference_the_bad_value_came_from_is_named() -> None:
+    """A defect that names only the parameter blames the step that READ the value. The producer is
+    one hop away and is the thing that has to change."""
+    manual = _manual_with_types("cal", "events_from_to", {"start_datetime": {"type": "string"}})
+    raw = {"start_datetime": {"$from": "get_calendar_event", "path": "start_datetime"}}
+
+    problems = _mistyped_params(manual, "events_from_to", {"start_datetime": 1729375200.0}, raw)
+
+    assert "get_calendar_event" in problems[0]
+
+
+def test_matching_types_are_left_alone() -> None:
+    manual = _manual_with_types(
+        "t",
+        "op",
+        {
+            "s": {"type": "string"},
+            "n": {"type": "number"},
+            "i": {"type": "integer"},
+            "b": {"type": "boolean"},
+            "a": {"type": "array"},
+            "o": {"type": "object"},
+        },
+    )
+    params = {"s": "x", "n": 1.5, "i": 3, "b": True, "a": [1], "o": {"k": 1}}
+
+    assert _mistyped_params(manual, "op", params, {}) == []
+
+
+def test_an_integral_float_satisfies_an_integer_param() -> None:
+    """A JSON round-trip turns 3 into 3.0. Refusing that would reject a call that works."""
+    manual = _manual_with_types("t", "op", {"i": {"type": "integer"}})
+
+    assert _mistyped_params(manual, "op", {"i": 3.0}, {}) == []
+
+
+def test_a_bool_does_not_pass_as_a_number() -> None:
+    """`bool` is an `int` to Python, so the plain isinstance check would wave True through for a
+    declared number — an operation asked for a count and handed True has been mis-planned."""
+    manual = _manual_with_types("t", "op", {"n": {"type": "number"}})
+
+    assert len(_mistyped_params(manual, "op", {"n": True}, {})) == 1
+
+
+def test_a_number_does_not_pass_as_a_bool() -> None:
+    manual = _manual_with_types("t", "op", {"b": {"type": "boolean"}})
+
+    assert len(_mistyped_params(manual, "op", {"b": 1}, {})) == 1
+
+
+def test_a_null_is_left_to_the_required_param_guard() -> None:
+    """Two guards, one question each. Reporting null here would give a required-but-absent param a
+    type defect instead of the null defect that actually describes it."""
+    manual = _manual_with_types("t", "op", {"s": {"type": "string"}})
+
+    assert _mistyped_params(manual, "op", {"s": None}, {}) == []
+
+
+def test_the_check_fails_open_wherever_the_schema_is_not_explicit() -> None:
+    """Every one of these would be a false positive, which refuses a call that WOULD have worked —
+    strictly worse than the failure being guarded against."""
+    untyped = _manual_with_types("t", "op", {"s": {}})
+    assert _mistyped_params(untyped, "op", {"s": 1}, {}) == []
+
+    unknown_type = _manual_with_types("t", "op", {"s": {"type": "date-time"}})
+    assert _mistyped_params(unknown_type, "op", {"s": 1}, {}) == []
+
+    union = _manual_with_types("t", "op", {"s": {"type": ["string", "number"]}})
+    assert _mistyped_params(union, "op", {"s": 1}, {}) == []
+
+    undeclared_key = _manual_with_types("t", "op", {"other": {"type": "string"}})
+    assert _mistyped_params(undeclared_key, "op", {"s": 1}, {}) == []
+
+    assert _mistyped_params(None, "op", {"s": 1}, {}) == []
+
+    no_such_op = _manual_with_types("t", "different_op", {"s": {"type": "string"}})
+    assert _mistyped_params(no_such_op, "op", {"s": 1}, {}) == []

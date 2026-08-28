@@ -459,12 +459,19 @@ PLAN_SYSTEM_PROMPT = (
     'against the exhibition calendar"): there the steps are only the FIRST pass, and read as an '
     "achievement goal the runtime would take that first pass for the whole job and run straight on "
     "to whatever follows the sub-goal — the report telling the user it is all done — while the "
-    "window is still open. Keep the window itself in the sub-goal's `goal` text, and give that "
-    "sub-goal's own plan a `pending` condition whose `until` says when the window closes: that "
-    "`until` is the only thing that ends a maintenance sub-goal, and one that declares no such "
-    'condition ends as soon as its steps do. When the window is a stretch of time ("for the next '
-    "hour\"), say so with `until`'s object form described below — the runtime can then end the "
-    "sub-goal off the environment's own clock rather than by repeated judgement.\n"
+    "window is still open. Keep the window itself in the sub-goal's `goal` text, and put a "
+    '`pending` condition ON THE SUBGOAL STEP itself — the same {"pending": [ ... ]} block '
+    'described below, as a key of the step alongside "goal" and "mode" — whose `until` says when '
+    "the window closes: that `until` is the only thing that ends a maintenance sub-goal, and one "
+    "that declares no such condition ends as soon as its steps do. When the window is a stretch "
+    'of time ("for the next hour"), say so with `until`\'s object form described below — the '
+    "runtime can then end the sub-goal off the environment's own clock rather than by repeated "
+    "judgement. Declare it HERE even though the sub-goal will have a plan of its own: this step "
+    'is the last moment at which the window has not started yet, so it is the last moment "for '
+    'the next hour" is literally true and a `seconds` can be stated honestly. Writing it later — '
+    "in the sub-plan, or in a re-plan part-way through — means the window is already open, its "
+    "remaining length is not something you were told, and you would have to guess a `seconds` "
+    "(do not).\n"
     "To NARROW or RESHAPE a collection before you act on it — keep only the qualifying items, "
     "dedupe, sort, take the top few, gather per-item results, or reduce to a single number — emit "
     "one data-op step per transform (they compose in order, one per step; do NOT do it all at "

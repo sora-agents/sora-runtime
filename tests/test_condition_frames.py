@@ -501,3 +501,135 @@ def test_a_lifted_condition_is_attributed_to_its_own_frame_two_levels_down() -> 
     by_then = {state.condition.then: state.declared_by for state in activity.pending_conditions}
     assert by_then[_OTHER_THEN] == ()  # declared two frames up, by the top-level plan
     assert by_then["reconcile the calendar"] == (("top", 1),)  # the middle frame's own key
+
+
+# ------------------------------------------------------------------------------------------------
+# A window declared on the sub-goal STEP
+# ------------------------------------------------------------------------------------------------
+#
+# The planner has nowhere else to put a maintenance sub-goal's bound. A mechanical sub-goal has no
+# plan of its own (it splices its fan-out into the caller's), and a deliberative one's sub-plan is
+# written cycles later, by which point the window is already open and its `seconds` can no longer be
+# stated. So it writes the `pending` block on the step — which, before this, nothing read.
+
+_STEP_PENDING = [
+    {
+        "watch": {
+            "signal": "state_changed",
+            "source": "insim:are/Calendar",
+            "path": "events",
+            "kind": "added",
+        },
+        "when": "one or more calendar events have been added",
+        "then": _THEN,
+        "until": {"text": "four minutes have passed", "seconds": 240},
+    }
+]
+
+
+def _window_step(mode: str) -> Step:
+    extra: dict[str, Any] = (
+        {"in": [], "as": "e", "template": {"action": "wait"}} if mode == "mechanical" else {}
+    )
+    return Step(
+        next_action="subgoal",
+        params={
+            "goal": _ANCESTOR_GOAL,
+            "mode": mode,
+            "goal_kind": "maintenance",
+            "pending": _STEP_PENDING,
+            **extra,
+        },
+    )
+
+
+async def test_a_mechanical_sub_goals_step_declared_window_is_lifted(tmp_path: Path) -> None:
+    """The motivating shape: a mechanical maintenance sub-goal, whose window can be declared in
+    exactly one place. An empty collection fans out to nothing — the condition is still what the
+    step was for, so it must survive the step vanishing."""
+    cycle, working = _cycle(tmp_path)
+    plan = Plan(id="p", goal="watch", steps=[_window_step("mechanical"), Step("wait", {})])
+    activity = Activity(id="a1", goal="watch", context={}, plan=plan)
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert len(activity.pending_conditions) == 1
+    state = activity.pending_conditions[0]
+    assert state.condition.then == _THEN
+    assert state.condition.until is not None and state.condition.until.seconds == 240.0
+    # Attributed to the frame the step lives in — the top-level plan here — so the window holds the
+    # activity open rather than belonging to a frame that was never pushed.
+    assert state.declared_by == ()
+
+
+async def test_a_deliberative_sub_goals_step_declared_window_is_lifted(tmp_path: Path) -> None:
+    cycle, working = _cycle(tmp_path)
+    cycle.procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "p2"), llm=FakeLLMClient())
+    plan = Plan(id="p", goal="watch", steps=[_window_step("deliberative")])
+    activity = Activity(id="a1", goal="watch", context={}, plan=plan)
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    assert [s.condition.then for s in activity.pending_conditions] == [_THEN]
+
+
+async def test_a_step_declared_window_is_not_declared_twice(tmp_path: Path) -> None:
+    """A mechanical fan-out leaves `step_index` on its own expansion and `reason` re-reads it, so
+    the step is reachable more than once. Declaring the window again would give the activity two
+    copies of one commitment, and retiring one would leave it waiting on the other for good."""
+    cycle, working = _cycle(tmp_path)
+    plan = Plan(id="p", goal="watch", steps=[_window_step("mechanical"), Step("wait", {})])
+    activity = Activity(id="a1", goal="watch", context={}, plan=plan)
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    activity.plan = plan  # as if the step were reached again
+    activity.step_index = 0
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert len(activity.pending_conditions) == 1
+
+
+async def test_a_retired_step_declared_window_is_not_put_back(tmp_path: Path) -> None:
+    cycle, working = _cycle(tmp_path)
+    plan = Plan(id="p", goal="watch", steps=[_window_step("mechanical"), Step("wait", {})])
+    activity = Activity(id="a1", goal="watch", context={}, plan=plan)
+    working.activities["a1"] = activity
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    activity.retired_conditions.add(activity.pending_conditions[0].condition)
+    activity.pending_conditions.clear()
+
+    activity.plan = plan
+    activity.step_index = 0
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.pending_conditions == []
+
+
+async def test_a_step_with_a_malformed_pending_block_still_runs(tmp_path: Path) -> None:
+    """Same degradation as the plan-level block: a mis-shaped clause is dropped, never raised. The
+    body is the part that does the work."""
+    cycle, working = _cycle(tmp_path)
+    step = Step(
+        next_action="subgoal",
+        params={
+            "goal": _ANCESTOR_GOAL,
+            "mode": "mechanical",
+            "in": [],
+            "as": "e",
+            "template": {"action": "wait"},
+            "pending": [{"when": "no watch at all"}, "not even a dict"],
+        },
+    )
+    activity = Activity(
+        id="a1", goal="watch", context={}, plan=Plan(id="p", goal="w", steps=[step])
+    )
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.pending_conditions == []
+    assert activity.plan is not None  # not dropped as a defect
