@@ -354,16 +354,18 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # messages_cursor takes, correct there because a message must create an activity at most once)
     # would let the first condition to advance it blind every other reader of that broadcast log.
     condition: PendingCondition
-    # Which FRAME declared this condition, as the chain of (plan id, sub-goal step index) that
-    # reaches it — `()` for the top-level plan. Lifting copies conditions off every live frame onto
-    # the activity and thereby erases where each came from, which is exactly what a maintenance
-    # frame's completion rule needs back (ADR-0027): only the conditions a frame declared ITSELF
-    # hold it, or a condition declared by the top-level plan pins an unrelated sub-plan open and the
-    # parent's own remaining steps never run. The chain, not the declaring plan's id: a fired
-    # condition's `then` REPLACES the body at the declaring depth (it pushes no frame), so an
-    # attribution naming the plan would release the frame after the first firing — the motivating
-    # run's failure exactly — while the frame's chain is unchanged by that swap. A sibling sub-goal
-    # pushed at another step of the same parent differs in the index, so it is a different frame.
+    # Which FRAME this condition governs, as the chain of (plan id, sub-goal step index) that
+    # reaches it — `()` for the top-level plan. Usually that is the frame whose Plan.pending
+    # declared it; a condition on a deliberative sub-goal step is assigned to the future child
+    # frame instead, because that step opens and owns the child's maintenance window. Lifting onto
+    # the activity erases provenance, which is exactly what a maintenance frame's completion rule
+    # needs back (ADR-0027): only the conditions governing a frame hold it, or a condition from the
+    # top level pins an unrelated sub-plan open and the parent's own remaining steps never run. The
+    # chain, not the declaring plan's id: a fired condition's `then` REPLACES the body at the
+    # declaring depth (it pushes no frame), so an attribution naming the plan would release the
+    # frame after the first firing — the motivating run's failure exactly — while the frame's chain
+    # is unchanged by that swap. A sibling sub-goal pushed at another step of the same parent
+    # differs in the index, so it is a different frame.
     declared_by: tuple[tuple[str, int], ...] = ()
     # DOMAIN time when this condition was lifted onto the activity, read off the clock of the
     # workspace owning its watch — the anchor a relative `until` ("four minutes after ...") is

@@ -86,11 +86,12 @@ class Activity:
     # conditions outliving an exhausted body, set when the body runs out with conditions still
     # unsatisfied. Named generally (not blocked_on_signal) to admit these later variants.
     blocked_on: SignalWait | InputWait | ConditionWait | None = None
-    # Per-run state for Plan.pending: which declared conditions are still unsatisfied and how far
-    # each has evaluated. Conditions declared by ANY frame are lifted here when that frame pops —
-    # the point of a condition is to outlive the plan that noticed it, and a deliberative sub-goal
-    # is usually where the agent first learns a branch exists (it sent the mail; now a reply may
-    # come). Transient run state, like history/bindings: the durable copy is Plan.pending.
+    # Per-run state for conditions declared by Plan.pending or by a maintenance sub-goal step:
+    # which are still unsatisfied and how far each has evaluated. Conditions declared by ANY frame
+    # are lifted here — the point of a condition is to outlive the plan that noticed it, and a
+    # deliberative sub-goal is usually where the agent first learns a branch exists (it sent the
+    # mail; now a reply may come). Transient run state, like history/bindings: the durable copy is
+    # on the Plan, or on the sub-goal Step that opens a bounded maintenance window.
     pending_conditions: list[PendingConditionState] = field(default_factory=list)
     # Deadlines already resolved for a `watch`, so a window survives being re-declared. A relative
     # `until` can only be stated honestly at the moment the waiting starts; a plan written midway

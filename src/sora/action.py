@@ -430,7 +430,10 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # sub-goal from a top-level goal — `parent_frames` is unambiguous here because the only
         # other infer fires when `plan is None`, and a reset clears the whole stack with the plan.
         # Seeding it (rather than adding a flag) keeps the PlanPrompt Protocol unchanged, so an
-        # existing custom prompt keeps working and gains the ancestor chain for free.
+        # existing custom prompt keeps working and gains the ancestor chain for free. A condition
+        # declared on the invoking step is already attributed to this future frame too; the default
+        # prompt renders it as the child's governing lifecycle contract, and ProceduralMemory uses
+        # the same structural match to reject a second Plan.pending declaration from the child.
         # kind=="then" is the exception: Observe installs a fired condition's `then` at the current
         # depth without pushing, so seeding a frame here would describe a stack position the plan
         # will never occupy — and name the exhausted body it replaces as its parent.

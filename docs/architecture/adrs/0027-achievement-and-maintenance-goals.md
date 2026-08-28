@@ -91,6 +91,21 @@ did.
 
 This replaces the stopgap. Under it, only a *maintenance* frame is held by its own conditions.
 
+For a condition declared on the **sub-goal step**, "its own" is structural rather than textual:
+
+* a mechanical sub-goal pushes no frame, so the condition governs the current frame;
+* a deliberative sub-goal's step governs the future child frame identified by the caller plan id
+  and sub-goal step index. The condition is lifted when the step is reached, before inference, but
+  is attributed to the child frame that will be pushed when the inferred plan installs.
+
+That step is the **sole owner of the deliberative child's monitoring lifecycle**. The child planner
+is shown the governing conditions as dynamic context and plans only the body that runs inside the
+window; it must not declare a second plan-level `pending` block. The inference boundary enforces
+that rule and gives a violating response the ordinary single corrective retry. It does not attempt
+to merge conditions by prose or by `watch`: two independent branches may legitimately watch the
+same signal, and resemblance is not identity. If the invoking step declares no governing
+condition, a child plan may still use `Plan.pending` normally.
+
 One part of the stopgap is **not** a goal-kind question and survives for both kinds: a frame is also
 held while it owes committed work — a queued `condition_fired` or an unapplied `condition_verdict`.
 That is "do not let the parent run ahead of work already accepted", and it applies regardless of

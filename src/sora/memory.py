@@ -1107,6 +1107,40 @@ def _render_goal_provenance(activity: Activity) -> str:
     )
 
 
+def _governing_step_conditions(activity: Activity) -> tuple[PendingCondition, ...]:
+    """Conditions the invoking step already assigned to this not-yet-installed child frame.
+
+    ``InferAction`` prompts for a deliberative sub-goal against a throwaway activity copy: its
+    active ``plan`` is still the caller, and that same caller is appended as the innermost parent
+    frame the real activity will push when the result installs. That otherwise-impossible shape is
+    the marker that this is a child-plan target rather than an installed frame or a ``then`` plan.
+    Step-owned conditions carry the future frame key already, so matching that key needs no prose
+    comparison and does not merge distinct conditions that happen to watch the same signal.
+    """
+    if not activity.parent_frames or activity.plan is None:
+        return ()
+    parent, index, _mark = activity.parent_frames[-1]
+    if activity.plan is not parent or activity.step_index != index:
+        return ()
+    key = tuple((plan.id, step_index) for plan, step_index, _ in activity.parent_frames)
+    return tuple(
+        state.condition for state in activity.pending_conditions if state.declared_by == key
+    )
+
+
+def _render_governing_step_conditions(activity: Activity) -> str:
+    conditions = _governing_step_conditions(activity)
+    if not conditions:
+        return ""
+    return (
+        "Governing pending conditions from the invoking sub-goal step:\n"
+        f"{render_pending(conditions)}\n"
+        "These conditions already own this sub-goal's lifecycle and its monitoring window. Plan "
+        "only the body that runs inside that window. Do not return a top-level `pending` field: "
+        "redeclaring even an equivalent condition would create a second independent waiter.\n"
+    )
+
+
 def default_plan_prompt(
     activity: Activity,
     tools: dict[str, Manual],
@@ -1126,6 +1160,7 @@ def default_plan_prompt(
     user = (
         f"Goal: {activity.goal}\n"
         f"{_render_goal_provenance(activity)}\n"
+        f"{_render_governing_step_conditions(activity)}"
         f"Available tools and their operations:\n{render_tools(tools)}\n\n"
         f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
         f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
@@ -1366,10 +1401,12 @@ def _iter_json_objects(text: str) -> Iterator[str]:
 
 
 REPARSE_FEEDBACK = (
-    "\n\nYour previous answer could not be parsed as JSON and was discarded. The parser reported:\n"
+    "\n\nYour previous answer could not be parsed or did not satisfy the response contract, and "
+    "was discarded. The parser or contract validator reported:\n"
     "{error}\n\nHere is exactly what you returned:\n{output}\n\n"
-    "Return the SAME answer with the syntax fixed — a single well-formed JSON object and nothing "
-    "else, no prose and no markdown fences. Do not change what the answer says; only make it parse."
+    "Correct exactly the reported problem and return a single well-formed JSON object and nothing "
+    "else — no prose and no markdown fences. Preserve everything that the report does not require "
+    "you to change."
 )
 
 
@@ -2132,15 +2169,24 @@ class ProceduralMemory:
             )
         system, user = self._prompt(activity, tools, observed or PerceptSnapshot(), messages or [])
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
+        governing = _governing_step_conditions(activity)
 
         def _to_plan(text: str) -> Plan:
             # Both halves parse from the same object, so they share the one retry: a plan recovered
             # without its declared conditions would look complete while quietly dropping the gate.
+            steps = _parse_plan_steps(text)
+            pending = _parse_plan_pending(text)
+            if governing and pending:
+                raise ValueError(
+                    "this sub-goal is already governed by pending conditions declared on its "
+                    "invoking step, so its child plan must not declare Plan.pending; omit the "
+                    "top-level pending field and return only the child plan body"
+                )
             return Plan(
                 id=uuid.uuid4().hex,
                 goal=activity.goal,
-                steps=_parse_plan_steps(text),
-                pending=_parse_plan_pending(text),
+                steps=steps,
+                pending=pending,
             )
 
         return await _complete_and_parse(self._llm, system, user, _to_plan, what="plan inference")

@@ -170,10 +170,11 @@ def _lift_step_conditions(step: Step, activity: Activity, wm: WorkingMemory) -> 
     here — the last point where "for the next four minutes" is still literally true — and before
     this it was read by nobody and dropped without a word.
 
-    Attributed to the frame the STEP lives in, not to a frame of its own. That is right in both
-    modes and for the same reason: neither pushes a frame the condition could belong to at the
-    moment it is declared, and a maintenance sub-goal is supposed to hold its caller open until the
-    window closes, which is exactly what attributing it here does.
+    A mechanical sub-goal pushes no frame, so its condition belongs to the current frame. A
+    deliberative sub-goal does push one once inference resolves, and the step's condition governs
+    that future child frame: assigning it to the caller would let the child exhaust and pop while
+    the window was still open. The future key is already determinate from the current plan id and
+    step index; it is the same tuple ``InferAction`` appends to the target copy it prompts against.
 
     Lifting is idempotent against the same dedup set the plan-level lift uses, so re-reaching the
     step (a mechanical fan-out re-reads `step_index`) cannot double-declare a window.
@@ -182,6 +183,11 @@ def _lift_step_conditions(step: Step, activity: Activity, wm: WorkingMemory) -> 
     if not isinstance(raw, list):
         return
     known = {state.condition for state in activity.pending_conditions} | activity.retired_conditions
+    owner = _frame_key(activity, 0)
+    if step.params.get("mode", "deliberative") == "deliberative":
+        plan = activity.plan
+        assert plan is not None  # a sub-goal step is dispatched only from a set plan
+        owner += ((plan.id, activity.step_index),)
     for entry in raw:
         condition = pending_from_raw(entry) if isinstance(entry, dict) else None
         if condition is None or condition in known:
@@ -192,9 +198,7 @@ def _lift_step_conditions(step: Step, activity: Activity, wm: WorkingMemory) -> 
             condition.when,
             condition.until.text if condition.until else None,
         )
-        activity.pending_conditions.append(
-            _lifted(condition, activity, wm, _frame_key(activity, 0))
-        )
+        activity.pending_conditions.append(_lifted(condition, activity, wm, owner))
 
 
 def _clock_for_source(view: EnvironmentView, source: str | None) -> DomainClock | None:

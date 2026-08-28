@@ -574,6 +574,81 @@ async def test_a_deliberative_sub_goals_step_declared_window_is_lifted(tmp_path:
     await _settle()
 
     assert [s.condition.then for s in activity.pending_conditions] == [_THEN]
+    # The step opens a real child frame. Its condition governs that frame, not the parent frame the
+    # step happens to live in, so the empty child body below cannot pop past the monitoring window.
+    assert activity.pending_conditions[0].declared_by == (("p", 0),)
+
+
+async def test_a_deliberative_child_prompt_is_told_its_step_already_governs_the_window(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    plan = Plan(id="p", goal="watch", steps=[_window_step("deliberative")])
+    activity = Activity(id="a1", goal="watch", context={}, plan=plan)
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, prompt = llm.calls[-1]
+    assert "Governing pending conditions from the invoking sub-goal step" in prompt
+    assert "one or more calendar events have been added" in prompt
+    assert "Do not return a top-level `pending` field" in prompt
+
+
+async def test_a_deliberative_child_cannot_redeclare_its_step_owned_window(
+    tmp_path: Path,
+) -> None:
+    duplicate = json.dumps({"steps": [], "pending": _STEP_PENDING})
+    corrected = json.dumps({"steps": []})
+    llm = FakeLLMClient([duplicate, corrected])
+    cycle, working = _cycle(tmp_path, llm)
+    parent = Plan(id="p", goal="watch", steps=[_window_step("deliberative")])
+    activity = Activity(id="a1", goal="watch", context={}, plan=parent)
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    assert len(llm.calls) == 2
+    assert "must not declare Plan.pending" in llm.calls[1][1]
+    assert len(activity.pending_conditions) == 1  # the step-owned condition, never a second waiter
+
+    await cycle.strategies.observe.observe(cycle)
+    assert activity.plan is not None
+    assert activity.plan.pending == ()
+
+
+async def test_a_step_owned_window_holds_an_empty_deliberative_child_until_retirement(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    parent = Plan(
+        id="p",
+        goal="watch",
+        steps=[_window_step("deliberative"), Step("wait", {})],
+    )
+    activity = Activity(id="a1", goal="watch", context={}, plan=parent)
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+    await cycle.strategies.observe.observe(cycle)
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.parent_frames == [(parent, 0, 0)]
+    assert activity.state is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, ConditionWait)
+
+    activity.condition_batch = list(activity.pending_conditions)
+    activity.condition_verdict = ConditionVerdict(retired=(0,))
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    result = await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.parent_frames == []
+    assert result.step == parent.steps[1]
 
 
 async def test_a_step_declared_window_is_not_declared_twice(tmp_path: Path) -> None:
