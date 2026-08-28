@@ -523,6 +523,12 @@ def main(argv: list[str] | None = None) -> None:
     if "" not in sys.path:
         sys.path.insert(0, "")
 
+    # Once for the sweep, not per scenario, and before any ARE import: ARE reads DEMO_FS_PATH at
+    # import time and binds it as a default argument, so staging it later is a silent no-op.
+    from examples.gaia2._local_fs import ensure_local_fallback_fs
+
+    ensure_local_fallback_fs()
+
     _run_capability(args)
     _print_report(aggregate(args.output_dir))
 

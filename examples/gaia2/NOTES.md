@@ -593,3 +593,40 @@ contact search is name-based, not job-based), the plan-defect check caught the d
 before any write, and the replan filtered the `Contacts` property instead and found the right
 person. The cost of being right was a third of the scenario's life — a statement about the model's
 latency, not about the recovery.
+
+## Update (2026-08-28): every run was blind to the first ~66s of its own timeline
+
+Found while root-causing a `time` scenario the judge failed for a single missing write
+(`Calendar__delete_calendar_event`: agent 4, oracle 5). Not a reasoning failure — the agent never
+perceived the event that made the fifth delete necessary, and the four it did make were exactly
+right for what it could see.
+
+ARE's `Files` app restores a tree of empty placeholders backed by a Hugging Face dataset (294 files,
+~247 MiB), copying real bytes down only on read. But `get_state()` lists that tree *with sizes*, and
+`FallbackFileSystem` answers each placeholder's size by asking the fallback — one `paths-info`
+request per file. Nothing is downloaded; it is ~294 metadata round-trips, ~66s, and it happens
+**twice** per run (~592 calls, ~135s): once while the oracle graph is built, then again on the
+agent's first Observe, because `set_fallback_root` clears the stat registry and re-marks every entry
+lazy. Measured stage-by-stage, scenario startup was ~97% Hub round-trips.
+
+Only the second one breaks correctness. `AreInProcessWorkspaceAdapter.discover()` starts the ARE
+clock *before* `Tool.focus()` takes the change baseline, so those ~66s of timeline elapse during the
+baseline read. Anything the scenario injects in that window is already in the baseline and can never
+diff as `added`, so no signal ever fires. In `scenario_universe_27_daamy9` two of six injected events
+landed there; one of them was the only conflict for the delete the agent never made. It is visible
+in any run log as a first plan prompt whose `Calendar.state` holds more events than the scenario's
+initial state, beside "(none observed yet)" — and it reads `x 410` (vs. 408) in the aug26, aug27 and
+aug28 `time` logs alike, so **every** run so far lost roughly the first 6.6% of its budget's events.
+
+The upstream cause is small: `_get_fallback_stats_for_item` calls `HfFileSystem.info(path)` bare,
+which defaults `expand_info=True` and so rejects the dircache the cheap listing already populated
+(its `last_commit` is None). It reads only `size`/`mode`, both already cached; `expand_info=False`
+would need zero extra calls.
+
+Fixed here by staging the fallback locally before ARE is imported (`_local_fs.py`, called from both
+drivers) — 592 Hub calls to 1, ~135s to ~0.3s, baseline back to the true 408 events at clock 0.15s,
+file contents still resolving. Downloading the whole 247 MiB takes ~30s, less than half the time
+stock ARE spends merely stat-ing it, so the mirror is cheaper than the status quo even on a cold
+cache. Scores are unaffected (same bytes, same tree); timings are not, so **runs before this date
+are not timing-comparable**, and runs before it on time-sensitive scenarios were scored against a
+handicap that had nothing to do with the agent.

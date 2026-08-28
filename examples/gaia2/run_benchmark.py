@@ -162,6 +162,12 @@ def main(argv: list[str] | None = None) -> None:
     if "" not in sys.path:
         sys.path.insert(0, "")
 
+    # Before any ARE import: ARE reads DEMO_FS_PATH at import time and binds it as a default
+    # argument, so staging it afterwards is a silent no-op. See _local_fs for what it costs.
+    from examples.gaia2._local_fs import ensure_local_fallback_fs
+
+    ensure_local_fallback_fs()
+
     # Lazy: ARE and the LLM client are optional dependency groups, only needed for an actual run.
     from examples.gaia2._runner import run_scenario
     from sora.adapters.are_sim import (

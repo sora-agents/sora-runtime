@@ -30,6 +30,29 @@ The `-64k` step is not optional — a plan prompt overruns Ollama's default cont
 silently truncated. See [`qwen3-30b-64k.Modelfile`](qwen3-30b-64k.Modelfile) for why the window
 cannot be set per request.
 
+### The file-system fallback is staged locally
+
+Both drivers call `ensure_local_fallback_fs()` before importing ARE, which downloads ARE's
+`demo_filesystem` (294 files, ~247 MiB) once into the standard Hugging Face cache and points
+`DEMO_FS_PATH` at it. This is not just a speed-up. Stock ARE answers every placeholder's file size
+with its own `paths-info` request, so each `Files.get_state()` costs ~294 round-trips and ~66s —
+twice per run. The second one lands *inside* the agent's focus baseline while the scenario clock is
+already running, so the agent never perceives anything the scenario injects in that window. A run
+log shows it as a first plan prompt whose `Calendar.state` holds more events than the scenario's
+initial state, beside "(none observed yet)". See [`_local_fs.py`](_local_fs.py).
+
+The first run pays ~30s to download; after that it is free and offline. Same bytes and same tree, so
+scores are unaffected — but timings are, so runs from before this are not comparable.
+
+- `SORA_GAIA2_LOCAL_FS=0` — opt out, use the Hub (slow, and blind at the head of the timeline).
+- `DEMO_FS_PATH=/some/path` — preset wins; point it at your own tree.
+- `GAIA2_FS_REVISION=<sha>` — track a different upstream commit than the pinned one.
+
+Once the snapshot is cached, `HF_HUB_OFFLINE=1` runs fine *on top of* this. Do not reach for it
+*instead*: with ARE still pointed at the Hub, its stat-failure path *deletes* the file's registry
+entry, permanently un-backing it, so a later read returns the empty placeholder rather than an
+error — a broken run that looks like a working one.
+
 > Gaia2 data is Meta's and gated by the dataset terms — fetch it on demand, never redistribute it.
 > `*.scenario.json` and the whole `scenarios/` directory are gitignored; keep fetched scenarios in
 > one of those two, since a scenario fetched by id keeps an upstream filename that the suffix
