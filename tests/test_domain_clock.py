@@ -49,6 +49,7 @@ from sora.strategies import (
     Strategies,
     TickResult,
     _clock_for_source,
+    _condition_window_key,
     _lift_pending_conditions,
 )
 from sora.types import (
@@ -616,7 +617,7 @@ async def test_a_watch_with_no_source_names_no_clock_and_is_refused(tmp_path: Pa
 # closes, which is what these cover.
 
 
-async def test_a_declared_deadline_is_remembered_for_its_watch(tmp_path: Path) -> None:
+async def test_a_declared_deadline_is_remembered_for_its_condition(tmp_path: Path) -> None:
     clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
     _cycle_, working, registry = _cycle(tmp_path, clock=clock)
     await registry.join(_ORIGIN)
@@ -625,7 +626,9 @@ async def test_a_declared_deadline_is_remembered_for_its_watch(tmp_path: Path) -
 
     _lift_pending_conditions(activity, working)
 
-    assert activity.window_deadlines[_CALENDAR] == datetime(2024, 10, 15, 9, 4, tzinfo=UTC)
+    assert activity.window_deadlines[_condition_window_key(_monitoring())] == datetime(
+        2024, 10, 15, 9, 4, tzinfo=UTC
+    )
 
 
 async def test_a_replan_that_cannot_restate_the_bound_inherits_it(tmp_path: Path) -> None:
@@ -668,7 +671,9 @@ async def test_a_declared_bound_always_beats_an_inherited_one(tmp_path: Path) ->
     _cycle_, working, registry = _cycle(tmp_path, clock=clock)
     await registry.join(_ORIGIN)
     activity = Activity(id="a", goal="watch", context={})
-    activity.window_deadlines[_CALENDAR] = datetime(2024, 10, 15, 9, 4, tzinfo=UTC)
+    activity.window_deadlines[_condition_window_key(_monitoring())] = datetime(
+        2024, 10, 15, 9, 4, tzinfo=UTC
+    )
     ten = _monitoring(Until(text="ten minutes have passed", seconds=600.0))
     activity.plan = Plan(id="p", goal="watch", steps=[Step("wait", {})], pending=(ten,))
 
@@ -676,7 +681,9 @@ async def test_a_declared_bound_always_beats_an_inherited_one(tmp_path: Path) ->
 
     state = activity.pending_conditions[0]
     assert state.inherited_deadline is None
-    assert activity.window_deadlines[_CALENDAR] == datetime(2024, 10, 15, 9, 10, tzinfo=UTC)
+    assert activity.window_deadlines[_condition_window_key(ten)] == datetime(
+        2024, 10, 15, 9, 10, tzinfo=UTC
+    )
 
 
 async def test_an_unrelated_watch_inherits_nothing(tmp_path: Path) -> None:
@@ -686,7 +693,9 @@ async def test_an_unrelated_watch_inherits_nothing(tmp_path: Path) -> None:
     _cycle_, working, registry = _cycle(tmp_path, clock=clock)
     await registry.join(_ORIGIN)
     activity = Activity(id="a", goal="watch", context={})
-    activity.window_deadlines[_CALENDAR] = datetime(2024, 10, 15, 9, 4, tzinfo=UTC)
+    activity.window_deadlines[_condition_window_key(_monitoring())] = datetime(
+        2024, 10, 15, 9, 4, tzinfo=UTC
+    )
     other = PendingCondition(
         watch=SignalWait(signal_name="state_changed", source="realestate", path="emails"),
         when="mail arrives",
@@ -700,6 +709,37 @@ async def test_an_unrelated_watch_inherits_nothing(tmp_path: Path) -> None:
     assert activity.pending_conditions[0].inherited_deadline is None
 
 
+async def test_an_independent_window_on_the_same_watch_inherits_nothing(tmp_path: Path) -> None:
+    """A watch is only the mechanical gate, not the window's identity. Two conditions may inspect
+    the same changes for different purposes, and the first one's deadline must not close the
+    second one's independently bounded lifecycle."""
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    _cycle_, working, registry = _cycle(tmp_path, clock=clock)
+    await registry.join(_ORIGIN)
+    first = _monitoring()
+    independent = PendingCondition(
+        watch=_CALENDAR,
+        when="a newly added event needs an attendee reminder",
+        then="send the attendee reminder",
+        until=Until(text="the independent reminder window has ended"),
+    )
+    activity = Activity(
+        id="a",
+        goal="watch",
+        context={},
+        plan=Plan(
+            id="p",
+            goal="watch",
+            steps=[Step("wait", {})],
+            pending=(first, independent),
+        ),
+    )
+
+    _lift_pending_conditions(activity, working)
+
+    assert activity.pending_conditions[1].inherited_deadline is None
+
+
 async def test_the_remembered_deadline_survives_a_replan(tmp_path: Path) -> None:
     clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
     _cycle_, working, registry = _cycle(tmp_path, clock=clock)
@@ -710,4 +750,6 @@ async def test_the_remembered_deadline_survives_a_replan(tmp_path: Path) -> None
 
     activity.reset_for_replan()
 
-    assert activity.window_deadlines[_CALENDAR] == datetime(2024, 10, 15, 9, 4, tzinfo=UTC)
+    assert activity.window_deadlines[_condition_window_key(_monitoring())] == datetime(
+        2024, 10, 15, 9, 4, tzinfo=UTC
+    )

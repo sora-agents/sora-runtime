@@ -399,8 +399,8 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # mutable field into a ConditionFiring before queueing it; the live waiter may be evaluated
     # again while that older firing is still waiting to be pursued.
     fired_changes: tuple[tuple[str, Change], ...] = ()
-    # A deadline this condition did not declare but INHERITED, because an earlier condition on the
-    # same `watch` declared one and the window it bounds is still the same window (ADR-0027 §5).
+    # A deadline this condition did not declare but INHERITED, because an earlier declaration of
+    # this same (watch, when, then) condition declared one (ADR-0027 §5).
     # Set only by the lift, only from `Activity.window_deadlines`, and only when this condition's
     # own `until` yields no instant of its own — a declared bound always wins over an inherited one.
     #

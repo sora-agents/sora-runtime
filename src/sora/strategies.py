@@ -136,27 +136,34 @@ def _lifted(
     starts — and from the watched workspace's own clock, since host wall-clock is a different clock
     entirely (ADR-0027 §5).
 
-    On top of that, a resolved deadline is remembered per `watch` and handed to a later condition on
-    the same watch that cannot resolve one of its own. That asymmetry is the point: a declared bound
-    always wins, and inheritance only ever fills a hole. It closes the case where a window outlives
-    the plan that declared it — a replan mid-window is told (rightly) never to guess a `seconds` it
-    was not given, so it writes an event-shaped string, and the clock exit the first plan had is
-    gone. Inheriting is not a guess: it is the bound the planner itself gave for this same watch.
+    On top of that, a resolved deadline is remembered for this condition and handed to a later
+    declaration of the same condition that cannot resolve one of its own. That asymmetry is the
+    point: a declared bound always wins, and inheritance only ever fills a hole. It closes the case
+    where a window outlives the plan that declared it — a replan mid-window is told (rightly) never
+    to guess a `seconds` it was not given, so it writes an event-shaped string, and the clock exit
+    the first plan had is gone. A shared `watch` is not enough: it is only the mechanical gate, and
+    independent conditions may legitimately inspect the same changes.
     """
     declared_at = _domain_now(wm, condition.watch.source)
     deadline = condition.until.deadline(declared_at) if condition.until else None
+    window_key = _condition_window_key(condition)
     if deadline is not None:
-        activity.window_deadlines[condition.watch] = deadline
+        activity.window_deadlines[window_key] = deadline
     return PendingConditionState(
         condition=condition,
         declared_by=declared_by,
         declared_at=declared_at,
         inherited_deadline=(
-            activity.window_deadlines.get(condition.watch) if deadline is None else None
+            activity.window_deadlines.get(window_key) if deadline is None else None
         ),
         evaluated_through=wm.signals_appended,
         derived_through=wm.property_changes_appended,
     )
+
+
+def _condition_window_key(condition: PendingCondition) -> tuple[SignalWait, str, str]:
+    """The stable part of a condition across a replan that cannot restate its relative bound."""
+    return (condition.watch, condition.when, condition.then)
 
 
 def _step_pending_conditions(step: Step) -> tuple[PendingCondition, ...]:

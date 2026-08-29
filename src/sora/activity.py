@@ -94,13 +94,15 @@ class Activity:
     # mail; now a reply may come). Transient run state, like history/bindings: the durable copy is
     # on the Plan, or on the sub-goal Step that opens a bounded maintenance window.
     pending_conditions: list[PendingConditionState] = field(default_factory=list)
-    # Deadlines already resolved for a `watch`, so a window survives being re-declared. A relative
-    # `until` can only be stated honestly at the moment the waiting starts; a plan written midway
-    # through an open window cannot restate it, and a replan is exactly that. Keyed by `watch`
-    # because the same watch IS the same window — a mechanical identity, not a resemblance. Kept
-    # across `reset_for_replan` for the same reason SEEDED_BINDINGS are: no plan produced this, so
-    # no plan's discarding makes it untrue.
-    window_deadlines: dict[SignalWait, datetime] = field(default_factory=dict)
+    # Deadlines already resolved for a condition's window, so that window survives being
+    # re-declared. A relative `until` can only be stated honestly at the moment waiting starts; a
+    # plan written midway through an open window cannot restate it, and a replan is exactly that.
+    # The key is (watch, when, then), deliberately excluding `until`: those three fields identify
+    # the condition whose bound is being carried, while `until` is the part a later plan may only
+    # restate as prose. The watch alone is merely a mechanical gate and can be shared by independent
+    # conditions. Kept across `reset_for_replan` for the same reason SEEDED_BINDINGS are: no plan
+    # produced this, so no plan's discarding makes it untrue.
+    window_deadlines: dict[tuple[SignalWait, str, str], datetime] = field(default_factory=dict)
     # A resolved condition evaluation parked for Reason's next pass — the pending-condition
     # counterpart to reconsider_verdict. Holds indices into the eligible list the call was made
     # about, so Reason re-derives that list to apply it. Transient run state.
