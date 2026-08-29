@@ -52,6 +52,7 @@ from sora.strategies import (
 from sora.transport import MessageTransport
 from sora.types import (
     Change,
+    ConditionFiring,
     ConditionWait,
     InferenceResult,
     InputWait,
@@ -658,6 +659,30 @@ async def test_seeded_ids_come_from_the_condition_pursued_not_the_whole_batch(
     assert activity.bindings["fired_added_ids"] == ["e9"]
 
 
+async def test_a_queued_fire_keeps_the_changes_from_its_own_firing(tmp_path: Path) -> None:
+    """The live waiter can fire again while an older firing waits behind unfinished body work.
+    The queue must retain the first event rather than observe the waiter's later mutable state."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    activity.step_index = 0  # keep the first firing queued behind the remaining body step
+    state = PendingConditionState(condition=_condition(), evaluated_through=1)
+    state.fired_changes = (("insim:are/Emails", Change(path="p", added=("first",))),)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    # The same waiter fires again before the queued work can be pursued.
+    state.fired_changes = (("insim:are/Emails", Change(path="p", added=("second",))),)
+    activity.step_index = 1
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.bindings["fired_added_ids"] == ["first"]
+
+
 async def test_nothing_fired_goes_back_to_waiting(tmp_path: Path) -> None:
     # Must NOT fall through to Reflect, which would see an exhausted plan and terminate outright.
     cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
@@ -752,7 +777,7 @@ async def test_reflect_does_not_terminate_over_a_fired_condition(tmp_path: Path)
     Terminating there would write a success episode for a goal with a `then` still owed."""
     cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p")))
     activity = _exhausted()
-    activity.condition_fired = [PendingConditionState(condition=_condition(), evaluated_through=99)]
+    activity.condition_fired = [ConditionFiring(condition=_condition())]
     working.activities[activity.id] = activity
 
     await cycle.strategies.reflect.reflect(activity, working, cycle, _tick())

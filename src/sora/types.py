@@ -395,13 +395,9 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # The changes that opened THIS condition's gate on the judgement now in flight, paired with the
     # source that reported them — the same (source, Change) shape the judge is given. Recorded at
     # fire time, next to the marks above, and for the same reason they are: by the cycle a verdict
-    # lands and its `then` is planned, the tick that carried the change is long gone.
-    #
-    # Held per condition rather than per activity because the fire QUEUE outlives a single batch: a
-    # verdict can fire two conditions, only one is pursued while the body is busy, and the next
-    # batch would overwrite a shared field before the second is reached — planning it against a
-    # change it never fired on. `_eligible_conditions` yields one percept per condition, so this is
-    # also strictly more precise than the batch-wide union the judge sees.
+    # lands, the tick that carried the change is long gone. A verdict that fires snapshots this
+    # mutable field into a ConditionFiring before queueing it; the live waiter may be evaluated
+    # again while that older firing is still waiting to be pursued.
     fired_changes: tuple[tuple[str, Change], ...] = ()
     # A deadline this condition did not declare but INHERITED, because an earlier condition on the
     # same `watch` declared one and the window it bounds is still the same window (ADR-0027 §5).
@@ -416,6 +412,14 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # a judge instructed to default to keeping, i.e. never. The runtime knows the instant the
     # planner cannot re-derive, so it carries it rather than asking.
     inherited_deadline: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ConditionFiring:
+    """One immutable firing queued for pursuit, detached from its live waiter's mutable marks."""
+
+    condition: PendingCondition
+    fired_changes: tuple[tuple[str, Change], ...] = ()
 
 
 @dataclass(frozen=True)

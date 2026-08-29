@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
-from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.environment import DomainClock, EnvironmentRegistry, WorkspaceOrigin
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -48,6 +49,7 @@ from sora.strategies import (
 )
 from sora.types import (
     Change,
+    ConditionFiring,
     ConditionVerdict,
     ConditionWait,
     PendingCondition,
@@ -78,10 +80,20 @@ class _NullTransport:
         return _empty()
 
 
-def _cycle(tmp_path: Path, llm: FakeLLMClient | None = None) -> tuple[DecisionCycle, WorkingMemory]:
+class _FixedClock:
+    def now(self) -> datetime:
+        return datetime(2024, 10, 15, 9, 0, tzinfo=UTC)
+
+
+def _cycle(
+    tmp_path: Path,
+    llm: FakeLLMClient | None = None,
+    *,
+    clock: DomainClock | None = None,
+) -> tuple[DecisionCycle, WorkingMemory]:
     tool = FakeTool("insim:are/Calendar")
     registry = EnvironmentRegistry(
-        adapters={_ORIGIN: FakeAdapter("fake", FakeWorkspace("ws", _ORIGIN, [tool]))}
+        adapters={_ORIGIN: FakeAdapter("fake", FakeWorkspace("ws", _ORIGIN, [tool], clock=clock))}
     )
     working = WorkingMemory(registry=registry)
     procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
@@ -342,7 +354,10 @@ async def test_committed_work_holds_an_achievement_frame_too(tmp_path: Path) -> 
     cycle, working = _cycle(tmp_path, llm)
     activity = _fanned_out(step_index=2, goal_kind="achievement", pending=(_condition(),))
     _lift_pending_conditions(activity, working)
-    activity.condition_fired = list(activity.pending_conditions)
+    activity.condition_fired = [
+        ConditionFiring(condition=state.condition, fired_changes=state.fired_changes)
+        for state in activity.pending_conditions
+    ]
     working.activities[activity.id] = activity
 
     await cycle.strategies.reason.reason(activity, working, cycle, _tick())
@@ -603,7 +618,8 @@ async def test_a_deliberative_child_cannot_redeclare_its_step_owned_window(
     duplicate = json.dumps({"steps": [], "pending": _STEP_PENDING})
     corrected = json.dumps({"steps": []})
     llm = FakeLLMClient([duplicate, corrected])
-    cycle, working = _cycle(tmp_path, llm)
+    cycle, working = _cycle(tmp_path, llm, clock=_FixedClock())
+    await cycle.registry.join(_ORIGIN)
     parent = Plan(id="p", goal="watch", steps=[_window_step("deliberative")])
     activity = Activity(id="a1", goal="watch", context={}, plan=parent)
     working.activities["a1"] = activity
@@ -624,7 +640,8 @@ async def test_a_step_owned_window_holds_an_empty_deliberative_child_until_retir
     tmp_path: Path,
 ) -> None:
     llm = FakeLLMClient(json.dumps({"steps": []}))
-    cycle, working = _cycle(tmp_path, llm)
+    cycle, working = _cycle(tmp_path, llm, clock=_FixedClock())
+    await cycle.registry.join(_ORIGIN)
     parent = Plan(
         id="p",
         goal="watch",

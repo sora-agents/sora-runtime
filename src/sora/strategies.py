@@ -57,6 +57,7 @@ from sora.types import (
     WAIT,
     Change,
     CompletedOperation,
+    ConditionFiring,
     ConditionVerdict,
     ConditionWait,
     InferenceResult,
@@ -158,6 +159,15 @@ def _lifted(
     )
 
 
+def _step_pending_conditions(step: Step) -> tuple[PendingCondition, ...]:
+    """Parse the valid pending conditions declared by a sub-goal step."""
+    raw = step.params.get("pending")
+    if not isinstance(raw, list):
+        return ()
+    parsed = (pending_from_raw(entry) if isinstance(entry, dict) else None for entry in raw)
+    return tuple(condition for condition in parsed if condition is not None)
+
+
 def _lift_step_conditions(step: Step, activity: Activity, wm: WorkingMemory) -> None:
     """Lift any `pending` a SUB-GOAL STEP declares, at the moment that step is reached.
 
@@ -179,18 +189,14 @@ def _lift_step_conditions(step: Step, activity: Activity, wm: WorkingMemory) -> 
     Lifting is idempotent against the same dedup set the plan-level lift uses, so re-reaching the
     step (a mechanical fan-out re-reads `step_index`) cannot double-declare a window.
     """
-    raw = step.params.get("pending")
-    if not isinstance(raw, list):
-        return
     known = {state.condition for state in activity.pending_conditions} | activity.retired_conditions
     owner = _frame_key(activity, 0)
     if step.params.get("mode", "deliberative") == "deliberative":
         plan = activity.plan
         assert plan is not None  # a sub-goal step is dispatched only from a set plan
         owner += ((plan.id, activity.step_index),)
-    for entry in raw:
-        condition = pending_from_raw(entry) if isinstance(entry, dict) else None
-        if condition is None or condition in known:
+    for condition in _step_pending_conditions(step):
+        if condition in known:
             continue
         known.add(condition)
         log.info(
@@ -252,7 +258,12 @@ def _unclosable_window(activity: Activity, sub_plan: Plan, wm: WorkingMemory) ->
     if step.next_action != SUBGOAL or goal_kind_of(step) != GOAL_KIND_MAINTENANCE:
         return None
     goal = step.params.get("goal")
-    for condition in sub_plan.pending:
+    # A deliberative maintenance window is normally declared on the invoking step: that is the
+    # last point where a relative duration can be stated honestly, and the condition is assigned
+    # to the future child frame. The child prompt consequently tells the planner not to repeat it
+    # in Plan.pending. Both declaration sites can hold the frame, so both must pass this guard.
+    conditions = (*sub_plan.pending, *_step_pending_conditions(step))
+    for condition in conditions:
         until = condition.until
         if until is None or not until.is_time_bounded:
             continue  # event-shaped: the judge can answer it without a clock
@@ -3633,8 +3644,14 @@ def _resolve_predicate_clause(
     silently drops whatever that clause was meant to catch. Composition resolves nothing itself —
     it is structure the evaluator walks — so all that is checked of it here is that it can be
     walked."""
-    if not isinstance(where, dict) or _REF_DECIDE in where:
-        return where, None  # not a clause, or a soft one escalated whole rather than resolved
+    if not isinstance(where, dict):
+        return where, (
+            f"a composed predicate contains {_shape_of(where)}, not an object describing a "
+            "predicate clause — the malformed clause selects nothing. Write each 'all'/'any' "
+            "entry as its own predicate object."
+        )
+    if _REF_DECIDE in where:
+        return where, None  # a soft clause is escalated whole rather than resolved mechanically
     for key in (_COMPOSE_ALL, _COMPOSE_ANY):
         if key not in where:
             continue
@@ -4199,7 +4216,12 @@ class DefaultReasonStrategy:
             )
             log.info("reason: retired %d pending condition(s) on %s", len(retired), activity.id)
         fired = [
-            judged[i] for i in verdict.fired if i < len(judged) and id(judged[i]) not in retired
+            ConditionFiring(
+                condition=judged[i].condition,
+                fired_changes=judged[i].fired_changes,
+            )
+            for i in verdict.fired
+            if i < len(judged) and id(judged[i]) not in retired
         ]
         # Queue every fire, pursue one. The verdict is plural on purpose — one call judges the whole
         # eligible batch, and a single reply can satisfy two gates — so keeping only the first would
@@ -4613,7 +4635,7 @@ def _undeclared_params(
 # are absent rather than empty — absent means "no opinion", which is how the check fails open.
 _JSON_TYPES: dict[str, tuple[type, ...]] = {
     "string": (str,),
-    "integer": (int, float),  # 3.0 for an integer param is a JSON-round-trip artefact, not a defect
+    "integer": (int,),
     "number": (int, float),
     "boolean": (bool,),
     "array": (list, tuple),
@@ -4673,6 +4695,8 @@ def _mistyped_params(
         if isinstance(value, bool):
             if accepted == (bool,):
                 continue
+        elif declared_type == "integer" and isinstance(value, float) and value.is_integer():
+            continue  # 3.0 after a JSON round trip still represents an integer; 3.14 does not
         elif isinstance(value, accepted):
             continue
         origin = raw.get(key)

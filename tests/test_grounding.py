@@ -1368,6 +1368,15 @@ def test_an_integral_float_satisfies_an_integer_param() -> None:
     assert _mistyped_params(manual, "op", {"i": 3.0}, {}) == []
 
 
+def test_a_non_integral_float_does_not_satisfy_an_integer_param() -> None:
+    manual = _manual_with_types("t", "op", {"i": {"type": "integer"}})
+
+    problems = _mistyped_params(manual, "op", {"i": 3.14}, {})
+
+    assert len(problems) == 1
+    assert "must be integer but got float" in problems[0]
+
+
 def test_a_bool_does_not_pass_as_a_number() -> None:
     """`bool` is an `int` to Python, so the plain isinstance check would wave True through for a
     declared number — an operation asked for a count and handed True has been mis-planned."""

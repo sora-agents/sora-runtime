@@ -648,7 +648,13 @@ async def test_filter_empty_or_malformed_composition_is_a_defect_not_a_blanket_k
     """An empty conjunction is vacuously TRUE in logic, which here would hand the whole collection
     to whatever fans out over it — one external action per item. The evaluator refuses both shapes
     and Reason reports them, so neither silently acts on everything nor silently acts on nothing."""
-    malformed: list[dict[str, object]] = [{"all": []}, {"any": []}, {"all": "not a list"}]
+    malformed: list[dict[str, object]] = [
+        {"all": []},
+        {"any": []},
+        {"all": "not a list"},
+        {"all": ["not a predicate"]},
+        {"any": [42]},
+    ]
     for where in malformed:
         step = Step(
             next_action="filter",

@@ -732,7 +732,7 @@ def _matches(element: Any, where: Any) -> bool:
     collection is the one worth refusing. Reason reports either as a plan defect
     (``_composition_defect``) rather than leaving it as a silent empty result."""
     if not isinstance(where, dict):
-        return True
+        return False
     if _COMPOSE_ALL in where:
         clauses = where[_COMPOSE_ALL]
         if not isinstance(clauses, list) or not clauses:

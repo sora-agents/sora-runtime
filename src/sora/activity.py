@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
     from sora.types import (
         CompletedOperation,
+        ConditionFiring,
         ConditionVerdict,
         ConditionWait,
         InputWait,
@@ -115,7 +116,7 @@ class Activity:
     # queue here rather than being dropped. A queue is required, not a convenience: every judged
     # condition's mark is advanced at fire time, so the signal that opened those gates is already
     # behind them and nothing would ever re-fire the ones not pursued. Transient run state.
-    condition_fired: list[PendingConditionState] = field(default_factory=list)
+    condition_fired: list[ConditionFiring] = field(default_factory=list)
     # Conditions whose `until` a verdict judged satisfied. Retiring drops the per-run state, but
     # Plan.pending is the frozen skeleton and never changes — so without a record here the next
     # lift would read the same declaration off the same plan and put the condition straight back on

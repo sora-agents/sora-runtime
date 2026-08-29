@@ -480,20 +480,21 @@ async def _land_subplan(
     *,
     clock: DomainClock | None = None,
     goal_kind: str = "maintenance",
+    step_pending: list[dict[str, Any]] | None = None,
 ) -> tuple[Activity, Plan]:
     """Drive a deliberative sub-goal all the way through: Reason fires `_infer_`, the sub-plan
     lands in Observe. Validation happens where the plan arrives, before anything is entered."""
     llm = FakeLLMClient(subplan)
     cycle, working, registry = _cycle(tmp_path, clock=clock, llm=llm)
     await registry.join(_ORIGIN)
-    subgoal = Step(
-        next_action="subgoal",
-        params={
-            "goal": "for the next four minutes clear conflicts as they appear",
-            "mode": "deliberative",
-            "goal_kind": goal_kind,
-        },
-    )
+    params: dict[str, Any] = {
+        "goal": "for the next four minutes clear conflicts as they appear",
+        "mode": "deliberative",
+        "goal_kind": goal_kind,
+    }
+    if step_pending is not None:
+        params["pending"] = step_pending
+    subgoal = Step(next_action="subgoal", params=params)
     parent = Plan(id="p", goal="watch the calendar", steps=[subgoal, Step("wait", {})])
     activity = Activity(id="a", goal="watch the calendar", context={}, plan=parent)
     working.activities["a"] = activity
@@ -516,6 +517,38 @@ async def test_a_maintenance_window_no_clock_could_close_is_refused(tmp_path: Pa
     defect = activity.superseded.defect
     assert defect is not None and "clock" in defect
     assert activity.replan_trail and activity.replan_trail[-1] == defect
+
+
+async def test_a_step_owned_maintenance_window_no_clock_could_close_is_refused(
+    tmp_path: Path,
+) -> None:
+    """A deliberative child's governing condition lives on its invoking step, not on the child
+    plan, but it is equally capable of holding that child frame open forever."""
+    step_pending = [
+        {
+            "watch": {
+                "signal": "state_changed",
+                "source": "realestate",
+                "path": "events",
+                "kind": "added",
+            },
+            "when": "one or more calendar events are added",
+            "then": "delete every overlapping preexisting calendar event",
+            "until": _BOUNDED,
+        }
+    ]
+
+    activity, _parent = await _land_subplan(
+        tmp_path,
+        json.dumps({"steps": []}),
+        step_pending=step_pending,
+    )
+
+    assert activity.plan is None
+    assert activity.parent_frames == []
+    assert activity.superseded is not None
+    defect = activity.superseded.defect
+    assert defect is not None and "clock" in defect
 
 
 async def test_the_same_window_is_accepted_where_the_clock_can_close_it(tmp_path: Path) -> None:
