@@ -59,12 +59,19 @@ class LLMUsage:
     (OpenAI ``completion_tokens_details.reasoning_tokens``, Gemini ``thoughts_token_count``). When
     present it supersedes the estimate above; when ``None`` (Anthropic adaptive thinking, which does
     not break thinking out) the estimate stands. Keeping both means one metric reads uniformly
-    across providers — exact where available, estimated where not."""
+    across providers — exact where available, estimated where not.
+
+    ``input_tokens`` is normalized to the total input processed, including cache reads and writes;
+    ``cached_input_tokens`` is the subset served from a cache. It is ``None`` when the provider did
+    not report cache usage, distinct from an explicit zero cache hit. OpenAI reports total input as
+    one inclusive figure, while Anthropic reports ordinary input, cache writes, and cache reads as
+    separate fields, so its adapter sums those fields at the provider boundary."""
 
     input_tokens: int
     output_tokens: int
     answer_chars: int
     reasoning_tokens: int | None = None
+    cached_input_tokens: int | None = None
 
     @property
     def answer_tokens(self) -> int:
@@ -107,6 +114,7 @@ def log_llm_usage(usage: LLMUsage) -> None:
             "llm_answer_chars": usage.answer_chars,
             # None on the estimate path (Anthropic); an exact count when the provider reports one.
             "llm_reasoning_tokens": usage.reasoning_tokens,
+            "llm_cached_input_tokens": usage.cached_input_tokens,
             "llm_inference_id": inference_id,
         },
     )
@@ -204,9 +212,10 @@ class MeteredLLMClient:
 
 class LLMMeter(logging.Handler):
     """Tallies the ``sora.llm`` per-call records the instrumentation emits — call count and summed
-    in-model seconds (from ``MeteredLLMClient``), plus token totals and thinking share (from
-    ``log_llm_usage``, when the concrete client is instrumented) — so a run surface can report them
-    at the end without holding a reference to the client (which bootstrap builds and hands off).
+    in-model seconds (from ``MeteredLLMClient``), plus token totals, cache hit rate, and thinking
+    share (from ``log_llm_usage``, when the concrete client is instrumented) — so a run surface can
+    report them at the end without holding a reference to the client (which bootstrap builds and
+    hands off).
     Attach it to the ``sora`` logger for the run, then call ``summary()``. Mirrors how the CLI's
     ``_Presenter`` reads the same log stream. The token tally is opt-in: with an uninstrumented
     client no ``usage`` record arrives and ``summary()`` reports timing only, exactly as before."""
@@ -217,6 +226,12 @@ class LLMMeter(logging.Handler):
         self.total_seconds = 0.0
         self.usage_calls = 0
         self.input_tokens = 0
+        # Cache totals retain observation coverage: an absent provider field is unknown, not a
+        # measured miss. `cached_input_tokens` sums the known cache reads; the two input buckets
+        # make the denominator and its coverage explicit for mixed-provider/compatibility runs.
+        self.cached_input_tokens = 0
+        self.cache_observed_input_tokens = 0
+        self.cache_unknown_input_tokens = 0
         self.output_tokens = 0
         self.answer_chars = 0
         # Summed per-call deliberation tokens: each call contributes its OWN figure — the provider's
@@ -251,10 +266,16 @@ class LLMMeter(logging.Handler):
         elif event == "usage":
             self.usage_calls += 1
             input_tokens = getattr(record, "llm_input_tokens", 0)
+            cached_input_tokens = getattr(record, "llm_cached_input_tokens", None)
             output_tokens = getattr(record, "llm_output_tokens", 0)
             answer_chars = getattr(record, "llm_answer_chars", 0)
             reasoning_tokens = getattr(record, "llm_reasoning_tokens", None)
             self.input_tokens += input_tokens
+            if cached_input_tokens is None:
+                self.cache_unknown_input_tokens += input_tokens
+            else:
+                self.cached_input_tokens += cached_input_tokens
+                self.cache_observed_input_tokens += input_tokens
             self.output_tokens += output_tokens
             self.answer_chars += answer_chars
             # Add this call's own deliberation figure — exact when the provider reported one, else
@@ -291,6 +312,19 @@ class LLMMeter(logging.Handler):
         output (0.0 when nothing was metered)."""
         return self.thinking_tokens / self.output_tokens if self.output_tokens else 0.0
 
+    @property
+    def cache_hit_rate(self) -> float | None:
+        """Share of cache-observed input served from provider prompt caches, or ``None`` when no
+        input carried cache accounting."""
+        if not self.cache_observed_input_tokens:
+            return None
+        return self.cached_input_tokens / self.cache_observed_input_tokens
+
+    @property
+    def cache_coverage(self) -> float:
+        """Share of total input for which the provider reported cache usage."""
+        return self.cache_observed_input_tokens / self.input_tokens if self.input_tokens else 0.0
+
     def summary(self, wall_seconds: float | None = None) -> str:
         plural = "" if self.calls == 1 else "s"
         text = f"{self.calls} LLM call{plural}"
@@ -308,6 +342,14 @@ class LLMMeter(logging.Handler):
                 f"; {self.input_tokens} in / {self.output_tokens} out tokens "
                 f"(~{pooled.answer_tokens} answer, ~{self.thinking_share * 100:.0f}% thinking)"
             )
+            cache_hit_rate = self.cache_hit_rate
+            if cache_hit_rate is None:
+                text += "; cache usage unavailable"
+            else:
+                text += (
+                    f"; {self.cached_input_tokens} cached, {cache_hit_rate * 100:.0f}% hit "
+                    f"({self.cache_coverage * 100:.0f}% cache coverage)"
+                )
             if self.wasted_output_tokens:
                 text += f"; {self.wasted_output_tokens} out discarded"
         return text

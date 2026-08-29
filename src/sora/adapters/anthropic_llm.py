@@ -87,11 +87,18 @@ class AnthropicLLMClient:
 
 def _usage_of(message: Any, *, answer_chars: int) -> LLMUsage:
     """Build a provider-neutral ``LLMUsage`` from an Anthropic message's ``usage`` block and the
-    already-measured answer length. Tolerant of a missing/partial ``usage`` (getattr + ``or 0``) so
-    instrumentation can never break a call — a metering gap degrades to zeros, never raises."""
+    already-measured answer length. Anthropic reports ordinary input, cache writes, and cache reads
+    separately, so normalize their sum into total input while retaining cache reads as the cached
+    subset. Tolerant of a missing/partial ``usage`` (getattr + ``or 0``) so instrumentation can
+    never break a call — a metering gap degrades to zeros, never raises."""
     usage = getattr(message, "usage", None)
+    uncached_input = int(getattr(usage, "input_tokens", 0) or 0)
+    cache_creation_input = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    cache_read_input = getattr(usage, "cache_read_input_tokens", None)
+    cached_input = int(cache_read_input) if cache_read_input is not None else None
     return LLMUsage(
-        input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+        input_tokens=uncached_input + cache_creation_input + (cached_input or 0),
         output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
         answer_chars=answer_chars,
+        cached_input_tokens=cached_input,
     )

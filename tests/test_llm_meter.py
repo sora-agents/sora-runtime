@@ -218,7 +218,7 @@ def test_log_llm_usage_emits_one_usage_record(_llm_logging_enabled: None) -> Non
     logger = logging.getLogger("sora.llm")
     logger.addHandler(handler)
     try:
-        log_llm_usage(LLMUsage(1200, 800, answer_chars=40))
+        log_llm_usage(LLMUsage(1200, 800, answer_chars=40, cached_input_tokens=900))
     finally:
         logger.removeHandler(handler)
 
@@ -227,6 +227,7 @@ def test_log_llm_usage_emits_one_usage_record(_llm_logging_enabled: None) -> Non
     assert record.__dict__["llm_input_tokens"] == 1200
     assert record.__dict__["llm_output_tokens"] == 800
     assert record.__dict__["llm_answer_chars"] == 40
+    assert record.__dict__["llm_cached_input_tokens"] == 900
     # The cue shows the answer size beside the output for a quick eyeball: ~10 answer of 800 out.
     assert "~10 answer, ~99% thinking" in record.getMessage()  # 790/800, rounded
 
@@ -248,6 +249,59 @@ def test_llm_meter_tallies_usage_and_summary_reports_tokens(_llm_logging_enabled
     assert meter.thinking_share == (1100 - round(640 / 4)) / 1100
     summary = meter.summary()
     assert "1500 in / 1100 out tokens (~160 answer, ~85% thinking)" in summary
+
+
+def test_llm_meter_tallies_cached_input_and_reports_hit_rate(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        log_llm_usage(LLMUsage(1000, 100, answer_chars=40, cached_input_tokens=800))
+        log_llm_usage(LLMUsage(500, 100, answer_chars=40))
+    finally:
+        logger.removeHandler(meter)
+
+    assert meter.cached_input_tokens == 800
+    assert meter.cache_observed_input_tokens == 1000
+    assert meter.cache_unknown_input_tokens == 500
+    assert meter.cache_hit_rate == 800 / 1000
+    assert meter.cache_coverage == 1000 / 1500
+    assert "800 cached, 80% hit (67% cache coverage)" in meter.summary()
+
+
+def test_llm_meter_reports_an_explicit_zero_as_a_measured_cache_miss(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        log_llm_usage(LLMUsage(42, 1, answer_chars=1, cached_input_tokens=0))
+    finally:
+        logger.removeHandler(meter)
+
+    assert meter.cache_hit_rate == 0.0
+    assert meter.cache_coverage == 1.0
+    assert "0 cached, 0% hit (100% cache coverage)" in meter.summary()
+
+
+def test_llm_meter_reports_cache_usage_as_unavailable_when_unobserved(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        log_llm_usage(LLMUsage(42, 1, answer_chars=1))
+    finally:
+        logger.removeHandler(meter)
+
+    assert meter.cache_hit_rate is None
+    assert meter.cache_coverage == 0.0
+    assert meter.cache_unknown_input_tokens == 42
+    assert "cache usage unavailable" in meter.summary()
 
 
 def test_llm_meter_summary_omits_tokens_when_uninstrumented() -> None:

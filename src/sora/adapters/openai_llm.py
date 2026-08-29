@@ -181,16 +181,19 @@ def _text_of(response: Any) -> str:
 
 def _usage_of(response: Any, *, answer_chars: int) -> LLMUsage:
     """Build a provider-neutral ``LLMUsage`` from a chat-completions ``usage`` block and the
-    already-measured answer length. Reads the exact ``reasoning_tokens`` when the provider reports
-    one (o-series / Gemini thinking models), else leaves it ``None`` so the meter estimates.
+    already-measured answer length. Reads the exact ``reasoning_tokens`` and cached-input subset
+    when the provider reports them; ``prompt_tokens`` already includes that cached subset.
     Tolerant of a missing/partial ``usage`` (getattr + ``or 0``) so instrumentation never breaks —
     a metering gap degrades to zeros, never raises."""
     usage = getattr(response, "usage", None)
-    details = getattr(usage, "completion_tokens_details", None)
-    reasoning = getattr(details, "reasoning_tokens", None)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    reasoning = getattr(completion_details, "reasoning_tokens", None)
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    cached_input = getattr(prompt_details, "cached_tokens", None)
     return LLMUsage(
         input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
         output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
         answer_chars=answer_chars,
         reasoning_tokens=int(reasoning) if reasoning is not None else None,
+        cached_input_tokens=int(cached_input) if cached_input is not None else None,
     )

@@ -3,13 +3,16 @@ client surfaces). Gated on the optional ``[llm]`` extra — the SDK import lives
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 pytest.importorskip("anthropic")
 
-from sora.adapters.anthropic_llm import _usage_of  # noqa: E402
+from sora.adapters.anthropic_llm import AnthropicLLMClient, _usage_of  # noqa: E402
 from sora.llm import LLMUsage  # noqa: E402
 
 
@@ -20,9 +23,101 @@ def test_usage_of_reads_the_token_block_and_carries_the_answer_length() -> None:
     assert usage.thinking_share == 790 / 800  # output minus the ~10-token answer
 
 
+def test_usage_of_normalizes_anthropic_cache_counts_into_total_input() -> None:
+    message = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=200,
+            cache_creation_input_tokens=300,
+            cache_read_input_tokens=500,
+            output_tokens=80,
+        )
+    )
+
+    usage = _usage_of(message, answer_chars=12)
+
+    assert usage == LLMUsage(1000, 80, answer_chars=12, cached_input_tokens=500)
+
+
+def test_usage_of_treats_explicit_zero_cached_input_as_zero() -> None:
+    message = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=42,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            output_tokens=0,
+        )
+    )
+
+    assert _usage_of(message, answer_chars=0).cached_input_tokens == 0
+
+
 def test_usage_of_tolerates_a_missing_or_partial_usage_block() -> None:
     # Instrumentation must never break a call: a message with no `usage` (or a partial one) degrades
     # to zeros rather than raising, so a metering gap is silent, not fatal.
     assert _usage_of(SimpleNamespace(), answer_chars=7) == LLMUsage(0, 0, answer_chars=7)
     partial = SimpleNamespace(usage=SimpleNamespace(input_tokens=42))
     assert _usage_of(partial, answer_chars=0).input_tokens == 42
+    assert _usage_of(partial, answer_chars=0).cached_input_tokens is None
+
+
+class _FakeMessageStream:
+    def __init__(self, message: SimpleNamespace) -> None:
+        self.message = message
+
+    async def __aenter__(self) -> _FakeMessageStream:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+    async def get_final_message(self) -> SimpleNamespace:
+        return self.message
+
+
+class _FakeMessages:
+    def __init__(self, message: SimpleNamespace) -> None:
+        self.message = message
+
+    def stream(self, **kwargs: Any) -> _FakeMessageStream:
+        return _FakeMessageStream(self.message)
+
+
+@pytest.fixture
+def _llm_logging_enabled() -> Iterator[None]:
+    logger = logging.getLogger("sora.llm")
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    yield
+    logger.setLevel(previous)
+
+
+@pytest.mark.asyncio
+async def test_streamed_message_emits_its_cached_input_usage(
+    _llm_logging_enabled: None,
+) -> None:
+    message = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="hi")],
+        usage=SimpleNamespace(
+            input_tokens=20,
+            cache_creation_input_tokens=10,
+            cache_read_input_tokens=70,
+            output_tokens=2,
+        ),
+    )
+    client = AnthropicLLMClient(model="m", api_key="test", instrument=True)
+    client._client = SimpleNamespace(messages=_FakeMessages(message))  # type: ignore[assignment]
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(handler)
+    try:
+        assert await client.complete(system="s", prompt="p") == "hi"
+    finally:
+        logger.removeHandler(handler)
+
+    usage_records = [r for r in records if r.__dict__.get("llm_event") == "usage"]
+    assert len(usage_records) == 1
+    (record,) = usage_records
+    assert record.__dict__["llm_input_tokens"] == 100
+    assert record.__dict__["llm_cached_input_tokens"] == 70

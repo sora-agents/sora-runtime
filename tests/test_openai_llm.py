@@ -33,6 +33,7 @@ def _response(
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
     reasoning_tokens: int | None = None,
+    cached_tokens: int | None = None,
     with_usage: bool = True,
 ) -> SimpleNamespace:
     """A minimal stand-in for an OpenAI ``ChatCompletion`` response — only the fields the client
@@ -48,6 +49,9 @@ def _response(
         usage = SimpleNamespace(
             prompt_tokens=prompt_tokens or 0,
             completion_tokens=completion_tokens or 0,
+            prompt_tokens_details=(
+                SimpleNamespace(cached_tokens=cached_tokens) if cached_tokens is not None else None
+            ),
             completion_tokens_details=details,
         )
     return SimpleNamespace(choices=[choice], usage=usage)
@@ -72,14 +76,25 @@ def test_text_of_tolerates_a_choice_with_no_message() -> None:
     assert _text_of(SimpleNamespace(choices=[SimpleNamespace()])) == ""
 
 
-def test_usage_of_reads_the_openai_token_block_and_the_exact_reasoning_count() -> None:
+def test_usage_of_reads_cached_input_and_the_exact_reasoning_count() -> None:
     # OpenAI (o-series) and Gemini's compat surface report reasoning tokens directly, so thinking is
     # the provider's exact number — NOT the answer-subtraction estimate the Anthropic path falls to.
     usage = _usage_of(
-        _response(prompt_tokens=1200, completion_tokens=800, reasoning_tokens=600),
+        _response(
+            prompt_tokens=1200,
+            completion_tokens=800,
+            reasoning_tokens=600,
+            cached_tokens=900,
+        ),
         answer_chars=40,
     )
-    assert usage == LLMUsage(1200, 800, answer_chars=40, reasoning_tokens=600)
+    assert usage == LLMUsage(
+        1200,
+        800,
+        answer_chars=40,
+        reasoning_tokens=600,
+        cached_input_tokens=900,
+    )
     assert usage.thinking_tokens == 600  # exact, not the 790 the char-estimate would give
     assert usage.thinking_share == 600 / 800
 
@@ -95,6 +110,14 @@ def test_usage_of_falls_back_to_the_estimate_when_no_reasoning_is_reported() -> 
 def test_usage_of_tolerates_a_missing_usage_block() -> None:
     # Instrumentation must never break a call: no usage -> zeros, never an exception.
     assert _usage_of(_response(with_usage=False), answer_chars=7) == LLMUsage(0, 0, answer_chars=7)
+
+
+def test_usage_of_distinguishes_missing_cached_input_from_an_explicit_zero() -> None:
+    missing = _usage_of(_response(prompt_tokens=42), answer_chars=0)
+    explicit_zero = _usage_of(_response(prompt_tokens=42, cached_tokens=0), answer_chars=0)
+
+    assert missing.cached_input_tokens is None
+    assert explicit_zero.cached_input_tokens == 0
 
 
 # ── complete() over an injected fake SDK ──────────────────────────────────────────────────────
@@ -307,7 +330,13 @@ async def test_instrument_emits_a_usage_record_carrying_the_exact_reasoning_toke
 ) -> None:
     client = OpenAICompatLLMClient(model="m", api_key="test", instrument=True)
     client._client = _FakeAsyncOpenAI(  # type: ignore[assignment]
-        _response("hi", prompt_tokens=100, completion_tokens=800, reasoning_tokens=600)
+        _response(
+            "hi",
+            prompt_tokens=100,
+            completion_tokens=800,
+            reasoning_tokens=600,
+            cached_tokens=80,
+        )
     )
     records: list[logging.LogRecord] = []
     handler = logging.Handler()
@@ -325,6 +354,7 @@ async def test_instrument_emits_a_usage_record_carrying_the_exact_reasoning_toke
     assert record.__dict__["llm_input_tokens"] == 100
     assert record.__dict__["llm_output_tokens"] == 800
     assert record.__dict__["llm_reasoning_tokens"] == 600
+    assert record.__dict__["llm_cached_input_tokens"] == 80
 
 
 @pytest.mark.asyncio
