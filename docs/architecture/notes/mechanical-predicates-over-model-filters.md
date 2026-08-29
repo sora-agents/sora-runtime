@@ -119,10 +119,10 @@ recoverable one; reporting beats both.
 
 ## The seeded bindings, and where they live
 
-At `_pursue_fired_condition`, the runtime writes three bindings from the change that opened the
-gate — `fired_added_ids`, `fired_removed_ids`, `fired_updated_ids` (`SEEDED_BINDINGS` in
+At `_pursue_fired_condition`, the runtime writes three bindings from a precise change that opened
+the gate — `fired_added_ids`, `fired_removed_ids`, `fired_updated_ids` (`SEEDED_BINDINGS` in
 `sora/activity.py`) — and `default_plan_prompt` renders them under *"Ids reported by the change
-that triggered this goal"*.
+that triggered this goal"*. A coarse change supplies none of them, as described below.
 
 Three decisions inside that are easy to get wrong:
 
@@ -154,10 +154,19 @@ it, so `render_seeded_bindings` shows only the reserved names and nothing else.
 it overwritten at the next firing. The prompt says not to; nothing enforces it. Cheap to add a
 check if it ever bites.
 
-**Empty is still fail-open under `not_in`.** An empty `fired_added_ids` excludes nothing, so an
-exclusion clause standing alone would keep the whole collection. The prompt tells the planner to
-pair it with a positive clause under `all`, which is also the shape the worked example teaches. This
-is guidance, not a guarantee — the honest statement of what is and is not enforced.
+**Coarse is unavailable, not empty.** A `Change` whose three id tuples are empty means the adapter
+knows only that something moved; it does not mean no items moved. Such a firing supplies none of the
+reserved bindings, and clears any left by an earlier firing. One coarse member also makes a mixed
+batch unavailable: the flattened lists have no completeness marker, so exposing the precise subset
+would present a lower bound as the whole delta. The plan prompt says ids are unavailable and warns
+that this is not an empty change set.
+
+**Known-empty is still fail-open under `not_in`.** For an entirely precise firing, all three
+bindings are present even when one direction is genuinely empty. An empty `fired_added_ids`
+excludes nothing, so an exclusion clause standing alone would keep the whole collection. The prompt
+tells the planner to pair it with a positive clause under `all`, which is also the shape the worked
+example teaches. This is guidance, not a guarantee — the honest statement of what is and is not
+enforced.
 
 ## What the pipeline looks like now
 

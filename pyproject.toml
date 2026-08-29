@@ -83,9 +83,10 @@ files = ["src/sora", "tests", "examples"]
 
 # ARE (meta-agents-research-environments) is an optional, untyped dependency-group (not installed in
 # CI), used only by the skip-gated integration tests and the gaia2 showcase's seeded MCP launcher.
-# Treat its imports as Any so those files type-check without the package present.
+# Its file-system staging helper imports huggingface_hub directly from that same optional group.
+# Treat those imports as Any so the files type-check without installing the benchmark environment.
 [[tool.mypy.overrides]]
-module = "are.*"
+module = ["are.*", "huggingface_hub"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

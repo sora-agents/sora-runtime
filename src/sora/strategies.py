@@ -4271,18 +4271,26 @@ class DefaultReasonStrategy:
         """
         state = activity.condition_fired.pop(0)
         log.info("reason: pending condition fired on %s -> %r", activity.id, state.condition.then)
-        # All three kinds, always, even when empty: a plan referencing a kind that did not occur
-        # should read "nothing was removed", not hit an unresolvable reference and replan. Ordered
-        # and de-duplicated, since a batch may carry several changes on the same path. Note an
-        # empty set still fails open under `not_in` (it excludes nothing) — the plan prompt tells
-        # the planner to pair such an exclusion with a positive clause for exactly that reason.
-        seeded: dict[str, list[Any]] = {name: [] for name in SEEDED_BINDINGS}
-        for _source, change in state.fired_changes:
-            for name, moved in zip(
-                SEEDED_BINDINGS, (change.added, change.removed, change.updated), strict=True
-            ):
-                seeded[name].extend(m for m in moved if m not in seeded[name])
-        activity.bindings.update(seeded)
+        # Replace the previous firing's ids even when this firing cannot supply new ones. A coarse
+        # Change means "something moved, ids and direction unknown", so turning its three empty
+        # tuples into authoritative empty sets would silently make `in` select nothing and
+        # `not_in` exclude nothing. Since these flattened bindings cannot mark a precise subset as
+        # incomplete, one coarse member makes the whole firing unavailable. Otherwise seed all
+        # three kinds, including genuinely known-empty directions, ordered and de-duplicated.
+        for name in SEEDED_BINDINGS:
+            activity.bindings.pop(name, None)
+        changes_are_precise = bool(state.fired_changes) and all(
+            change.added or change.removed or change.updated
+            for _source, change in state.fired_changes
+        )
+        if changes_are_precise:
+            seeded: dict[str, list[Any]] = {name: [] for name in SEEDED_BINDINGS}
+            for _source, change in state.fired_changes:
+                for name, moved in zip(
+                    SEEDED_BINDINGS, (change.added, change.removed, change.updated), strict=True
+                ):
+                    seeded[name].extend(m for m in moved if m not in seeded[name])
+            activity.bindings.update(seeded)
         step = Step(
             next_action=SUBGOAL,
             params={

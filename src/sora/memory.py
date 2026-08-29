@@ -542,14 +542,18 @@ PLAN_SYSTEM_PROMPT = (
     '`qualifying` binding -> a mechanical sub-goal whose "in" is {"$bind": "qualifying"}. To act '
     "on values a tool produced per item (e.g. a condition score per gallery), map with a "
     "mechanical sub-goal, then `collect` its results before filtering or reducing them.\n"
-    "When the goal you are planning was triggered by a `pending` condition FIRING, the runtime has "
-    "ALREADY extracted the ids that change reported, into three bindings shown in this prompt "
-    "under 'Ids reported by the change that triggered this goal': `fired_added_ids`, "
+    "When the goal you are planning was triggered by a `pending` condition FIRING and its change "
+    "reported item ids, the runtime has ALREADY extracted them into three bindings shown in this "
+    "prompt under 'Ids reported by the change that triggered this goal': `fired_added_ids`, "
     "`fired_removed_ids`, `fired_updated_ids`. Reference them directly. Do NOT write a $decide to "
     "work out what just changed — the answer is already in hand, and re-deriving it sends the "
-    "whole collection to a model to do set membership. Never use those three names for your own "
-    "`out`. An `op: not_in` against an EMPTY one excludes nothing, so pair an exclusion clause "
-    "with a positive clause under `all` rather than leaning on it alone.\n"
+    "whole collection to a model to do set membership. If that section instead says ids are "
+    "unavailable, the adapter reported only that something changed: do not interpret that as an "
+    "empty change set, reference the absent bindings, or invent the missing ids. Plan from the "
+    "currently observed state only when it is sufficient to act safely. Never use those three "
+    "names for your own `out`. An `op: not_in` against an EMPTY available binding excludes "
+    "nothing, so pair an exclusion clause with a positive clause under `all` rather than leaning "
+    "on it alone.\n"
     "So 'whenever a booking is added, cancel the existing bookings that clash with it' is fully "
     "mechanical — no $decide and no model call: `filter` the collection down to the added items "
     'with {"path": "<id field>", "op": "in", "value": {"$bind": "fired_added_ids"}} -> `filter` it '
@@ -1759,7 +1763,7 @@ def render_seeded_bindings(bindings: dict[str, Any]) -> str:
     """
     present = {name: bindings[name] for name in SEEDED_BINDINGS if name in bindings}
     if not present:
-        return "(none — this goal was not triggered by a watched change)"
+        return "(unavailable — no item ids were reported; this is not an empty change set)"
     return render_bindings(present)
 
 

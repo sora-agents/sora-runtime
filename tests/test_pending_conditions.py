@@ -25,7 +25,7 @@ from typing import Any
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, ScriptedTransport
 from sora.action import default_action_registry
-from sora.activity import Activity, ActivityState
+from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
 from sora.memory import (
@@ -632,6 +632,73 @@ async def test_a_fired_condition_seeds_the_changed_ids_for_its_then_plan(tmp_pat
     _system, prompt = llm.calls[-1]
     assert "Ids reported by the change that triggered this goal" in prompt
     assert "e10" in prompt
+
+
+async def test_a_coarse_firing_does_not_seed_authoritative_empty_id_sets(
+    tmp_path: Path,
+) -> None:
+    """A coarse change says the ids are unknown, not that no ids moved."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=0)
+    state.fired_changes = (("insim:are/Emails", Change(path="folders.INBOX.emails")),)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert all(name not in activity.bindings for name in SEEDED_BINDINGS)
+    await asyncio.sleep(0)  # let the background _infer_ task run
+    _system, prompt = llm.calls[-1]
+    assert "no item ids were reported" in prompt
+    assert "not an empty change set" in prompt
+
+
+async def test_one_coarse_change_makes_a_mixed_firing_id_set_unknown(tmp_path: Path) -> None:
+    """The flattened bindings cannot honestly present a known-incomplete subset as authoritative."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    state = PendingConditionState(condition=_condition(), evaluated_through=0)
+    state.fired_changes = (
+        ("insim:are/Emails", Change(path="folders.INBOX.emails", added=("e9",))),
+        ("insim:are/Emails", Change(path="folders.INBOX.emails")),
+    )
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert all(name not in activity.bindings for name in SEEDED_BINDINGS)
+
+
+async def test_a_coarse_firing_removes_seeded_ids_from_an_earlier_firing(tmp_path: Path) -> None:
+    """Omitting unknown bindings must not expose a previous firing's ids instead."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _exhausted()
+    activity.bindings.update(
+        {
+            "fired_added_ids": ["stale-added"],
+            "fired_removed_ids": ["stale-removed"],
+            "fired_updated_ids": ["stale-updated"],
+        }
+    )
+    state = PendingConditionState(condition=_condition(), evaluated_through=0)
+    state.fired_changes = (("insim:are/Emails", Change(path="folders.INBOX.emails")),)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert all(name not in activity.bindings for name in SEEDED_BINDINGS)
 
 
 async def test_seeded_ids_come_from_the_condition_pursued_not_the_whole_batch(
