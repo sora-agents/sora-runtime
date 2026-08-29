@@ -62,9 +62,9 @@ agent:
     model: qwen3:30b
     base_url: http://localhost:11434/v1
     instrument: true
-    # No api_key needed for a local runtime: the client supplies a placeholder when base_url is set
-    # and no key is in the environment. Set api_key (or OPENAI_API_KEY) only for an endpoint that
-    # actually authenticates (a hosted gateway).
+    # No api_key_env needed for a local runtime: a custom base_url receives a placeholder unless an
+    # explicit key is selected. For a hosted gateway, set api_key_env to the name of its dedicated
+    # environment variable; custom endpoints never inherit OPENAI_API_KEY.
   transport:
     # The ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies
     # via send_message_to_user. Shares the running simulation with the are-sim workspace below.

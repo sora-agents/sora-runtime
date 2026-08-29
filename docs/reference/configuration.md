@@ -110,7 +110,8 @@ Adapter-specific keys:
 | Key | Type | Notes |
 | --- | --- | --- |
 | `client` | `str`, optional | Dotted path to an `LLMClient` subclass; default `sora.adapters.anthropic_llm.AnthropicLLMClient`. |
-| *(everything else)* | — | Passed through as constructor kwargs to the chosen client — e.g. `model:`. Never hardcoded; the API key comes from the environment, not this block (see [Getting Started — Configuring the LLM and its API key](../getting-started/configuration.md#configuring-the-llm-and-its-api-key)). |
+| `api_key_env` | `str`, optional | Name of the environment variable containing the client's API key. Bootstrap resolves it into the `api_key` constructor kwarg and fails at startup if it is unset. Mutually exclusive with `api_key`; the secret value itself never belongs in this block. |
+| *(everything else)* | — | Passed through as constructor kwargs to the chosen client — e.g. `model:`. Never hardcoded; see [Getting Started — Configuring the LLM and its API key](../getting-started/configuration.md#configuring-the-llm-and-its-api-key). |
 
 Every configured client is wrapped in `MeteredLLMClient` automatically (timing/usage
 instrumentation) — not a config option.
@@ -154,6 +155,6 @@ question to the user.
 
 !!! info "Hand-authored framing pending"
     This page renders the exact, source-checked schema. The security-boundary and operational
-    guidance the design calls for — e.g. why credentials never belong in `agent.llm`, or which
+    guidance the design calls for — e.g. why credential values never belong in `agent.llm`, or which
     `context_adaptation` level suits which failure mode — is still owed as hand-written prose; track
     it against the reference-authoring task.

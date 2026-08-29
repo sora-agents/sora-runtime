@@ -4,7 +4,7 @@ One client covers three provider families through ``base_url``/``model`` config 
 provider is a config change, not a new adapter:
 
 * OpenAI itself (no ``base_url``),
-* Gemini's OpenAI-compatible surface (``base_url`` = the ``.../v1beta/openai/`` endpoint),
+* hosted gateways and Gemini's OpenAI-compatible surface (selected with ``base_url``),
 * local runtimes — Ollama, LM Studio, vLLM, llama.cpp — which all serve ``/v1/chat/completions``.
 
 Lives under ``adapters/`` because it is a concrete integration on an optional extra
@@ -16,7 +16,6 @@ which the string-in/string-out seam has no use for yet — it belongs with multi
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from openai import AsyncOpenAI, Timeout
@@ -26,6 +25,7 @@ from sora.llm import LLMUsage, log_llm_usage
 # Only a fallback: the model id is a configuration value (a ctor arg, wired from agent.yaml), never
 # baked in — swapping models/providers must not require a code change.
 DEFAULT_MODEL = "gpt-5.1"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 # Seconds of SILENCE tolerated on a streaming completion, not a cap on how long it may take: with
 # `stream=True` the SDK's read timeout applies between chunks, so a legitimately long call keeps
@@ -82,23 +82,24 @@ class OpenAICompatLLMClient:
         stream: bool = True,
         stall_timeout: float | None = DEFAULT_STREAM_STALL_TIMEOUT,
     ) -> None:
-        # api_key/base_url=None let the SDK resolve them from the environment (OPENAI_API_KEY /
-        # OPENAI_BASE_URL) — only pass them to override. max_tokens defaults to unset: reasoning
-        # models reject a cap and every target runs fine without one; when set it is sent as
+        # With no explicit base_url, api_key=None lets the SDK resolve OPENAI_API_KEY while an
+        # explicit official URL prevents OPENAI_BASE_URL from redirecting that credential. A
+        # configured base_url is a separate trust boundary: it never inherits OPENAI_API_KEY and
+        # receives either an explicit key or a placeholder.
+        # max_tokens defaults to unset: reasoning models reject a cap; when set it is sent as
         # `max_completion_tokens` (the current field; the legacy `max_tokens` is rejected by
         # reasoning models).
         client_kwargs: dict[str, Any] = {}
         if api_key is not None:
             client_kwargs["api_key"] = api_key
-        elif base_url is not None and not os.environ.get("OPENAI_API_KEY"):
+        elif base_url is not None:
             # A custom endpoint (a local runtime — Ollama/LM Studio/vLLM/llama.cpp) generally
             # ignores the key, but AsyncOpenAI still refuses to construct without a non-empty one.
             # Supply a placeholder so pointing `base_url` at a local runtime is config-only, with no
-            # dummy `api_key:` required. OpenAI proper (no base_url) still needs a real key, and an
-            # endpoint that *does* require auth is served by setting api_key/OPENAI_API_KEY.
+            # dummy `api_key:` required. An authenticated custom endpoint receives its selected
+            # environment credential from bootstrap as the explicit api_key argument.
             client_kwargs["api_key"] = "not-needed"
-        if base_url is not None:
-            client_kwargs["base_url"] = base_url
+        client_kwargs["base_url"] = base_url if base_url is not None else DEFAULT_OPENAI_BASE_URL
         if stall_timeout is not None:
             # Explicit per-phase timeout rather than a scalar: a scalar would apply the same budget
             # to connect, and a slow TLS handshake is not the failure being bounded here.

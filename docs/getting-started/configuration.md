@@ -52,6 +52,29 @@ loads a local `.env` automatically when present, so you don't need to `export` i
 is gitignored, and **real environment variables still take precedence** (a `.env` value is used only
 when the variable isn't already set), so it never silently overrides a key you exported deliberately.
 
+For OpenAI proper, `OpenAICompatLLMClient` likewise uses the SDK-standard `OPENAI_API_KEY` when
+`base_url` is absent. For a hosted OpenAI-compatible endpoint, name a dedicated environment
+variable explicitly; the variable name is safe to commit, while bootstrap resolves its value only
+when constructing the client:
+
+```yaml
+agent:
+  llm:
+    client: sora.adapters.openai_llm.OpenAICompatLLMClient
+    model: moonshotai/kimi-k2.5
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+```
+
+```console
+$ export OPENROUTER_API_KEY=sk-or-v1-...
+```
+
+`api_key_env` and an explicit `api_key` are mutually exclusive, and a named but unset variable is a
+startup error. A configured `base_url` never inherits `OPENAI_API_KEY`: without `api_key_env` (or a
+programmatically supplied `api_key`) it receives a non-secret placeholder, which is suitable for
+unauthenticated local runtimes such as Ollama.
+
 ## See also
 
 - [Quickstart](quickstart.md) — installing and running your first agent

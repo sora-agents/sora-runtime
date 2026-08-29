@@ -311,12 +311,25 @@ def adapter_for(
 def llm_for(config: AgentConfig) -> LLMClient | None:
     """Build the ``LLMClient`` behind ``ProceduralMemory.infer`` from the optional ``llm:`` block.
     Absent -> ``None`` (store/retrieve-only procedural memory, no model). Present -> the client
-    named by ``client:`` (default the shipped ``AnthropicLLMClient``), with the rest of the block
-    passed as kwargs — so ``model:`` is config, never hardcoded, and the key stays in the env."""
+    named by ``client:`` (default the shipped ``AnthropicLLMClient``). ``api_key_env:`` is resolved
+    here into the client's ``api_key`` kwarg; the rest of the block is passed through unchanged —
+    so ``model:`` is config, never hardcoded, while the secret itself stays in the environment."""
     if not config.llm:
         return None
     settings = dict(config.llm)
     client_path = settings.pop("client", _DEFAULT_LLM_CLIENT)
+    api_key_env = settings.pop("api_key_env", None)
+    if api_key_env is not None:
+        if "api_key" in settings:
+            raise ValueError("agent.llm.api_key and api_key_env are mutually exclusive")
+        if not isinstance(api_key_env, str) or not api_key_env:
+            raise ValueError("agent.llm.api_key_env must be a non-empty environment variable name")
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            raise ValueError(
+                f"agent.llm.api_key_env names {api_key_env}, but that variable is not set"
+            )
+        settings["api_key"] = api_key
     client_cls = import_object(client_path)
     client = client_cls(**settings)
     # Wrap every built client so each round-trip is timed and logged (`sora.llm`) — instrumentation

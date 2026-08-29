@@ -349,6 +349,14 @@ def _config(
     )
 
 
+class _CredentialLLMClient:
+    def __init__(self, *, api_key: str) -> None:
+        self.api_key = api_key
+
+    async def complete(self, *, system: str, prompt: str) -> str:
+        return ""
+
+
 def test_llm_for_absent_block_is_none() -> None:
     assert llm_for(_config(llm=None)) is None
 
@@ -372,6 +380,63 @@ def test_llm_for_carries_the_model_id_for_the_run_trace() -> None:
     client = llm_for(_config(llm={"client": "fakes.FakeLLMClient", "model": "qwen3:30b-64k"}))
     assert isinstance(client, MeteredLLMClient)
     assert client.model == "qwen3:30b-64k"
+
+
+def test_llm_for_resolves_api_key_from_the_configured_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sora.llm import MeteredLLMClient
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+
+    client = llm_for(
+        _config(
+            llm={
+                "client": "test_bootstrap._CredentialLLMClient",
+                "api_key_env": "OPENROUTER_API_KEY",
+            }
+        )
+    )
+
+    assert isinstance(client, MeteredLLMClient)
+    assert isinstance(client._inner, _CredentialLLMClient)
+    assert client._inner.api_key == "openrouter-secret"
+
+
+def test_llm_for_rejects_an_unset_api_key_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MISSING_LLM_API_KEY", raising=False)
+
+    with pytest.raises(
+        ValueError,
+        match="agent.llm.api_key_env names MISSING_LLM_API_KEY, but that variable is not set",
+    ):
+        llm_for(
+            _config(
+                llm={
+                    "client": "test_bootstrap._CredentialLLMClient",
+                    "api_key_env": "MISSING_LLM_API_KEY",
+                }
+            )
+        )
+
+
+def test_llm_for_rejects_api_key_and_api_key_env_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "from-environment")
+
+    with pytest.raises(ValueError, match="api_key and api_key_env are mutually exclusive"):
+        llm_for(
+            _config(
+                llm={
+                    "client": "test_bootstrap._CredentialLLMClient",
+                    "api_key": "inline-secret",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                }
+            )
+        )
 
 
 def test_transport_for_defaults_to_in_process() -> None:

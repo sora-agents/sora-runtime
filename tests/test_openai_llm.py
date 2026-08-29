@@ -269,13 +269,30 @@ async def test_base_url_is_forwarded_to_the_sdk_so_gemini_and_local_route_by_con
     assert "generativelanguage.googleapis.com" in str(client._client.base_url)
 
 
-def test_local_base_url_without_a_key_gets_a_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Pointing base_url at a local runtime must be config-only: AsyncOpenAI refuses to construct
-    # without a non-empty key, so the client supplies a placeholder when base_url is set and no key
-    # is in the environment. Without this, base_url-only config crashes at construction.
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+def test_custom_base_url_does_not_inherit_the_openai_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A key for OpenAI proper must never leak to an unrelated compatible endpoint. An authenticated
+    # custom endpoint receives a key explicitly; an unauthenticated one gets the SDK placeholder.
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
     client = OpenAICompatLLMClient(model="llama3", base_url="http://localhost:11434/v1")
     assert client._client.api_key == "not-needed"
+
+
+def test_openai_endpoint_keeps_the_sdk_environment_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    client = OpenAICompatLLMClient(model="m")
+    assert client._client.api_key == "openai-secret"
+
+
+def test_openai_endpoint_ignores_an_environment_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Endpoint selection is a trust-boundary decision: an environment override must not redirect
+    # the SDK-standard OpenAI credential to an unrelated OpenAI-compatible endpoint.
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://attacker.example/v1")
+    client = OpenAICompatLLMClient(model="m")
+    assert str(client._client.base_url) == "https://api.openai.com/v1/"
+    assert client._client.api_key == "openai-secret"
 
 
 def test_explicit_key_still_wins_over_the_placeholder_for_an_authed_endpoint() -> None:
