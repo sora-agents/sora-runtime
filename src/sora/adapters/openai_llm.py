@@ -136,7 +136,11 @@ class OpenAICompatLLMClient:
             response = await self._client.chat.completions.create(**kwargs)
             text = _text_of(response)
             if self._instrument:
-                log_llm_usage(_usage_of(response, answer_chars=len(text)))
+                log_llm_usage(
+                    _usage_of(response, answer_chars=len(text)),
+                    request,
+                    finish_reason=_finish_reason_of(response),
+                )
             return text
         if self._instrument:
             # Only asked for when it will be used: a chunked response carries no usage block unless
@@ -145,6 +149,7 @@ class OpenAICompatLLMClient:
             kwargs["stream_options"] = {"include_usage": True}
         parts: list[str] = []
         usage_chunk: Any = None
+        finish_reason: str | None = None
         stream = await self._client.chat.completions.create(**kwargs, stream=True)
         # `async with`, not a bare `async for`: the stall timeout above raises *mid-iteration* —
         # that is the path it exists for — and an unclosed stream leaves the httpx response open,
@@ -158,12 +163,19 @@ class OpenAICompatLLMClient:
                 if getattr(chunk, "usage", None) is not None:
                     usage_chunk = chunk
                 for choice in getattr(chunk, "choices", None) or []:
+                    candidate = getattr(choice, "finish_reason", None)
+                    if isinstance(candidate, str):
+                        finish_reason = candidate
                     content = getattr(getattr(choice, "delta", None), "content", None)
                     if content:
                         parts.append(content)
         text = "".join(parts)
         if self._instrument:
-            log_llm_usage(_usage_of(usage_chunk, answer_chars=len(text)))
+            log_llm_usage(
+                _usage_of(usage_chunk, answer_chars=len(text)),
+                request,
+                finish_reason=finish_reason,
+            )
         return text
 
     async def aclose(self) -> None:
@@ -182,6 +194,14 @@ def _text_of(response: Any) -> str:
     message = getattr(choices[0], "message", None)
     content = getattr(message, "content", None)
     return content or ""
+
+
+def _finish_reason_of(response: Any) -> str | None:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return None
+    reason = getattr(choices[0], "finish_reason", None)
+    return reason if isinstance(reason, str) else None
 
 
 def _usage_of(response: Any, *, answer_chars: int) -> LLMUsage:

@@ -34,11 +34,12 @@ def _response(
     completion_tokens: int | None = None,
     reasoning_tokens: int | None = None,
     cached_tokens: int | None = None,
+    finish_reason: str | None = "stop",
     with_usage: bool = True,
 ) -> SimpleNamespace:
     """A minimal stand-in for an OpenAI ``ChatCompletion`` response — only the fields the client
     reads (``choices[0].message.content`` and the ``usage`` token block)."""
-    choice = SimpleNamespace(message=SimpleNamespace(content=content))
+    choice = SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish_reason)
     usage = None
     if with_usage:
         details = (
@@ -136,6 +137,15 @@ def _chunks(response: SimpleNamespace) -> list[SimpleNamespace]:
         SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=ch))], usage=None)
         for ch in text
     ]
+    finish_reason = response.choices[0].finish_reason if response.choices else None
+    out.append(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason=finish_reason)
+            ],
+            usage=None,
+        )
+    )
     out.append(SimpleNamespace(choices=[], usage=response.usage))
     return out
 
@@ -381,6 +391,32 @@ async def test_instrument_emits_a_usage_record_carrying_the_exact_reasoning_toke
     assert record.__dict__["llm_output_tokens"] == 800
     assert record.__dict__["llm_reasoning_tokens"] == 600
     assert record.__dict__["llm_cached_input_tokens"] == 80
+    assert record.__dict__["llm_finish_reason"] == "stop"
+    assert record.__dict__["llm_semantic_label"] == "test"
+    assert record.__dict__["llm_prompt_version"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_instrument_carries_provider_finish_reason_for_both_response_modes(
+    stream: bool, _llm_logging_enabled: None
+) -> None:
+    client = OpenAICompatLLMClient(model="m", api_key="test", instrument=True, stream=stream)
+    client._client = _FakeAsyncOpenAI(  # type: ignore[assignment]
+        _response("hi", finish_reason="length")
+    )
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(handler)
+    try:
+        await client.complete(_request())
+    finally:
+        logger.removeHandler(handler)
+
+    (usage,) = [r for r in records if r.__dict__.get("llm_event") == "usage"]
+    assert usage.__dict__["llm_finish_reason"] == "length"
 
 
 @pytest.mark.asyncio

@@ -412,6 +412,10 @@ async def test_discarded_inference_emits_a_meter_cue(tmp_path: Path) -> None:
     discarded = [r for r in records if r.__dict__.get("llm_event") == "discarded"]
     assert len(discarded) == 1
     assert discarded[0].__dict__["llm_inference_id"] == "inf-1"
+    outcomes = [r for r in records if r.__dict__.get("llm_event") == "outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0].__dict__["llm_inference_id"] == "inf-1"
+    assert outcomes[0].__dict__["llm_outcome"] == "success"
 
 
 # --------------------------------------------------------------------------------------------------

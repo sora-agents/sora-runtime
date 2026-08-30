@@ -9,6 +9,7 @@ end reaches episodic memory, and the user hears about it.
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from sora.action import default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry
+from sora.llm import LLMMeter
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -320,6 +322,33 @@ async def test_a_result_that_arrives_after_the_deadline_is_discarded(tmp_path: P
 
     assert replanning is ActivityState.READY
     assert activity.plan is None or activity.plan.id != "p9"
+
+
+async def test_an_already_queued_result_wins_over_the_watchdog(tmp_path: Path) -> None:
+    """Observe may start after the deadline even though the provider result is already waiting.
+    That result is resolved and used; the watchdog must not append a stale error behind it."""
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring("plan")
+    working.activities["a1"] = activity
+    plan = Plan(id="p9", goal="arrived", steps=[_step("go")])
+    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=plan))
+
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(meter)
+    try:
+        await DefaultObserveStrategy(inference_deadline=1.0).observe(cycle)
+    finally:
+        logger.removeHandler(meter)
+        logger.setLevel(previous)
+
+    assert activity.plan is plan
+    assert activity.state is ActivityState.READY
+    (inference,) = meter.report().inferences
+    assert inference.outcome == "success"
+    assert inference.discarded is False
 
 
 async def test_a_failed_then_inference_replans_rather_than_killing_the_activity(

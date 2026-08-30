@@ -99,6 +99,7 @@ async def test_streamed_message_emits_its_cached_input_usage(
 ) -> None:
     message = SimpleNamespace(
         content=[SimpleNamespace(type="text", text="hi")],
+        stop_reason="max_tokens",
         usage=SimpleNamespace(
             input_tokens=20,
             cache_creation_input_tokens=10,
@@ -123,6 +124,9 @@ async def test_streamed_message_emits_its_cached_input_usage(
     (record,) = usage_records
     assert record.__dict__["llm_input_tokens"] == 100
     assert record.__dict__["llm_cached_input_tokens"] == 70
+    assert record.__dict__["llm_finish_reason"] == "max_tokens"
+    assert record.__dict__["llm_semantic_label"] == "plan"
+    assert record.__dict__["llm_prompt_version"] == "1"
 
 
 @pytest.mark.asyncio

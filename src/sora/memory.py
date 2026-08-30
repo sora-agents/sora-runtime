@@ -22,7 +22,7 @@ from urllib.parse import quote
 from sora.action import InvokeAction, invoke_step
 from sora.activity import SEEDED_BINDINGS
 from sora.environment import WorkspaceOrigin
-from sora.llm import CompletionRequest
+from sora.llm import CompletionRequest, log_llm_malformed
 from sora.manual import (
     Manual,
     ManualSection,
@@ -1215,7 +1215,7 @@ def default_plan_prompt(
     return PLAN_SYSTEM_PROMPT, user
 
 
-def step_from_raw(raw: dict[str, Any]) -> Step:
+def step_from_raw(raw: dict[str, Any], *, record_malformed: bool = False) -> Step:
     """Convert one raw plan-step dict (the model's JSON step shape) into a ``Step``. An ``invoke`` —
     the default when no ``action`` is given — routes through ``invoke_step`` so the tool_id and
     operation_name land under the routing keys; every other action (including a ``subgoal``, whose
@@ -1239,24 +1239,35 @@ def step_from_raw(raw: dict[str, Any]) -> Step:
         kind = params["goal_kind"]
         if not isinstance(kind, str) or kind not in GOAL_KINDS:
             del params["goal_kind"]  # dropped here, not inside the log call, so it happens
+            if record_malformed:
+                log_llm_malformed(dropped=1)
             log.warning(
                 "plan: sub-goal %r declared an unusable goal_kind %r; reading it as %s",
                 params.get("goal"),
                 kind,
                 GOAL_KIND_ACHIEVEMENT,
             )
+    if action == SUBGOAL and record_malformed and "pending" in params:
+        raw_pending = params["pending"]
+        if isinstance(raw_pending, list):
+            for entry in raw_pending:
+                pending_from_raw(entry, record_malformed=True)
+        else:
+            log_llm_malformed(dropped=1)
     return Step(next_action=action, params=params)
 
 
 def _parse_plan_steps(text: str) -> list[Step]:
     try:
         data = _load_json_object(text)
-        return [step_from_raw(raw) for raw in data["steps"]]
+        return [step_from_raw(raw, record_malformed=True) for raw in data["steps"]]
     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         raise ValueError(f"could not parse a plan from model output: {exc!r}\n---\n{text}") from exc
 
 
-def pending_from_raw(raw: dict[str, Any]) -> PendingCondition | None:
+def pending_from_raw(
+    raw: dict[str, Any], *, record_malformed: bool = False
+) -> PendingCondition | None:
     """Convert one raw ``pending`` entry into a ``PendingCondition``, or None if it is unusable.
 
     A malformed condition is **dropped, not raised**: the body is the part that does the work, and
@@ -1271,22 +1282,32 @@ def pending_from_raw(raw: dict[str, Any]) -> PendingCondition | None:
     nothing to judge or nothing to do.
     """
     if not isinstance(raw, dict):
+        if record_malformed:
+            log_llm_malformed(dropped=1)
         return None
     watch = raw.get("watch")
     when, then = raw.get("when"), raw.get("then")
     if not isinstance(watch, dict) or not isinstance(when, str) or not isinstance(then, str):
+        if record_malformed:
+            log_llm_malformed(dropped=1)
         return None
     signal_name = watch.get("signal") or watch.get("signal_name")
     if not isinstance(signal_name, str) or not signal_name:
+        if record_malformed:
+            log_llm_malformed(dropped=1)
         return None
     if not when.strip() or not then.strip():
+        if record_malformed:
+            log_llm_malformed(dropped=1)
         return None
-    until = _until_from_raw(raw.get("until"))
+    until = _until_from_raw(raw.get("until"), record_malformed=record_malformed)
     # An unrecognized `kind` degrades to no narrowing rather than to a watch nothing can satisfy:
     # the same choice the rest of this parser makes, and the safe direction for a scope whose only
     # job is to skip model calls.
     kind = watch.get("kind")
     if kind not in ("added", "removed", "updated"):
+        if kind is not None and record_malformed:
+            log_llm_malformed(dropped=1)
         kind = None
     return PendingCondition(
         watch=SignalWait(
@@ -1308,7 +1329,7 @@ def pending_from_raw(raw: dict[str, Any]) -> PendingCondition | None:
 _MAX_UNTIL_SECONDS = 100 * 365 * 24 * 3600
 
 
-def _until_from_raw(raw: Any) -> Until | None:
+def _until_from_raw(raw: Any, *, record_malformed: bool = False) -> Until | None:
     """An ``until`` as the planner may write it: a bare string (event-shaped — the judge answers
     it, which is what every plan did before bounds existed), or ``{"text": ..., "seconds": N}``
     declaring that the clause is a deadline and how long the window is (ADR-0027 §5).
@@ -1322,18 +1343,32 @@ def _until_from_raw(raw: Any) -> Until | None:
     are unreadable in the same sense: positive, and still naming no instant that arithmetic could
     reach (`_MAX_UNTIL_SECONDS`)."""
     if isinstance(raw, str):
-        return Until(text=raw) if raw.strip() else None
+        if raw.strip():
+            return Until(text=raw)
+        if record_malformed:
+            log_llm_malformed(dropped=1)
+        return None
     if not isinstance(raw, dict):
+        if raw is not None and record_malformed:
+            log_llm_malformed(dropped=1)
         return None
     text = raw.get("text")
     if not isinstance(text, str) or not text.strip():
+        if record_malformed:
+            log_llm_malformed(dropped=1)
         return None
     seconds = raw.get("seconds")
     if isinstance(seconds, bool) or not isinstance(seconds, int | float):
+        if seconds is not None and record_malformed:
+            log_llm_malformed(dropped=1)
         return Until(text=text)
     if isinstance(seconds, float) and not math.isfinite(seconds):
+        if record_malformed:
+            log_llm_malformed(dropped=1)
         return Until(text=text)  # tested before the range, so a huge int never reaches float()
     if not 0 < seconds <= _MAX_UNTIL_SECONDS:
+        if record_malformed:
+            log_llm_malformed(dropped=1)
         return Until(text=text)
     return Until(text=text, seconds=float(seconds))
 
@@ -1342,13 +1377,16 @@ def _parse_plan_pending(text: str) -> tuple[PendingCondition, ...]:
     """The ``pending`` half of the plan contract. Absent means none — every plan predates this
     field, and a planner that declares nothing must keep working exactly as before."""
     try:
-        data = _load_json_object(text)
+        # The plan body already records a structural JSON repair for this same document.
+        data = _load_json_object(text, record_repair=False)
     except (json.JSONDecodeError, TypeError, AttributeError):
         return ()  # the steps parse above already raised on genuinely unparseable output
     raw = data.get("pending") if isinstance(data, dict) else None
     if not isinstance(raw, list):
+        if isinstance(data, dict) and "pending" in data:
+            log_llm_malformed(dropped=1)
         return ()
-    parsed = (pending_from_raw(entry) for entry in raw)
+    parsed = (pending_from_raw(entry, record_malformed=True) for entry in raw)
     return tuple(cond for cond in parsed if cond is not None)
 
 
@@ -1442,7 +1480,9 @@ async def _complete_and_parse[T](
         request,
         user=request.user + REPARSE_FEEDBACK.format(error=failure, output=text),
     )
-    return parse(await llm.complete(retry))
+    repaired = parse(await llm.complete(retry))
+    log_llm_malformed(repaired=1)
+    return repaired
 
 
 def _drop_surplus_closers(text: str) -> str | None:
@@ -1486,7 +1526,7 @@ def _drop_surplus_closers(text: str) -> str | None:
     return "".join(kept) if dropped else None
 
 
-def _load_json_object(text: str) -> Any:
+def _load_json_object(text: str, *, record_repair: bool = True) -> Any:
     """Parse a JSON value from model output, tolerating both a code-fence wrapper and surrounding
     prose. Fast path: parse the fence-stripped text directly (the common clean case). Fallback: try
     each balanced ``{...}`` in order and return the first that parses, so a prose-wrapped
@@ -1504,13 +1544,19 @@ def _load_json_object(text: str) -> Any:
     # fast-path error (they're the same failure viewed twice, not a handler bug).
     for span in _iter_json_objects(stripped):
         try:
-            return json.loads(span)
+            value = json.loads(span)
+            if record_repair:
+                log_llm_malformed(repaired=1)
+            return value
         except json.JSONDecodeError as exc:
             last_err = exc
     repaired = _drop_surplus_closers(stripped)
     if repaired is not None:
         try:
-            return json.loads(repaired)
+            value = json.loads(repaired)
+            if record_repair:
+                log_llm_malformed(repaired=1)
+            return value
         except json.JSONDecodeError as exc:
             last_err = exc
     raise last_err
@@ -1889,9 +1935,13 @@ def _parse_verdict(text: str) -> bool:
     fail-soft degrade (ADR-0024)."""
     try:
         obj = _load_json_object(text)
-        return bool(obj["valid"])
+        valid = obj["valid"]
     except (ValueError, KeyError, TypeError):
+        log_llm_malformed(dropped=1)
         return True
+    if not isinstance(valid, bool):
+        log_llm_malformed(repaired=1)
+    return bool(valid)
 
 
 # --- pending conditions: the batched "did any of these fire?" judgement — ADR-0022 --------------
@@ -1922,7 +1972,9 @@ CONDITION_SYSTEM_PROMPT = (
 )
 
 
-def _parse_condition_verdict(text: str, count: int) -> ConditionVerdict:
+def _parse_condition_verdict(
+    text: str, count: int, *, expect_fired: bool = True
+) -> ConditionVerdict:
     """Parse the batched ``{"fired": [...], "retired": [...]}`` answer.
 
     Degrades to "nothing happened" on malformed output rather than raising: the activity then keeps
@@ -1933,21 +1985,32 @@ def _parse_condition_verdict(text: str, count: int) -> ConditionVerdict:
     try:
         obj = _load_json_object(text)
     except (ValueError, TypeError, AttributeError):
+        log_llm_malformed(dropped=2 if expect_fired else 1)
         return ConditionVerdict()
 
-    def _indices(key: str) -> tuple[int, ...]:
+    def _indices(key: str, *, required: bool = True) -> tuple[int, ...]:
         raw = obj.get(key) if isinstance(obj, dict) else None
         if not isinstance(raw, list):
+            if required or raw is not None:
+                log_llm_malformed(dropped=1)
             return ()
         out: list[int] = []
         for entry in raw:
             if isinstance(entry, bool) or not isinstance(entry, int):
+                log_llm_malformed(dropped=1)
                 continue  # bool is an int subclass; a `true` here is not index 1
-            if 0 <= entry < count and entry not in out:
-                out.append(entry)
+            if not 0 <= entry < count:
+                log_llm_malformed(dropped=1)
+                continue
+            if entry in out:
+                log_llm_malformed(repaired=1)
+                continue
+            out.append(entry)
         return tuple(out)
 
-    return ConditionVerdict(fired=_indices("fired"), retired=_indices("retired"))
+    return ConditionVerdict(
+        fired=_indices("fired", required=expect_fired), retired=_indices("retired")
+    )
 
 
 # --- pending conditions: the retire-only sweep over a watch that has gone quiet — ADR-0027 -------
@@ -2004,19 +2067,32 @@ def _parse_relevance(text: str, episodes: Sequence[Any]) -> RelevanceCandidate |
     try:
         obj = _load_json_object(text)
     except (ValueError, TypeError, AttributeError):
+        log_llm_malformed(dropped=1)
         return None
-    if not isinstance(obj, dict) or not obj.get("relevant"):
+    if not isinstance(obj, dict):
+        log_llm_malformed(dropped=1)
+        return None
+    relevant = obj.get("relevant")
+    if not isinstance(relevant, bool):
+        log_llm_malformed(dropped=1)
+        return None
+    if not relevant:
         return None
     index = obj.get("task")
-    if isinstance(index, bool) or not isinstance(index, int):
-        return None
-    if not 0 <= index < len(episodes):
-        return None
     goal, question = obj.get("goal"), obj.get("question")
+    malformed = 0
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(episodes):
+        malformed += 1
     if not isinstance(goal, str) or not goal.strip():
-        return None
+        malformed += 1
     if not isinstance(question, str) or not question.strip():
+        malformed += 1
+    if malformed:
+        log_llm_malformed(dropped=malformed)
         return None
+    assert isinstance(index, int)
+    assert isinstance(goal, str)
+    assert isinstance(question, str)
     episode = episodes[index]
     episode_id = episode.get("activity_id") if isinstance(episode, dict) else None
     if not isinstance(episode_id, str):
@@ -2077,9 +2153,14 @@ def _parse_keep(text: str, count: int) -> list[int]:
     seen: set[int] = set()
     kept: list[int] = []
     for i in keep:
-        if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < count and i not in seen:
-            seen.add(i)
-            kept.append(i)
+        if isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < count:
+            log_llm_malformed(dropped=1)
+            continue
+        if i in seen:
+            log_llm_malformed(repaired=1)
+            continue
+        seen.add(i)
+        kept.append(i)
     return kept
 
 
@@ -2457,7 +2538,7 @@ class ProceduralMemory:
                 prompt_version="1",
             )
         )
-        return _parse_condition_verdict(text, len(conditions)).retired
+        return _parse_condition_verdict(text, len(conditions), expect_fired=False).retired
 
     async def judge_relevance(
         self,

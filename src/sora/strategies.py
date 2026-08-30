@@ -38,7 +38,7 @@ from sora.action import (
     release,
 )
 from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
-from sora.llm import log_llm_discarded
+from sora.llm import LLMOutcome, log_llm_discarded, log_llm_outcome
 from sora.memory import (
     PerceptSnapshot,
     pending_from_raw,
@@ -1296,7 +1296,11 @@ class DefaultObserveStrategy:
                         # the error the trace just says failed with no cause (e.g. a schema error).
                         log.warning("observe: resolved %s -> FAILED: %s", op, _truncate(ack.result))
                     break
-        # Before the drain, so an expiry raised here is applied by the very same Observe.
+        # Drain first: a provider result may already be queued even though Observe starts after its
+        # deadline. It is a real resolution, so do not append a synthetic timeout behind it. Then
+        # expire requests that remain pending and drain again so a true absence still resolves in
+        # this same Observe pass.
+        await self._resolve_inferences(cycle)
         self._expire_stalled_inferences(cycle)
         await self._resolve_inferences(cycle)
         await self._suspend_on_completion_signal(cycle, just_resolved)
@@ -1489,6 +1493,14 @@ class DefaultObserveStrategy:
         completion (an LLM call can't be cut mid-generation) but its result is no longer wanted."""
         wm = cycle.working
         async for inf_id, res in cycle.inference_sink.drain():
+            outcome: LLMOutcome = (
+                "unresolvable"
+                if res.unresolvable is not None
+                else "error"
+                if res.error is not None
+                else "success"
+            )
+            log_llm_outcome(inf_id, outcome)
             for activity in wm.activities.values():
                 if (
                     activity.pending_inference is not None

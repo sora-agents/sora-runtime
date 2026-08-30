@@ -12,9 +12,18 @@ from sora.llm import (
     LLMMeter,
     LLMUsage,
     MeteredLLMClient,
+    PromptSection,
     current_inference_id,
     log_llm_discarded,
+    log_llm_malformed,
+    log_llm_outcome,
     log_llm_usage,
+)
+from sora.memory import (
+    _parse_condition_verdict,
+    _parse_keep,
+    _parse_relevance,
+    _parse_verdict,
 )
 
 
@@ -131,6 +140,10 @@ async def test_llm_meter_tallies_calls_and_seconds(_llm_logging_enabled: None) -
 
     assert meter.calls == 2
     assert meter.total_seconds >= 0.0
+    report = meter.report()
+    assert report.section_characters is None
+    assert report.dynamic_section_characters is None
+    assert report.inferences[0].dynamic_section_share is None
 
 
 def test_llm_meter_summary_singular_plural_and_wall() -> None:
@@ -275,6 +288,12 @@ def test_llm_meter_tallies_cached_input_and_reports_hit_rate(
     assert meter.cache_hit_rate == 800 / 1000
     assert meter.cache_coverage == 1000 / 1500
     assert "800 cached, 80% hit (67% cache coverage)" in meter.summary()
+    report = meter.report()
+    assert report.cache_observed_input_tokens == 1000
+    assert report.cache_unknown_input_tokens == 500
+    (inference,) = report.inferences
+    assert inference.cache_observed_input_tokens == 1000
+    assert inference.cache_unknown_input_tokens == 500
 
 
 def test_llm_meter_reports_an_explicit_zero_as_a_measured_cache_miss(
@@ -460,3 +479,171 @@ def test_llm_meter_summary_unchanged_when_nothing_discarded() -> None:
     assert meter.summary() == "3 LLM calls, 4.0s in-model"
     assert "used" not in meter.summary()
     assert "wasted" not in meter.summary()
+
+
+@pytest.mark.asyncio
+async def test_request_metadata_reaches_timing_and_usage_records(
+    _llm_logging_enabled: None,
+) -> None:
+    request = CompletionRequest(
+        "system",
+        "user",
+        semantic_label="plan",
+        prompt_version="3",
+        sections=(
+            PromptSection("contract", characters=80, dynamic=False),
+            PromptSection("observations", characters=20, dynamic=True),
+        ),
+    )
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(handler)
+    try:
+        await MeteredLLMClient(_StubClient()).complete(request)
+        log_llm_usage(LLMUsage(100, 10, answer_chars=8), request, finish_reason="stop")
+    finally:
+        logger.removeHandler(handler)
+
+    attributed = [
+        record for record in records if record.__dict__.get("llm_event") in {"done", "usage"}
+    ]
+    assert len(attributed) == 2
+    for record in attributed:
+        assert record.__dict__["llm_semantic_label"] == "plan"
+        assert record.__dict__["llm_prompt_version"] == "3"
+        assert record.__dict__["llm_section_characters"] == 100
+        assert record.__dict__["llm_dynamic_section_characters"] == 20
+    assert attributed[-1].__dict__["llm_finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_structured_report_aggregates_round_trips_by_inference(
+    _llm_logging_enabled: None,
+) -> None:
+    """A parse retry is two provider round trips but one off-cycle inference and outcome."""
+    request = CompletionRequest(
+        "system",
+        "user",
+        semantic_label="plan",
+        prompt_version="3",
+        sections=(
+            PromptSection("static", characters=75, dynamic=False),
+            PromptSection("goal", characters=25, dynamic=True),
+        ),
+    )
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    token = current_inference_id.set("inf-plan")
+    try:
+        for finish_reason in ("length", "stop"):
+            log_llm_usage(
+                LLMUsage(100, 20, answer_chars=20, cached_input_tokens=40),
+                request,
+                finish_reason=finish_reason,
+            )
+            await MeteredLLMClient(_StubClient()).complete(request)
+        log_llm_malformed(dropped=2, repaired=1)
+        log_llm_outcome("inf-plan", "success")
+        log_llm_discarded("inf-plan")
+    finally:
+        current_inference_id.reset(token)
+        logger.removeHandler(meter)
+
+    report = meter.report()
+    assert report.calls == 2
+    assert report.latency_seconds == meter.total_seconds
+    assert report.input_tokens == 200
+    assert report.cached_input_tokens == 80
+    assert report.output_tokens == 40
+    assert report.section_characters == 200
+    assert report.dynamic_section_characters == 50
+    assert report.malformed_fields_dropped == 2
+    assert report.malformed_fields_repaired == 1
+    assert len(report.inferences) == 1
+    inference = report.inferences[0]
+    assert inference.inference_id == "inf-plan"
+    assert inference.semantic_label == "plan"
+    assert inference.prompt_version == "3"
+    assert inference.round_trips == 2
+    assert inference.latency_seconds == meter.total_seconds
+    assert inference.dynamic_section_share == 0.25
+    assert inference.finish_reasons == ("length", "stop")
+    assert inference.outcome == "success"
+    assert inference.discarded is True
+    assert inference.malformed_fields_dropped == 2
+    assert inference.malformed_fields_repaired == 1
+
+
+@pytest.mark.asyncio
+async def test_untagged_malformed_cue_stays_aggregate_only_for_anonymous_call(
+    _llm_logging_enabled: None,
+) -> None:
+    request = CompletionRequest("system", "user", semantic_label="plan", prompt_version="3")
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        await MeteredLLMClient(_StubClient()).complete(request)
+        log_llm_usage(LLMUsage(100, 20, answer_chars=20), request)
+        # Parsers have no request metadata when this supported synchronous path has no inference id.
+        log_llm_malformed(dropped=2, repaired=1)
+    finally:
+        logger.removeHandler(meter)
+
+    report = meter.report()
+    assert report.malformed_fields_dropped == 2
+    assert report.malformed_fields_repaired == 1
+    assert len(report.inferences) == 1
+    (inference,) = report.inferences
+    assert inference.semantic_label == "plan"
+    assert inference.prompt_version == "3"
+    assert inference.malformed_fields_dropped == 0
+    assert inference.malformed_fields_repaired == 0
+
+
+def test_structured_report_keeps_the_first_terminal_outcome(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        log_llm_outcome("inf-1", "success")
+        log_llm_outcome("inf-1", "error")  # a later stale result for the same terminal inference
+    finally:
+        logger.removeHandler(meter)
+
+    (inference,) = meter.report().inferences
+    assert inference.outcome == "success"
+
+
+def test_tolerant_response_parsers_report_every_dropped_or_repaired_field(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    token = current_inference_id.set("inf-tolerant")
+    try:
+        assert _parse_verdict('{"valid": "yes"}') is True
+        verdict = _parse_condition_verdict('{"fired": [0, "bad", 9, 0], "retired": "none"}', 1)
+        assert verdict.fired == (0,)
+        assert verdict.retired == ()
+        assert _parse_keep('{"keep": [0, "bad", 9, 0]}', 1) == [0]
+        assert (
+            _parse_relevance(
+                '{"relevant": true, "task": "zero", "goal": "", "question": 3}',
+                [{"activity_id": "a1"}],
+            )
+            is None
+        )
+    finally:
+        current_inference_id.reset(token)
+        logger.removeHandler(meter)
+
+    (inference,) = meter.report().inferences
+    assert inference.malformed_fields_dropped == 8
+    assert inference.malformed_fields_repaired == 3

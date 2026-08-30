@@ -215,7 +215,25 @@ policy, retry, credential refresh, and interrupt handling remain outside the cli
 is what lets a second provider slot in without touching the decision cycle. Configured via
 `agent.yaml`'s `llm:` block (see [Configuration Reference](configuration.md#agentllm)); every
 configured client is wrapped in the shipped `MeteredLLMClient` automatically for timing/usage
-instrumentation.
+instrumentation. `LLMMeter.report()` returns a frozen, machine-readable `LLMReport`: aggregate
+round trips, latency, tokens, rendered-section sizes, and malformed-field counts plus one
+`LLMInferenceReport` per inference id. Each inference row carries the request's semantic label and
+prompt version, its summed latency and token use (including parse retries), provider finish
+reasons, terminal outcome, and an independent discard flag. A successful completion can therefore
+still be reported as discarded when ADR-0021's stale-result guard rejects it.
+
+Cache accounting preserves observation coverage at both levels: `cached_input_tokens` sums known
+cache reads, while `cache_observed_input_tokens` and `cache_unknown_input_tokens` separate input for
+which the provider did and did not report cache usage. An absent provider field is therefore not
+reported as a measured zero-cache run. Malformed counts are attached to an inference only when its
+id is present; an anonymous parser cue has no reliable request metadata and remains aggregate-only
+rather than creating a phantom inference row.
+
+Prompt-section contribution is based on the request's declared `PromptSection.characters`, not a
+provider tokenizer. An empty `sections` tuple means that contribution is unavailable. Finish
+reasons are likewise optional provider observations. Malformed counts cover fields the local
+anti-corruption boundary safely drops or repairs; a response that cannot be recovered remains an
+error outcome rather than being counted as a successful repair.
 
 ---
 

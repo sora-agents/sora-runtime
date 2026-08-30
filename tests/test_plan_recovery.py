@@ -17,12 +17,14 @@ a well-formed pending condition — discarded over one stray brace at the tail o
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from fakes import FakeLLMClient
 from sora.activity import Activity
+from sora.llm import LLMMeter, MeteredLLMClient, current_inference_id
 from sora.memory import (
     FileMemoryBackend,
     ProceduralMemory,
@@ -118,6 +120,28 @@ async def test_unrepairable_output_is_retried_once_with_the_error(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_a_successful_parse_retry_is_counted_as_a_repair(tmp_path: Path) -> None:
+    llm = FakeLLMClient(["not json at all", '{"steps": []}'])
+    memory = ProceduralMemory(FileMemoryBackend(tmp_path), llm=MeteredLLMClient(llm))
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(meter)
+    token = current_inference_id.set("inf-retry")
+    try:
+        await memory.infer(_activity(), {})
+    finally:
+        current_inference_id.reset(token)
+        logger.removeHandler(meter)
+        logger.setLevel(previous)
+
+    (inference,) = meter.report().inferences
+    assert inference.round_trips == 2
+    assert inference.malformed_fields_repaired == 1
+
+
+@pytest.mark.asyncio
 async def test_a_repairable_plan_costs_no_second_call(tmp_path: Path) -> None:
     """The free repair runs first, so a stray brace never buys a round trip."""
     llm = FakeLLMClient(['{"steps": [{"action": "focus", "tool_id": "t1"}]}}'])
@@ -125,6 +149,59 @@ async def test_a_repairable_plan_costs_no_second_call(tmp_path: Path) -> None:
     plan = await memory.infer(_activity(), {})
     assert len(plan.steps) == 1
     assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_report_counts_repaired_json_and_dropped_malformed_plan_fields(
+    tmp_path: Path,
+) -> None:
+    raw = (
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "action": "subgoal",
+                        "goal": "child",
+                        "goal_kind": ["not", "a", "label"],
+                    }
+                ],
+                "pending": [
+                    {"watch": {}, "when": "reply arrives", "then": "follow up"},
+                    "not an object",
+                    {
+                        "watch": {"signal": "changed", "kind": "moved"},
+                        "when": "it changes",
+                        "then": "follow up",
+                        "until": {"text": "tomorrow", "seconds": "soon"},
+                    },
+                ],
+            }
+        )
+        + "}"
+    )
+    llm = FakeLLMClient(raw)
+    memory = ProceduralMemory(FileMemoryBackend(tmp_path), llm=MeteredLLMClient(llm))
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(meter)
+    token = current_inference_id.set("inf-malformed")
+    try:
+        plan = await memory.infer(_activity(), {})
+    finally:
+        current_inference_id.reset(token)
+        logger.removeHandler(meter)
+        logger.setLevel(previous)
+
+    assert len(plan.steps) == 1
+    assert len(plan.pending) == 1
+    assert plan.pending[0].watch.kind is None
+    assert plan.pending[0].until is not None
+    assert plan.pending[0].until.seconds is None
+    (inference,) = meter.report().inferences
+    assert inference.malformed_fields_dropped == 5
+    assert inference.malformed_fields_repaired == 1
 
 
 @pytest.mark.asyncio

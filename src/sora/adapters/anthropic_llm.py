@@ -81,7 +81,12 @@ class AnthropicLLMClient:
             # answer_chars is the returned answer's length — the thinking estimate subtracts it from
             # output_tokens. Thinking-block *text* is not counted: adaptive thinking doesn't return
             # it, so it can't be measured directly (see LLMUsage).
-            log_llm_usage(_usage_of(message, answer_chars=len(text)))
+            finish_reason = getattr(message, "stop_reason", None)
+            log_llm_usage(
+                _usage_of(message, answer_chars=len(text)),
+                request,
+                finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+            )
         return text
 
     async def aclose(self) -> None:

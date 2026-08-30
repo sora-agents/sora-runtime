@@ -5,8 +5,8 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from dataclasses import dataclass
-from typing import Literal, Protocol
+from dataclasses import dataclass, replace
+from typing import Any, Literal, Protocol, cast
 
 # A dedicated child of the `sora` tree so instrumentation records are addressable on their own —
 # the CLI presenter surfaces them as a per-call cue, `LLMMeter` tallies them, and neither has to
@@ -82,6 +82,25 @@ class CompletionRequest:
     sections: tuple[PromptSection, ...] = ()
 
 
+def _request_metadata(request: CompletionRequest | None) -> dict[str, object]:
+    if request is None:
+        return {
+            "llm_semantic_label": None,
+            "llm_prompt_version": None,
+            "llm_section_characters": None,
+            "llm_dynamic_section_characters": None,
+        }
+    section_characters = sum(section.characters for section in request.sections)
+    dynamic_characters = sum(section.characters for section in request.sections if section.dynamic)
+    return {
+        "llm_semantic_label": request.semantic_label,
+        "llm_prompt_version": request.prompt_version,
+        # No declarations means unavailable, not a measured zero-size prompt.
+        "llm_section_characters": section_characters if request.sections else None,
+        "llm_dynamic_section_characters": dynamic_characters if request.sections else None,
+    }
+
+
 @dataclass(frozen=True)
 class LLMUsage:
     """Provider-native token accounting for one round-trip. Surfaced by the *concrete* client
@@ -135,7 +154,12 @@ class LLMUsage:
         return self.thinking_tokens / self.output_tokens if self.output_tokens else 0.0
 
 
-def log_llm_usage(usage: LLMUsage) -> None:
+def log_llm_usage(
+    usage: LLMUsage,
+    request: CompletionRequest | None = None,
+    *,
+    finish_reason: str | None = None,
+) -> None:
     """Emit one ``sora.llm`` usage record for a single round-trip. Kept here, not in the concrete
     client, so the *record shape* (event name, field names) stays owned by this instrumentation
     module — the client only supplies the provider-native numbers. Paired with, and distinct from,
@@ -158,6 +182,8 @@ def log_llm_usage(usage: LLMUsage) -> None:
             "llm_reasoning_tokens": usage.reasoning_tokens,
             "llm_cached_input_tokens": usage.cached_input_tokens,
             "llm_inference_id": inference_id,
+            "llm_finish_reason": finish_reason,
+            **_request_metadata(request),
         },
     )
 
@@ -174,6 +200,42 @@ def log_llm_discarded(inference_id: str) -> None:
         "~ llm %sdiscarded (result superseded)",
         _id_tag(inference_id),
         extra={"llm_event": "discarded", "llm_inference_id": inference_id},
+    )
+
+
+LLMOutcome = Literal["success", "unresolvable", "error"]
+
+
+def log_llm_outcome(inference_id: str, outcome: LLMOutcome) -> None:
+    """Record how a completed inference resolved, independently from whether it became stale."""
+    _llm_log.info(
+        "~ llm %soutcome: %s",
+        _id_tag(inference_id),
+        outcome,
+        extra={
+            "llm_event": "outcome",
+            "llm_inference_id": inference_id,
+            "llm_outcome": outcome,
+        },
+    )
+
+
+def log_llm_malformed(*, dropped: int = 0, repaired: int = 0) -> None:
+    """Count malformed response fields conservatively dropped or mechanically repaired."""
+    if not dropped and not repaired:
+        return
+    inference_id = current_inference_id.get()
+    _llm_log.info(
+        "~ llm %smalformed: %d dropped / %d repaired",
+        _id_tag(inference_id),
+        dropped,
+        repaired,
+        extra={
+            "llm_event": "malformed",
+            "llm_inference_id": inference_id,
+            "llm_malformed_fields_dropped": dropped,
+            "llm_malformed_fields_repaired": repaired,
+        },
     )
 
 
@@ -238,6 +300,7 @@ class MeteredLLMClient:
                     "llm_event": "done",
                     "llm_seconds": elapsed,
                     "llm_inference_id": inference_id,
+                    **_request_metadata(request),
                 },
             )
 
@@ -247,6 +310,72 @@ class MeteredLLMClient:
         aclose = getattr(self._inner, "aclose", None)
         if aclose is not None:
             await aclose()
+
+
+@dataclass(frozen=True)
+class LLMInferenceReport:
+    inference_id: str | None
+    semantic_label: str | None
+    prompt_version: str | None
+    round_trips: int
+    latency_seconds: float
+    input_tokens: int
+    cached_input_tokens: int
+    cache_observed_input_tokens: int
+    cache_unknown_input_tokens: int
+    output_tokens: int
+    section_characters: int | None
+    dynamic_section_characters: int | None
+    finish_reasons: tuple[str, ...]
+    outcome: LLMOutcome | None
+    discarded: bool
+    malformed_fields_dropped: int
+    malformed_fields_repaired: int
+
+    @property
+    def dynamic_section_share(self) -> float | None:
+        if self.section_characters is None or not self.section_characters:
+            return None
+        return (self.dynamic_section_characters or 0) / self.section_characters
+
+
+@dataclass(frozen=True)
+class LLMReport:
+    calls: int
+    usage_calls: int
+    latency_seconds: float
+    input_tokens: int
+    cached_input_tokens: int
+    cache_observed_input_tokens: int
+    cache_unknown_input_tokens: int
+    output_tokens: int
+    thinking_tokens: int
+    section_characters: int | None
+    dynamic_section_characters: int | None
+    malformed_fields_dropped: int
+    malformed_fields_repaired: int
+    inferences: tuple[LLMInferenceReport, ...]
+
+
+@dataclass(frozen=True)
+class _InferenceAccumulator:
+    inference_id: str | None
+    semantic_label: str | None = None
+    prompt_version: str | None = None
+    round_trips: int = 0
+    latency_seconds: float = 0.0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_observed_input_tokens: int = 0
+    cache_unknown_input_tokens: int = 0
+    output_tokens: int = 0
+    section_characters: int | None = None
+    dynamic_section_characters: int | None = None
+    finish_reasons: tuple[str, ...] = ()
+    outcome: LLMOutcome | None = None
+    discarded: bool = False
+    malformed_fields_dropped: int = 0
+    malformed_fields_repaired: int = 0
 
 
 class LLMMeter(logging.Handler):
@@ -287,11 +416,60 @@ class LLMMeter(logging.Handler):
         self.wasted_seconds = 0.0
         self.wasted_input_tokens = 0
         self.wasted_output_tokens = 0
+        self.section_characters: int | None = None
+        self.dynamic_section_characters: int | None = None
+        self.malformed_fields_dropped = 0
+        self.malformed_fields_repaired = 0
         # Per-inference-id partials, retained so a later `discarded` cue can fold that call's
         # already-metered cost into the wasted buckets (one round-trip per id; popped on discard).
         # An id never discarded lingers here for the run — bounded by call count, negligible.
         self._seconds_by_id: dict[str, float] = {}
+        self._calls_by_id: dict[str, int] = {}
         self._tokens_by_id: dict[str, tuple[int, int]] = {}  # id -> (input, output)
+        self._inferences: dict[
+            tuple[str | None, str | None, str | None], _InferenceAccumulator
+        ] = {}
+
+    def _inference_for(
+        self, record: logging.LogRecord
+    ) -> tuple[tuple[str | None, str | None, str | None], _InferenceAccumulator]:
+        inference_id = getattr(record, "llm_inference_id", None)
+        semantic_label = getattr(record, "llm_semantic_label", None)
+        prompt_version = getattr(record, "llm_prompt_version", None)
+        if inference_id is not None:
+            existing_key = next((key for key in self._inferences if key[0] == inference_id), None)
+            if existing_key is not None:
+                accumulator = self._inferences[existing_key]
+                resolved_label = semantic_label or accumulator.semantic_label
+                resolved_version = prompt_version or accumulator.prompt_version
+                key = (inference_id, resolved_label, resolved_version)
+                if key != existing_key:
+                    del self._inferences[existing_key]
+                    accumulator = replace(
+                        accumulator,
+                        semantic_label=resolved_label,
+                        prompt_version=resolved_version,
+                    )
+                    self._inferences[key] = accumulator
+                return key, accumulator
+        key = (inference_id, semantic_label, prompt_version)
+        candidate = self._inferences.get(key)
+        if candidate is None:
+            candidate = _InferenceAccumulator(
+                inference_id=inference_id,
+                semantic_label=semantic_label,
+                prompt_version=prompt_version,
+            )
+            self._inferences[key] = candidate
+        return key, candidate
+
+    def _replace_inference(
+        self,
+        record: logging.LogRecord,
+        **changes: object,
+    ) -> None:
+        key, accumulator = self._inference_for(record)
+        self._inferences[key] = replace(accumulator, **cast(Any, changes))
 
     def emit(self, record: logging.LogRecord) -> None:
         event = getattr(record, "llm_event", None)
@@ -300,8 +478,36 @@ class LLMMeter(logging.Handler):
             self.calls += 1
             seconds = getattr(record, "llm_seconds", 0.0)
             self.total_seconds += seconds
+            section_characters = getattr(record, "llm_section_characters", None)
+            dynamic_characters = getattr(record, "llm_dynamic_section_characters", None)
+            counted_sections = section_characters if isinstance(section_characters, int) else None
+            counted_dynamic = dynamic_characters if isinstance(dynamic_characters, int) else None
+            if counted_sections is not None:
+                self.section_characters = (self.section_characters or 0) + counted_sections
+                self.dynamic_section_characters = (self.dynamic_section_characters or 0) + (
+                    counted_dynamic or 0
+                )
+            _, accumulator = self._inference_for(record)
+            self._replace_inference(
+                record,
+                round_trips=accumulator.round_trips + 1,
+                latency_seconds=accumulator.latency_seconds + seconds,
+                section_characters=(
+                    (accumulator.section_characters or 0) + counted_sections
+                    if counted_sections is not None
+                    else accumulator.section_characters
+                ),
+                dynamic_section_characters=(
+                    (accumulator.dynamic_section_characters or 0) + (counted_dynamic or 0)
+                    if counted_sections is not None
+                    else accumulator.dynamic_section_characters
+                ),
+            )
             if inference_id is not None:
-                self._seconds_by_id[inference_id] = seconds
+                self._seconds_by_id[inference_id] = (
+                    self._seconds_by_id.get(inference_id, 0.0) + seconds
+                )
+                self._calls_by_id[inference_id] = self._calls_by_id.get(inference_id, 0) + 1
         elif event == "usage":
             self.usage_calls += 1
             input_tokens = getattr(record, "llm_input_tokens", 0)
@@ -324,17 +530,108 @@ class LLMMeter(logging.Handler):
             self.thinking_tokens += LLMUsage(
                 input_tokens, output_tokens, answer_chars, reasoning_tokens=reasoning_tokens
             ).thinking_tokens
+            finish_reason = getattr(record, "llm_finish_reason", None)
+            _, accumulator = self._inference_for(record)
+            self._replace_inference(
+                record,
+                input_tokens=accumulator.input_tokens + input_tokens,
+                cached_input_tokens=(accumulator.cached_input_tokens + (cached_input_tokens or 0)),
+                cache_observed_input_tokens=(
+                    accumulator.cache_observed_input_tokens
+                    + (input_tokens if cached_input_tokens is not None else 0)
+                ),
+                cache_unknown_input_tokens=(
+                    accumulator.cache_unknown_input_tokens
+                    + (input_tokens if cached_input_tokens is None else 0)
+                ),
+                output_tokens=accumulator.output_tokens + output_tokens,
+                finish_reasons=(
+                    accumulator.finish_reasons + (finish_reason,)
+                    if isinstance(finish_reason, str)
+                    else accumulator.finish_reasons
+                ),
+            )
             if inference_id is not None:
-                self._tokens_by_id[inference_id] = (input_tokens, output_tokens)
+                previous = self._tokens_by_id.get(inference_id, (0, 0))
+                self._tokens_by_id[inference_id] = (
+                    previous[0] + input_tokens,
+                    previous[1] + output_tokens,
+                )
         elif event == "discarded" and inference_id is not None:
+            _, accumulator = self._inference_for(record)
+            self._replace_inference(record, discarded=True)
             seconds = self._seconds_by_id.pop(inference_id, None)
             if seconds is not None:  # the discarded call was metered (timing always is)
-                self.wasted_calls += 1
+                self.wasted_calls += self._calls_by_id.pop(inference_id, 1)
                 self.wasted_seconds += seconds
             tokens = self._tokens_by_id.pop(inference_id, None)
             if tokens is not None:  # ...and, when the client is instrumented, its tokens too
                 self.wasted_input_tokens += tokens[0]
                 self.wasted_output_tokens += tokens[1]
+        elif event == "outcome" and inference_id is not None:
+            outcome = getattr(record, "llm_outcome", None)
+            if outcome in ("success", "unresolvable", "error"):
+                _, accumulator = self._inference_for(record)
+                # A watchdog result and the provider result can race under the same id. Whichever
+                # result resolved the activity is terminal; a later stale cue must not rewrite it.
+                if accumulator.outcome is None:
+                    self._replace_inference(record, outcome=outcome)
+        elif event == "malformed":
+            dropped = getattr(record, "llm_malformed_fields_dropped", 0)
+            repaired = getattr(record, "llm_malformed_fields_repaired", 0)
+            self.malformed_fields_dropped += dropped
+            self.malformed_fields_repaired += repaired
+            # With no inference id the parser cue carries no request metadata. Keep it in the
+            # aggregate rather than inventing an anonymous (None, None, None) inference row or
+            # guessing which metadata-bearing synchronous call produced it.
+            if inference_id is not None:
+                _, accumulator = self._inference_for(record)
+                self._replace_inference(
+                    record,
+                    malformed_fields_dropped=(accumulator.malformed_fields_dropped + dropped),
+                    malformed_fields_repaired=(accumulator.malformed_fields_repaired + repaired),
+                )
+
+    def report(self) -> LLMReport:
+        """Return the machine-readable aggregate and per-inference instrumentation."""
+        inferences = tuple(
+            LLMInferenceReport(
+                inference_id=row.inference_id,
+                semantic_label=row.semantic_label,
+                prompt_version=row.prompt_version,
+                round_trips=row.round_trips,
+                latency_seconds=row.latency_seconds,
+                input_tokens=row.input_tokens,
+                cached_input_tokens=row.cached_input_tokens,
+                cache_observed_input_tokens=row.cache_observed_input_tokens,
+                cache_unknown_input_tokens=row.cache_unknown_input_tokens,
+                output_tokens=row.output_tokens,
+                section_characters=row.section_characters,
+                dynamic_section_characters=row.dynamic_section_characters,
+                finish_reasons=row.finish_reasons,
+                outcome=row.outcome,
+                discarded=row.discarded,
+                malformed_fields_dropped=row.malformed_fields_dropped,
+                malformed_fields_repaired=row.malformed_fields_repaired,
+            )
+            for row in self._inferences.values()
+        )
+        return LLMReport(
+            calls=self.calls,
+            usage_calls=self.usage_calls,
+            latency_seconds=self.total_seconds,
+            input_tokens=self.input_tokens,
+            cached_input_tokens=self.cached_input_tokens,
+            cache_observed_input_tokens=self.cache_observed_input_tokens,
+            cache_unknown_input_tokens=self.cache_unknown_input_tokens,
+            output_tokens=self.output_tokens,
+            thinking_tokens=self.thinking_tokens,
+            section_characters=self.section_characters,
+            dynamic_section_characters=self.dynamic_section_characters,
+            malformed_fields_dropped=self.malformed_fields_dropped,
+            malformed_fields_repaired=self.malformed_fields_repaired,
+            inferences=inferences,
+        )
 
     def _pooled(self) -> LLMUsage:
         """This run's pooled input/output/answer totals as one ``LLMUsage`` (0/0 when nothing was
