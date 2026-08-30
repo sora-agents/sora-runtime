@@ -38,7 +38,7 @@ from sora.action import (
     release,
 )
 from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
-from sora.llm import LLMOutcome, log_llm_discarded, log_llm_outcome
+from sora.llm import LLMOutcome, log_llm_discarded, log_llm_late_completion, log_llm_outcome
 from sora.memory import (
     PerceptSnapshot,
     pending_from_raw,
@@ -1500,7 +1500,19 @@ class DefaultObserveStrategy:
                 if res.error is not None
                 else "success"
             )
-            log_llm_outcome(inf_id, outcome)
+            claimed = any(
+                activity.pending_inference is not None
+                and activity.pending_inference.id == inf_id
+                and activity.state is ActivityState.RUNNING
+                for activity in wm.activities.values()
+            )
+            if claimed:
+                log_llm_outcome(inf_id, outcome)
+            else:
+                # A watchdog/interrupt/superseding inference already resolved the runtime side.
+                # The provider finishing later is useful observability, but it is not a second
+                # terminal outcome and must not read like an earlier error turned into success.
+                log_llm_late_completion(inf_id, outcome)
             for activity in wm.activities.values():
                 if (
                     activity.pending_inference is not None

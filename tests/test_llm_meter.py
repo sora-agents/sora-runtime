@@ -14,6 +14,7 @@ from sora.llm import (
     MeteredLLMClient,
     PromptSection,
     current_inference_id,
+    llm_call_scope,
     log_llm_discarded,
     log_llm_malformed,
     log_llm_outcome,
@@ -291,9 +292,9 @@ def test_llm_meter_tallies_cached_input_and_reports_hit_rate(
     report = meter.report()
     assert report.cache_observed_input_tokens == 1000
     assert report.cache_unknown_input_tokens == 500
-    (inference,) = report.inferences
-    assert inference.cache_observed_input_tokens == 1000
-    assert inference.cache_unknown_input_tokens == 500
+    assert len(report.inferences) == 2
+    assert sum(row.cache_observed_input_tokens for row in report.inferences) == 1000
+    assert sum(row.cache_unknown_input_tokens for row in report.inferences) == 500
 
 
 def test_llm_meter_reports_an_explicit_zero_as_a_measured_cache_miss(
@@ -375,31 +376,65 @@ async def test_per_call_cues_carry_a_short_inference_id_tag(_llm_logging_enabled
     messages = [r.getMessage() for r in records]
     assert all("[32a3ad56]" in m for m in messages)  # every cue for this call carries the tag
     assert any(m.startswith("~ llm [32a3ad56] usage:") for m in messages)
-    assert any(m.startswith("~ llm [32a3ad56] (") for m in messages)  # the timing cue
+    assert any(m.startswith("~ llm [32a3ad56] test/v1 (") for m in messages)  # timing
     assert any(m == "~ llm [32a3ad56] discarded (result superseded)" for m in messages)
 
 
 @pytest.mark.asyncio
-async def test_per_call_cues_have_no_tag_without_an_inference_id(
+async def test_per_call_cues_get_a_logical_call_tag_without_an_inference_id(
     _llm_logging_enabled: None,
 ) -> None:
-    # A call not driven by an off-cycle inference (id unset) keeps the byte-for-byte pre-existing
-    # cue text — no tag — so uninstrumented / non-inference LLM use reads exactly as before.
+    # Background judgements are not pending activity inferences, but they are still logical LLM
+    # calls. Their timing/usage cues need a generated id so concurrent retirement/relevance calls
+    # can be correlated rather than appearing as anonymous, interchangeable lines.
+    class _UsageClient(_StubClient):
+        async def complete(self, request: CompletionRequest) -> str:
+            log_llm_usage(LLMUsage(1000, 800, answer_chars=40), request)
+            return await super().complete(request)
+
     records: list[logging.LogRecord] = []
     handler = logging.Handler()
     handler.emit = records.append  # type: ignore[method-assign,assignment]
     logger = logging.getLogger("sora.llm")
     logger.addHandler(handler)
     try:
-        await MeteredLLMClient(_StubClient()).complete(_request())
-        log_llm_usage(LLMUsage(1000, 800, answer_chars=40))
+        await MeteredLLMClient(_UsageClient()).complete(_request())
     finally:
         logger.removeHandler(handler)
 
     messages = [r.getMessage() for r in records]
-    assert any(m.startswith("~ llm usage:") for m in messages)  # no "[...]" tag
-    assert any(m.startswith("~ llm (") for m in messages)
-    assert all("[" not in m for m in messages)
+    call_ids = {r.__dict__["llm_call_id"] for r in records}
+    assert len(call_ids) == 1
+    (call_id,) = call_ids
+    assert isinstance(call_id, str)
+    assert all(f"[{call_id[:8]}]" in message for message in messages)
+    assert any(f"~ llm [{call_id[:8]}] test/v1 usage:" in m for m in messages)
+    assert any(f"~ llm [{call_id[:8]}] test/v1 (" in m for m in messages)
+    assert all(r.__dict__["llm_inference_id"] is None for r in records)
+
+
+@pytest.mark.asyncio
+async def test_background_calls_have_distinct_report_rows(_llm_logging_enabled: None) -> None:
+    class _UsageClient(_StubClient):
+        async def complete(self, request: CompletionRequest) -> str:
+            log_llm_usage(LLMUsage(10, 2, answer_chars=4), request)
+            return await super().complete(request)
+
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    client = MeteredLLMClient(_UsageClient())
+    try:
+        await client.complete(CompletionRequest("s", "u", "retirement", "1"))
+        await client.complete(CompletionRequest("s", "u", "retirement", "1"))
+    finally:
+        logger.removeHandler(meter)
+
+    assert len(meter.report().inferences) == 2
+    assert {row.inference_id for row in meter.report().inferences} == {None}
+    call_ids = {row.call_id for row in meter.report().inferences}
+    assert None not in call_ids
+    assert len(call_ids) == 2
 
 
 @pytest.mark.asyncio
@@ -578,7 +613,7 @@ async def test_structured_report_aggregates_round_trips_by_inference(
 
 
 @pytest.mark.asyncio
-async def test_untagged_malformed_cue_stays_aggregate_only_for_anonymous_call(
+async def test_call_scope_attributes_malformed_cue_without_an_activity_inference(
     _llm_logging_enabled: None,
 ) -> None:
     request = CompletionRequest("system", "user", semantic_label="plan", prompt_version="3")
@@ -586,10 +621,10 @@ async def test_untagged_malformed_cue_stays_aggregate_only_for_anonymous_call(
     logger = logging.getLogger("sora.llm")
     logger.addHandler(meter)
     try:
-        await MeteredLLMClient(_StubClient()).complete(request)
-        log_llm_usage(LLMUsage(100, 20, answer_chars=20), request)
-        # Parsers have no request metadata when this supported synchronous path has no inference id.
-        log_llm_malformed(dropped=2, repaired=1)
+        with llm_call_scope():
+            await MeteredLLMClient(_StubClient()).complete(request)
+            log_llm_usage(LLMUsage(100, 20, answer_chars=20), request)
+            log_llm_malformed(dropped=2, repaired=1)
     finally:
         logger.removeHandler(meter)
 
@@ -600,8 +635,10 @@ async def test_untagged_malformed_cue_stays_aggregate_only_for_anonymous_call(
     (inference,) = report.inferences
     assert inference.semantic_label == "plan"
     assert inference.prompt_version == "3"
-    assert inference.malformed_fields_dropped == 0
-    assert inference.malformed_fields_repaired == 0
+    assert inference.inference_id is None
+    assert inference.call_id is not None
+    assert inference.malformed_fields_dropped == 2
+    assert inference.malformed_fields_repaired == 1
 
 
 def test_structured_report_keeps_the_first_terminal_outcome(

@@ -22,7 +22,7 @@ from urllib.parse import quote
 from sora.action import InvokeAction, invoke_step
 from sora.activity import SEEDED_BINDINGS
 from sora.environment import WorkspaceOrigin
-from sora.llm import CompletionRequest, log_llm_malformed
+from sora.llm import CompletionRequest, llm_call_scope, log_llm_malformed
 from sora.manual import (
     Manual,
     ManualSection,
@@ -2530,15 +2530,16 @@ class ProceduralMemory:
         log.debug(
             "observe: retirement system prompt\n%s\nUser prompt\n%s", RETIREMENT_SYSTEM_PROMPT, user
         )
-        text = await self._llm.complete(
-            CompletionRequest(
-                RETIREMENT_SYSTEM_PROMPT,
-                user,
-                semantic_label="retirement",
-                prompt_version="1",
+        with llm_call_scope():
+            text = await self._llm.complete(
+                CompletionRequest(
+                    RETIREMENT_SYSTEM_PROMPT,
+                    user,
+                    semantic_label="retirement",
+                    prompt_version="1",
+                )
             )
-        )
-        return _parse_condition_verdict(text, len(conditions), expect_fired=False).retired
+            return _parse_condition_verdict(text, len(conditions), expect_fired=False).retired
 
     async def judge_relevance(
         self,
@@ -2579,15 +2580,16 @@ class ProceduralMemory:
             f"Current observed properties:\n{render_properties(snapshot.properties)}"
         )
         log.debug("relevance: system prompt\n%s\nUser prompt\n%s", RELEVANCE_SYSTEM_PROMPT, user)
-        text = await self._llm.complete(
-            CompletionRequest(
-                RELEVANCE_SYSTEM_PROMPT,
-                user,
-                semantic_label="relevance",
-                prompt_version="1",
+        with llm_call_scope():
+            text = await self._llm.complete(
+                CompletionRequest(
+                    RELEVANCE_SYSTEM_PROMPT,
+                    user,
+                    semantic_label="relevance",
+                    prompt_version="1",
+                )
             )
-        )
-        return _parse_relevance(text, episodes)
+            return _parse_relevance(text, episodes)
 
     async def store(self, plan: Plan) -> None:
         """Persists a Plan that was actually followed to completion, so future retrieve() calls

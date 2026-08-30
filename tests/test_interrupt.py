@@ -412,10 +412,13 @@ async def test_discarded_inference_emits_a_meter_cue(tmp_path: Path) -> None:
     discarded = [r for r in records if r.__dict__.get("llm_event") == "discarded"]
     assert len(discarded) == 1
     assert discarded[0].__dict__["llm_inference_id"] == "inf-1"
-    outcomes = [r for r in records if r.__dict__.get("llm_event") == "outcome"]
-    assert len(outcomes) == 1
-    assert outcomes[0].__dict__["llm_inference_id"] == "inf-1"
-    assert outcomes[0].__dict__["llm_outcome"] == "success"
+    # A provider result nobody can apply is not a second terminal runtime outcome. Label it as a
+    # late completion so a watchdog's earlier `outcome: error` cannot appear to turn into success.
+    assert not [r for r in records if r.__dict__.get("llm_event") == "outcome"]
+    late = [r for r in records if r.__dict__.get("llm_event") == "late_completion"]
+    assert len(late) == 1
+    assert late[0].__dict__["llm_inference_id"] == "inf-1"
+    assert late[0].__dict__["llm_late_outcome"] == "success"
 
 
 # --------------------------------------------------------------------------------------------------

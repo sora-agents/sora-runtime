@@ -5,6 +5,9 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Literal, Protocol, cast
 
@@ -24,13 +27,39 @@ current_inference_id: contextvars.ContextVar[str | None] = contextvars.ContextVa
     "current_inference_id", default=None
 )
 
+# A logical model-call id is broader than an off-cycle activity inference. Retirement and
+# relevance judgements deliberately do not move an activity to RUNNING (ADR-0021), but their log
+# records still need a stable identity. A semantic caller may hold this scope across parsing; the
+# metered transport supplies a one-round-trip scope when the caller has none.
+current_llm_call_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_llm_call_id", default=None
+)
 
-def _id_tag(inference_id: str | None) -> str:
-    """A short, eyeballable inference-id prefix for the per-call cues (``[32a3ad56] ``), so a later
-    ``discarded`` cue is visibly the *same* call as its usage/timing lines — which is otherwise
-    unrecoverable, since the discard is only known a cycle after those lines already printed. Empty
-    for a call not driven by an off-cycle inference (id ``None``), leaving those lines unchanged."""
-    return f"[{inference_id[:8]}] " if inference_id else ""
+
+@contextmanager
+def llm_call_scope() -> Iterator[str]:
+    """Correlate one semantic LLM call without changing activity inference state."""
+    existing = current_llm_call_id.get()
+    call_id = existing or current_inference_id.get() or uuid.uuid4().hex
+    token = current_llm_call_id.set(call_id)
+    try:
+        yield call_id
+    finally:
+        current_llm_call_id.reset(token)
+
+
+def _logical_call_id() -> str:
+    return current_llm_call_id.get() or current_inference_id.get() or uuid.uuid4().hex
+
+
+def _id_tag(call_id: str | None, request: CompletionRequest | None = None) -> str:
+    """A short, eyeballable logical-call prefix for per-call cues
+    (``[32a3ad56] plan/v1 ``), so a later ``discarded`` cue is visibly the *same* call as its
+    usage/timing lines — otherwise unrecoverable once those lines have already printed."""
+    if call_id is None:
+        return ""
+    label = f"{request.semantic_label}/v{request.prompt_version} " if request is not None else ""
+    return f"[{call_id[:8]}] {label}"
 
 
 # A response's answer text averages ~this many characters per token (English/JSON prose). Only used
@@ -166,9 +195,10 @@ def log_llm_usage(
     ``MeteredLLMClient``'s timing record: one call emits at most one ``done`` (seconds) and, when
     the client is instrumented, one ``usage`` (tokens). ``LLMMeter`` tallies both."""
     inference_id = current_inference_id.get()
+    call_id = _logical_call_id()
     _llm_log.info(
         "~ llm %susage: %d in / %d out tok (~%d answer, ~%.0f%% thinking)",
-        _id_tag(inference_id),
+        _id_tag(call_id, request),
         usage.input_tokens,
         usage.output_tokens,
         usage.answer_tokens,
@@ -181,6 +211,7 @@ def log_llm_usage(
             # None on the estimate path (Anthropic); an exact count when the provider reports one.
             "llm_reasoning_tokens": usage.reasoning_tokens,
             "llm_cached_input_tokens": usage.cached_input_tokens,
+            "llm_call_id": call_id,
             "llm_inference_id": inference_id,
             "llm_finish_reason": finish_reason,
             **_request_metadata(request),
@@ -199,7 +230,11 @@ def log_llm_discarded(inference_id: str) -> None:
     _llm_log.info(
         "~ llm %sdiscarded (result superseded)",
         _id_tag(inference_id),
-        extra={"llm_event": "discarded", "llm_inference_id": inference_id},
+        extra={
+            "llm_event": "discarded",
+            "llm_call_id": inference_id,
+            "llm_inference_id": inference_id,
+        },
     )
 
 
@@ -214,8 +249,24 @@ def log_llm_outcome(inference_id: str, outcome: LLMOutcome) -> None:
         outcome,
         extra={
             "llm_event": "outcome",
+            "llm_call_id": inference_id,
             "llm_inference_id": inference_id,
             "llm_outcome": outcome,
+        },
+    )
+
+
+def log_llm_late_completion(inference_id: str, outcome: LLMOutcome) -> None:
+    """Record a provider result that arrived after its runtime inference stopped being live."""
+    _llm_log.info(
+        "~ llm %slate completion: %s (result not applied)",
+        _id_tag(inference_id),
+        outcome,
+        extra={
+            "llm_event": "late_completion",
+            "llm_call_id": inference_id,
+            "llm_inference_id": inference_id,
+            "llm_late_outcome": outcome,
         },
     )
 
@@ -225,13 +276,15 @@ def log_llm_malformed(*, dropped: int = 0, repaired: int = 0) -> None:
     if not dropped and not repaired:
         return
     inference_id = current_inference_id.get()
+    call_id = _logical_call_id()
     _llm_log.info(
         "~ llm %smalformed: %d dropped / %d repaired",
-        _id_tag(inference_id),
+        _id_tag(call_id),
         dropped,
         repaired,
         extra={
             "llm_event": "malformed",
+            "llm_call_id": call_id,
             "llm_inference_id": inference_id,
             "llm_malformed_fields_dropped": dropped,
             "llm_malformed_fields_repaired": repaired,
@@ -286,23 +339,25 @@ class MeteredLLMClient:
         self.model = model if model is not None else _model_name(inner)
 
     async def complete(self, request: CompletionRequest) -> str:
-        start = time.perf_counter()
-        try:
-            return await self._inner.complete(request)
-        finally:
-            elapsed = time.perf_counter() - start
-            inference_id = current_inference_id.get()
-            _llm_log.info(
-                "~ llm %s(%.2fs)",
-                _id_tag(inference_id),
-                elapsed,
-                extra={
-                    "llm_event": "done",
-                    "llm_seconds": elapsed,
-                    "llm_inference_id": inference_id,
-                    **_request_metadata(request),
-                },
-            )
+        with llm_call_scope() as call_id:
+            start = time.perf_counter()
+            try:
+                return await self._inner.complete(request)
+            finally:
+                elapsed = time.perf_counter() - start
+                inference_id = current_inference_id.get()
+                _llm_log.info(
+                    "~ llm %s(%.2fs)",
+                    _id_tag(call_id, request),
+                    elapsed,
+                    extra={
+                        "llm_event": "done",
+                        "llm_seconds": elapsed,
+                        "llm_call_id": call_id,
+                        "llm_inference_id": inference_id,
+                        **_request_metadata(request),
+                    },
+                )
 
     async def aclose(self) -> None:
         # Forward lifecycle to the wrapped client if it has any — keeps the decorator drop-in for a
@@ -314,6 +369,7 @@ class MeteredLLMClient:
 
 @dataclass(frozen=True)
 class LLMInferenceReport:
+    call_id: str | None
     inference_id: str | None
     semantic_label: str | None
     prompt_version: str | None
@@ -359,6 +415,7 @@ class LLMReport:
 
 @dataclass(frozen=True)
 class _InferenceAccumulator:
+    call_id: str | None
     inference_id: str | None
     semantic_label: str | None = None
     prompt_version: str | None = None
@@ -427,35 +484,45 @@ class LLMMeter(logging.Handler):
         self._calls_by_id: dict[str, int] = {}
         self._tokens_by_id: dict[str, tuple[int, int]] = {}  # id -> (input, output)
         self._inferences: dict[
-            tuple[str | None, str | None, str | None], _InferenceAccumulator
+            tuple[str | None, str | None, str | None, str | None], _InferenceAccumulator
         ] = {}
 
     def _inference_for(
         self, record: logging.LogRecord
-    ) -> tuple[tuple[str | None, str | None, str | None], _InferenceAccumulator]:
+    ) -> tuple[tuple[str | None, str | None, str | None, str | None], _InferenceAccumulator]:
+        call_id = getattr(record, "llm_call_id", None)
         inference_id = getattr(record, "llm_inference_id", None)
         semantic_label = getattr(record, "llm_semantic_label", None)
         prompt_version = getattr(record, "llm_prompt_version", None)
-        if inference_id is not None:
-            existing_key = next((key for key in self._inferences if key[0] == inference_id), None)
+        identity = call_id or inference_id
+        if identity is not None:
+            existing_key = next((key for key in self._inferences if key[0] == identity), None)
             if existing_key is not None:
                 accumulator = self._inferences[existing_key]
                 resolved_label = semantic_label or accumulator.semantic_label
                 resolved_version = prompt_version or accumulator.prompt_version
-                key = (inference_id, resolved_label, resolved_version)
+                key = (
+                    identity,
+                    inference_id or accumulator.inference_id,
+                    resolved_label,
+                    resolved_version,
+                )
                 if key != existing_key:
                     del self._inferences[existing_key]
                     accumulator = replace(
                         accumulator,
+                        call_id=call_id or accumulator.call_id,
+                        inference_id=inference_id or accumulator.inference_id,
                         semantic_label=resolved_label,
                         prompt_version=resolved_version,
                     )
                     self._inferences[key] = accumulator
                 return key, accumulator
-        key = (inference_id, semantic_label, prompt_version)
+        key = (identity, inference_id, semantic_label, prompt_version)
         candidate = self._inferences.get(key)
         if candidate is None:
             candidate = _InferenceAccumulator(
+                call_id=call_id,
                 inference_id=inference_id,
                 semantic_label=semantic_label,
                 prompt_version=prompt_version,
@@ -473,6 +540,7 @@ class LLMMeter(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         event = getattr(record, "llm_event", None)
+        call_id = getattr(record, "llm_call_id", None)
         inference_id = getattr(record, "llm_inference_id", None)
         if event == "done":
             self.calls += 1
@@ -581,10 +649,9 @@ class LLMMeter(logging.Handler):
             repaired = getattr(record, "llm_malformed_fields_repaired", 0)
             self.malformed_fields_dropped += dropped
             self.malformed_fields_repaired += repaired
-            # With no inference id the parser cue carries no request metadata. Keep it in the
-            # aggregate rather than inventing an anonymous (None, None, None) inference row or
-            # guessing which metadata-bearing synchronous call produced it.
-            if inference_id is not None:
+            # A semantic call scope correlates parser recovery even for background judgements,
+            # which intentionally have no activity inference id.
+            if call_id is not None or inference_id is not None:
                 _, accumulator = self._inference_for(record)
                 self._replace_inference(
                     record,
@@ -596,6 +663,7 @@ class LLMMeter(logging.Handler):
         """Return the machine-readable aggregate and per-inference instrumentation."""
         inferences = tuple(
             LLMInferenceReport(
+                call_id=row.call_id,
                 inference_id=row.inference_id,
                 semantic_label=row.semantic_label,
                 prompt_version=row.prompt_version,
