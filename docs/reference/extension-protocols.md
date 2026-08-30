@@ -191,18 +191,31 @@ not implemented yet.
 ## LLM clients
 
 ```python
+@dataclass(frozen=True)
+class CompletionRequest:
+    system: str
+    user: str
+    semantic_label: str
+    prompt_version: str
+    profile: CompletionProfile | None = None
+    sections: tuple[PromptSection, ...] = ()
+
 class LLMClient(Protocol):
-    async def complete(self, *, system: str, prompt: str) -> str: ...
+    async def complete(self, request: CompletionRequest) -> str: ...
 ```
 
-Deliberately narrow and wire-format-neutral: a system instruction plus a prompt in, text out —
-commits to no provider shape (not OpenAI `chat/completions`, not Anthropic `messages`), so
-`ProceduralMemory.infer` stays independent of any one SDK. **Non-ownership contract**: an
-`LLMClient` owns *only* the round-trip. Retries, streaming, credential refresh, prompt caching, and
-interrupt handling belong to the cycle/agent, never to the client — that boundary is what lets a
-second provider slot in without touching the decision cycle. Configured via `agent.yaml`'s `llm:`
-block (see [Configuration Reference](configuration.md#agentllm)); every configured client is wrapped
-in the shipped `MeteredLLMClient` automatically for timing/usage instrumentation.
+Deliberately narrow and wire-format-neutral: a text completion request in, text out — commits to no
+provider shape (not OpenAI `chat/completions`, not Anthropic `messages`), so
+`ProceduralMemory.infer` stays independent of any one SDK. The request carries call description
+(semantic label, prompt version, and section-size metadata) and optional transport hints; adapters
+may ignore hints they do not support. It deliberately carries no response contract.
+
+**Non-ownership contract**: an `LLMClient` owns only the round-trip. Validation, repair, caching
+policy, retry, credential refresh, and interrupt handling remain outside the client. That boundary
+is what lets a second provider slot in without touching the decision cycle. Configured via
+`agent.yaml`'s `llm:` block (see [Configuration Reference](configuration.md#agentllm)); every
+configured client is wrapped in the shipped `MeteredLLMClient` automatically for timing/usage
+instrumentation.
 
 ---
 

@@ -220,6 +220,7 @@ async def test_infer_builds_plan_from_model_json(tmp_path: Path) -> None:
         invoke_step("EmailClientApp", "list_emails"),
         Step(next_action="unfocus", params={"tool_id": "EmailClientApp"}),
     ]
+    assert (llm.requests[0].semantic_label, llm.requests[0].prompt_version) == ("plan", "1")
 
 
 async def test_infer_defaults_missing_action_to_invoke(tmp_path: Path) -> None:
@@ -986,6 +987,7 @@ async def test_ground_returns_concrete_params(tmp_path: Path) -> None:
     )
 
     assert params == {"email_id": 42, "body": "hi Alice"}
+    assert (llm.requests[0].semantic_label, llm.requests[0].prompt_version) == ("ground", "1")
 
 
 async def test_ground_prompt_carries_operation_schema_and_history(tmp_path: Path) -> None:
@@ -1116,6 +1118,7 @@ async def test_select_tolerates_prose_wrapped_keep(tmp_path: Path) -> None:
     kept = await mem.select(_activity_with_history("f", "s", {}), ["a", "b", "c"], "the middle one")
 
     assert kept == ["b"]
+    assert (llm.requests[0].semantic_label, llm.requests[0].prompt_version) == ("select", "1")
 
 
 async def test_ground_rejects_non_json(tmp_path: Path) -> None:

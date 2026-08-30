@@ -33,6 +33,7 @@ from sora.bootstrap import (
     transport_for,
 )
 from sora.environment import WorkspaceOrigin
+from sora.llm import CompletionRequest
 from sora.memory import FileMemoryBackend
 from sora.strategies import (
     BeforeEachOp,
@@ -353,7 +354,7 @@ class _CredentialLLMClient:
     def __init__(self, *, api_key: str) -> None:
         self.api_key = api_key
 
-    async def complete(self, *, system: str, prompt: str) -> str:
+    async def complete(self, request: CompletionRequest) -> str:
         return ""
 
 

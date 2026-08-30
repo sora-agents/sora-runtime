@@ -17,8 +17,9 @@ telling you to write a strategy instead.
 
 ## The two seams, and their division of labor
 
-- **`LLMClient.complete(system, prompt) -> str`** (`sora/llm.py`) — the raw model round-trip. Dumb,
-  stateless, text-in/text-out. No tools, no multi-turn, no structured output.
+- **`LLMClient.complete(request) -> str`** (`sora/llm.py`) — the raw model round-trip. Dumb,
+  stateless, text-in/text-out. The provider-neutral request describes the call and carries optional
+  transport hints; it adds no tools, multi-turn state, or structured-output contract.
 - **`ProceduralMemory.infer(activity, tools, observed) -> Plan`** (`sora/memory.py`) — *one*
   `complete()` call → a static `Plan`. A pure function of `(goal, tool catalog, currently-observed
   properties/signals)`; it gets **no `wm`, no `cycle`, no memory access** — `observed` is a narrow

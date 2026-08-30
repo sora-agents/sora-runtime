@@ -15,7 +15,7 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
-from sora.llm import LLMUsage, log_llm_usage
+from sora.llm import CompletionRequest, LLMUsage, log_llm_usage
 
 # Only a fallback: the model id is a configuration value (a ctor arg, wired from agent.yaml), never
 # baked in — swapping Opus/Sonnet/versions must not require a code change.
@@ -53,17 +53,21 @@ class AnthropicLLMClient:
         self._max_tokens = max_tokens
         self._instrument = instrument
 
-    async def complete(self, *, system: str, prompt: str) -> str:
+    async def complete(self, request: CompletionRequest) -> str:
         # Stream rather than a single create(): the SDK refuses a non-streaming call whose
         # worst-case duration (estimated from max_tokens) could exceed 10 minutes, which a large
         # plan-inference budget behind adaptive thinking crosses. Streaming lifts that ceiling;
         # get_final_message() consumes the whole stream and returns the same assembled Message.
         async with self._client.messages.stream(
             model=self.model,
-            max_tokens=self._max_tokens,
-            system=system,
+            max_tokens=(
+                request.profile.max_output_tokens
+                if request.profile is not None and request.profile.max_output_tokens is not None
+                else self._max_tokens
+            ),
+            system=request.system,
             thinking={"type": "adaptive"},
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": request.user}],
         ) as stream:
             message = await stream.get_final_message()
         # Join the answer's text blocks (skip thinking blocks); getattr keeps this robust to the

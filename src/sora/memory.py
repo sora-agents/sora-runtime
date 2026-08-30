@@ -11,7 +11,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
@@ -22,6 +22,7 @@ from urllib.parse import quote
 from sora.action import InvokeAction, invoke_step
 from sora.activity import SEEDED_BINDINGS
 from sora.environment import WorkspaceOrigin
+from sora.llm import CompletionRequest
 from sora.manual import (
     Manual,
     ManualSection,
@@ -1416,8 +1417,7 @@ REPARSE_FEEDBACK = (
 
 async def _complete_and_parse[T](
     llm: LLMClient,
-    system: str,
-    user: str,
+    request: CompletionRequest,
     parse: Callable[[str], T],
     *,
     what: str,
@@ -1432,14 +1432,17 @@ async def _complete_and_parse[T](
     going to on the fifth attempt, and each attempt is charged to the same inference id (the
     contextvar the caller set), so a retried inference reports its true cost rather than hiding half
     of it. A retry that also fails raises, exactly as a single failed parse did before."""
-    text = await llm.complete(system=system, prompt=user)
+    text = await llm.complete(request)
     try:
         return parse(text)
     except ValueError as exc:
         failure = str(exc)
         log.warning("reason: %s did not parse (%s) — retrying once with the error", what, failure)
-    retry = user + REPARSE_FEEDBACK.format(error=failure, output=text)
-    return parse(await llm.complete(system=system, prompt=retry))
+    retry = replace(
+        request,
+        user=request.user + REPARSE_FEEDBACK.format(error=failure, output=text),
+    )
+    return parse(await llm.complete(retry))
 
 
 def _drop_surplus_closers(text: str) -> str | None:
@@ -2193,7 +2196,8 @@ class ProceduralMemory:
                 pending=pending,
             )
 
-        return await _complete_and_parse(self._llm, system, user, _to_plan, what="plan inference")
+        request = CompletionRequest(system, user, semantic_label="plan", prompt_version="1")
+        return await _complete_and_parse(self._llm, request, _to_plan, what="plan inference")
 
     async def ground(
         self,
@@ -2221,7 +2225,9 @@ class ProceduralMemory:
             activity, operation_name, manual, partial_params, observed or PerceptSnapshot()
         )
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
-        text = await self._llm.complete(system=system, prompt=user)
+        text = await self._llm.complete(
+            CompletionRequest(system, user, semantic_label="ground", prompt_version="1")
+        )
         params = _parse_params(text)
         _check_no_dropped_elements(partial_params, params)
         return params
@@ -2276,7 +2282,14 @@ class ProceduralMemory:
             f"Items:\n{items}"
         )
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", SELECT_SYSTEM_PROMPT, user)
-        text = await self._llm.complete(system=SELECT_SYSTEM_PROMPT, prompt=user)
+        text = await self._llm.complete(
+            CompletionRequest(
+                SELECT_SYSTEM_PROMPT,
+                user,
+                semantic_label="select",
+                prompt_version="1",
+            )
+        )
         return [collection[index] for index in _parse_keep(text, len(collection))]
 
     async def revalidate(
@@ -2329,7 +2342,14 @@ class ProceduralMemory:
         log.debug(
             "reason: revalidate system prompt\n%s\nUser prompt\n%s", REVALIDATE_SYSTEM_PROMPT, user
         )
-        text = await self._llm.complete(system=REVALIDATE_SYSTEM_PROMPT, prompt=user)
+        text = await self._llm.complete(
+            CompletionRequest(
+                REVALIDATE_SYSTEM_PROMPT,
+                user,
+                semantic_label="revalidate",
+                prompt_version="1",
+            )
+        )
         return _parse_verdict(text)
 
     async def evaluate_conditions(
@@ -2376,7 +2396,14 @@ class ProceduralMemory:
         log.debug(
             "reason: condition system prompt\n%s\nUser prompt\n%s", CONDITION_SYSTEM_PROMPT, user
         )
-        text = await self._llm.complete(system=CONDITION_SYSTEM_PROMPT, prompt=user)
+        text = await self._llm.complete(
+            CompletionRequest(
+                CONDITION_SYSTEM_PROMPT,
+                user,
+                semantic_label="condition",
+                prompt_version="1",
+            )
+        )
         return _parse_condition_verdict(text, len(conditions))
 
     async def judge_retirement(
@@ -2422,7 +2449,14 @@ class ProceduralMemory:
         log.debug(
             "observe: retirement system prompt\n%s\nUser prompt\n%s", RETIREMENT_SYSTEM_PROMPT, user
         )
-        text = await self._llm.complete(system=RETIREMENT_SYSTEM_PROMPT, prompt=user)
+        text = await self._llm.complete(
+            CompletionRequest(
+                RETIREMENT_SYSTEM_PROMPT,
+                user,
+                semantic_label="retirement",
+                prompt_version="1",
+            )
+        )
         return _parse_condition_verdict(text, len(conditions)).retired
 
     async def judge_relevance(
@@ -2464,7 +2498,14 @@ class ProceduralMemory:
             f"Current observed properties:\n{render_properties(snapshot.properties)}"
         )
         log.debug("relevance: system prompt\n%s\nUser prompt\n%s", RELEVANCE_SYSTEM_PROMPT, user)
-        text = await self._llm.complete(system=RELEVANCE_SYSTEM_PROMPT, prompt=user)
+        text = await self._llm.complete(
+            CompletionRequest(
+                RELEVANCE_SYSTEM_PROMPT,
+                user,
+                semantic_label="relevance",
+                prompt_version="1",
+            )
+        )
         return _parse_relevance(text, episodes)
 
     async def store(self, plan: Plan) -> None:

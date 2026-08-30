@@ -6,7 +6,7 @@ import contextvars
 import logging
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 # A dedicated child of the `sora` tree so instrumentation records are addressable on their own —
 # the CLI presenter surfaces them as a per-call cue, `LLMMeter` tallies them, and neither has to
@@ -38,6 +38,48 @@ def _id_tag(inference_id: str | None) -> str:
 # estimate below can subtract it from output_tokens. Rough on purpose — the discriminating signal
 # (a thinking-bound call runs ~90%+, an answer-bound one near 0) survives any sane value of it.
 _CHARS_PER_TOKEN = 4
+
+
+@dataclass(frozen=True)
+class CompletionProfile:
+    """Optional provider-neutral transport hints for one completion.
+
+    ``reasoning`` exposes only the portable intersection: ``low``, ``medium``, and ``high``.
+    Providers add incompatible extremes such as ``minimal``, ``xhigh``, or ``max``; ``None`` keeps
+    the provider/model default rather than disabling reasoning. Adapters may map a band to a
+    measured native setting or ignore it. ``max_output_tokens`` is likewise a hint, not a response
+    contract.
+    """
+
+    max_output_tokens: int | None = None
+    reasoning: Literal["low", "medium", "high"] | None = None
+
+
+@dataclass(frozen=True)
+class PromptSection:
+    """Provider-neutral size metadata for one named section of a rendered prompt."""
+
+    name: str
+    characters: int
+    dynamic: bool
+
+
+@dataclass(frozen=True)
+class CompletionRequest:
+    """One provider-neutral text completion request.
+
+    The request describes the call and carries transport hints only. It does not own response
+    validation, repair, caching policy, or retry; those stay with the reasoning/cycle layer that
+    understands the runtime contract. ``sections`` describes already-rendered text for metering —
+    it does not ask a provider to cache, reorder, or otherwise reinterpret that text.
+    """
+
+    system: str
+    user: str
+    semantic_label: str
+    prompt_version: str
+    profile: CompletionProfile | None = None
+    sections: tuple[PromptSection, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -138,21 +180,18 @@ def log_llm_discarded(inference_id: str) -> None:
 class LLMClient(Protocol):
     """A single completion round-trip — the runtime's one seam onto a language model.
 
-    Deliberately narrow and wire-format-neutral: a system instruction plus a prompt in, text out.
-    It commits to *no* provider shape — not OpenAI ``chat/completions``, not Anthropic ``messages``
-    — so the reasoning path (``ProceduralMemory.infer``) stays independent of any one SDK, and the
-    concrete client (an optional extra under ``sora/adapters/``) is the only place a wire format
-    appears. The canonical format the runtime converts *to* is its own domain (``Plan``/``Step``),
-    not a borrowed message schema; that conversion (the anti-corruption boundary) lives in
-    ``infer``, never here.
+    Deliberately narrow and wire-format-neutral: a ``CompletionRequest`` in, text out. It commits
+    to *no* provider shape — not OpenAI ``chat/completions``, not Anthropic ``messages`` — so the
+    reasoning path stays independent of any one SDK, and a concrete adapter is the only place a
+    wire format appears. Adapters may ignore unsupported profile hints.
 
-    Non-ownership contract: an ``LLMClient`` owns *only* the round-trip. Retries, streaming,
-    credential refresh, prompt caching, and interrupt handling belong to the cycle/agent, never to
-    the client. Keeping that boundary explicit is what lets a second provider slot in without
-    touching the decision cycle.
+    Non-ownership contract: the request owns call description and transport hints; an
+    ``LLMClient`` owns only the round-trip. Validation, repair, caching policy, retry, credential
+    refresh, and interrupt handling remain outside the client. The text-to-domain anti-corruption
+    boundary therefore stays in procedural memory, never here.
     """
 
-    async def complete(self, *, system: str, prompt: str) -> str: ...
+    async def complete(self, request: CompletionRequest) -> str: ...
 
 
 def _model_name(client: object) -> str | None:
@@ -184,10 +223,10 @@ class MeteredLLMClient:
         # "none" there would be a plain lie rather than a missing detail.
         self.model = model if model is not None else _model_name(inner)
 
-    async def complete(self, *, system: str, prompt: str) -> str:
+    async def complete(self, request: CompletionRequest) -> str:
         start = time.perf_counter()
         try:
-            return await self._inner.complete(system=system, prompt=prompt)
+            return await self._inner.complete(request)
         finally:
             elapsed = time.perf_counter() - start
             inference_id = current_inference_id.get()

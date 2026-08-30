@@ -108,6 +108,10 @@ async def test_unrepairable_output_is_retried_once_with_the_error(tmp_path: Path
     plan = await memory.infer(_activity(), {})
     assert len(plan.steps) == 1
     assert len(llm.calls) == 2
+    assert [(request.semantic_label, request.prompt_version) for request in llm.requests] == [
+        ("plan", "1"),
+        ("plan", "1"),
+    ]
     retry_prompt = llm.calls[1][1]
     assert "could not be parsed" in retry_prompt
     assert "not json at all" in retry_prompt  # it is shown its own output, to fix in place

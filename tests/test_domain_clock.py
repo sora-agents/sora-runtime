@@ -365,6 +365,7 @@ async def test_without_a_clock_a_time_bounded_until_is_left_to_the_judge(tmp_pat
 
     assert len(activity.pending_conditions) == 1
     assert llm.calls  # fell through to the judge rather than guessing
+    assert (llm.requests[0].semantic_label, llm.requests[0].prompt_version) == ("retirement", "1")
 
 
 async def test_an_event_shaped_until_is_never_resolved_mechanically(tmp_path: Path) -> None:

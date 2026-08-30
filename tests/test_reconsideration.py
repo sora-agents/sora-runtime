@@ -242,6 +242,10 @@ async def test_revalidate_parses_verdict_and_sees_goal_and_remaining_steps(tmp_p
     activity = Activity(id="a", goal="schedule Monday sync", context={}, plan=plan)
 
     assert await proc.revalidate(activity) is False
+    assert (llm.requests[-1].semantic_label, llm.requests[-1].prompt_version) == (
+        "revalidate",
+        "1",
+    )
     system, user = llm.calls[-1]
     assert system == REVALIDATE_SYSTEM_PROMPT
     assert "schedule Monday sync" in user  # goal is in the prompt

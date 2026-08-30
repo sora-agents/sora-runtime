@@ -8,6 +8,7 @@ from collections.abc import Iterator
 import pytest
 
 from sora.llm import (
+    CompletionRequest,
     LLMMeter,
     LLMUsage,
     MeteredLLMClient,
@@ -32,26 +33,31 @@ def _llm_logging_enabled() -> Iterator[None]:
 class _StubClient:
     def __init__(self, response: str = "ok") -> None:
         self.response = response
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[CompletionRequest] = []
         self.closed = False
 
-    async def complete(self, *, system: str, prompt: str) -> str:
-        self.calls.append((system, prompt))
+    async def complete(self, request: CompletionRequest) -> str:
+        self.calls.append(request)
         return self.response
 
     async def aclose(self) -> None:
         self.closed = True
 
 
+def _request() -> CompletionRequest:
+    return CompletionRequest("s", "p", "test", "1")
+
+
 @pytest.mark.asyncio
 async def test_metered_client_is_transparent_and_forwards_arguments() -> None:
     inner = _StubClient("the answer")
     metered = MeteredLLMClient(inner)
+    request = CompletionRequest("sys", "usr", "plan", "1")
 
-    result = await metered.complete(system="sys", prompt="usr")
+    result = await metered.complete(request)
 
     assert result == "the answer"  # passes the inner result straight through
-    assert inner.calls == [("sys", "usr")]  # forwards keyword args unchanged
+    assert inner.calls == [request]  # forwards the same metadata-bearing value unchanged
 
 
 def test_metered_client_falls_back_to_the_clients_own_model() -> None:
@@ -73,7 +79,7 @@ async def test_metered_client_logs_one_timed_cue_per_call(_llm_logging_enabled: 
     logger = logging.getLogger("sora.llm")
     logger.addHandler(handler)
     try:
-        await metered.complete(system="s", prompt="p")
+        await metered.complete(_request())
     finally:
         logger.removeHandler(handler)
 
@@ -89,7 +95,7 @@ async def test_metered_client_logs_one_timed_cue_per_call(_llm_logging_enabled: 
 @pytest.mark.asyncio
 async def test_metered_client_logs_even_when_inner_raises(_llm_logging_enabled: None) -> None:
     class _Boom(_StubClient):
-        async def complete(self, *, system: str, prompt: str) -> str:
+        async def complete(self, request: CompletionRequest) -> str:
             raise RuntimeError("boom")
 
     meter = LLMMeter()
@@ -97,7 +103,7 @@ async def test_metered_client_logs_even_when_inner_raises(_llm_logging_enabled: 
     logger.addHandler(meter)
     try:
         with pytest.raises(RuntimeError, match="boom"):
-            await MeteredLLMClient(_Boom()).complete(system="s", prompt="p")
+            await MeteredLLMClient(_Boom()).complete(_request())
     finally:
         logger.removeHandler(meter)
 
@@ -118,8 +124,8 @@ async def test_llm_meter_tallies_calls_and_seconds(_llm_logging_enabled: None) -
     logger.addHandler(meter)
     metered = MeteredLLMClient(_StubClient())
     try:
-        await metered.complete(system="s", prompt="p")
-        await metered.complete(system="s", prompt="p")
+        await metered.complete(_request())
+        await metered.complete(_request())
     finally:
         logger.removeHandler(meter)
 
@@ -340,7 +346,7 @@ async def test_per_call_cues_carry_a_short_inference_id_tag(_llm_logging_enabled
     logger.addHandler(handler)
     token = current_inference_id.set("32a3ad56cdb2421c")  # a full id; the tag shows the first 8
     try:
-        await MeteredLLMClient(_StubClient()).complete(system="s", prompt="p")
+        await MeteredLLMClient(_StubClient()).complete(_request())
         log_llm_usage(LLMUsage(1000, 800, answer_chars=40))
     finally:
         current_inference_id.reset(token)
@@ -366,7 +372,7 @@ async def test_per_call_cues_have_no_tag_without_an_inference_id(
     logger = logging.getLogger("sora.llm")
     logger.addHandler(handler)
     try:
-        await MeteredLLMClient(_StubClient()).complete(system="s", prompt="p")
+        await MeteredLLMClient(_StubClient()).complete(_request())
         log_llm_usage(LLMUsage(1000, 800, answer_chars=40))
     finally:
         logger.removeHandler(handler)
@@ -388,7 +394,7 @@ async def test_llm_meter_moves_a_discarded_inference_to_the_wasted_bucket(
     logger.addHandler(meter)
     token = current_inference_id.set("inf-1")
     try:
-        await MeteredLLMClient(_StubClient()).complete(system="s", prompt="p")  # done, tagged inf-1
+        await MeteredLLMClient(_StubClient()).complete(_request())  # done, tagged inf-1
         log_llm_usage(LLMUsage(1000, 800, answer_chars=40))  # usage, tagged inf-1
         log_llm_discarded("inf-1")  # the result was invalidated/superseded -> wasted
     finally:
@@ -411,7 +417,7 @@ async def test_llm_meter_keeps_a_used_inference_out_of_the_wasted_bucket(
     logger.addHandler(meter)
     token = current_inference_id.set("inf-1")
     try:
-        await MeteredLLMClient(_StubClient()).complete(system="s", prompt="p")
+        await MeteredLLMClient(_StubClient()).complete(_request())
         log_llm_usage(LLMUsage(1000, 800, answer_chars=40))
     finally:
         current_inference_id.reset(token)

@@ -13,7 +13,7 @@ import pytest
 pytest.importorskip("anthropic")
 
 from sora.adapters.anthropic_llm import AnthropicLLMClient, _usage_of  # noqa: E402
-from sora.llm import LLMUsage  # noqa: E402
+from sora.llm import CompletionProfile, CompletionRequest, LLMUsage  # noqa: E402
 
 
 def test_usage_of_reads_the_token_block_and_carries_the_answer_length() -> None:
@@ -77,8 +77,10 @@ class _FakeMessageStream:
 class _FakeMessages:
     def __init__(self, message: SimpleNamespace) -> None:
         self.message = message
+        self.kwargs: dict[str, Any] = {}
 
     def stream(self, **kwargs: Any) -> _FakeMessageStream:
+        self.kwargs = kwargs
         return _FakeMessageStream(self.message)
 
 
@@ -112,7 +114,7 @@ async def test_streamed_message_emits_its_cached_input_usage(
     logger = logging.getLogger("sora.llm")
     logger.addHandler(handler)
     try:
-        assert await client.complete(system="s", prompt="p") == "hi"
+        assert await client.complete(CompletionRequest("s", "p", "plan", "1")) == "hi"
     finally:
         logger.removeHandler(handler)
 
@@ -121,3 +123,25 @@ async def test_streamed_message_emits_its_cached_input_usage(
     (record,) = usage_records
     assert record.__dict__["llm_input_tokens"] == 100
     assert record.__dict__["llm_cached_input_tokens"] == 70
+
+
+@pytest.mark.asyncio
+async def test_request_profile_overrides_output_cap_and_ignores_unsupported_hints() -> None:
+    message = SimpleNamespace(content=[SimpleNamespace(type="text", text="hi")])
+    messages = _FakeMessages(message)
+    client = AnthropicLLMClient(model="m", api_key="test", max_tokens=8192)
+    client._client = SimpleNamespace(messages=messages)  # type: ignore[assignment]
+
+    request = CompletionRequest(
+        "system",
+        "user",
+        "condition",
+        "1",
+        profile=CompletionProfile(max_output_tokens=64, reasoning="low"),
+    )
+    assert await client.complete(request) == "hi"
+
+    assert messages.kwargs["max_tokens"] == 64
+    assert messages.kwargs["system"] == "system"
+    assert messages.kwargs["messages"] == [{"role": "user", "content": "user"}]
+    assert "reasoning" not in messages.kwargs

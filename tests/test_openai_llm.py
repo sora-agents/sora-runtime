@@ -24,7 +24,7 @@ from sora.adapters.openai_llm import (  # noqa: E402
     _text_of,
     _usage_of,
 )
-from sora.llm import LLMUsage  # noqa: E402
+from sora.llm import CompletionProfile, CompletionRequest, LLMUsage  # noqa: E402
 
 
 def _response(
@@ -55,6 +55,10 @@ def _response(
             completion_tokens_details=details,
         )
     return SimpleNamespace(choices=[choice], usage=usage)
+
+
+def _request() -> CompletionRequest:
+    return CompletionRequest("s", "p", "test", "1")
 
 
 # ── pure extraction helpers ───────────────────────────────────────────────────────────────────
@@ -207,7 +211,7 @@ async def test_complete_maps_system_and_prompt_to_chat_messages_and_returns_the_
     fake = _FakeAsyncOpenAI(_response("the answer"))
     client._client = fake  # type: ignore[assignment]
 
-    out = await client.complete(system="be terse", prompt="hi")
+    out = await client.complete(CompletionRequest("be terse", "hi", "plan", "1"))
 
     assert out == "the answer"
     kwargs = fake.chat.completions.kwargs
@@ -220,6 +224,28 @@ async def test_complete_maps_system_and_prompt_to_chat_messages_and_returns_the_
 
 
 @pytest.mark.asyncio
+async def test_request_profile_overrides_output_cap_without_changing_other_defaults() -> None:
+    client = OpenAICompatLLMClient(model="m", api_key="test", max_tokens=8192)
+    fake = _FakeAsyncOpenAI(_response("the answer"))
+    client._client = fake  # type: ignore[assignment]
+
+    request = CompletionRequest(
+        "system",
+        "user",
+        "condition",
+        "1",
+        profile=CompletionProfile(max_output_tokens=64, reasoning="low"),
+    )
+    await client.complete(request)
+
+    kwargs = fake.chat.completions.kwargs
+    assert kwargs is not None
+    assert kwargs["max_completion_tokens"] == 64
+    # Provider mappings for qualitative reasoning classes are a later, measured change.
+    assert "reasoning_effort" not in kwargs
+
+
+@pytest.mark.asyncio
 async def test_the_call_streams_by_default_and_joins_the_deltas() -> None:
     # Streaming is what turns the configured read timeout into a *stall* detector: chunks keep
     # resetting it, so a slow-but-healthy thinking model is no longer indistinguishable from a
@@ -228,7 +254,7 @@ async def test_the_call_streams_by_default_and_joins_the_deltas() -> None:
     fake = _FakeAsyncOpenAI(_response("the answer"))
     client._client = fake  # type: ignore[assignment]
 
-    assert await client.complete(system="s", prompt="p") == "the answer"
+    assert await client.complete(_request()) == "the answer"
     kwargs = fake.chat.completions.kwargs
     assert kwargs is not None
     assert kwargs["stream"] is True
@@ -242,7 +268,7 @@ async def test_streaming_can_be_turned_off_for_an_endpoint_that_cannot_do_it() -
     fake = _FakeAsyncOpenAI(_response("the answer"))
     client._client = fake  # type: ignore[assignment]
 
-    assert await client.complete(system="s", prompt="p") == "the answer"
+    assert await client.complete(_request()) == "the answer"
     kwargs = fake.chat.completions.kwargs
     assert kwargs is not None
     assert "stream" not in kwargs
@@ -255,12 +281,12 @@ async def test_usage_is_only_requested_when_it_will_be_used() -> None:
     # run must not pay that compatibility cost for a number it would discard.
     plain = OpenAICompatLLMClient(model="m", api_key="test")
     plain._client = _FakeAsyncOpenAI(_response("hi"))  # type: ignore[assignment]
-    await plain.complete(system="s", prompt="p")
+    await plain.complete(_request())
     assert "stream_options" not in (plain._client.chat.completions.kwargs or {})  # type: ignore[attr-defined]
 
     metered = OpenAICompatLLMClient(model="m", api_key="test", instrument=True)
     metered._client = _FakeAsyncOpenAI(_response("hi"))  # type: ignore[assignment]
-    await metered.complete(system="s", prompt="p")
+    await metered.complete(_request())
     kwargs = metered._client.chat.completions.kwargs  # type: ignore[attr-defined]
     assert kwargs["stream_options"] == {"include_usage": True}
 
@@ -344,7 +370,7 @@ async def test_instrument_emits_a_usage_record_carrying_the_exact_reasoning_toke
     logger = logging.getLogger("sora.llm")
     logger.addHandler(handler)
     try:
-        await client.complete(system="s", prompt="p")
+        await client.complete(_request())
     finally:
         logger.removeHandler(handler)
 
@@ -368,7 +394,7 @@ async def test_uninstrumented_client_emits_no_usage_record() -> None:
     logger.setLevel(logging.INFO)
     logger.addHandler(handler)
     try:
-        await client.complete(system="s", prompt="p")
+        await client.complete(_request())
     finally:
         logger.removeHandler(handler)
 
@@ -395,7 +421,7 @@ async def test_a_stalled_stream_closes_the_response_on_its_way_out() -> None:
     client._client = fake  # type: ignore[assignment]
 
     with pytest.raises(APITimeoutError):
-        await client.complete(system="s", prompt="p")
+        await client.complete(_request())
 
     stream = fake.chat.completions.stream
     assert stream is not None
@@ -408,7 +434,7 @@ async def test_a_completed_stream_is_closed_too() -> None:
     fake = _FakeAsyncOpenAI(_response("hello"))
     client._client = fake  # type: ignore[assignment]
 
-    assert await client.complete(system="s", prompt="p") == "hello"
+    assert await client.complete(_request()) == "hello"
 
     stream = fake.chat.completions.stream
     assert stream is not None

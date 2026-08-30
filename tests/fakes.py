@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Any
 
 from sora.environment import DomainClock, Tool, Workspace, WorkspaceOrigin
+from sora.llm import CompletionRequest
 from sora.manual import Manual, OperationSpecification, ToolRecord, WorkspaceRecord
 from sora.perception import Message, SignalSink
 from sora.types import ObservableProperty, OperationAck, Signal
@@ -111,7 +112,8 @@ class ScriptedTransport:
 
 class FakeLLMClient:
     """Deterministic, subprocess-free stand-in for a real ``LLMClient`` (see ``sora.llm``). Records
-    every ``(system, prompt)`` call so a test can assert what the LLM was asked, and replays canned
+    every request so a test can assert its metadata, retains the legacy ``(system, prompt)`` view
+    for prompt-content assertions, and replays canned
     completion text. A single response string is reused for every call; a list is consumed in order
     with the last entry sticking once the queue is down to one. Structurally satisfies the
     ``LLMClient`` Protocol (enforced by ``mypy --strict`` at its use sites), so it plugs straight
@@ -124,9 +126,11 @@ class FakeLLMClient:
         self.model = model
         self._responses = [response] if isinstance(response, str) else list(response)
         self.calls: list[tuple[str, str]] = []  # (system, prompt) per call, for assertions
+        self.requests: list[CompletionRequest] = []
 
-    async def complete(self, *, system: str, prompt: str) -> str:
-        self.calls.append((system, prompt))
+    async def complete(self, request: CompletionRequest) -> str:
+        self.requests.append(request)
+        self.calls.append((request.system, request.user))
         if not self._responses:
             raise AssertionError("FakeLLMClient has no configured response")
         return self._responses[0] if len(self._responses) == 1 else self._responses.pop(0)

@@ -1443,6 +1443,7 @@ async def test_the_judgement_is_shown_the_record_the_change_points_at(tmp_path: 
         observed,
     )
 
+    assert (llm.requests[0].semantic_label, llm.requests[0].prompt_version) == ("condition", "1")
     _system, prompt = llm.calls[0]
     assert "cannot make Saturday" in prompt  # the body, not merely the id
     assert "Tuesday the 22nd" in prompt
@@ -1547,6 +1548,7 @@ async def test_the_relevance_judgement_is_shown_the_record_the_change_points_at(
         observed,
     )
 
+    assert (llm.requests[0].semantic_label, llm.requests[0].prompt_version) == ("relevance", "1")
     _system, prompt = llm.calls[0]
     assert "cannot make Saturday" in prompt  # the body, not merely the id
     assert "Tuesday the 22nd" in prompt

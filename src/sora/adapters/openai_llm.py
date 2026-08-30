@@ -11,7 +11,7 @@ Lives under ``adapters/`` because it is a concrete integration on an optional ex
 (``pip install sora-runtime[openai]``); the core never imports it — only ``bootstrap`` / an
 application wires it in, keeping the provider SDK out of the dependency-free core. Native Gemini
 (the ``google-genai`` SDK) is deliberately *not* here: its edge is multimodal / thinking-config,
-which the string-in/string-out seam has no use for yet — it belongs with multimodal Observe.
+which the text-completion seam has no use for yet — it belongs with multimodal Observe.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import Any
 
 from openai import AsyncOpenAI, Timeout
 
-from sora.llm import LLMUsage, log_llm_usage
+from sora.llm import CompletionRequest, LLMUsage, log_llm_usage
 
 # Only a fallback: the model id is a configuration value (a ctor arg, wired from agent.yaml), never
 # baked in — swapping models/providers must not require a code change.
@@ -117,16 +117,21 @@ class OpenAICompatLLMClient:
         # cap, so a target that needs it usually wants `stall_timeout: null` as well.
         self._stream = stream
 
-    async def complete(self, *, system: str, prompt: str) -> str:
+    async def complete(self, request: CompletionRequest) -> str:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": request.system},
+                {"role": "user", "content": request.user},
             ],
         }
-        if self._max_tokens is not None:
-            kwargs["max_completion_tokens"] = self._max_tokens
+        max_output_tokens = (
+            request.profile.max_output_tokens
+            if request.profile is not None and request.profile.max_output_tokens is not None
+            else self._max_tokens
+        )
+        if max_output_tokens is not None:
+            kwargs["max_completion_tokens"] = max_output_tokens
         if not self._stream:
             response = await self._client.chat.completions.create(**kwargs)
             text = _text_of(response)
