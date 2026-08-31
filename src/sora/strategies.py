@@ -60,6 +60,7 @@ from sora.types import (
     ConditionFiring,
     ConditionVerdict,
     ConditionWait,
+    InferenceKind,
     InferenceResult,
     InputWait,
     OperationInvocation,
@@ -69,10 +70,12 @@ from sora.types import (
     RelevanceCandidate,
     SignalWait,
     Step,
+    SubgoalMode,
     changes_of,
     diff_values,
     goal_kind_of,
     path_matches,
+    subgoal_mode_of,
     walk_path,
     watch_matches,
 )
@@ -175,7 +178,9 @@ def _step_pending_conditions(step: Step) -> tuple[PendingCondition, ...]:
     return tuple(condition for condition in parsed if condition is not None)
 
 
-def _lift_step_conditions(step: Step, activity: Activity, wm: WorkingMemory) -> None:
+def _lift_step_conditions(
+    step: Step, activity: Activity, wm: WorkingMemory, mode: SubgoalMode
+) -> None:
     """Lift any `pending` a SUB-GOAL STEP declares, at the moment that step is reached.
 
     A plan declares conditions; a sub-goal step is not a plan, so this looks like the wrong home for
@@ -198,7 +203,7 @@ def _lift_step_conditions(step: Step, activity: Activity, wm: WorkingMemory) -> 
     """
     known = {state.condition for state in activity.pending_conditions} | activity.retired_conditions
     owner = _frame_key(activity, 0)
-    if step.params.get("mode", "deliberative") == "deliberative":
+    if mode is SubgoalMode.DELIBERATIVE:
         plan = activity.plan
         assert plan is not None  # a sub-goal step is dispatched only from a set plan
         owner += ((plan.id, activity.step_index),)
@@ -986,7 +991,14 @@ class DefaultInterruptHandler:
 # worse than leaving `subgoal` out: a `then` is pursued only once the body is idle, which for the
 # monitoring goals that declare conditions means a suspended parent frame is intact underneath it
 # every time, so the residual branch's terminate destroyed an activity mid-window.
-_REPLANNABLE_INFERENCE = frozenset({"plan", "subgoal", "ground", "then"})
+_REPLANNABLE_INFERENCE = frozenset(
+    {
+        InferenceKind.PLAN,
+        InferenceKind.SUBGOAL,
+        InferenceKind.GROUND,
+        InferenceKind.CONDITION_FOLLOWUP,
+    }
+)
 
 
 def _inference_defect(kind: str, error: str) -> str:
@@ -1543,11 +1555,14 @@ class DefaultObserveStrategy:
                         # Only for `ground`: a $decide filter's gap is about its predicate, and an
                         # empty `in` there is already an answer rather than a defect, so there is
                         # nothing to re-attribute.
-                        defect = (
-                            _with_empty_binding_origin(activity, res.unresolvable)
-                            if kind == "ground"
-                            else res.unresolvable
-                        )
+                        if kind is InferenceKind.GROUND:
+                            defect = _with_empty_binding_origin(activity, res.unresolvable)
+                        elif kind is InferenceKind.SELECT:
+                            defect = res.unresolvable
+                        else:
+                            raise AssertionError(
+                                f"{kind.value} inference cannot resolve as unresolvable"
+                            )
                         activity.reset_for_replan(defect=defect)
                         activity.state = ActivityState.READY
                         log.warning(
@@ -1556,7 +1571,7 @@ class DefaultObserveStrategy:
                             activity.id,
                             defect,
                         )
-                    elif res.error is not None and kind == "select":
+                    elif res.error is not None and kind is InferenceKind.SELECT:
                         # A $decide filter is a transform, not control flow: a transient model or
                         # parse failure degrades to an empty shortlist (the pipeline does nothing
                         # this run) rather than terminating the activity — keeps the data-op alive.
@@ -1569,7 +1584,7 @@ class DefaultObserveStrategy:
                             res.error,
                             out,
                         )
-                    elif res.error is not None and kind == "condition":
+                    elif res.error is not None and kind is InferenceKind.CONDITION:
                         # A failed condition evaluation degrades to "nothing fired" — the same
                         # fail-soft as select/revalidate, and the same reasoning: the activity was
                         # already waiting, so keeping it waiting changes nothing, while the opposite
@@ -1597,7 +1612,7 @@ class DefaultObserveStrategy:
                             activity.id,
                             res.error,
                         )
-                    elif res.error is not None and kind == "revalidate":
+                    elif res.error is not None and kind is InferenceKind.REVALIDATE:
                         # A failed revalidation must not force a replan (would thrash): degrade to
                         # "still valid" so Reason proceeds — mirrors select's fail-soft (ADR-0024).
                         # Advance the baseline to the re-check's fire-time world (like a valid
@@ -1638,35 +1653,8 @@ class DefaultObserveStrategy:
                             res.error,
                         )
                     elif res.error is not None:
-                        # Residual net for an inference kind with no degradation of its own (every
-                        # kind the runtime ships routes above). Terminating is right when there is
-                        # no defined way to continue — but it must not be *silent*, which is what
-                        # this branch used to be: no episode, so the failure never reached memory
-                        # and Reflect's "TERMINATED was already recorded" was untrue for this path,
-                        # and no word to the user, so an activity born from an instruction ended
-                        # without an answer. Both are repaired here, and awaited rather than
-                        # dispatched: this is the activity's last cycle, so there is no later pass
-                        # to finish the work on.
-                        activity.grounded_params = None
-                        activity.superseded = None  # no replacement is coming; don't keep it parked
-                        activity.state = ActivityState.TERMINATED
-                        log.error(
-                            "observe: %s for activity %s failed (%s) -> terminated",
-                            kind,
-                            activity.id,
-                            res.error,
-                        )
-                        await cycle.episodic.learn(
-                            activity,
-                            f"failed: {activity.goal} ({kind} inference failed: {res.error})",
-                            succeeded=False,
-                        )
-                        await _report_to_user(
-                            cycle,
-                            f"I could not carry on with {activity.goal!r}: the {kind} step of my "
-                            f"own reasoning failed ({res.error}). Nothing was changed.",
-                        )
-                    elif kind == "plan":
+                        raise AssertionError(f"unhandled failure for {kind.value} inference")
+                    elif kind is InferenceKind.PLAN:
                         inferred: Plan = res.value  # type: ignore[assignment]  # kind=="plan" => Plan
                         activity.plan = inferred
                         activity.step_index = 0
@@ -1690,7 +1678,7 @@ class DefaultObserveStrategy:
                             activity.id,
                             render_plan(inferred),
                         )
-                    elif kind in ("subgoal", "then"):
+                    elif kind in (InferenceKind.SUBGOAL, InferenceKind.CONDITION_FOLLOWUP):
                         # A mid-plan sub-goal's synthesized sub-plan: push the parent frame (its
                         # plan + the sub-goal's step_index) and enter the sub-plan, so Reason
                         # advances it and pops back to the parent when it exhausts (ADR-0022). It
@@ -1702,7 +1690,7 @@ class DefaultObserveStrategy:
                         # world moves — a stack that grew once per firing would walk a healthy
                         # monitor into the depth cap for doing its job.
                         sub_plan: Plan = res.value  # type: ignore[assignment]  # both kinds => Plan
-                        if kind == "subgoal":
+                        if kind is InferenceKind.SUBGOAL:
                             # Validate before entering, so a sub-goal that could never end is never
                             # half-installed and the superseded bundle the replan reads is the
                             # PARENT plan (the one still holding the goal) rather than a frame that
@@ -1727,7 +1715,9 @@ class DefaultObserveStrategy:
                         activity.state = ActivityState.READY
                         log.info(
                             "observe: entered %s for activity %s",
-                            "sub-plan" if kind == "subgoal" else "a fired condition's `then`",
+                            "sub-plan"
+                            if kind is InferenceKind.SUBGOAL
+                            else "a fired condition's `then`",
                             activity.id,
                         )
                         log.debug(
@@ -1736,7 +1726,7 @@ class DefaultObserveStrategy:
                             len(activity.parent_frames),
                             render_plan(sub_plan),
                         )
-                    elif kind == "select":
+                    elif kind is InferenceKind.SELECT:
                         # A $decide data-op filter (ADR-0023): the surviving subset lands into the
                         # named binding, exactly like a mechanical filter would have written it. Not
                         # a Percept (deliberation output, not observed state) — same as plan/ground.
@@ -1750,7 +1740,7 @@ class DefaultObserveStrategy:
                             out,
                             activity.id,
                         )
-                    elif kind == "condition":
+                    elif kind is InferenceKind.CONDITION:
                         # The batched pending-condition verdict (ADR-0022): park it for Reason's
                         # next pass, which applies it against the eligible list it re-derives.
                         # Deliberation output, like plan/ground/select/revalidate — never a Percept.
@@ -1769,7 +1759,7 @@ class DefaultObserveStrategy:
                             activity.condition_verdict.retired,
                             activity.id,
                         )
-                    elif kind == "revalidate":
+                    elif kind is InferenceKind.REVALIDATE:
                         # The context-adaptation validity verdict (ADR-0024): park the bool for
                         # Reason's next pass (proceed / reset_for_replan) — deliberation output,
                         # like plan/ground/select. Advance the baseline to the world this re-check
@@ -1785,10 +1775,12 @@ class DefaultObserveStrategy:
                             activity.reconsider_verdict,
                             activity.id,
                         )
-                    else:
+                    elif kind is InferenceKind.GROUND:
                         activity.grounded_params = res.value  # type: ignore[assignment]  # => dict
                         activity.state = ActivityState.READY
                         log.info("observe: resolved grounded params for activity %s", activity.id)
+                    else:
+                        raise AssertionError(f"unhandled successful {kind.value} inference")
                     break
             else:
                 # No live activity claimed this result: it was invalidated (an interrupt re-routed
@@ -2921,7 +2913,7 @@ def _empty_binding_origin(activity: Activity, names: list[str], empty: frozenset
         shown = f" — {json.dumps(params, default=str)} —" if params else ","
         outcome = (
             "matched no items in its input collection"
-            if step.next_action == "filter"
+            if step.next_action == FilterAction.name
             else "produced an empty result"
         )
         derived = "; every binding derived from it was empty in consequence" if walked else ""
@@ -3012,7 +3004,7 @@ def _spent_operation_read(
 
 
 def _invoked_operation(step: Step) -> str | None:
-    if step.next_action != "invoke":
+    if step.next_action != InvokeAction.name:
         return None
     name = step.params.get("operation_name")
     return name if isinstance(name, str) else None
@@ -4319,7 +4311,7 @@ class DefaultReasonStrategy:
             next_action=SUBGOAL,
             params={
                 "goal": state.condition.then,
-                "mode": "deliberative",
+                "mode": SubgoalMode.DELIBERATIVE,
                 "from_condition": True,
             },
         )
@@ -4337,8 +4329,14 @@ class DefaultReasonStrategy:
         ``step_index`` on the first expanded step and reporting ``_SUBGOAL_SPLICED`` so ``reason``
         re-reads it. An empty collection expands to nothing and the sub-goal simply vanishes; one
         that could not be *read* is a plan defect instead -> replan (``_SUBGOAL_DEFECT``)."""
-        mode = step.params.get("mode", "deliberative")
-        if mode == "deliberative":
+        try:
+            mode = subgoal_mode_of(step)
+        except ValueError as exc:
+            mode_defect = str(exc)
+            log.warning("reason: plan defect for activity %s — %s", activity.id, mode_defect)
+            activity.reset_for_replan(defect=mode_defect)
+            return _SUBGOAL_DEFECT
+        if mode is SubgoalMode.DELIBERATIVE:
             # A deliberative sub-goal is accepted once it has passed the recursion guard below:
             # the child inference needs its step-owned conditions in the prompt, but a rejected
             # step must not leave a condition behind for a replacement plan to inherit.
@@ -4362,7 +4360,7 @@ class DefaultReasonStrategy:
                     cycle, activity, f"Stuck on {goal!r}: {halt}. How should I proceed?"
                 )
                 return _SUBGOAL_HALTED
-            _lift_step_conditions(step, activity, wm)
+            _lift_step_conditions(step, activity, wm, mode)
             catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
             observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
             infer = cycle.actions.internal(InferAction.name)
@@ -4373,7 +4371,9 @@ class DefaultReasonStrategy:
                 observed=observed,
                 messages=list(wm.messages),
                 # "then" lands like a sub-plan but at the same depth (Observe pushes no frame).
-                kind="then" if from_condition else "subgoal",
+                kind=(
+                    InferenceKind.CONDITION_FOLLOWUP if from_condition else InferenceKind.SUBGOAL
+                ),
                 goal=goal,
                 # A sub-plan has its own assumptions; baseline the gate against the world it is
                 # synthesized in, so entering a sub-goal re-anchors reconsideration (ADR-0024).
@@ -4399,7 +4399,7 @@ class DefaultReasonStrategy:
         # The fan-out is now known to be a committed step (including a known-empty one), so its
         # maintenance window can safely outlive the splice.  Do this after validation: conditions
         # on a rejected mechanical step belong to no plan and must not survive its replan.
-        _lift_step_conditions(step, activity, wm)
+        _lift_step_conditions(step, activity, wm, mode)
         activity.plan = replace(plan, steps=plan.steps[:i] + expanded + plan.steps[i + 1 :])
         log.info(
             "reason: sub-goal %r fanned out to %d step(s)", step.params.get("goal"), len(expanded)

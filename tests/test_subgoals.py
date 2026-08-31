@@ -59,6 +59,7 @@ from sora.types import (
     OperationInvocation,
     Plan,
     Step,
+    SubgoalMode,
     SupersededPlan,
     goal_kind_of,
 )
@@ -933,9 +934,37 @@ def test_step_from_raw_parses_a_subgoal_template() -> None:
     step = step_from_raw(raw)
     assert step.next_action == "subgoal"
     assert step.params["goal"] == "save each apartment"
-    assert step.params["mode"] == "mechanical"
+    assert step.params["mode"] is SubgoalMode.MECHANICAL
     assert step.params["as"] == "apt"
     assert step.params["template"]["operation_name"] == "save_apartment"  # nested dict preserved
+
+
+def test_step_from_raw_rejects_an_unknown_subgoal_mode() -> None:
+    for mode in ("mechancial", 7, ["mechanical"]):
+        with pytest.raises(ValueError, match="sub-goal mode"):
+            step_from_raw({"action": "subgoal", "goal": "save each", "mode": mode})
+
+
+async def test_a_hand_built_subgoal_with_an_unknown_mode_replans(tmp_path: Path) -> None:
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    step = _mechanical_subgoal()
+    step.params["mode"] = "mechancial"
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[step]),
+        history=[_history("search_apartments", [{"id": "a1"}])],
+    )
+    working.activities["a"] = activity
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is None
+    assert activity.plan is None
+    assert "sub-goal mode" in (activity.replan_trail[-1] or "")
 
 
 def test_step_from_raw_defaults_missing_action_to_invoke() -> None:

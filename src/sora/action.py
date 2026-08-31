@@ -17,6 +17,7 @@ from sora.types import (
     OPERATION_NAME,
     TOOL_ID,
     ActionAck,
+    InferenceKind,
     InferenceResult,
     OperationInvocation,
     PendingInference,
@@ -408,7 +409,7 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # (it lands the same way, on Activity.plan — see PendingInference) and a `goal` override so
         # the sub-plan is inferred for the sub-goal's goal, not the activity's top-level one (ADR-
         # 0022). pending_inference still lives on the real activity, so Observe resolves it by id.
-        kind = kwargs.get("kind", "plan")
+        kind = InferenceKind.parse(kwargs.get("kind", InferenceKind.PLAN))
         goal = kwargs.get("goal")
         # A signature of the world this plan is inferred against (ADR-0024), captured by Reason at
         # fire time and carried through to plan install so the context-adaptation gate baselines
@@ -438,7 +439,11 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # depth without pushing, so seeding a frame here would describe a stack position the plan
         # will never occupy — and name the exhausted body it replaces as its parent.
         frames = list(activity.parent_frames)
-        if goal is not None and activity.plan is not None and kind != "then":
+        if (
+            goal is not None
+            and activity.plan is not None
+            and kind is not InferenceKind.CONDITION_FOLLOWUP
+        ):
             frames.append((activity.plan, activity.step_index, activity.history_mark))
         target = (
             activity
@@ -480,7 +485,7 @@ class GroundAction:  # predefined internal action: _ground_ — the async param-
         activity = cycle.working.activities[kwargs["activity_id"]]
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind="ground", requested_at=time.time()
+            id=inf_id, kind=InferenceKind.GROUND, requested_at=time.time()
         )
         activity.state = ActivityState.RUNNING
         log.info("reason: grounding %s params via the model", kwargs["operation_name"])
@@ -556,7 +561,10 @@ class RevalidateAction:  # predefined internal action: _revalidate_ — the plan
         baseline = kwargs.get("baseline")
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind="revalidate", requested_at=time.time(), baseline=baseline
+            id=inf_id,
+            kind=InferenceKind.REVALIDATE,
+            requested_at=time.time(),
+            baseline=baseline,
         )
         activity.state = ActivityState.RUNNING  # off-cycle, like _infer_ — immediate, never blocks
         log.info("reason: revalidating plan for %r", activity.goal)
@@ -600,7 +608,7 @@ class EvaluateConditionsAction:  # predefined internal action: _evaluate_conditi
         observed = kwargs.get("observed")
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind="condition", requested_at=time.time()
+            id=inf_id, kind=InferenceKind.CONDITION, requested_at=time.time()
         )
         activity.state = ActivityState.RUNNING
         log.info(
@@ -799,7 +807,7 @@ class FilterAction:  # predefined data-op: _filter_
             # _ground_ — park RUNNING, resolve into bindings[out] a later cycle (via Observe).
             inf_id = uuid.uuid4().hex
             activity.pending_inference = PendingInference(
-                id=inf_id, kind="select", requested_at=time.time(), out=out
+                id=inf_id, kind=InferenceKind.SELECT, requested_at=time.time(), out=out
             )
             activity.state = ActivityState.RUNNING
             log.info("data-op: filter %r via the model (%d items)", out, len(collection))

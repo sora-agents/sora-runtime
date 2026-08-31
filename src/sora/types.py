@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 
@@ -491,6 +492,27 @@ class PendingOperation:  # tracks one in-flight invoke — lives on Activity, no
     invoked_at: float
 
 
+class InferenceKind(StrEnum):
+    PLAN = "plan"
+    SUBGOAL = "subgoal"
+    CONDITION_FOLLOWUP = "then"
+    GROUND = "ground"
+    SELECT = "select"
+    REVALIDATE = "revalidate"
+    CONDITION = "condition"
+
+    @classmethod
+    def parse(cls, value: object) -> InferenceKind:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value)
+            except ValueError:
+                pass
+        raise ValueError(f"{value!r} is not a valid inference kind")
+
+
 @dataclass(frozen=True)
 class PendingInference:  # tracks one in-flight infer()/ground() — lives on Activity, not WM
     # Mutually exclusive with PendingOperation (a cycle emits either one external action or one
@@ -508,7 +530,7 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     # re-check (ADR-0024), landing a bool onto Activity.reconsider_verdict; "condition" is the
     # batched pending-condition judgement, landing a ConditionVerdict onto
     # Activity.condition_verdict.
-    kind: str
+    kind: InferenceKind
     requested_at: float
     out: str | None = None  # target binding name for kind=="select"; None for the others
     # A compact signature of the perception the pending deliberation was fired against, captured at
@@ -519,6 +541,9 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     # during the call's flight then earns its own reconsideration). None for "ground"/"select" and
     # for a reused plan (no fresh inference), which falls back to an entry-time baseline.
     baseline: object | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", InferenceKind.parse(self.kind))
 
 
 class UnresolvableGrounding(Exception):
@@ -596,6 +621,27 @@ class Step:
     # those keys.
     next_action: str
     params: dict[str, Any]
+
+
+class SubgoalMode(StrEnum):
+    MECHANICAL = "mechanical"
+    DELIBERATIVE = "deliberative"
+
+    @classmethod
+    def parse(cls, value: object) -> SubgoalMode:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value)
+            except ValueError:
+                pass
+        raise ValueError(f"sub-goal mode {value!r} is neither mechanical nor deliberative")
+
+
+def subgoal_mode_of(step: Step) -> SubgoalMode:
+    """The sub-goal's execution mode, with an absent mode retaining the deliberative default."""
+    return SubgoalMode.parse(step.params.get("mode", SubgoalMode.DELIBERATIVE))
 
 
 @dataclass(frozen=True)

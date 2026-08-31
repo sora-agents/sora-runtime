@@ -59,6 +59,7 @@ from sora.strategies import (
 )
 from sora.transport import InProcessTransport
 from sora.types import (
+    InferenceKind,
     InputWait,
     InterruptRequest,
     ObservableProperty,
@@ -286,7 +287,7 @@ async def test_handler_invalidates_an_in_flight_inference(tmp_path: Path) -> Non
         state=ActivityState.RUNNING,
         plan=Plan(id="p1", goal=_GOAL, steps=[Step(next_action="wait", params={})]),
         step_index=1,
-        pending_inference=PendingInference(id="inf-old", kind="plan", requested_at=0.0),
+        pending_inference=PendingInference(id="inf-old", kind=InferenceKind.PLAN, requested_at=0.0),
         grounded_params={"stale": True},
     )
     working.activities["a1"] = activity

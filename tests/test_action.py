@@ -67,13 +67,35 @@ from sora.strategies import (
     Strategies,
     TickResult,
 )
-from sora.types import OPERATION_NAME, TOOL_ID, ObservableProperty, Signal, SignalWait
+from sora.types import (
+    OPERATION_NAME,
+    TOOL_ID,
+    InferenceKind,
+    ObservableProperty,
+    PendingInference,
+    Signal,
+    SignalWait,
+)
 
 # --------------------------------------------------------------------------------------------------
 # Harness — the fakes plus a recording transport and a real FileMemoryBackend-backed DecisionCycle.
 # --------------------------------------------------------------------------------------------------
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
+
+
+def test_pending_inference_rejects_an_unknown_kind() -> None:
+    with pytest.raises(ValueError, match="not a valid inference kind"):
+        PendingInference(id="inf-1", kind="paln", requested_at=0.0)  # type: ignore[arg-type]
+
+
+def test_pending_inference_normalizes_a_wire_value_to_its_closed_kind() -> None:
+    pending = PendingInference(
+        id="inf-1",
+        kind="plan",  # type: ignore[arg-type]  # backwards-compatible wire spelling
+        requested_at=0.0,
+    )
+    assert pending.kind is InferenceKind.PLAN
 
 
 class RecordingTransport:

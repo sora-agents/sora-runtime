@@ -47,6 +47,7 @@ from sora.strategies import (
     TickResult,
 )
 from sora.types import (
+    InferenceKind,
     InferenceResult,
     InputWait,
     InterruptRequest,
@@ -171,7 +172,7 @@ def _running(activity_id: str, op_id: str) -> Activity:
     )
 
 
-def _inferring(activity_id: str, *, inf_id: str, kind: str) -> Activity:
+def _inferring(activity_id: str, *, inf_id: str, kind: InferenceKind) -> Activity:
     """An activity RUNNING on an off-cycle infer/ground — the deferred-result waiting state."""
     return Activity(
         id=activity_id,
@@ -290,7 +291,7 @@ async def test_inference_result_resolves_plan_and_readies_activity(tmp_path: Pat
     # The happy path of the deferred-result mechanism: an activity RUNNING on a pending_inference
     # (kind="plan") picks up the Plan from inference_sink in Observe, resets step_index, goes READY.
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("a1", inf_id="inf-1", kind="plan")
+    activity = _inferring("a1", inf_id="inf-1", kind=InferenceKind.PLAN)
     activity.step_index = 7  # a stale index from before; the resolve must reset it to 0
     working.activities["a1"] = activity
     plan = Plan(id="p", goal="g", steps=[Step(next_action="wait", params={})])
@@ -307,7 +308,7 @@ async def test_inference_result_resolves_plan_and_readies_activity(tmp_path: Pat
 async def test_ground_inference_result_parks_grounded_params(tmp_path: Path) -> None:
     # kind="ground": the resolved params land on grounded_params (for Reason's next pass), not plan.
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("a1", inf_id="inf-1", kind="ground")
+    activity = _inferring("a1", inf_id="inf-1", kind=InferenceKind.GROUND)
     working.activities["a1"] = activity
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value={"to": "boss@x"}))
 
@@ -345,7 +346,9 @@ async def test_stale_inference_is_discarded_after_reinference(tmp_path: Path) ->
     # (inf-1) no longer matches the live one (inf-2), so it's discarded and the activity stays
     # RUNNING awaiting the fresh result — the id guard, mirroring the external-op late-ack guard.
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("a1", inf_id="inf-2", kind="plan")  # the *new* in-flight inference
+    activity = _inferring(
+        "a1", inf_id="inf-2", kind=InferenceKind.PLAN
+    )  # the *new* in-flight inference
     working.activities["a1"] = activity
     stale = Plan(id="stale", goal="g", steps=[Step(next_action="wait", params={})])
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=stale))  # the old one
@@ -365,7 +368,7 @@ async def test_failed_inference_replans_instead_of_stranding(tmp_path: Path) -> 
     # degrades to a replan rather than terminating: nothing was attempted, so the activity has
     # nothing wrong with it beyond one unusable model response.
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("a1", inf_id="inf-1", kind="plan")
+    activity = _inferring("a1", inf_id="inf-1", kind=InferenceKind.PLAN)
     working.activities["a1"] = activity
     # The shape InferAction actually reports: repr(exc), whose message quotes the offending output.
     cycle.inference_sink.push(
@@ -455,7 +458,7 @@ async def test_user_stop_pauses_an_inference_running_activity_at_once(tmp_path: 
     # model call. The handler drops the inference and pauses to BLOCKED immediately, discharging the
     # interrupt this cycle — unlike an in-flight external op, which keeps it pending (ADR-0021).
     cycle, working, _ = _cycle(tmp_path, situate=_NoopSituate())
-    activity = _inferring("a1", inf_id="inf-1", kind="plan")
+    activity = _inferring("a1", inf_id="inf-1", kind=InferenceKind.PLAN)
     working.activities["a1"] = activity
 
     await cycle.interrupt(Signal("user_stop", {}))

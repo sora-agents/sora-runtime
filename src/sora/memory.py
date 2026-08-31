@@ -44,6 +44,7 @@ from sora.types import (
     RelevanceCandidate,
     SignalWait,
     Step,
+    SubgoalMode,
     SupersededPlan,
     UnresolvableGrounding,
     Until,
@@ -1231,6 +1232,12 @@ def step_from_raw(raw: dict[str, Any], *, record_malformed: bool = False) -> Ste
     if action == InvokeAction.name:
         return invoke_step(raw["tool_id"], raw["operation_name"], **raw.get("params", {}))
     params = {k: v for k, v in raw.items() if k != "action"}
+    if action == SUBGOAL and "mode" in params:
+        # Mode chooses the execution algorithm, so an unknown value cannot degrade safely: before
+        # this check every value other than the exact string "deliberative" silently selected the
+        # mechanical fan-out path. Reject it as a response-contract error so plan repair gets one
+        # chance to correct the typo instead of executing a different algorithm.
+        params["mode"] = SubgoalMode.parse(params["mode"])
     if action == SUBGOAL and "goal_kind" in params:
         # `isinstance` first, and not merely for tidiness: membership-testing an unhashable value
         # (a model that over-structures the field into `["maintenance"]`) raises TypeError, which

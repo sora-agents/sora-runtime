@@ -63,6 +63,7 @@ from sora.strategies import (
 )
 from sora.types import (
     CompletedOperation,
+    InferenceKind,
     InferenceResult,
     InputWait,
     ObservableProperty,
@@ -411,7 +412,10 @@ async def test_invalidated_then_re_inferred_plans_are_both_traced(
         replacement = Plan(id="p2", goal="g", steps=[invoke_step("t", "read_op")])
         activity.state = ActivityState.RUNNING
         activity.pending_inference = PendingInference(
-            id="inf-2", kind="plan", requested_at=0.0, baseline=_perception_signature(working)
+            id="inf-2",
+            kind=InferenceKind.PLAN,
+            requested_at=0.0,
+            baseline=_perception_signature(working),
         )
         cycle.inference_sink.push("inf-2", InferenceResult(id="inf-2", value=replacement))
         await DefaultObserveStrategy().observe(cycle)
@@ -491,7 +495,9 @@ async def test_superseded_plan_is_cleared_once_the_replacement_installs(tmp_path
     assert activity.superseded is not None
 
     activity.state = ActivityState.RUNNING
-    activity.pending_inference = PendingInference(id="inf-1", kind="plan", requested_at=0.0)
+    activity.pending_inference = PendingInference(
+        id="inf-1", kind=InferenceKind.PLAN, requested_at=0.0
+    )
     replacement = Plan(id="p2", goal="g", steps=[invoke_step("t", "read_op")])
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=replacement))
     await DefaultObserveStrategy().observe(cycle)
@@ -621,7 +627,7 @@ def _inferring_plan(working: WorkingMemory, *, baseline: object) -> Activity:
         context={},
         state=ActivityState.RUNNING,
         pending_inference=PendingInference(
-            id="inf-1", kind="plan", requested_at=0.0, baseline=baseline
+            id="inf-1", kind=InferenceKind.PLAN, requested_at=0.0, baseline=baseline
         ),
     )
     working.activities["a"] = activity

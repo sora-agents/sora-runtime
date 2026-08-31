@@ -66,6 +66,7 @@ from sora.types import (
     TOOL_ID,
     WAIT,
     ActionAck,
+    InferenceKind,
     InferenceResult,
     ObservableProperty,
     OperationAck,
@@ -774,7 +775,9 @@ def _inferring_activity(activity_id: str, inf_id: str) -> Activity:
         goal="plan something",
         context={},
         state=ActivityState.RUNNING,
-        pending_inference=PendingInference(id=inf_id, kind="plan", requested_at=time.time()),
+        pending_inference=PendingInference(
+            id=inf_id, kind=InferenceKind.PLAN, requested_at=time.time()
+        ),
     )
 
 

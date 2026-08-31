@@ -38,7 +38,7 @@ from sora.strategies import (
     _inference_defect,
     _report_to_user,
 )
-from sora.types import InferenceResult, PendingInference, Plan, Step
+from sora.types import InferenceKind, InferenceResult, PendingInference, Plan, Step
 
 _PLAN_DEFECT = "the plan inference did not return a usable result (ValueError)"
 
@@ -66,7 +66,7 @@ def _cycle(tmp_path: Path) -> tuple[DecisionCycle, WorkingMemory, ScriptedTransp
     return cycle, working, transport
 
 
-def _inferring(kind: str, *, plan: Plan | None = None, **fields: Any) -> Activity:
+def _inferring(kind: InferenceKind, *, plan: Plan | None = None, **fields: Any) -> Activity:
     return Activity(
         id="a1",
         goal="book the day",
@@ -118,7 +118,7 @@ async def test_a_failed_subgoal_inference_replans_rather_than_killing_the_activi
     sitting right there intact. Killing the activity throws away work that nothing is wrong with."""
     cycle, working, _ = _cycle(tmp_path)
     parent = Plan(id="p1", goal="book the day", steps=[_step("search"), _step("send")])
-    activity = _inferring("subgoal", plan=parent, step_index=1)
+    activity = _inferring(InferenceKind.SUBGOAL, plan=parent, step_index=1)
     working.activities["a1"] = activity
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('nope')"))
 
@@ -136,7 +136,7 @@ async def test_a_failed_subgoal_inference_replans_rather_than_killing_the_activi
 
 async def test_a_failed_plan_inference_leaves_nothing_stale_behind(tmp_path: Path) -> None:
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("plan", grounded_params={"to": "someone"})
+    activity = _inferring(InferenceKind.PLAN, grounded_params={"to": "someone"})
     working.activities["a1"] = activity
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('nope')"))
 
@@ -163,7 +163,7 @@ async def test_a_second_identical_failure_asks_the_user_instead_of_inferring_aga
     identical defects, which is why the defect string is normalized."""
     cycle, working, transport = _cycle(tmp_path)
     # One failure already on the trail, no operation run since (so nothing forgives it).
-    activity = _inferring("plan", replan_trail=[_PLAN_DEFECT])
+    activity = _inferring(InferenceKind.PLAN, replan_trail=[_PLAN_DEFECT])
     working.activities["a1"] = activity
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('again')"))
 
@@ -188,7 +188,7 @@ async def test_one_failure_is_not_enough_to_halt(tmp_path: Path) -> None:
     """A single bad response is a slip, not a pattern — it must still get a second attempt, which
     is the case the JSON repair and the one re-inference exist to rescue."""
     cycle, working, transport = _cycle(tmp_path)
-    activity = _inferring("plan")
+    activity = _inferring(InferenceKind.PLAN)
     working.activities["a1"] = activity
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('once')"))
 
@@ -199,38 +199,11 @@ async def test_one_failure_is_not_enough_to_halt(tmp_path: Path) -> None:
     assert transport.sent == []  # nothing to tell the user yet
 
 
-# --------------------------------------------------------------------------------------------------
-# the residual terminate path is no longer silent
-# --------------------------------------------------------------------------------------------------
-
-
-async def test_an_undegradable_failure_records_an_episode_and_says_so(tmp_path: Path) -> None:
-    """Terminating is right when there is no defined way to continue, but it must not be invisible.
-    It used to be both: no episode (so Reflect's "TERMINATED was already recorded" was untrue for
-    this path, and memory never saw the failure) and no word to the user."""
-    cycle, working, transport = _cycle(tmp_path)
-    activity = _inferring("divine")  # a kind with no degradation of its own
-    working.activities["a1"] = activity
-    cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('nope')"))
-
-    await DefaultObserveStrategy().observe(cycle)
-
-    assert activity.state is ActivityState.TERMINATED
-    episodes = await cycle.episodic.consult(activity)
-    assert len(episodes) == 1
-    assert episodes[0]["succeeded"] is False
-    assert "divine" in episodes[0]["summary"]
-    assert len(transport.sent) == 1
-    to, content = transport.sent[0]
-    assert to == "user"
-    assert "book the day" in content["text"]
-
-
 async def test_a_degraded_failure_records_no_episode(tmp_path: Path) -> None:
     """The mirror: an activity that is going to try again has not ended, so writing an episode for
     it would be a claim about an outcome that has not happened."""
     cycle, working, transport = _cycle(tmp_path)
-    activity = _inferring("plan")
+    activity = _inferring(InferenceKind.PLAN)
     working.activities["a1"] = activity
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('nope')"))
 
@@ -269,7 +242,9 @@ async def test_an_inference_that_never_returns_is_given_up_on(tmp_path: Path) ->
     only way out of RUNNING is the deadline. On the run that motivated this, one plan inference
     held the agent for ~14 minutes and cost it the scenario's whole real-time budget."""
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("plan")  # requested_at=0.0 — long expired against the host clock
+    activity = _inferring(
+        InferenceKind.PLAN
+    )  # requested_at=0.0 — long expired against the host clock
     working.activities["a1"] = activity
 
     await DefaultObserveStrategy(inference_deadline=1.0).observe(cycle)
@@ -282,8 +257,10 @@ async def test_a_call_still_within_its_deadline_is_left_alone(tmp_path: Path) ->
     """The watchdog must not become a latency budget: a thinking model legitimately spends tens of
     seconds, and expiring a call that was about to succeed buys a replan nobody needed."""
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("plan")
-    activity.pending_inference = PendingInference(id="inf-1", kind="plan", requested_at=time.time())
+    activity = _inferring(InferenceKind.PLAN)
+    activity.pending_inference = PendingInference(
+        id="inf-1", kind=InferenceKind.PLAN, requested_at=time.time()
+    )
     working.activities["a1"] = activity
 
     await DefaultObserveStrategy(inference_deadline=300.0).observe(cycle)
@@ -295,7 +272,7 @@ async def test_a_call_still_within_its_deadline_is_left_alone(tmp_path: Path) ->
 async def test_the_deadline_can_be_disabled(tmp_path: Path) -> None:
     """An interactive session may want to wait indefinitely; `None` is not "use the default"."""
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("plan")
+    activity = _inferring(InferenceKind.PLAN)
     working.activities["a1"] = activity
 
     await DefaultObserveStrategy(inference_deadline=None).observe(cycle)
@@ -310,7 +287,7 @@ async def test_a_result_that_arrives_after_the_deadline_is_discarded(tmp_path: P
     which is exactly what the existing stale-inference guard is for; the deadline reuses it rather
     than adding a second rule."""
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("plan")
+    activity = _inferring(InferenceKind.PLAN)
     working.activities["a1"] = activity
 
     await DefaultObserveStrategy(inference_deadline=1.0).observe(cycle)
@@ -328,7 +305,7 @@ async def test_an_already_queued_result_wins_over_the_watchdog(tmp_path: Path) -
     """Observe may start after the deadline even though the provider result is already waiting.
     That result is resolved and used; the watchdog must not append a stale error behind it."""
     cycle, working, _ = _cycle(tmp_path)
-    activity = _inferring("plan")
+    activity = _inferring(InferenceKind.PLAN)
     working.activities["a1"] = activity
     plan = Plan(id="p9", goal="arrived", steps=[_step("go")])
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", value=plan))
@@ -362,7 +339,7 @@ async def test_a_failed_then_inference_replans_rather_than_killing_the_activity(
     suspended underneath it."""
     cycle, working, _ = _cycle(tmp_path)
     parent = Plan(id="p1", goal="watch the calendar", steps=[_step("search"), _step("send")])
-    activity = _inferring("then", plan=parent, step_index=1)
+    activity = _inferring(InferenceKind.CONDITION_FOLLOWUP, plan=parent, step_index=1)
     working.activities["a1"] = activity
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('nope')"))
 
