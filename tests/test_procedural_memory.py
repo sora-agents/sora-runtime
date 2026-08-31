@@ -768,6 +768,15 @@ def test_plan_prompt_instructs_references_for_runtime_dependent_params() -> None
     assert "$from" in PLAN_SYSTEM_PROMPT and "$decide" in PLAN_SYSTEM_PROMPT
 
 
+def test_plan_prompt_requires_outcome_specific_user_reports() -> None:
+    """A reply must tell the user what happened, not merely that the plan reached its last step."""
+    lowered = PLAN_SYSTEM_PROMPT.lower()
+    assert "outcome-specific" in lowered
+    assert "everything is done" in lowered
+    assert "does not report an outcome" in lowered
+    assert "results not yet available" in lowered and "$decide" in lowered
+
+
 def test_plan_prompt_forbids_unrequested_outward_communication() -> None:
     """The planner must not correspond with third parties off its own bat.
 
