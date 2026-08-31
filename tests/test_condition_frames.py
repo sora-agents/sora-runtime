@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from sora._strategies.conditions import _eligible_conditions, _lift_pending_conditions
+from sora._strategies.subgoals import _goal_token_overlap
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -43,9 +45,6 @@ from sora.strategies import (
     DefaultReflectStrategy,
     DefaultSituateStrategy,
     Strategies,
-    _eligible_conditions,
-    _goal_token_overlap,
-    _lift_pending_conditions,
 )
 from sora.types import (
     Change,

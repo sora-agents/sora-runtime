@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from sora._strategies.conditions import _lift_pending_conditions
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -40,7 +41,6 @@ from sora.strategies import (
     DefaultSituateStrategy,
     Strategies,
     TickResult,
-    _lift_pending_conditions,
 )
 from sora.types import (
     ConditionWait,
@@ -424,14 +424,14 @@ async def test_a_newly_declared_condition_resets_the_backoff_for_good(tmp_path: 
 
     await _sweep(cycle)  # a verdict that retires nothing is what earns the backoff
 
-    assert observe._retirement_marks[activity.id][1] == 1
+    assert observe._retirement._marks[activity.id][1] == 1
 
     activity.pending_conditions.append(
         PendingConditionState(condition=_contingency(), evaluated_through=0)
     )
     await cycle.strategies.observe.observe(cycle)
 
-    assert observe._retirement_marks[activity.id][1] == 0
+    assert observe._retirement._marks[activity.id][1] == 0
 
 
 async def test_the_sweep_can_be_switched_off(tmp_path: Path) -> None:

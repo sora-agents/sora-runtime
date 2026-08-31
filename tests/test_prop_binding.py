@@ -10,13 +10,11 @@ candidates collide) instead of silently resolving to nothing.
 
 from __future__ import annotations
 
+from sora._strategies.subgoals import _expand_mechanical
+from sora.data_ops import _resolve_collection
 from sora.memory import render_properties
 from sora.perception import Percept
-from sora.strategies import (
-    _expand_mechanical,
-    _resolve_collection,
-    resolve_references,
-)
+from sora.strategies import resolve_references
 from sora.types import ObservableProperty, Step
 
 # A contacts-app state property of the shape ARE actually publishes: an {id -> record} map under a

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeTool, FakeWorkspace, ScriptedTransport
+from sora._strategies.observe import _SIGNAL_RETENTION
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -42,7 +43,6 @@ from sora.memory import (
     WorkingMemory,
 )
 from sora.strategies import (
-    _SIGNAL_RETENTION,
     DefaultActStrategy,
     DefaultObserveStrategy,
     DefaultReflectStrategy,

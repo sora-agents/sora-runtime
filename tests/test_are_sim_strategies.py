@@ -33,6 +33,7 @@ from examples.are.sim.email_calendar.strategies import (
 )
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from sora._strategies.reconsideration import _perception_signature
 from sora.action import RevalidateAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -55,7 +56,6 @@ from sora.strategies import (
     DefaultSituateStrategy,
     Strategies,
     TickResult,
-    _perception_signature,
 )
 from sora.transport import InProcessTransport
 from sora.types import (

@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
+from sora._strategies.subgoals import _DEFAULT_MAX_SUBGOAL_DEPTH
 from sora.action import InferAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -42,7 +43,6 @@ from sora.memory import (
 )
 from sora.perception import Message
 from sora.strategies import (
-    _DEFAULT_MAX_SUBGOAL_DEPTH,
     DefaultActStrategy,
     DefaultObserveStrategy,
     DefaultReasonStrategy,

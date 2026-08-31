@@ -26,6 +26,7 @@ from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
+from sora.data_ops import _as_collection, _resolve_collection
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
 from sora.memory import (
     EpisodicMemory,
@@ -36,8 +37,8 @@ from sora.memory import (
     WorkingMemory,
 )
 from sora.perception import Message, Percept
+from sora.references import _MISSING, _latest_result
 from sora.strategies import (
-    _MISSING,
     DefaultActStrategy,
     DefaultObserveStrategy,
     DefaultReasonStrategy,
@@ -45,9 +46,6 @@ from sora.strategies import (
     DefaultSituateStrategy,
     Strategies,
     TickResult,
-    _as_collection,
-    _latest_result,
-    _resolve_collection,
 )
 from sora.transport import MessageTransport
 from sora.types import (

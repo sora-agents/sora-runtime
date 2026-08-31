@@ -233,7 +233,7 @@ async def test_the_baseline_survives_an_unfocus_so_changes_while_away_are_report
 
 async def test_derived_changes_are_bounded_by_a_retention_cap(tmp_path: Path) -> None:
     cycle, working, tool = await _cycle(tmp_path)
-    from sora.strategies import _DERIVED_RETENTION, _SIGNAL_RETENTION
+    from sora._strategies.observe import _DERIVED_RETENTION, _SIGNAL_RETENTION
 
     # Sized against a different window than signals are (a derived change fills at tick rate, not
     # event rate), so a shared constant would be the wrong bound -- pin that they stay distinct.
@@ -444,7 +444,7 @@ async def test_observation_heartbeat_reports_per_tool_counts_and_rate(
     # change was dropped". Counts per tool plus elapsed wall time say which, without a guess.
     import logging
 
-    from sora.strategies import _OBSERVATION_HEARTBEAT
+    from sora._strategies.observe import _OBSERVATION_HEARTBEAT
 
     cycle, working, tool = await _cycle(tmp_path)
     tool.set_properties([_events("e1")])
@@ -461,7 +461,7 @@ async def test_the_heartbeat_stays_silent_below_debug(tmp_path: Path, caplog: An
     # It runs every cycle at 11/s; the counting itself is skipped unless someone is listening.
     import logging
 
-    from sora.strategies import _OBSERVATION_HEARTBEAT
+    from sora._strategies.observe import _OBSERVATION_HEARTBEAT
 
     cycle, working, tool = await _cycle(tmp_path)
     tool.set_properties([_events("e1")])

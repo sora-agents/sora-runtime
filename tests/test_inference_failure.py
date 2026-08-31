@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from fakes import ScriptedTransport
+from sora._strategies.inference import _inference_defect
+from sora._strategies.interaction import _report_to_user
 from sora.action import default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -35,8 +37,6 @@ from sora.strategies import (
     DefaultSituateStrategy,
     Strategies,
     TickResult,
-    _inference_defect,
-    _report_to_user,
 )
 from sora.types import InferenceKind, InferenceResult, PendingInference, Plan, Step
 

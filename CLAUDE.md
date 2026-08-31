@@ -46,7 +46,10 @@ Module-to-concept map (from the API Sketch's own file markers — this is where 
 | `sora/activity.py` | `Activity`, `ActivityState` |
 | `sora/action.py` | `InternalAction`, `ExternalAction`, `ActionRegistry`, the predefined external actions (invoke/focus/unfocus/join/leave/send) and internal actions (create_activity/load/unload/filter/suspend/resume/infer/ground), `default_action_registry()` |
 | `sora/memory.py` | `MemoryBackend`, `WorkingMemory`, `SemanticMemory`, `ProceduralMemory`, `EpisodicMemory` |
-| `sora/strategies.py` | `TickResult`, `Strategies`, the five phase-strategy Protocols, `DefaultObserveStrategy`, `DefaultReasonStrategy` |
+| `sora/strategies.py` | Stable public strategy-extension façade: `TickResult`, `Strategies`, phase Protocols, policies, and default re-exports |
+| `sora/_strategies/` | Default implementations organized by phase (`observe`, `reflect`, `situate`, `reason`, `act`) plus their private condition, inference, interaction, parameter, reconsideration, and subgoal mechanics |
+| `sora/references.py` | Reference grammar, deterministic resolution, and diagnostics shared by grounding and planning |
+| `sora/data_ops.py` | Structured collection and predicate grammar shared by planning and action data-ops |
 | `sora/llm.py` | `LLMClient` — the wire-format-neutral model seam (concrete `AnthropicLLMClient` lives under `sora/adapters/`, optional `[llm]` extra) |
 | `sora/transport.py` | `MessageTransport` |
 | `sora/cycle.py` | `DecisionCycle`, `Agent` |

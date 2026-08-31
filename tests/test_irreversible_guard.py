@@ -29,6 +29,13 @@ from sora.memory import (
     SemanticMemory,
     WorkingMemory,
 )
+from sora.references import (
+    _dereferenced_bindings,
+    _dereferenced_operations,
+    _is_empty,
+    _spent_operation_read,
+    _unsatisfiable_reference,
+)
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
@@ -38,11 +45,6 @@ from sora.strategies import (
     NoneReconsideration,
     Strategies,
     TickResult,
-    _dereferenced_bindings,
-    _dereferenced_operations,
-    _is_empty,
-    _spent_operation_read,
-    _unsatisfiable_reference,
 )
 from sora.types import (
     CompletedOperation,

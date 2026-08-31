@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 import uuid
@@ -24,7 +23,6 @@ from sora.types import (
     PendingOperation,
     Step,
     UnresolvableGrounding,
-    walk_path,
 )
 
 if TYPE_CHECKING:
@@ -426,7 +424,7 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # planned, let alone abandoned. Cleared here rather than at each install site so no future
         # path that leaves a bundle parked can leak it into a sub-plan's prompt.
         # The copy also carries the frame Observe *will* push when it installs the sub-plan
-        # (strategies.py's kind=="subgoal" branch), so the copy models the stack position the plan
+        # (inference.py's subgoal reconciliation), so the copy models the stack position the plan
         # is being written for rather than the parent's. That is what lets a PlanPrompt tell a
         # sub-goal from a top-level goal — `parent_frames` is unambiguous here because the only
         # other infer fires when `plan is None`, and a reset clears the whole stack with the plan.
@@ -648,147 +646,16 @@ class EvaluateConditionsAction:  # predefined internal action: _evaluate_conditi
 # so the collection-`filter` here never collides with FilterPerceptionsAction's perception-`filter`.
 # The pipeline is imperative (one op per step); a declarative $foreach/$select binding spec stays
 # rejected (ADR-0022 option (a)). Reason passes the resolved list as `collection` and the op's other
-# params as kwargs; the op is a pure transform except FilterAction's $decide escalation.
-_REF_DECIDE = "$decide"  # mirrors sora.strategies / ADR-0017's soft reference token
-# Boolean composition keys for a `filter` predicate. Plain names, not `$`-prefixed: the `$` tokens
-# mark a *reference* to be resolved before evaluation, and these are structure the evaluator walks.
-_COMPOSE_ALL = "all"
-_COMPOSE_ANY = "any"
+# params as kwargs; the op is a pure transform except FilterAction's $decide escalation. Predicate
+# grammar and evaluation live in sora.data_ops; the action classes only apply those transforms to
+# an activity binding.
 
 
 def pluck(element: Any, path: str | None) -> Any:
-    """The value at ``path`` of ``element`` (the shared dotted-path grammar), or ``None`` on a bad
-    path — a missing key is a non-match/absent value for a data-op, never a crash. Public because
-    it is the one path-projection helper shared across the data-op layer: mechanical ``filter``
-    evaluation (``_matches`` here) and cross-collection membership projection (Reason, in
-    ``strategies``) must read a field the same way."""
-    if not path:
-        return element
-    try:
-        return walk_path(element, path)
-    except (KeyError, IndexError, TypeError, ValueError):
-        return None
+    """Compatibility import for :func:`sora.data_ops.pluck`."""
+    from sora.data_ops import pluck as data_op_pluck
 
-
-def _dedup_key(value: Any) -> str:
-    """A stable, hashable signature for a (possibly unhashable, e.g. dict) value, for _distinct_."""
-    return json.dumps(value, sort_keys=True, default=str)
-
-
-def _overlaps(element: Any, where: dict[str, Any]) -> bool:
-    """Does the element's own ``[start_path, end_path]`` interval meet any interval in ``against``?
-
-    The two-sided sibling of ``between``: ``between`` compares one value against one fixed pair,
-    this compares one *pair* against a whole collection of them. ``against`` arrives already
-    resolved and projected by Reason into ``[start, end]`` pairs, exactly as an ``in`` membership
-    set arrives projected to keys — so this stays a literal comparison with no reference
-    resolution, and no per-member alias to scope.
-
-    Half-open by default (``boundaries: "exclusive"``): two intervals that merely touch at a
-    boundary do NOT overlap, which is what a calendar means by a conflict. ``"inclusive"`` makes a
-    shared endpoint count. Nothing here is calendar-specific — intervals are ordered values of any
-    comparable type, and ISO-8601 timestamps happen to compare correctly as strings.
-
-    Every unusable input is a non-match rather than a crash or a blanket keep, matching the ordered
-    ops: an element missing either end, a malformed pair, a null bound, an incomparable type. That
-    direction is deliberate — this predicate's output feeds delete fan-outs, where failing *open*
-    would act on the whole collection. An ``against`` that could not be read at all is caught in
-    Reason as a plan defect (``_operand_defect``), since silently matching nothing is a confident
-    wrong answer about the world."""
-    start = pluck(element, where.get("start_path", ""))
-    end = pluck(element, where.get("end_path", ""))
-    intervals = where.get("against")
-    if start is None or end is None or not isinstance(intervals, (list, tuple)):
-        return False
-    inclusive = where.get("boundaries") == "inclusive"
-    for interval in intervals:
-        if not (isinstance(interval, (list, tuple)) and len(interval) == 2):
-            continue
-        other_start, other_end = interval
-        if other_start is None or other_end is None:
-            continue
-        try:
-            if (
-                (start <= other_end and end >= other_start)
-                if inclusive
-                else (start < other_end and end > other_start)
-            ):
-                return True
-        except TypeError:
-            continue  # incomparable types -> non-match, never a crash (like lt/le/gt/ge)
-    return False
-
-
-def _matches(element: Any, where: Any) -> bool:
-    """Evaluate a mechanical ``filter`` predicate against one element: ``{"path", "op", "value"}``
-    with op in eq/ne/lt/le/gt/ge/between/in/not_in/overlaps. ``in``/``not_in`` test membership of
-    the element's ``path`` value in ``value`` (a literal list, or — resolved upstream in Reason —
-    the projected keys of another collection named by a reference); ``overlaps`` tests the
-    element's own interval against a collection of them (see ``_overlaps``). A ``$decide``
-    predicate never gets here (FilterAction escalates it). No predicate keeps everything. A
-    membership set that isn't a list is treated as empty: ``in`` matches nothing, ``not_in`` keeps
-    everything (fails open, so a malformed exclusion set never silently drops the whole
-    collection).
-
-    A predicate may instead COMPOSE others under ``all`` (conjunction) or ``any`` (disjunction),
-    recursively. Composition is what makes the mechanical path reach predicates that previously had
-    to escalate whole: the real ones are rarely a single clause — "not one of the newly added
-    events AND overlapping one of them" is two — and one un-mechanical clause used to drag the
-    entire predicate to a model call over the whole collection. A malformed or EMPTY clause list
-    matches nothing rather than vacuously everything: ``all([])`` is true in logic, but this
-    predicate's consumers fan out over what it keeps, so the failure that acts on the whole
-    collection is the one worth refusing. Reason reports either as a plan defect
-    (``_composition_defect``) rather than leaving it as a silent empty result."""
-    if not isinstance(where, dict):
-        return False
-    if _COMPOSE_ALL in where:
-        clauses = where[_COMPOSE_ALL]
-        if not isinstance(clauses, list) or not clauses:
-            return False
-        return all(_matches(element, clause) for clause in clauses)
-    if _COMPOSE_ANY in where:
-        clauses = where[_COMPOSE_ANY]
-        if not isinstance(clauses, list) or not clauses:
-            return False
-        return any(_matches(element, clause) for clause in clauses)
-    op = where.get("op", "eq")
-    if op == "overlaps":
-        return _overlaps(element, where)
-    actual = pluck(element, where.get("path", ""))
-    value = where.get("value")
-    if op == "eq":
-        return bool(actual == value)
-    if op == "ne":
-        return bool(actual != value)
-    if op == "in":
-        return isinstance(value, (list, tuple)) and actual in value
-    if op == "not_in":
-        return not (isinstance(value, (list, tuple)) and actual in value)
-    if op == "between":
-        if not (isinstance(value, (list, tuple)) and len(value) == 2):
-            return False
-        lo, hi = value
-        if actual is None:
-            return False
-        try:
-            return bool(lo <= actual <= hi)
-        except TypeError:
-            return False  # incomparable types -> non-match, never a crash (like lt/le/gt/ge)
-    if actual is None:
-        return False  # ordered comparisons need a present value
-    try:
-        if op == "lt":
-            return bool(actual < value)
-        if op == "le":
-            return bool(actual <= value)
-        if op == "gt":
-            return bool(actual > value)
-        if op == "ge":
-            return bool(actual >= value)
-    except TypeError:
-        return False
-    log.warning("filter: unknown predicate op %r -> excluding element", op)
-    return False
+    return data_op_pluck(element, path)
 
 
 class FilterAction:  # predefined data-op: _filter_
@@ -798,6 +665,9 @@ class FilterAction:  # predefined data-op: _filter_
         self._tasks: set[asyncio.Task[None]] = set()
 
     async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        from sora.data_ops import _matches
+        from sora.references import _REF_DECIDE
+
         activity = cycle.working.activities[kwargs["activity_id"]]
         out = kwargs["out"]
         collection = kwargs["collection"]
@@ -873,6 +743,8 @@ class DistinctAction:  # predefined data-op: _distinct_
     name = "distinct"
 
     async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        from sora.data_ops import _dedup_key, pluck
+
         activity = cycle.working.activities[kwargs["activity_id"]]
         by = kwargs.get("by")
         seen: set[str] = set()
@@ -889,6 +761,8 @@ class SortAction:  # predefined data-op: _sort_
     name = "sort"
 
     async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        from sora.data_ops import pluck
+
         activity = cycle.working.activities[kwargs["activity_id"]]
         by = kwargs.get("by")
         collection = list(kwargs["collection"])
@@ -929,6 +803,8 @@ class ReduceAction:  # predefined data-op: _reduce_
     name = "reduce"
 
     async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        from sora.data_ops import pluck
+
         activity = cycle.working.activities[kwargs["activity_id"]]
         collection = kwargs["collection"]
         op = kwargs.get("op", "count")

@@ -24,6 +24,8 @@ from fakes import (
     ScriptedTransport,
     plan_json,
 )
+from sora._strategies.reason import _DEFAULT_MAX_REPLAN_ATTEMPTS
+from sora._strategies.reconsideration import _perception_signature, _step_side_effecting
 from sora.action import (
     FocusAction,
     InferAction,
@@ -46,7 +48,6 @@ from sora.memory import (
 )
 from sora.perception import Percept
 from sora.strategies import (
-    _DEFAULT_MAX_REPLAN_ATTEMPTS,
     BeforeEachOp,
     BeforeWrites,
     DefaultActStrategy,
@@ -58,8 +59,6 @@ from sora.strategies import (
     PerceptionSignatureGate,
     Strategies,
     TickResult,
-    _perception_signature,
-    _step_side_effecting,
 )
 from sora.types import (
     CompletedOperation,

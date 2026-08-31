@@ -27,6 +27,11 @@ from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from sora._strategies.conditions import (
+    _clock_for_source,
+    _condition_window_key,
+    _lift_pending_conditions,
+)
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -48,9 +53,6 @@ from sora.strategies import (
     DefaultSituateStrategy,
     Strategies,
     TickResult,
-    _clock_for_source,
-    _condition_window_key,
-    _lift_pending_conditions,
 )
 from sora.types import (
     ConditionWait,

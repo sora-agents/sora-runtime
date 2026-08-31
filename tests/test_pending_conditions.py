@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, ScriptedTransport
+from sora._strategies.conditions import _eligible_conditions
 from sora.action import default_action_registry
 from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -47,7 +48,6 @@ from sora.strategies import (
     DefaultRelevanceJudge,
     DefaultSituateStrategy,
     Strategies,
-    _eligible_conditions,
 )
 from sora.transport import MessageTransport
 from sora.types import (

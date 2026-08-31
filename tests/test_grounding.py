@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from sora._strategies.parameters import _mistyped_params, _null_required_params, _undeclared_params
 from sora.action import default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -43,9 +44,6 @@ from sora.strategies import (
     DefaultSituateStrategy,
     Strategies,
     TickResult,
-    _mistyped_params,
-    _null_required_params,
-    _undeclared_params,
     resolve_references,
 )
 from sora.transport import MessageTransport
