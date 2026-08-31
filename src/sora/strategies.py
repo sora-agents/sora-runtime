@@ -4338,8 +4338,10 @@ class DefaultReasonStrategy:
         re-reads it. An empty collection expands to nothing and the sub-goal simply vanishes; one
         that could not be *read* is a plan defect instead -> replan (``_SUBGOAL_DEFECT``)."""
         mode = step.params.get("mode", "deliberative")
-        _lift_step_conditions(step, activity, wm)
         if mode == "deliberative":
+            # A deliberative sub-goal is accepted once it has passed the recursion guard below:
+            # the child inference needs its step-owned conditions in the prompt, but a rejected
+            # step must not leave a condition behind for a replacement plan to inherit.
             goal = step.params["goal"]
             # A `then` (see `_pursue_fired_condition`) restates the goal that declared it — the
             # planner is told to phrase it "like the original goal" — so containment in an ancestor
@@ -4360,6 +4362,7 @@ class DefaultReasonStrategy:
                     cycle, activity, f"Stuck on {goal!r}: {halt}. How should I proceed?"
                 )
                 return _SUBGOAL_HALTED
+            _lift_step_conditions(step, activity, wm)
             catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
             observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
             infer = cycle.actions.internal(InferAction.name)
@@ -4393,6 +4396,10 @@ class DefaultReasonStrategy:
             log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
             activity.reset_for_replan(defect=defect)
             return _SUBGOAL_DEFECT
+        # The fan-out is now known to be a committed step (including a known-empty one), so its
+        # maintenance window can safely outlive the splice.  Do this after validation: conditions
+        # on a rejected mechanical step belong to no plan and must not survive its replan.
+        _lift_step_conditions(step, activity, wm)
         activity.plan = replace(plan, steps=plan.steps[:i] + expanded + plan.steps[i + 1 :])
         log.info(
             "reason: sub-goal %r fanned out to %d step(s)", step.params.get("goal"), len(expanded)

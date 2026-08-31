@@ -612,6 +612,40 @@ async def test_a_deliberative_child_prompt_is_told_its_step_already_governs_the_
     assert "Do not return a top-level `pending` field" in prompt
 
 
+async def test_a_rejected_mechanical_subgoal_does_not_claim_a_corrected_childs_window(
+    tmp_path: Path,
+) -> None:
+    """A condition belongs to a step only after that step has been accepted.
+
+    A malformed mechanical maintenance sub-goal used to lift its condition onto the caller before
+    fan-out rejected the step.  A corrected deliberative replacement then de-duplicated against
+    that stale condition, leaving the child without either its frame ownership or the prompt that
+    prevents it from declaring a second waiter.
+    """
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    malformed = _window_step("mechanical")
+    for name in ("in", "as", "template"):
+        malformed.params.pop(name)
+    activity = Activity(
+        id="a1", goal="watch", context={}, plan=Plan(id="bad", goal="watch", steps=[malformed])
+    )
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.plan is None
+    assert activity.pending_conditions == []
+
+    activity.plan = Plan(id="corrected", goal="watch", steps=[_window_step("deliberative")])
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    assert [state.declared_by for state in activity.pending_conditions] == [(("corrected", 0),)]
+    _system, prompt = llm.calls[-1]
+    assert "Governing pending conditions from the invoking sub-goal step" in prompt
+
+
 async def test_a_deliberative_child_cannot_redeclare_its_step_owned_window(
     tmp_path: Path,
 ) -> None:
