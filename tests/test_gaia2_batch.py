@@ -14,7 +14,12 @@ from typing import Any
 
 import pytest
 from examples.gaia2 import _runner
-from examples.gaia2._runner import _awaiting_input, _make_stop_when
+from examples.gaia2._runner import (
+    _awaiting_input,
+    _context_overflow,
+    _make_stop_when,
+    _terminal_cause,
+)
 from examples.gaia2.batch import (
     _jsonl_record,
     _pass_at_1,
@@ -298,14 +303,24 @@ def test_aggregate_empty_dir_is_safe(tmp_path: Path) -> None:
 
 
 def _agent_with(
-    states: list[ActivityState], blocked_on: list[Any] | None = None
+    states: list[ActivityState],
+    blocked_on: list[Any] | None = None,
+    *,
+    cycle_count: int = 0,
+    logical_call_limit_exceeded: bool = False,
 ) -> SimpleNamespace:
     waits: list[Any] = blocked_on if blocked_on is not None else [None] * len(states)
     activities = {
         i: SimpleNamespace(state=st, blocked_on=w)
         for i, (st, w) in enumerate(zip(states, waits, strict=True))
     }
-    return SimpleNamespace(working=SimpleNamespace(activities=activities))
+    return SimpleNamespace(
+        working=SimpleNamespace(activities=activities),
+        cycle=SimpleNamespace(cycle_count=cycle_count),
+        procedural=SimpleNamespace(
+            logical_call_limit_exceeded=logical_call_limit_exceeded,
+        ),
+    )
 
 
 def _sim(*, running: bool, paused: bool = False) -> SimpleNamespace:
@@ -349,6 +364,65 @@ def test_stop_when_wall_clock_cap_fires() -> None:
     predicate = _make_stop_when(sim, _agent_with([ActivityState.READY]), None, -1.0)
     assert predicate is not None
     assert predicate() is True
+    assert predicate.reason == "timeout"
+
+
+def test_stop_when_enforces_the_explicit_logical_agent_call_limit() -> None:
+    predicate = _make_stop_when(
+        _sim(running=True),
+        _agent_with([ActivityState.READY], logical_call_limit_exceeded=True),
+        None,
+        1200.0,
+    )
+    assert predicate is not None
+    assert predicate() is True
+    assert predicate.reason == "llm_call_limit"
+
+
+def test_stop_when_does_not_treat_decision_cycles_as_benchmark_steps() -> None:
+    predicate = _make_stop_when(
+        _sim(running=True),
+        _agent_with([ActivityState.READY], cycle_count=10_000),
+        None,
+        1200.0,
+    )
+    assert predicate is not None
+    assert predicate() is False
+
+
+def test_context_overflow_is_classified_without_provider_specific_exception_types() -> None:
+    assert _context_overflow(RuntimeError("maximum context length exceeded")) is True
+    assert _context_overflow(RuntimeError("connection reset")) is False
+
+
+def test_terminal_cause_does_not_call_an_unscored_timeline_stop_verification() -> None:
+    assert _terminal_cause(None, False, "verification_completion", None) == "unscored_completion"
+    assert _terminal_cause(None, False, "verification_completion", False) == (
+        "verification_completion"
+    )
+
+
+def test_terminal_cause_reads_provider_failures_captured_off_cycle() -> None:
+    assert (
+        _terminal_cause(
+            None,
+            False,
+            "verification_completion",
+            None,
+            inference_errors=("BadRequestError('maximum context length exceeded')",),
+        )
+        == "context_overflow"
+    )
+    assert (
+        _terminal_cause(
+            None,
+            False,
+            "verification_completion",
+            None,
+            inference_errors=("ConnectionError('connection reset')",),
+        )
+        == "infrastructure_error"
+    )
 
 
 # -- the pause cap: bound a stalled judge without bounding a slow scenario ------------------------

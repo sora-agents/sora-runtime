@@ -16,9 +16,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +51,59 @@ class RunResult:
     awaiting_input: list[str] = field(default_factory=list)
     write_counts: Any = None
     timeline_expired: bool = False
+    llm_report: Any = None
+    replan_count: int = 0
+    terminal_cause: str | None = None
+    agent_llm_calls: int = 0
+    external_actions: int = 0
+    decision_cycles: int = 0
+
+
+StopReason = Literal["verification_completion", "llm_call_limit", "timeout"]
+
+
+@dataclass
+class _StopController:
+    simulation: Any
+    agent: Any
+    deadline: float
+    paused_since: float | None = None
+    reason: StopReason | None = None
+
+    def __call__(self) -> bool:
+        now = time.monotonic()
+        if self.agent.procedural.logical_call_limit_exceeded:
+            self.reason = "llm_call_limit"
+            return True
+        if now >= self.deadline:
+            self.reason = "timeout"
+            return True
+        if self.simulation.is_paused():
+            self.paused_since = now if self.paused_since is None else self.paused_since
+            if now - self.paused_since >= MAX_PAUSE_SECONDS:
+                self.reason = "timeout"
+                return True
+            return False
+        self.paused_since = None
+        if self.simulation.is_running():
+            return False
+        from sora.activity import ActivityState
+        from sora.types import ConditionWait, InputWait
+
+        activities = list(self.agent.working.activities.values())
+        if not activities:
+            return False
+        done = all(
+            activity.state is ActivityState.TERMINATED
+            or (
+                activity.state is ActivityState.BLOCKED
+                and isinstance(activity.blocked_on, InputWait | ConditionWait)
+            )
+            for activity in activities
+        )
+        if done:
+            self.reason = "verification_completion"
+        return done
 
 
 def _awaiting_input(agent: Any) -> list[str]:
@@ -87,58 +139,68 @@ def _make_stop_when(
     agent: Any,
     exit_when_idle: float | None,
     max_wall_seconds: float,
-) -> Callable[[], bool] | None:
+) -> _StopController | None:
     """The turn-aware done predicate (see ``run_benchmark.py``'s module docstring). Returns None
     when the caller opts into ``TerminalSession``'s own quiet-window heuristic (``exit_when_idle``
     set), letting the session drive its old single-turn behavior unchanged."""
-    from sora.activity import ActivityState
-    from sora.types import ConditionWait, InputWait
-
     if exit_when_idle is not None:
         return None
-    deadline = time.monotonic() + max_wall_seconds
-    paused_since: float | None = None
+    return _StopController(
+        simulation=simulation,
+        agent=agent,
+        deadline=time.monotonic() + max_wall_seconds,
+    )
 
-    def _timeline_done() -> bool:
-        nonlocal paused_since
-        now = time.monotonic()
-        if now >= deadline:
-            return True
-        # A paused environment is a judge call in flight, so the timeline is mid-turn, not over --
-        # but bound that wait on its own. The whole-run clock already backstops a stalled judge;
-        # what it cannot do is tell a stall from a slow scenario, so it can only be set to the
-        # larger of the two and then pays that price per hung scenario across a sweep. This keeps
-        # the two independent: a judge that answers in seconds is never touched, and one that never
-        # answers costs MAX_PAUSE_SECONDS instead of the full wall clock.
-        if simulation.is_paused():
-            paused_since = now if paused_since is None else paused_since
-            return now - paused_since >= MAX_PAUSE_SECONDS
-        paused_since = None
-        if simulation.is_running():
-            return False  # timeline live — keep going, more turns may arrive
-        acts = list(agent.working.activities.values())
-        if not acts:
-            return False
-        # Done also when what is left is a wait nothing will satisfy. An activity parked on
-        # InputWait is waiting for a user Message, and one parked on ConditionWait is waiting for a
-        # tool signal (a declared pending condition, ADR-0022); past the end of the timeline
-        # neither is coming, so it can never reach TERMINATED and the run would otherwise sit out
-        # its whole wall clock in silence. Deliberately *below* the is_running() guard: while the
-        # timeline is live a later turn genuinely can satisfy either wait — Observe resumes on a
-        # user Message or on a matching signal — and cutting the run short would throw away a
-        # recoverable state. This is a harness-level bound standing in for the timers that would
-        # bound an absent trigger in a long-running agent; it does not generalize beyond a
-        # simulation with an end.
-        return all(
-            a.state is ActivityState.TERMINATED
-            or (
-                a.state is ActivityState.BLOCKED
-                and isinstance(a.blocked_on, InputWait | ConditionWait)
-            )
-            for a in acts
-        )
 
-    return _timeline_done
+def _context_overflow(exc: Exception | str | None) -> bool:
+    if exc is None:
+        return False
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("context overflow", "context length", "context window", "maximum context")
+    )
+
+
+def _terminal_cause(
+    exc: Exception | None,
+    timeline_expired: bool,
+    stop_reason: StopReason | None,
+    success: bool | None,
+    *,
+    inference_errors: tuple[str, ...] = (),
+) -> str:
+    if _context_overflow(exc) or any(_context_overflow(error) for error in inference_errors):
+        return "context_overflow"
+    if exc is not None or inference_errors:
+        return "infrastructure_error"
+    if stop_reason == "llm_call_limit":
+        return "llm_call_limit"
+    if timeline_expired or stop_reason == "timeout":
+        return "timeout"
+    if isinstance(success, bool):
+        return "verification_completion"
+    return "unscored_completion"
+
+
+def _terminal_inference_errors(llm_report: Any) -> tuple[str, ...]:
+    """Errors in the unresolved suffix of off-cycle inference outcomes.
+
+    A provider failure is delivered through ``InferenceResult`` and therefore never escapes
+    ``TerminalSession.run``. A later successful inference means the runtime recovered; only errors
+    after the last success describe why the run finally stopped.
+    """
+    if llm_report is None:
+        return ()
+    errors: list[str] = []
+    for inference in reversed(llm_report.inferences):
+        outcome = getattr(inference, "outcome", None)
+        if outcome == "success":
+            break
+        error = getattr(inference, "error", None)
+        if outcome == "error" and isinstance(error, str):
+            errors.append(error)
+    return tuple(reversed(errors))
 
 
 def run_scenario(
@@ -161,7 +223,12 @@ def run_scenario(
 
     simulation = AreSimulation(scenario)
     agent = build_agent(config, simulation=simulation)
-    stop_when = _make_stop_when(simulation, agent, exit_when_idle, max_wall_seconds)
+    stop_when = _make_stop_when(
+        simulation,
+        agent,
+        exit_when_idle,
+        max_wall_seconds,
+    )
 
     session = TerminalSession(
         agent,
@@ -207,6 +274,14 @@ def run_scenario(
     except Exception:  # a diagnostic must never cost the run its real result
         log.warning("write-count check failed", exc_info=True)
 
+    terminal_cause = _terminal_cause(
+        exc,
+        expired,
+        stop_when.reason if stop_when is not None else None,
+        outcome.success if isinstance(outcome.success, bool) else None,
+        inference_errors=_terminal_inference_errors(session.llm_report),
+    )
+
     return RunResult(
         outcome=outcome,
         environment=simulation.environment(),
@@ -221,4 +296,12 @@ def run_scenario(
         # every field beside it and losing it to a probe failure would be worse than losing any
         # single one of them.
         timeline_expired=expired,
+        llm_report=session.llm_report,
+        replan_count=sum(
+            getattr(activity, "replan_count", 0) for activity in agent.working.activities.values()
+        ),
+        terminal_cause=terminal_cause,
+        agent_llm_calls=agent.procedural.logical_calls_admitted,
+        external_actions=agent.cycle.external_action_count,
+        decision_cycles=agent.cycle.cycle_count,
     )
