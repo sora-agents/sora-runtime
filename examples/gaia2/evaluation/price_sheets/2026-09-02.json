@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "effective_date": "2026-09-02",
+  "currency": "USD",
+  "models": {
+    "gpt-5.4-2026-03-05": [
+      {"max_input_tokens": 272000, "input_per_million": 2.5, "cached_input_per_million": 0.25, "output_per_million": 15.0},
+      {"max_input_tokens": null, "input_per_million": 5.0, "cached_input_per_million": 0.5, "output_per_million": 22.5}
+    ],
+    "moonshotai/kimi-k2.5": [
+      {"max_input_tokens": null, "input_per_million": 0.45, "cached_input_per_million": 0.07, "output_per_million": 2.25}
+    ]
+  },
+  "notes": {
+    "moonshotai/kimi-k2.5": "OpenRouter DeepInfra endpoint rates; routing is pinned to deepinfra and fallbacks are disabled."
+  }
+}

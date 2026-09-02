@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "name": "gpt-5.4-medium-prompt",
+      "provider": "openai",
+      "client": "sora.adapters.openai_llm.OpenAICompatLLMClient",
+      "model": "gpt-5.4-2026-03-05",
+      "endpoint": "https://api.openai.com/v1",
+      "credential_env": "OPENAI_API_KEY",
+      "campaigns": ["prompt"],
+      "settings": {
+        "reasoning_effort": {"status": "sent", "value": "medium"},
+        "reasoning": {"status": "intentionally_omitted", "value": null},
+        "temperature": {"status": "sent", "value": 0.5},
+        "top_p": {"status": "intentionally_omitted", "value": null},
+        "seed": {"status": "intentionally_omitted", "value": null},
+        "verbosity": {"status": "intentionally_omitted", "value": null},
+        "max_output_tokens": {"status": "sent", "value": 16384},
+        "service_tier": {"status": "intentionally_omitted", "value": null},
+        "provider_routing": {"status": "intentionally_omitted", "value": null},
+        "router_metadata": {"status": "intentionally_omitted", "value": null}
+      },
+      "stream": true,
+      "stall_timeout": 300,
+      "sdk_max_retries": 0,
+      "instrument": true
+    },
+    {
+      "name": "kimi-k2.5-prompt",
+      "provider": "openrouter",
+      "client": "sora.adapters.openai_llm.OpenAICompatLLMClient",
+      "model": "moonshotai/kimi-k2.5",
+      "endpoint": "https://openrouter.ai/api/v1",
+      "credential_env": "OPENROUTER_API_KEY",
+      "campaigns": ["prompt"],
+      "settings": {
+        "reasoning_effort": {"status": "intentionally_omitted", "value": null},
+        "reasoning": {"status": "sent", "value": {"enabled": true}},
+        "temperature": {"status": "sent", "value": 0.5},
+        "top_p": {"status": "intentionally_omitted", "value": null},
+        "seed": {"status": "intentionally_omitted", "value": null},
+        "verbosity": {"status": "intentionally_omitted", "value": null},
+        "max_output_tokens": {"status": "sent", "value": 16384},
+        "service_tier": {"status": "intentionally_omitted", "value": null},
+        "provider_routing": {
+          "status": "sent",
+          "value": {
+            "only": ["deepinfra"],
+            "order": ["deepinfra"],
+            "allow_fallbacks": false,
+            "require_parameters": true
+          }
+        },
+        "router_metadata": {"status": "sent", "value": true}
+      },
+      "stream": true,
+      "stall_timeout": 300,
+      "sdk_max_retries": 0,
+      "instrument": true
+    },
+    {
+      "name": "gpt-5.4-high-paper",
+      "provider": "openai",
+      "client": "sora.adapters.openai_llm.OpenAICompatLLMClient",
+      "model": "gpt-5.4-2026-03-05",
+      "endpoint": "https://api.openai.com/v1",
+      "credential_env": "OPENAI_API_KEY",
+      "campaigns": ["prompt", "aamas2027"],
+      "settings": {
+        "reasoning_effort": {"status": "sent", "value": "high"},
+        "reasoning": {"status": "intentionally_omitted", "value": null},
+        "temperature": {"status": "sent", "value": 0.5},
+        "top_p": {"status": "intentionally_omitted", "value": null},
+        "seed": {"status": "intentionally_omitted", "value": null},
+        "verbosity": {"status": "intentionally_omitted", "value": null},
+        "max_output_tokens": {"status": "sent", "value": 16384},
+        "service_tier": {"status": "intentionally_omitted", "value": null},
+        "provider_routing": {"status": "intentionally_omitted", "value": null},
+        "router_metadata": {"status": "intentionally_omitted", "value": null}
+      },
+      "stream": true,
+      "stall_timeout": 300,
+      "sdk_max_retries": 0,
+      "instrument": true
+    }
+  ]
+}

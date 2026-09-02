@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "suite": "acceptance",
+  "cases": [
+    {"capability": "search", "id": "21_mq2acb"},
+    {"capability": "execution", "id": "23_1hu54e"},
+    {"capability": "adaptability", "id": "27_6u1vo2"},
+    {"capability": "ambiguity", "id": "28_zqomls"},
+    {"capability": "time", "id": "25_6onsr2"}
+  ]
+}
