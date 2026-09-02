@@ -758,6 +758,7 @@ async def test_stop_when_predicate_ends_the_session_and_is_polled(
         await asyncio.wait_for(task, timeout=2)  # exits on its own via the predicate, no EOF
         assert task.exception() is None
         assert calls["n"] >= 2  # polled across loops, not a one-shot check
+        assert session.llm_report is not None  # frozen for the eval runner after teardown
     finally:
         stdin.close()
 

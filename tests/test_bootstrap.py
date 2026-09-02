@@ -383,6 +383,25 @@ def test_llm_for_carries_the_model_id_for_the_run_trace() -> None:
     assert client.model == "qwen3:30b-64k"
 
 
+def test_llm_for_keeps_the_logical_call_limit_out_of_provider_kwargs() -> None:
+    from fakes import FakeLLMClient
+    from sora.llm import MeteredLLMClient
+
+    client = llm_for(
+        _config(
+            llm={
+                "client": "fakes.FakeLLMClient",
+                "response": "hi",
+                "max_logical_calls": 200,
+            }
+        )
+    )
+
+    assert isinstance(client, MeteredLLMClient)
+    assert isinstance(client._inner, FakeLLMClient)
+    assert client.logical_calls_admitted == 0
+
+
 def test_llm_for_resolves_api_key_from_the_configured_environment_variable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -159,6 +159,9 @@ class Activity:
     # "produced N plans and never moved". Transient run state; never persisted.
     replan_trail: list[str | None] = field(default_factory=list)
     replan_history_mark: int = 0  # len(history) as of the last replan — the progress marker above
+    # Monotonic evaluation accounting. ``replan_trail`` is intentionally cleared by progress and
+    # therefore cannot answer how many replans occurred over a whole scenario.
+    replan_count: int = 0
     # context is exclusively for strategy-author data — the runtime itself never writes into it,
     # which is what keeps pending_operation/last_operation as dedicated fields instead of context
     # keys with a naming convention: no shared namespace means no collision to avoid in the first
@@ -219,6 +222,7 @@ class Activity:
         the plan itself cannot work (its assumption about the world is false and will stay false),
         and leave it None when the plan was fine but the world moved under it. The replanning prompt
         reads it to decide whether to tell the planner to reuse this plan or to route around it."""
+        self.replan_count += 1
         was_inferring = self.pending_inference is not None
         # Park what is being dropped for the *next* inference to read (ADR-0024): a blank-slate
         # replan is correct but wasteful, and the planner reuses what still applies far better than

@@ -109,10 +109,18 @@ class DecisionCycle:
         # Monotonic count of ticks run, for observability (the README's `[cycle N]` trace). Read via
         # cycle_count; a richer per-phase presenter (the --verbose CLI) is deferred to CLI polish.
         self._cycle_count = 0
+        # Agent-selected external actions actually dispatched through Act. Startup joins and
+        # mechanical WAITs are excluded: neither corresponds to a model-selected environment
+        # interaction in a benchmark trajectory.
+        self._external_action_count = 0
 
     @property
     def cycle_count(self) -> int:
         return self._cycle_count
+
+    @property
+    def external_action_count(self) -> int:
+        return self._external_action_count
 
     async def tick(self) -> None:
         """One Observe -> Reflect -> Situate -> Reason -> Act pass, threading a TickResult through
@@ -226,6 +234,7 @@ class DecisionCycle:
             result = await self.strategies.act.bind(step, tool.manual, self, result)
         invocation = result.invocation
         if invocation is not None:
+            self._external_action_count += 1
             await action.execute(
                 self.registry,
                 self,
@@ -235,6 +244,7 @@ class DecisionCycle:
                 **invocation.params,
             )
         elif not action.requires_binding:
+            self._external_action_count += 1
             await action.execute(self.registry, self, activity_id=selected.id, **step.params)
         # else: a binding action produced no invocation — a deliberate skip (e.g. the mechanical
         # guard against dispatching an invoke whose required param resolved to null). Dispatch

@@ -21,6 +21,7 @@ from sora.adapters.openai_llm import (  # noqa: E402
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_STREAM_STALL_TIMEOUT,
     OpenAICompatLLMClient,
+    _provider_observation_of,
     _text_of,
     _usage_of,
 )
@@ -108,21 +109,33 @@ def test_usage_of_falls_back_to_the_estimate_when_no_reasoning_is_reported() -> 
     # A non-reasoning model (or a server that omits the details block) leaves reasoning_tokens None,
     # so thinking degrades to the same output-minus-answer estimate the Anthropic client uses.
     usage = _usage_of(_response(prompt_tokens=100, completion_tokens=800), answer_chars=40)
+    assert usage is not None
     assert usage.reasoning_tokens is None
     assert usage.thinking_tokens == 790  # 800 out - ~10 answer tok
 
 
 def test_usage_of_tolerates_a_missing_usage_block() -> None:
-    # Instrumentation must never break a call: no usage -> zeros, never an exception.
-    assert _usage_of(_response(with_usage=False), answer_chars=7) == LLMUsage(0, 0, answer_chars=7)
+    # Missing accounting is unavailable, not an exact zero-token provider round trip.
+    assert _usage_of(_response(with_usage=False), answer_chars=7) is None
 
 
 def test_usage_of_distinguishes_missing_cached_input_from_an_explicit_zero() -> None:
     missing = _usage_of(_response(prompt_tokens=42), answer_chars=0)
     explicit_zero = _usage_of(_response(prompt_tokens=42, cached_tokens=0), answer_chars=0)
 
+    assert missing is not None
+    assert explicit_zero is not None
     assert missing.cached_input_tokens is None
     assert explicit_zero.cached_input_tokens == 0
+
+
+def test_provider_observation_reads_openrouter_metadata_and_sdk_model_extra() -> None:
+    direct = {"requested": "moonshotai/kimi-k2.5", "summary": "selected=Moonshot AI"}
+    assert _provider_observation_of(SimpleNamespace(openrouter_metadata=direct)) == direct
+    assert (
+        _provider_observation_of(SimpleNamespace(model_extra={"openrouter_metadata": direct}))
+        == direct
+    )
 
 
 # ── complete() over an injected fake SDK ──────────────────────────────────────────────────────
@@ -253,6 +266,61 @@ async def test_request_profile_overrides_output_cap_without_changing_other_defau
     assert kwargs["max_completion_tokens"] == 64
     # Provider mappings for qualitative reasoning classes are a later, measured change.
     assert "reasoning_effort" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_complete_forwards_only_non_null_evaluation_settings() -> None:
+    client = OpenAICompatLLMClient(
+        model="m",
+        api_key="test",
+        reasoning_effort="xhigh",
+        temperature=0.5,
+        top_p=None,
+        seed=None,
+        verbosity="low",
+        service_tier="default",
+        max_retries=0,
+        stream=False,
+    )
+    client._client = _FakeAsyncOpenAI(_response("hi"))  # type: ignore[assignment]
+
+    await client.complete(_request())
+
+    kwargs = client._client.chat.completions.kwargs  # type: ignore[attr-defined]
+    assert kwargs["reasoning_effort"] == "xhigh"
+    assert kwargs["temperature"] == 0.5
+    assert kwargs["verbosity"] == "low"
+    assert kwargs["service_tier"] == "default"
+    assert "top_p" not in kwargs
+    assert "seed" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_complete_forwards_openrouter_reasoning_routing_and_metadata_opt_in() -> None:
+    routing = {
+        "only": ["moonshotai"],
+        "order": ["moonshotai"],
+        "allow_fallbacks": False,
+        "require_parameters": True,
+    }
+    client = OpenAICompatLLMClient(
+        model="moonshotai/kimi-k2.5",
+        api_key="test",
+        reasoning={"enabled": True},
+        provider_routing=routing,
+        router_metadata=True,
+        stream=False,
+    )
+    client._client = _FakeAsyncOpenAI(_response("hi"))  # type: ignore[assignment]
+
+    await client.complete(_request())
+
+    kwargs = client._client.chat.completions.kwargs  # type: ignore[attr-defined]
+    assert kwargs["extra_body"] == {
+        "reasoning": {"enabled": True},
+        "provider": routing,
+    }
+    assert kwargs["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
 
 
 @pytest.mark.asyncio

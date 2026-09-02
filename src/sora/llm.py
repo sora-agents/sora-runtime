@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import logging
 import time
 import uuid
@@ -35,16 +36,28 @@ current_llm_call_id: contextvars.ContextVar[str | None] = contextvars.ContextVar
     "current_llm_call_id", default=None
 )
 
+# Which metering decorators have admitted the active semantic call. This state exists only inside
+# ``llm_call_scope`` and is reset when that scope exits, so parser repair can share one admission
+# without retaining every completed call id for the lifetime of a production agent.
+_admitted_meter_ids: contextvars.ContextVar[frozenset[int]] = contextvars.ContextVar(
+    "admitted_meter_ids", default=frozenset()
+)
+
 
 @contextmanager
 def llm_call_scope() -> Iterator[str]:
     """Correlate one semantic LLM call without changing activity inference state."""
     existing = current_llm_call_id.get()
-    call_id = existing or current_inference_id.get() or uuid.uuid4().hex
+    if existing is not None:
+        yield existing
+        return
+    call_id = current_inference_id.get() or uuid.uuid4().hex
     token = current_llm_call_id.set(call_id)
+    admission_token = _admitted_meter_ids.set(frozenset())
     try:
         yield call_id
     finally:
+        _admitted_meter_ids.reset(admission_token)
         current_llm_call_id.reset(token)
 
 
@@ -118,6 +131,8 @@ def _request_metadata(request: CompletionRequest | None) -> dict[str, object]:
             "llm_prompt_version": None,
             "llm_section_characters": None,
             "llm_dynamic_section_characters": None,
+            "llm_system_prompt_sha256": None,
+            "llm_user_prompt_sha256": None,
         }
     section_characters = sum(section.characters for section in request.sections)
     dynamic_characters = sum(section.characters for section in request.sections if section.dynamic)
@@ -127,6 +142,8 @@ def _request_metadata(request: CompletionRequest | None) -> dict[str, object]:
         # No declarations means unavailable, not a measured zero-size prompt.
         "llm_section_characters": section_characters if request.sections else None,
         "llm_dynamic_section_characters": dynamic_characters if request.sections else None,
+        "llm_system_prompt_sha256": hashlib.sha256(request.system.encode()).hexdigest(),
+        "llm_user_prompt_sha256": hashlib.sha256(request.user.encode()).hexdigest(),
     }
 
 
@@ -188,6 +205,10 @@ def log_llm_usage(
     request: CompletionRequest | None = None,
     *,
     finish_reason: str | None = None,
+    observed_model: str | None = None,
+    sdk_name: str | None = None,
+    sdk_version: str | None = None,
+    provider_observation: dict[str, Any] | None = None,
 ) -> None:
     """Emit one ``sora.llm`` usage record for a single round-trip. Kept here, not in the concrete
     client, so the *record shape* (event name, field names) stays owned by this instrumentation
@@ -214,6 +235,10 @@ def log_llm_usage(
             "llm_call_id": call_id,
             "llm_inference_id": inference_id,
             "llm_finish_reason": finish_reason,
+            "llm_observed_model": observed_model,
+            "llm_sdk_name": sdk_name,
+            "llm_sdk_version": sdk_version,
+            "llm_provider_observation": provider_observation,
             **_request_metadata(request),
         },
     )
@@ -241,7 +266,12 @@ def log_llm_discarded(inference_id: str) -> None:
 LLMOutcome = Literal["success", "unresolvable", "error"]
 
 
-def log_llm_outcome(inference_id: str, outcome: LLMOutcome) -> None:
+def log_llm_outcome(
+    inference_id: str,
+    outcome: LLMOutcome,
+    *,
+    error: str | None = None,
+) -> None:
     """Record how a completed inference resolved, independently from whether it became stale."""
     _llm_log.info(
         "~ llm %soutcome: %s",
@@ -252,6 +282,7 @@ def log_llm_outcome(inference_id: str, outcome: LLMOutcome) -> None:
             "llm_call_id": inference_id,
             "llm_inference_id": inference_id,
             "llm_outcome": outcome,
+            "llm_error": error,
         },
     )
 
@@ -292,6 +323,25 @@ def log_llm_malformed(*, dropped: int = 0, repaired: int = 0) -> None:
     )
 
 
+def log_llm_terminal_parse_failure() -> None:
+    """Record a response that still failed its semantic parser after all local/model repair.
+
+    This is separate from malformed-field accounting: a dropped optional field can leave a usable
+    answer, while a terminal parse failure yields no domain value at all. Evaluation needs both.
+    """
+    inference_id = current_inference_id.get()
+    call_id = _logical_call_id()
+    _llm_log.info(
+        "~ llm %sterminal parse failure",
+        _id_tag(call_id),
+        extra={
+            "llm_event": "terminal_parse_failure",
+            "llm_call_id": call_id,
+            "llm_inference_id": inference_id,
+        },
+    )
+
+
 class LLMClient(Protocol):
     """A single completion round-trip — the runtime's one seam onto a language model.
 
@@ -316,6 +366,12 @@ def _model_name(client: object) -> str | None:
     return model if isinstance(model, str) else None
 
 
+class LLMCallLimitExceeded(RuntimeError):
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"run is limited to {limit} logical agent LLM calls")
+        self.limit = limit
+
+
 class MeteredLLMClient:
     """A transparent ``LLMClient`` decorator that times each round-trip and logs a ``sora.llm`` cue.
 
@@ -327,7 +383,15 @@ class MeteredLLMClient:
     (`LLMMeter`, the CLI presenter) never has to parse it back out of the message text.
     """
 
-    def __init__(self, inner: LLMClient, *, model: str | None = None) -> None:
+    def __init__(
+        self,
+        inner: LLMClient,
+        *,
+        model: str | None = None,
+        max_logical_calls: int | None = None,
+    ) -> None:
+        if max_logical_calls is not None and max_logical_calls <= 0:
+            raise ValueError("max_logical_calls must be positive when set")
         self._inner = inner
         # The model id, purely descriptive — a run surface reads it to record *which* model produced
         # a trace (an unexpected trajectory is a different question for a small local model than for
@@ -337,9 +401,35 @@ class MeteredLLMClient:
         # a config that omits `model:` still runs a model — the client's default — and reporting
         # "none" there would be a plain lie rather than a missing detail.
         self.model = model if model is not None else _model_name(inner)
+        self._max_logical_calls = max_logical_calls
+        self._logical_calls_admitted = 0
+        self._logical_call_limit_exceeded = False
+
+    @property
+    def logical_calls_admitted(self) -> int:
+        return self._logical_calls_admitted
+
+    @property
+    def logical_call_limit_exceeded(self) -> bool:
+        return self._logical_call_limit_exceeded
 
     async def complete(self, request: CompletionRequest) -> str:
         with llm_call_scope() as call_id:
+            # No await may occur between the check and reservation: coroutine scheduling is
+            # cooperative, so this is atomic even when several activities infer off-cycle. A
+            # parser-repair pass reuses its semantic call id and is therefore another round trip,
+            # not another admission. Provider/SDK retries stay inside the concrete invocation.
+            meter_id = id(self)
+            admitted = _admitted_meter_ids.get()
+            if meter_id not in admitted:
+                if (
+                    self._max_logical_calls is not None
+                    and self._logical_calls_admitted >= self._max_logical_calls
+                ):
+                    self._logical_call_limit_exceeded = True
+                    raise LLMCallLimitExceeded(self._max_logical_calls)
+                _admitted_meter_ids.set(admitted | {meter_id})
+                self._logical_calls_admitted += 1
             start = time.perf_counter()
             try:
                 return await self._inner.complete(request)
@@ -368,6 +458,21 @@ class MeteredLLMClient:
 
 
 @dataclass(frozen=True)
+class LLMPromptHashes:
+    system_sha256: str
+    user_sha256: str
+
+
+@dataclass(frozen=True)
+class LLMRoundTripUsage:
+    input_tokens: int
+    cached_input_tokens: int | None
+    output_tokens: int
+    reasoning_tokens: int
+    reasoning_tokens_exact: bool
+
+
+@dataclass(frozen=True)
 class LLMInferenceReport:
     call_id: str | None
     inference_id: str | None
@@ -382,11 +487,22 @@ class LLMInferenceReport:
     output_tokens: int
     section_characters: int | None
     dynamic_section_characters: int | None
+    system_prompt_sha256: str | None
+    user_prompt_sha256: str | None
+    prompt_hashes: tuple[LLMPromptHashes, ...]
+    usages: tuple[LLMRoundTripUsage, ...]
     finish_reasons: tuple[str, ...]
+    observed_models: tuple[str, ...]
+    sdk_observations: tuple[tuple[str, str | None], ...]
+    provider_observations: tuple[dict[str, Any], ...]
+    reasoning_tokens: int
+    reasoning_tokens_exact: bool | None
     outcome: LLMOutcome | None
+    error: str | None
     discarded: bool
     malformed_fields_dropped: int
     malformed_fields_repaired: int
+    terminal_parse_failures: int
 
     @property
     def dynamic_section_share(self) -> float | None:
@@ -410,6 +526,7 @@ class LLMReport:
     dynamic_section_characters: int | None
     malformed_fields_dropped: int
     malformed_fields_repaired: int
+    terminal_parse_failures: int
     inferences: tuple[LLMInferenceReport, ...]
 
 
@@ -428,11 +545,22 @@ class _InferenceAccumulator:
     output_tokens: int = 0
     section_characters: int | None = None
     dynamic_section_characters: int | None = None
+    system_prompt_sha256: str | None = None
+    user_prompt_sha256: str | None = None
+    prompt_hashes: tuple[LLMPromptHashes, ...] = ()
+    usages: tuple[LLMRoundTripUsage, ...] = ()
     finish_reasons: tuple[str, ...] = ()
+    observed_models: tuple[str, ...] = ()
+    sdk_observations: tuple[tuple[str, str | None], ...] = ()
+    provider_observations: tuple[dict[str, Any], ...] = ()
+    reasoning_tokens: int = 0
+    reasoning_tokens_exact: bool | None = None
     outcome: LLMOutcome | None = None
+    error: str | None = None
     discarded: bool = False
     malformed_fields_dropped: int = 0
     malformed_fields_repaired: int = 0
+    terminal_parse_failures: int = 0
 
 
 class LLMMeter(logging.Handler):
@@ -477,6 +605,7 @@ class LLMMeter(logging.Handler):
         self.dynamic_section_characters: int | None = None
         self.malformed_fields_dropped = 0
         self.malformed_fields_repaired = 0
+        self.terminal_parse_failures = 0
         # Per-inference-id partials, retained so a later `discarded` cue can fold that call's
         # already-metered cost into the wasted buckets (one round-trip per id; popped on discard).
         # An id never discarded lingers here for the run — bounded by call count, negligible.
@@ -550,6 +679,13 @@ class LLMMeter(logging.Handler):
             dynamic_characters = getattr(record, "llm_dynamic_section_characters", None)
             counted_sections = section_characters if isinstance(section_characters, int) else None
             counted_dynamic = dynamic_characters if isinstance(dynamic_characters, int) else None
+            system_prompt_sha256 = getattr(record, "llm_system_prompt_sha256", None)
+            user_prompt_sha256 = getattr(record, "llm_user_prompt_sha256", None)
+            prompt_hash = (
+                LLMPromptHashes(system_prompt_sha256, user_prompt_sha256)
+                if isinstance(system_prompt_sha256, str) and isinstance(user_prompt_sha256, str)
+                else None
+            )
             if counted_sections is not None:
                 self.section_characters = (self.section_characters or 0) + counted_sections
                 self.dynamic_section_characters = (self.dynamic_section_characters or 0) + (
@@ -569,6 +705,19 @@ class LLMMeter(logging.Handler):
                     (accumulator.dynamic_section_characters or 0) + (counted_dynamic or 0)
                     if counted_sections is not None
                     else accumulator.dynamic_section_characters
+                ),
+                system_prompt_sha256=(
+                    accumulator.system_prompt_sha256
+                    or (system_prompt_sha256 if isinstance(system_prompt_sha256, str) else None)
+                ),
+                user_prompt_sha256=(
+                    accumulator.user_prompt_sha256
+                    or (user_prompt_sha256 if isinstance(user_prompt_sha256, str) else None)
+                ),
+                prompt_hashes=(
+                    accumulator.prompt_hashes + (prompt_hash,)
+                    if prompt_hash is not None
+                    else accumulator.prompt_hashes
                 ),
             )
             if inference_id is not None:
@@ -599,7 +748,18 @@ class LLMMeter(logging.Handler):
                 input_tokens, output_tokens, answer_chars, reasoning_tokens=reasoning_tokens
             ).thinking_tokens
             finish_reason = getattr(record, "llm_finish_reason", None)
+            observed_model = getattr(record, "llm_observed_model", None)
+            sdk_name = getattr(record, "llm_sdk_name", None)
+            sdk_version = getattr(record, "llm_sdk_version", None)
+            provider_observation = getattr(record, "llm_provider_observation", None)
             _, accumulator = self._inference_for(record)
+            this_reasoning = LLMUsage(
+                input_tokens,
+                output_tokens,
+                answer_chars,
+                reasoning_tokens=reasoning_tokens,
+            ).thinking_tokens
+            this_exact = reasoning_tokens is not None
             self._replace_inference(
                 record,
                 input_tokens=accumulator.input_tokens + input_tokens,
@@ -617,6 +777,47 @@ class LLMMeter(logging.Handler):
                     accumulator.finish_reasons + (finish_reason,)
                     if isinstance(finish_reason, str)
                     else accumulator.finish_reasons
+                ),
+                observed_models=(
+                    accumulator.observed_models + (observed_model,)
+                    if isinstance(observed_model, str)
+                    and observed_model not in accumulator.observed_models
+                    else accumulator.observed_models
+                ),
+                sdk_observations=(
+                    accumulator.sdk_observations
+                    + ((sdk_name, sdk_version if isinstance(sdk_version, str) else None),)
+                    if isinstance(sdk_name, str)
+                    and (
+                        sdk_name,
+                        sdk_version if isinstance(sdk_version, str) else None,
+                    )
+                    not in accumulator.sdk_observations
+                    else accumulator.sdk_observations
+                ),
+                provider_observations=(
+                    accumulator.provider_observations + (provider_observation,)
+                    if isinstance(provider_observation, dict)
+                    and provider_observation not in accumulator.provider_observations
+                    else accumulator.provider_observations
+                ),
+                reasoning_tokens=accumulator.reasoning_tokens + this_reasoning,
+                reasoning_tokens_exact=(
+                    this_exact
+                    if accumulator.reasoning_tokens_exact is None
+                    else accumulator.reasoning_tokens_exact and this_exact
+                ),
+                usages=accumulator.usages
+                + (
+                    LLMRoundTripUsage(
+                        input_tokens=input_tokens,
+                        cached_input_tokens=(
+                            cached_input_tokens if isinstance(cached_input_tokens, int) else None
+                        ),
+                        output_tokens=output_tokens,
+                        reasoning_tokens=this_reasoning,
+                        reasoning_tokens_exact=this_exact,
+                    ),
                 ),
             )
             if inference_id is not None:
@@ -643,7 +844,12 @@ class LLMMeter(logging.Handler):
                 # A watchdog result and the provider result can race under the same id. Whichever
                 # result resolved the activity is terminal; a later stale cue must not rewrite it.
                 if accumulator.outcome is None:
-                    self._replace_inference(record, outcome=outcome)
+                    error = getattr(record, "llm_error", None)
+                    self._replace_inference(
+                        record,
+                        outcome=outcome,
+                        error=error if isinstance(error, str) else None,
+                    )
         elif event == "malformed":
             dropped = getattr(record, "llm_malformed_fields_dropped", 0)
             repaired = getattr(record, "llm_malformed_fields_repaired", 0)
@@ -657,6 +863,14 @@ class LLMMeter(logging.Handler):
                     record,
                     malformed_fields_dropped=(accumulator.malformed_fields_dropped + dropped),
                     malformed_fields_repaired=(accumulator.malformed_fields_repaired + repaired),
+                )
+        elif event == "terminal_parse_failure":
+            self.terminal_parse_failures += 1
+            if call_id is not None or inference_id is not None:
+                _, accumulator = self._inference_for(record)
+                self._replace_inference(
+                    record,
+                    terminal_parse_failures=accumulator.terminal_parse_failures + 1,
                 )
 
     def report(self) -> LLMReport:
@@ -676,11 +890,22 @@ class LLMMeter(logging.Handler):
                 output_tokens=row.output_tokens,
                 section_characters=row.section_characters,
                 dynamic_section_characters=row.dynamic_section_characters,
+                system_prompt_sha256=row.system_prompt_sha256,
+                user_prompt_sha256=row.user_prompt_sha256,
+                prompt_hashes=row.prompt_hashes,
+                usages=row.usages,
                 finish_reasons=row.finish_reasons,
+                observed_models=row.observed_models,
+                sdk_observations=row.sdk_observations,
+                provider_observations=row.provider_observations,
+                reasoning_tokens=row.reasoning_tokens,
+                reasoning_tokens_exact=row.reasoning_tokens_exact,
                 outcome=row.outcome,
+                error=row.error,
                 discarded=row.discarded,
                 malformed_fields_dropped=row.malformed_fields_dropped,
                 malformed_fields_repaired=row.malformed_fields_repaired,
+                terminal_parse_failures=row.terminal_parse_failures,
             )
             for row in self._inferences.values()
         )
@@ -698,6 +923,7 @@ class LLMMeter(logging.Handler):
             dynamic_section_characters=self.dynamic_section_characters,
             malformed_fields_dropped=self.malformed_fields_dropped,
             malformed_fields_repaired=self.malformed_fields_repaired,
+            terminal_parse_failures=self.terminal_parse_failures,
             inferences=inferences,
         )
 

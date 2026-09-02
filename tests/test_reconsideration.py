@@ -800,6 +800,7 @@ def test_replans_with_nothing_run_between_them_accumulate() -> None:
         None,
         "search_contacts returned []",
     ]
+    assert activity.replan_count == 3  # monotonic accounting survives trail policy
 
 
 def test_progress_is_counted_from_the_last_replan_not_from_zero() -> None:

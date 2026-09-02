@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 from openai import AsyncOpenAI, Timeout
+from openai import __version__ as OPENAI_SDK_VERSION
 
 from sora.llm import CompletionRequest, LLMUsage, log_llm_usage
 
@@ -81,6 +82,16 @@ class OpenAICompatLLMClient:
         instrument: bool = False,
         stream: bool = True,
         stall_timeout: float | None = DEFAULT_STREAM_STALL_TIMEOUT,
+        reasoning_effort: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
+        verbosity: str | None = None,
+        service_tier: str | None = None,
+        max_retries: int | None = None,
+        reasoning: dict[str, Any] | None = None,
+        provider_routing: dict[str, Any] | None = None,
+        router_metadata: bool | None = None,
     ) -> None:
         # With no explicit base_url, api_key=None lets the SDK resolve OPENAI_API_KEY while an
         # explicit official URL prevents OPENAI_BASE_URL from redirecting that credential. A
@@ -100,6 +111,8 @@ class OpenAICompatLLMClient:
             # environment credential from bootstrap as the explicit api_key argument.
             client_kwargs["api_key"] = "not-needed"
         client_kwargs["base_url"] = base_url if base_url is not None else DEFAULT_OPENAI_BASE_URL
+        if max_retries is not None:
+            client_kwargs["max_retries"] = max_retries
         if stall_timeout is not None:
             # Explicit per-phase timeout rather than a scalar: a scalar would apply the same budget
             # to connect, and a slow TLS handshake is not the failure being bounded here.
@@ -116,6 +129,33 @@ class OpenAICompatLLMClient:
         # broken or absent (some local runtimes); on that path the timeout reverts to a duration
         # cap, so a target that needs it usually wants `stall_timeout: null` as well.
         self._stream = stream
+        # Evaluation-wide transport settings, distinct from CompletionProfile's per-semantic-call
+        # hints. Only non-null values are retained and sent: omission is behavior for reasoning
+        # models (notably Gemini's provider-default dynamic thinking), so replacing it with an
+        # explicit null would not be equivalent on every OpenAI-compatible endpoint.
+        self._request_settings = {
+            name: value
+            for name, value in {
+                "reasoning_effort": reasoning_effort,
+                "temperature": temperature,
+                "top_p": top_p,
+                "seed": seed,
+                "verbosity": verbosity,
+                "service_tier": service_tier,
+            }.items()
+            if value is not None
+        }
+        self._extra_body = {
+            name: value
+            for name, value in {
+                "reasoning": reasoning,
+                "provider": provider_routing,
+            }.items()
+            if value is not None
+        }
+        self._extra_headers = (
+            {"X-OpenRouter-Metadata": "enabled"} if router_metadata is True else {}
+        )
 
     async def complete(self, request: CompletionRequest) -> str:
         kwargs: dict[str, Any] = {
@@ -124,6 +164,7 @@ class OpenAICompatLLMClient:
                 {"role": "system", "content": request.system},
                 {"role": "user", "content": request.user},
             ],
+            **self._request_settings,
         }
         max_output_tokens = (
             request.profile.max_output_tokens
@@ -132,15 +173,25 @@ class OpenAICompatLLMClient:
         )
         if max_output_tokens is not None:
             kwargs["max_completion_tokens"] = max_output_tokens
+        if self._extra_body:
+            kwargs["extra_body"] = self._extra_body
+        if self._extra_headers:
+            kwargs["extra_headers"] = self._extra_headers
         if not self._stream:
             response = await self._client.chat.completions.create(**kwargs)
             text = _text_of(response)
             if self._instrument:
-                log_llm_usage(
-                    _usage_of(response, answer_chars=len(text)),
-                    request,
-                    finish_reason=_finish_reason_of(response),
-                )
+                usage = _usage_of(response, answer_chars=len(text))
+                if usage is not None:
+                    log_llm_usage(
+                        usage,
+                        request,
+                        finish_reason=_finish_reason_of(response),
+                        observed_model=_observed_model_of(response),
+                        sdk_name="openai",
+                        sdk_version=OPENAI_SDK_VERSION,
+                        provider_observation=_provider_observation_of(response),
+                    )
             return text
         if self._instrument:
             # Only asked for when it will be used: a chunked response carries no usage block unless
@@ -150,6 +201,8 @@ class OpenAICompatLLMClient:
         parts: list[str] = []
         usage_chunk: Any = None
         finish_reason: str | None = None
+        observed_model: str | None = None
+        provider_observation: dict[str, Any] | None = None
         stream = await self._client.chat.completions.create(**kwargs, stream=True)
         # `async with`, not a bare `async for`: the stall timeout above raises *mid-iteration* —
         # that is the path it exists for — and an unclosed stream leaves the httpx response open,
@@ -158,10 +211,16 @@ class OpenAICompatLLMClient:
         # budget to the same value, healthy calls then start timing out waiting for a connection.
         async with stream:
             async for chunk in stream:
+                candidate_model = getattr(chunk, "model", None)
+                if isinstance(candidate_model, str):
+                    observed_model = candidate_model
                 # The usage block rides a final chunk that carries no choices, so both are collected
                 # independently rather than assuming they arrive together.
                 if getattr(chunk, "usage", None) is not None:
                     usage_chunk = chunk
+                candidate_observation = _provider_observation_of(chunk)
+                if candidate_observation is not None:
+                    provider_observation = candidate_observation
                 for choice in getattr(chunk, "choices", None) or []:
                     candidate = getattr(choice, "finish_reason", None)
                     if isinstance(candidate, str):
@@ -171,11 +230,17 @@ class OpenAICompatLLMClient:
                         parts.append(content)
         text = "".join(parts)
         if self._instrument:
-            log_llm_usage(
-                _usage_of(usage_chunk, answer_chars=len(text)),
-                request,
-                finish_reason=finish_reason,
-            )
+            usage = _usage_of(usage_chunk, answer_chars=len(text))
+            if usage is not None:
+                log_llm_usage(
+                    usage,
+                    request,
+                    finish_reason=finish_reason,
+                    observed_model=observed_model,
+                    sdk_name="openai",
+                    sdk_version=OPENAI_SDK_VERSION,
+                    provider_observation=provider_observation,
+                )
         return text
 
     async def aclose(self) -> None:
@@ -204,13 +269,35 @@ def _finish_reason_of(response: Any) -> str | None:
     return reason if isinstance(reason, str) else None
 
 
-def _usage_of(response: Any, *, answer_chars: int) -> LLMUsage:
+def _observed_model_of(response: Any) -> str | None:
+    model = getattr(response, "model", None)
+    return model if isinstance(model, str) else None
+
+
+def _provider_observation_of(response: Any) -> dict[str, Any] | None:
+    metadata = getattr(response, "openrouter_metadata", None)
+    if metadata is None:
+        extra = getattr(response, "model_extra", None)
+        if isinstance(extra, dict):
+            metadata = extra.get("openrouter_metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    dump = getattr(metadata, "model_dump", None)
+    if callable(dump):
+        dumped = dump()
+        return dumped if isinstance(dumped, dict) else None
+    return None
+
+
+def _usage_of(response: Any, *, answer_chars: int) -> LLMUsage | None:
     """Build a provider-neutral ``LLMUsage`` from a chat-completions ``usage`` block and the
     already-measured answer length. Reads the exact ``reasoning_tokens`` and cached-input subset
     when the provider reports them; ``prompt_tokens`` already includes that cached subset.
-    Tolerant of a missing/partial ``usage`` (getattr + ``or 0``) so instrumentation never breaks —
-    a metering gap degrades to zeros, never raises."""
+    A missing ``usage`` block returns ``None`` so callers preserve the distinction between unknown
+    accounting and an exact zero-token round trip; partial blocks remain fail-soft."""
     usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
     completion_details = getattr(usage, "completion_tokens_details", None)
     reasoning = getattr(completion_details, "reasoning_tokens", None)
     prompt_details = getattr(usage, "prompt_tokens_details", None)

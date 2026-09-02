@@ -318,6 +318,13 @@ def llm_for(config: AgentConfig) -> LLMClient | None:
         return None
     settings = dict(config.llm)
     client_path = settings.pop("client", _DEFAULT_LLM_CLIENT)
+    max_logical_calls = settings.pop("max_logical_calls", None)
+    if max_logical_calls is not None and (
+        not isinstance(max_logical_calls, int)
+        or isinstance(max_logical_calls, bool)
+        or max_logical_calls <= 0
+    ):
+        raise ValueError("agent.llm.max_logical_calls must be a positive integer")
     api_key_env = settings.pop("api_key_env", None)
     if api_key_env is not None:
         if "api_key" in settings:
@@ -339,7 +346,11 @@ def llm_for(config: AgentConfig) -> LLMClient | None:
     from sora.llm import MeteredLLMClient
 
     model = settings.get("model")
-    return MeteredLLMClient(client, model=str(model) if model is not None else None)
+    return MeteredLLMClient(
+        client,
+        model=str(model) if model is not None else None,
+        max_logical_calls=max_logical_calls,
+    )
 
 
 def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]:

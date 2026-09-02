@@ -48,16 +48,19 @@ def test_usage_of_treats_explicit_zero_cached_input_as_zero() -> None:
         )
     )
 
-    assert _usage_of(message, answer_chars=0).cached_input_tokens == 0
+    usage = _usage_of(message, answer_chars=0)
+    assert usage is not None
+    assert usage.cached_input_tokens == 0
 
 
 def test_usage_of_tolerates_a_missing_or_partial_usage_block() -> None:
-    # Instrumentation must never break a call: a message with no `usage` (or a partial one) degrades
-    # to zeros rather than raising, so a metering gap is silent, not fatal.
-    assert _usage_of(SimpleNamespace(), answer_chars=7) == LLMUsage(0, 0, answer_chars=7)
+    # Missing accounting is unavailable, not an exact zero-token provider round trip.
+    assert _usage_of(SimpleNamespace(), answer_chars=7) is None
     partial = SimpleNamespace(usage=SimpleNamespace(input_tokens=42))
-    assert _usage_of(partial, answer_chars=0).input_tokens == 42
-    assert _usage_of(partial, answer_chars=0).cached_input_tokens is None
+    usage = _usage_of(partial, answer_chars=0)
+    assert usage is not None
+    assert usage.input_tokens == 42
+    assert usage.cached_input_tokens is None
 
 
 class _FakeMessageStream:

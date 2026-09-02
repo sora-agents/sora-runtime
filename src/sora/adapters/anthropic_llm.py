@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from anthropic import AsyncAnthropic
+from anthropic import __version__ as ANTHROPIC_SDK_VERSION
 
 from sora.llm import CompletionRequest, LLMUsage, log_llm_usage
 
@@ -82,11 +83,18 @@ class AnthropicLLMClient:
             # output_tokens. Thinking-block *text* is not counted: adaptive thinking doesn't return
             # it, so it can't be measured directly (see LLMUsage).
             finish_reason = getattr(message, "stop_reason", None)
-            log_llm_usage(
-                _usage_of(message, answer_chars=len(text)),
-                request,
-                finish_reason=finish_reason if isinstance(finish_reason, str) else None,
-            )
+            usage = _usage_of(message, answer_chars=len(text))
+            if usage is not None:
+                log_llm_usage(
+                    usage,
+                    request,
+                    finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+                    observed_model=(
+                        message.model if isinstance(getattr(message, "model", None), str) else None
+                    ),
+                    sdk_name="anthropic",
+                    sdk_version=ANTHROPIC_SDK_VERSION,
+                )
         return text
 
     async def aclose(self) -> None:
@@ -94,13 +102,15 @@ class AnthropicLLMClient:
         await self._client.close()
 
 
-def _usage_of(message: Any, *, answer_chars: int) -> LLMUsage:
+def _usage_of(message: Any, *, answer_chars: int) -> LLMUsage | None:
     """Build a provider-neutral ``LLMUsage`` from an Anthropic message's ``usage`` block and the
     already-measured answer length. Anthropic reports ordinary input, cache writes, and cache reads
     separately, so normalize their sum into total input while retaining cache reads as the cached
-    subset. Tolerant of a missing/partial ``usage`` (getattr + ``or 0``) so instrumentation can
-    never break a call — a metering gap degrades to zeros, never raises."""
+    subset. A missing ``usage`` block returns ``None`` so callers preserve the distinction between
+    unknown accounting and an exact zero-token round trip; partial blocks remain fail-soft."""
     usage = getattr(message, "usage", None)
+    if usage is None:
+        return None
     uncached_input = int(getattr(usage, "input_tokens", 0) or 0)
     cache_creation_input = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
     cache_read_input = getattr(usage, "cache_read_input_tokens", None)

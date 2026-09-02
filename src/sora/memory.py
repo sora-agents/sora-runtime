@@ -22,7 +22,12 @@ from urllib.parse import quote
 from sora.action import InvokeAction, invoke_step
 from sora.activity import SEEDED_BINDINGS
 from sora.environment import WorkspaceOrigin
-from sora.llm import CompletionRequest, llm_call_scope, log_llm_malformed
+from sora.llm import (
+    CompletionRequest,
+    llm_call_scope,
+    log_llm_malformed,
+    log_llm_terminal_parse_failure,
+)
 from sora.manual import (
     Manual,
     ManualSection,
@@ -1480,19 +1485,26 @@ async def _complete_and_parse[T](
     going to on the fifth attempt, and each attempt is charged to the same inference id (the
     contextvar the caller set), so a retried inference reports its true cost rather than hiding half
     of it. A retry that also fails raises, exactly as a single failed parse did before."""
-    text = await llm.complete(request)
-    try:
-        return parse(text)
-    except ValueError as exc:
-        failure = str(exc)
-        log.warning("reason: %s did not parse (%s) — retrying once with the error", what, failure)
-    retry = replace(
-        request,
-        user=request.user + REPARSE_FEEDBACK.format(error=failure, output=text),
-    )
-    repaired = parse(await llm.complete(retry))
-    log_llm_malformed(repaired=1)
-    return repaired
+    with llm_call_scope():
+        text = await llm.complete(request)
+        try:
+            return parse(text)
+        except ValueError as exc:
+            failure = str(exc)
+            log.warning(
+                "reason: %s did not parse (%s) — retrying once with the error", what, failure
+            )
+        retry = replace(
+            request,
+            user=request.user + REPARSE_FEEDBACK.format(error=failure, output=text),
+        )
+        try:
+            repaired = parse(await llm.complete(retry))
+        except ValueError:
+            log_llm_terminal_parse_failure()
+            raise
+        log_llm_malformed(repaired=1)
+        return repaired
 
 
 def _drop_surplus_closers(text: str) -> str | None:
@@ -2231,6 +2243,15 @@ class ProceduralMemory:
         model = getattr(self._llm, "model", None)
         return model if isinstance(model, str) else None
 
+    @property
+    def logical_calls_admitted(self) -> int:
+        calls = getattr(self._llm, "logical_calls_admitted", 0)
+        return calls if isinstance(calls, int) else 0
+
+    @property
+    def logical_call_limit_exceeded(self) -> bool:
+        return bool(getattr(self._llm, "logical_call_limit_exceeded", False))
+
     async def retrieve(self, activity: Activity) -> Plan | None:
         """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
         similarity, backend-dependent. The cheap path: skips infer() entirely when it hits."""
@@ -2319,7 +2340,13 @@ class ProceduralMemory:
         text = await self._llm.complete(
             CompletionRequest(system, user, semantic_label="ground", prompt_version="1")
         )
-        params = _parse_params(text)
+        try:
+            params = _parse_params(text)
+        except UnresolvableGrounding:
+            raise
+        except ValueError:
+            log_llm_terminal_parse_failure()
+            raise
         _check_no_dropped_elements(partial_params, params)
         return params
 
@@ -2381,7 +2408,14 @@ class ProceduralMemory:
                 prompt_version="1",
             )
         )
-        return [collection[index] for index in _parse_keep(text, len(collection))]
+        try:
+            kept = _parse_keep(text, len(collection))
+        except UnresolvableGrounding:
+            raise
+        except ValueError:
+            log_llm_terminal_parse_failure()
+            raise
+        return [collection[index] for index in kept]
 
     async def revalidate(
         self,

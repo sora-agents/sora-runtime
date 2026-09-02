@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TextIO, runtime_checkable
 from sora import scaffold
 from sora.activity import ActivityState
 from sora.bootstrap import build_agent, import_object
-from sora.llm import LLMMeter
+from sora.llm import LLMMeter, LLMReport
 from sora.perception import Message
 from sora.types import USER_STOP, Signal
 
@@ -284,6 +284,12 @@ class TerminalSession:
         # --verbose setting — the complete execution log (prompts, results, plans) that was
         # previously only obtainable by running --verbose and copy-pasting the terminal.
         self._log_file = log_file
+        self._llm_report: LLMReport | None = None
+
+    @property
+    def llm_report(self) -> LLMReport | None:
+        """Frozen metering result after ``run()`` returns; unavailable while a run is active."""
+        return self._llm_report
 
     async def run(self) -> None:
         console = _Console()
@@ -398,6 +404,7 @@ class TerminalSession:
                 log_handle.close()
             sora_log.setLevel(previous_level)
             wall = time.monotonic() - wall_start
+            self._llm_report = meter.report()
             console.line(_paint(f"-- {meter.summary(wall)} --", _DIM, enabled=self._color))
             console.line(_paint("Goodbye.", _DIM, enabled=self._color))
 

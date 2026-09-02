@@ -9,6 +9,7 @@ import pytest
 
 from sora.llm import (
     CompletionRequest,
+    LLMCallLimitExceeded,
     LLMMeter,
     LLMUsage,
     MeteredLLMClient,
@@ -18,6 +19,7 @@ from sora.llm import (
     log_llm_discarded,
     log_llm_malformed,
     log_llm_outcome,
+    log_llm_terminal_parse_failure,
     log_llm_usage,
 )
 from sora.memory import (
@@ -128,6 +130,62 @@ async def test_metered_client_forwards_aclose() -> None:
 
 
 @pytest.mark.asyncio
+async def test_metered_client_rejects_before_admitting_a_call_past_the_logical_limit() -> None:
+    inner = _StubClient()
+    metered = MeteredLLMClient(inner, max_logical_calls=2)
+
+    await metered.complete(_request())
+    await metered.complete(_request())
+    with pytest.raises(LLMCallLimitExceeded, match="2 logical agent LLM calls"):
+        await metered.complete(_request())
+
+    assert len(inner.calls) == 2
+    assert metered.logical_calls_admitted == 2
+    assert metered.logical_call_limit_exceeded is True
+
+
+@pytest.mark.asyncio
+async def test_failed_logical_call_consumes_admission_budget() -> None:
+    class _Boom(_StubClient):
+        async def complete(self, request: CompletionRequest) -> str:
+            raise RuntimeError("boom")
+
+    metered = MeteredLLMClient(_Boom(), max_logical_calls=1)
+    with pytest.raises(RuntimeError, match="boom"):
+        await metered.complete(_request())
+    with pytest.raises(LLMCallLimitExceeded):
+        await metered.complete(_request())
+
+    assert metered.logical_calls_admitted == 1
+
+
+@pytest.mark.asyncio
+async def test_parse_repair_round_trip_under_one_call_scope_consumes_one_admission() -> None:
+    inner = _StubClient()
+    metered = MeteredLLMClient(inner, max_logical_calls=1)
+
+    with llm_call_scope():
+        await metered.complete(_request())
+        await metered.complete(_request())
+
+    assert len(inner.calls) == 2
+    assert metered.logical_calls_admitted == 1
+    with pytest.raises(LLMCallLimitExceeded):
+        await metered.complete(_request())
+
+
+@pytest.mark.asyncio
+async def test_admission_deduplication_retains_no_completed_call_ids() -> None:
+    metered = MeteredLLMClient(_StubClient())
+
+    for _ in range(100):
+        await metered.complete(_request())
+
+    assert metered.logical_calls_admitted == 100
+    assert not hasattr(metered, "_admitted_call_ids")
+
+
+@pytest.mark.asyncio
 async def test_llm_meter_tallies_calls_and_seconds(_llm_logging_enabled: None) -> None:
     meter = LLMMeter()
     logger = logging.getLogger("sora.llm")
@@ -164,6 +222,64 @@ def test_llm_meter_ignores_unrelated_records() -> None:
     meter = LLMMeter()
     meter.handle(logging.LogRecord("sora.cycle", logging.INFO, __file__, 0, "observe: x", (), None))
     assert meter.calls == 0  # only records carrying llm_event="done" are counted
+
+
+def test_meter_reports_terminal_parse_failure_separately_from_field_repairs(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        with llm_call_scope():
+            log_llm_terminal_parse_failure()
+    finally:
+        logger.removeHandler(meter)
+
+    report = meter.report()
+    assert report.terminal_parse_failures == 1
+    assert report.malformed_fields_repaired == 0
+    assert report.inferences[0].terminal_parse_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_meter_reports_prompt_hashes_and_provider_observations(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    client = MeteredLLMClient(_StubClient())
+    request = CompletionRequest("system", "user", "plan", "1")
+    try:
+        with llm_call_scope():
+            log_llm_usage(
+                LLMUsage(10, 5, 4, reasoning_tokens=3),
+                request,
+                observed_model="snapshot-model",
+                sdk_name="provider-sdk",
+                sdk_version="1.2.3",
+                provider_observation={
+                    "requested": "moonshotai/kimi-k2.5",
+                    "summary": "selected=Moonshot AI",
+                },
+            )
+            await client.complete(request)
+    finally:
+        logger.removeHandler(meter)
+
+    (call,) = meter.report().inferences
+    assert len(call.system_prompt_sha256 or "") == 64
+    assert len(call.user_prompt_sha256 or "") == 64
+    assert call.observed_models == ("snapshot-model",)
+    assert call.sdk_observations == (("provider-sdk", "1.2.3"),)
+    assert call.provider_observations == (
+        {
+            "requested": "moonshotai/kimi-k2.5",
+            "summary": "selected=Moonshot AI",
+        },
+    )
+    assert (call.reasoning_tokens, call.reasoning_tokens_exact) == (3, True)
 
 
 def test_llm_usage_estimates_thinking_from_output_minus_answer() -> None:
@@ -603,6 +719,10 @@ async def test_structured_report_aggregates_round_trips_by_inference(
     assert inference.semantic_label == "plan"
     assert inference.prompt_version == "3"
     assert inference.round_trips == 2
+    assert len(inference.usages) == 2
+    assert [usage.input_tokens for usage in inference.usages] == [100, 100]
+    assert len(inference.prompt_hashes) == 2
+    assert inference.user_prompt_sha256 == inference.prompt_hashes[0].user_sha256
     assert inference.latency_seconds == meter.total_seconds
     assert inference.dynamic_section_share == 0.25
     assert inference.finish_reasons == ("length", "stop")
@@ -610,6 +730,29 @@ async def test_structured_report_aggregates_round_trips_by_inference(
     assert inference.discarded is True
     assert inference.malformed_fields_dropped == 2
     assert inference.malformed_fields_repaired == 1
+
+
+@pytest.mark.asyncio
+async def test_structured_report_keeps_primary_and_repair_prompt_hashes(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    client = MeteredLLMClient(_StubClient())
+    primary = CompletionRequest("system", "primary", "plan", "1")
+    repair = CompletionRequest("system", "repair", "plan", "1")
+    try:
+        with llm_call_scope():
+            await client.complete(primary)
+            await client.complete(repair)
+    finally:
+        logger.removeHandler(meter)
+
+    (inference,) = meter.report().inferences
+    assert len(inference.prompt_hashes) == 2
+    assert inference.prompt_hashes[0].user_sha256 != inference.prompt_hashes[1].user_sha256
+    assert inference.user_prompt_sha256 == inference.prompt_hashes[0].user_sha256
 
 
 @pytest.mark.asyncio
@@ -655,6 +798,25 @@ def test_structured_report_keeps_the_first_terminal_outcome(
 
     (inference,) = meter.report().inferences
     assert inference.outcome == "success"
+
+
+def test_structured_report_retains_an_off_cycle_inference_error(
+    _llm_logging_enabled: None,
+) -> None:
+    meter = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(meter)
+    try:
+        log_llm_outcome(
+            "inf-1",
+            "error",
+            error="BadRequestError('maximum context length exceeded')",
+        )
+    finally:
+        logger.removeHandler(meter)
+
+    (inference,) = meter.report().inferences
+    assert inference.error == "BadRequestError('maximum context length exceeded')"
 
 
 def test_tolerant_response_parsers_report_every_dropped_or_repaired_field(

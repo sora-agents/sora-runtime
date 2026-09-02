@@ -739,6 +739,7 @@ async def test_tick_binds_when_action_requires_binding(tmp_path: Path) -> None:
     assert probe.received == OperationInvocation(
         tool_id="clock", operation_name="get_time", params={"tz": "UTC"}
     )
+    assert cycle.external_action_count == 1
 
 
 async def test_tick_skips_bind_for_non_binding_action(tmp_path: Path) -> None:
@@ -877,3 +878,4 @@ async def test_tick_wait_step_dispatches_no_action(tmp_path: Path) -> None:
 
     assert tool.invoked_with is None
     assert working.activities["a1"].state is ActivityState.READY
+    assert cycle.external_action_count == 0

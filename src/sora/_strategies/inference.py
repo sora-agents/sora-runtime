@@ -149,7 +149,7 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
             for activity in wm.activities.values()
         )
         if claimed:
-            log_llm_outcome(inf_id, outcome)
+            log_llm_outcome(inf_id, outcome, error=res.error)
         else:
             # A watchdog/interrupt/superseding inference already resolved the runtime side.
             # The provider finishing later is useful observability, but it is not a second
