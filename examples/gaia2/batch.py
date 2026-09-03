@@ -208,9 +208,14 @@ def _read_jsonl(path: str) -> list[dict[str, Any]]:
 
 def _pass_at_1(records: list[dict[str, Any]]) -> tuple[float | None, int, int]:
     """Pass@1 over one config's records = mean of the non-None scores (each record is one run;
-    unscored/errored records are excluded). Returns (pass@1 or None if nothing scored, scored_count,
-    total_count)."""
-    scores = [r["score"] for r in records if r.get("score") is not None]
+    unscored, errored, and timeline-expired records are excluded). Returns (pass@1 or None if
+    nothing scored, scored_count, total_count)."""
+    scores = [
+        record["score"]
+        for record in records
+        if record.get("score") is not None
+        and not record.get("metadata", {}).get("timeline_expired", False)
+    ]
     total = len(records)
     if not scores:
         return None, 0, total

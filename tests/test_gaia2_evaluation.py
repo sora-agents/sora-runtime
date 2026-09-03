@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from examples.gaia2.evaluation.campaigns.prompt.contracts import run_contract_suite
@@ -21,7 +21,9 @@ from examples.gaia2.evaluation.campaigns.prompt.synthetic import (
 from examples.gaia2.evaluation.cli import (
     _append_checkpoint,
     _call_records_and_cost,
+    _checkpoint_records,
     _headless_neutral_done,
+    _live_gaia_record,
     _live_neutral_record,
     _parser,
     _run_command,
@@ -780,6 +782,157 @@ def test_live_neutral_reports_admitted_logical_calls_not_provider_round_trips(
     assert record.provider_round_trips == 0
 
 
+def test_live_gaia_attaches_and_records_pinned_judge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scenario_root = tmp_path / "scenarios"
+    scenario_path = scenario_root / "search" / "scenario-case.json"
+    scenario_path.parent.mkdir(parents=True)
+    scenario_path.write_text("{}")
+    scenario = object()
+    attached: dict[str, object] = {}
+
+    monkeypatch.setattr("sora.adapters.are_sim.load_scenario", lambda _path: scenario)
+
+    def _attach(candidate: object, **kwargs: object) -> None:
+        assert candidate is scenario
+        attached.update(kwargs)
+
+    monkeypatch.setattr("sora.adapters.are_sim.attach_judge", _attach)
+    monkeypatch.setattr(
+        "examples.gaia2._runner.run_scenario",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            outcome=SimpleNamespace(success=True),
+            exception=None,
+            write_counts=None,
+            llm_report=None,
+            replan_count=0,
+            duration=1.0,
+            agent_llm_calls=1,
+            external_actions=1,
+            terminal_cause="verification_completion",
+            decision_cycles=1,
+        ),
+    )
+    judge = load_judge_profile(PROMPT_ROOT / "judge.json")
+    profile = load_profiles(EVAL_ROOT / "profiles.json")["gpt-5.4-medium-prompt"]
+    sheet = PriceSheet.load(EVAL_ROOT / "price_sheets" / "2026-09-02.json")
+    entry = SimpleNamespace(
+        arm="baseline",
+        profile=profile.name,
+        suite="development",
+        capability="search",
+        case_id="case",
+        repeat=0,
+        reserved_agent_cost=3.0,
+        reserved_judge_cost=0.5,
+    )
+
+    record = _live_gaia_record(
+        entry,
+        scenario_root=scenario_root,
+        ack_locked_acceptance=False,
+        config_path=tmp_path / "agent.yaml",
+        profile=profile,
+        sheet=sheet,
+        judge_profile=judge,
+        max_wall_seconds=1200.0,
+        max_agent_llm_calls=200,
+    )
+
+    assert attached == {
+        "model": "gpt-5.1-2025-11-13",
+        "provider": "openai",
+        "endpoint": None,
+        "offline_validation": False,
+        "relax_verdict_case": True,
+    }
+    assert record.passed is True
+    assert record.score == 1.0
+    assert record.judge_profile == judge.to_dict()
+
+
+def test_live_gaia_discards_a_judge_score_from_a_timed_out_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scenario_root = tmp_path / "scenarios"
+    scenario_path = scenario_root / "search" / "scenario-case.json"
+    scenario_path.parent.mkdir(parents=True)
+    scenario_path.write_text("{}")
+    monkeypatch.setattr("sora.adapters.are_sim.load_scenario", lambda _path: object())
+    monkeypatch.setattr("sora.adapters.are_sim.attach_judge", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "examples.gaia2._runner.run_scenario",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            outcome=SimpleNamespace(success=True),
+            exception=None,
+            write_counts=None,
+            llm_report=None,
+            replan_count=0,
+            duration=1000.0,
+            agent_llm_calls=1,
+            external_actions=1,
+            terminal_cause="timeout",
+            decision_cycles=1,
+        ),
+    )
+    judge = load_judge_profile(PROMPT_ROOT / "judge.json")
+    profile = load_profiles(EVAL_ROOT / "profiles.json")["gpt-5.4-medium-prompt"]
+    sheet = PriceSheet.load(EVAL_ROOT / "price_sheets" / "2026-09-02.json")
+    entry = SimpleNamespace(
+        arm="baseline",
+        profile=profile.name,
+        suite="development",
+        capability="search",
+        case_id="case",
+        repeat=0,
+        reserved_agent_cost=3.0,
+        reserved_judge_cost=0.5,
+    )
+
+    record = _live_gaia_record(
+        entry,
+        scenario_root=scenario_root,
+        ack_locked_acceptance=False,
+        config_path=tmp_path / "agent.yaml",
+        profile=profile,
+        sheet=sheet,
+        judge_profile=judge,
+        max_wall_seconds=1200.0,
+        max_agent_llm_calls=200,
+    )
+
+    assert record.passed is None
+    assert record.score is None
+    assert record.status == "invalid: timeout"
+
+
+def test_report_excludes_known_invalid_gaia_scores_from_quality_aggregates() -> None:
+    baseline = EvaluationRecord.example(
+        arm="baseline", suite="development", case_id="case", score=1.0
+    )
+    baseline = EvaluationRecord(**(baseline.to_dict() | {"terminal_cause": "timeout"}))
+    candidate = EvaluationRecord.example(
+        arm="candidate", suite="development", case_id="case", score=1.0
+    )
+    candidate = EvaluationRecord(
+        **(candidate.to_dict() | {"terminal_cause": "verification_completion"})
+    )
+
+    aggregates = build_report([baseline, candidate])["aggregates"]
+
+    pass_rows = {
+        row["arm"]: row["pass_at_1"]
+        for row in aggregates["pass_at_1"]
+        if row["suite"] == "development"
+    }
+    assert pass_rows == {"baseline": None, "candidate": 1.0}
+    assert aggregates["paired_run_deltas"][0]["baseline_score"] is None
+    assert aggregates["paired_run_deltas"][0]["score_delta"] is None
+
+
 def test_headless_neutral_stops_when_only_input_waits_remain() -> None:
     from sora.activity import ActivityState
     from sora.types import InputWait
@@ -962,6 +1115,131 @@ def test_completed_checkpoint_resume_needs_no_removed_provider_credential(
         ]
     )
     assert _run_command(args) == 0
+
+
+def test_checkpoint_resume_keeps_an_invalid_gaia_attempt_pending(
+    tmp_path: Path,
+) -> None:
+    profile_name = "gpt-5.4-medium-prompt"
+    judge_profile = load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
+    manifests = load_manifests(PROMPT_ROOT / "manifests")
+    case = manifests["development"].cases[0]
+    _append_checkpoint(
+        tmp_path / "checkpoint.jsonl",
+        f"baseline:{profile_name}:development:{case.case_id}:0",
+        EvaluationRecord(
+            arm="baseline",
+            profile=profile_name,
+            suite="development",
+            capability=case.capability,
+            case_id=case.case_id,
+            repeat=0,
+            score=1.0,
+            passed=True,
+            judge_profile=judge_profile,
+            terminal_cause="timeout",
+        ),
+    )
+    completed, records = _checkpoint_records(tmp_path / "checkpoint.jsonl")
+    matrix = build_run_matrix(
+        RunSelection(
+            profiles=(profile_name,),
+            suites=("development",),
+            arm="baseline",
+        ),
+        BudgetPolicy(),
+        manifests,
+        prior_records=records,
+    )
+
+    assert completed == set()
+    assert matrix.prior_gaia_runs == 1
+    assert matrix.gaia_runs == 5
+
+
+def test_pending_gaia_runs_stage_local_filesystem_once_before_are(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile_name = "gpt-5.4-medium-prompt"
+    events: list[str] = []
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "examples.gaia2._local_fs.ensure_local_fallback_fs",
+        lambda: events.append("stage"),
+    )
+
+    def _fake_gaia(entry: object, **_kwargs: object) -> EvaluationRecord:
+        events.append("run")
+        judge_profile = cast(Any, _kwargs["judge_profile"])
+        return EvaluationRecord(
+            arm=cast(Any, entry).arm,
+            profile=cast(Any, entry).profile,
+            suite=cast(Any, entry).suite,
+            capability=cast(Any, entry).capability,
+            case_id=cast(Any, entry).case_id,
+            repeat=cast(Any, entry).repeat,
+            score=1.0,
+            passed=True,
+            judge_profile=judge_profile.to_dict(),
+        )
+
+    monkeypatch.setattr("examples.gaia2.evaluation.cli._live_gaia_record", _fake_gaia)
+    args = _parser().parse_args(
+        [
+            "prompt",
+            "run",
+            "--profile",
+            profile_name,
+            "--suite",
+            "development",
+            "--arm",
+            "baseline",
+            "--output-dir",
+            str(tmp_path),
+            "--price-sheet",
+            str(EVAL_ROOT / "price_sheets" / "2026-09-02.json"),
+            "--confirm-budget",
+            "180",
+        ]
+    )
+
+    assert _run_command(args) == 0
+    assert events[0] == "stage"
+    assert events.count("stage") == 1
+    assert events.count("run") > 1
+    output = capsys.readouterr().out
+    assert "judge development/" in output
+    assert ": PASS (terminal=None)" in output
+
+
+def test_prompt_run_rejects_judge_override_that_differs_from_pin(tmp_path: Path) -> None:
+    args = _parser().parse_args(
+        [
+            "prompt",
+            "run",
+            "--profile",
+            "gpt-5.4-medium-prompt",
+            "--suite",
+            "development",
+            "--arm",
+            "baseline",
+            "--output-dir",
+            str(tmp_path),
+            "--price-sheet",
+            str(EVAL_ROOT / "price_sheets" / "2026-09-02.json"),
+            "--confirm-budget",
+            "180",
+            "--dry-run",
+            "--judge-model",
+            "gpt-5.1",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must match the pinned judge"):
+        _run_command(args)
 
 
 def test_evaluation_cli_and_readme_name_both_campaigns() -> None:

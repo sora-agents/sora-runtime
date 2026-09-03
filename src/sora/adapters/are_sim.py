@@ -200,6 +200,33 @@ class AreSimulation:
 
         return bool(self._env.state == EnvironmentState.PAUSED)
 
+    def all_turns_answered(self) -> bool:
+        """True once the agent has completed a user reply for every benchmark turn.
+
+        ARE installs online judge gates only *between* turns. The final reply therefore has no
+        successor event that stops the otherwise live timeline, whose default duration is 1000
+        wall-clock seconds. This probe uses the same turn boundary as ARE's gate -- completed agent
+        ``send_message_to_user`` events -- so eval tooling can stop after the final reply without
+        mistaking the idle gap before a later turn for completion.
+
+        Deliberately not part of ``Simulation``: it is a benchmark-runner diagnostic, not a runtime
+        capability. Before turn initialization, or if the event log cannot be sampled, completion
+        remains unknown and the caller keeps waiting.
+        """
+        env = self._env
+        turns = getattr(self._scenario, "nb_turns", None)
+        is_reply = getattr(self._scenario, "is_send_message_to_user", None)
+        if env is None or not isinstance(turns, int) or isinstance(turns, bool) or turns <= 0:
+            return False
+        if not callable(is_reply):
+            return False
+        try:
+            replies = sum(1 for event in env.event_log.list_view() if is_reply(event))
+        except Exception:  # a diagnostic must never cost the run its real result
+            log.warning("turn-completion probe failed", exc_info=True)
+            return False
+        return replies >= turns
+
     def timeline_expired(self) -> bool:
         """True when ARE's event loop exited because ``scenario.duration`` was reached, rather than
         because the scenario played out or something stopped it.

@@ -825,6 +825,40 @@ def test_timeline_expiry_latched_at_stop_survives_a_later_read() -> None:
 # ------------------------------------------------------------------------------------------------
 
 
+def test_all_turns_answered_counts_completed_agent_replies() -> None:
+    events = [SimpleNamespace(reply=True), SimpleNamespace(reply=True)]
+    scenario = SimpleNamespace(
+        nb_turns=2,
+        is_send_message_to_user=lambda event: event.reply,
+    )
+    sim = AreSimulation(scenario)
+    sim._env = SimpleNamespace(
+        event_log=SimpleNamespace(list_view=lambda: events),
+    )
+
+    assert sim.all_turns_answered() is True
+
+
+def test_all_turns_answered_is_false_during_an_intermediate_turn_gap() -> None:
+    events = [SimpleNamespace(reply=True)]
+    scenario = SimpleNamespace(
+        nb_turns=2,
+        is_send_message_to_user=lambda event: event.reply,
+    )
+    sim = AreSimulation(scenario)
+    sim._env = SimpleNamespace(
+        event_log=SimpleNamespace(list_view=lambda: events),
+    )
+
+    assert sim.all_turns_answered() is False
+
+
+def test_all_turns_answered_is_safe_before_turn_initialization() -> None:
+    sim = AreSimulation(SimpleNamespace(nb_turns=None))
+
+    assert sim.all_turns_answered() is False
+
+
 def _sim_with_validate_result(result: Any) -> AreSimulation:
     # AreSimulation.validate() only needs a scenario with a validate(env) method and a non-None
     # _env (past the start() assert) — no ARE Environment required.

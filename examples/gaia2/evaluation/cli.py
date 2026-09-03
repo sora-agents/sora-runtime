@@ -258,8 +258,10 @@ def _checkpoint_records(path: Path) -> tuple[set[str], list[EvaluationRecord]]:
         if not line.strip():
             continue
         row = json.loads(line)
-        keys.add(str(row["matrix_key"]))
-        records.append(record_from_dict(row["record"]))
+        record = record_from_dict(row["record"])
+        if record.completes_matrix_entry:
+            keys.add(str(row["matrix_key"]))
+        records.append(record)
     return keys, records
 
 
@@ -445,8 +447,17 @@ def _live_gaia_record(
         missing = sum(sum(turn.missing.values()) for turn in result.write_counts.turns)
         surplus = sum(sum(turn.surplus.values()) for turn in result.write_counts.turns)
     llm_report = result.llm_report
-    passed = result.outcome.success if result.exception is None else None
+    valid_completion = (
+        result.exception is None and result.terminal_cause == "verification_completion"
+    )
+    passed = result.outcome.success if valid_completion else None
     score = float(passed) if isinstance(passed, bool) else None
+    if result.exception is not None:
+        status = f"error: {result.exception}"
+    elif not valid_completion:
+        status = f"invalid: {result.terminal_cause or 'unknown terminal cause'}"
+    else:
+        status = "complete"
     return EvaluationRecord(
         arm=entry.arm,
         profile=entry.profile,
@@ -478,7 +489,7 @@ def _live_gaia_record(
         judge_reserve=entry.reserved_judge_cost,
         judge_profile=judge_profile.to_dict(),
         call_records=calls,
-        status=(f"error: {result.exception}" if result.exception else "complete"),
+        status=status,
         terminal_cause=cast(Any, result.terminal_cause),
         decision_cycles=result.decision_cycles,
     )
@@ -784,6 +795,15 @@ def _run_command(args: argparse.Namespace) -> int:
         _append_checkpoint(checkpoint, entry.key, record)
         records.append(record)
         completed.add(entry.key)
+        if entry.suite in GAIA_SUITES:
+            verdict = (
+                "PASS" if record.passed is True else "FAIL" if record.passed is False else "INVALID"
+            )
+            print(
+                f"judge {entry.suite}/{entry.capability}/{entry.case_id} "
+                f"[{entry.profile}, {entry.arm}, repeat {entry.repeat}]: {verdict} "
+                f"(terminal={record.terminal_cause})"
+            )
     print(f"completed {len(records)} records; checkpoint: {checkpoint}")
     return 0
 

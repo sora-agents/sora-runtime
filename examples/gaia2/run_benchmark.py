@@ -16,9 +16,10 @@ Correctness gate (one scenario):
         --scenario /path/to/gaia2_scenario.json \
         --judge-model claude-sonnet-5 --judge-provider anthropic --verbose
 
-The run stops **timeline-aware**: it rides through the idle gaps between a scenario's turns and ends
-once ARE's own event loop has completed the scenario (all turns delivered, all per-turn judge checks
-fired), then calls ``validate()`` once — so a multi-turn scenario is scored fully. A wall-clock cap
+The run stops **turn-aware**: it rides through the idle gaps between a scenario's turns, then ends
+as soon as the agent's final reply has settled and calls ``validate()`` once. ARE installs online
+judge gates between turns but not after the final one, so waiting for its event loop to stop would
+otherwise consume the scenario's full duration after successful work. A wall-clock cap
 (``--max-wall-seconds``) is the safety valve; ``--exit-when-idle`` opts back into the old
 single-turn quiet-window heuristic.
 

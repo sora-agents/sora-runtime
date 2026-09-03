@@ -261,10 +261,11 @@ def test_pass_at_1_excludes_unscored_records() -> None:
         {"score": 0.0},
         {"score": 1.0},
         {"score": None},  # unscored — excluded from both the mean and the denominator
+        {"score": 0.0, "metadata": {"timeline_expired": True}},
     ]
     pass_at_1, scored, total = _pass_at_1(records)
     assert pass_at_1 == 2 / 3
-    assert (scored, total) == (3, 4)
+    assert (scored, total) == (3, 5)
 
 
 def test_pass_at_1_all_unscored_is_none() -> None:
@@ -323,12 +324,21 @@ def _agent_with(
     )
 
 
-def _sim(*, running: bool, paused: bool = False) -> SimpleNamespace:
+def _sim(
+    *,
+    running: bool,
+    paused: bool = False,
+    all_turns_answered: bool = False,
+) -> SimpleNamespace:
     """The predicate reads both flags, so a fake has to answer both. They are not exclusive: a
     paused environment is one ARE holds mid-turn around a judge call, and ``is_running()`` counts
     that as live — the pair a real ``AreSimulation`` reports while a judge is in flight is
     ``running=True, paused=True``."""
-    return SimpleNamespace(is_running=lambda: running, is_paused=lambda: paused)
+    return SimpleNamespace(
+        is_running=lambda: running,
+        is_paused=lambda: paused,
+        all_turns_answered=lambda: all_turns_answered,
+    )
 
 
 def test_stop_when_none_when_exit_when_idle_set() -> None:
@@ -341,6 +351,25 @@ def test_stop_when_rides_through_live_timeline() -> None:
     agent = _agent_with([ActivityState.TERMINATED])  # even fully idle, a live timeline keeps going
     predicate = _make_stop_when(sim, agent, None, 1200.0)
     assert predicate is not None
+    assert predicate() is False
+
+
+def test_stop_when_ends_live_timeline_after_the_final_reply() -> None:
+    sim = _sim(running=True, all_turns_answered=True)
+    agent = _agent_with([ActivityState.TERMINATED])
+    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    assert predicate is not None
+
+    assert predicate() is True
+    assert predicate.reason == "verification_completion"
+
+
+def test_stop_when_waits_for_final_work_to_settle_after_the_final_reply() -> None:
+    sim = _sim(running=True, all_turns_answered=True)
+    agent = _agent_with([ActivityState.READY])
+    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    assert predicate is not None
+
     assert predicate() is False
 
 

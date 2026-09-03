@@ -9,6 +9,15 @@ from typing import Any, Literal, cast
 SCHEMA_VERSION = 1
 CAPABILITIES = ("search", "execution", "adaptability", "ambiguity", "time")
 GAIA_SUITES = ("familiar", "development", "acceptance")
+NON_EVALUABLE_GAIA_TERMINAL_CAUSES = frozenset(
+    {
+        "llm_call_limit",
+        "context_overflow",
+        "timeout",
+        "infrastructure_error",
+        "unscored_completion",
+    }
+)
 NEUTRAL_CASE_IDS = (
     "lookup-ordinary",
     "lookup-adversarial",
@@ -470,6 +479,7 @@ def build_run_matrix(
     prior_keys = {
         f"{record.arm}:{record.profile}:{record.suite}:{record.case_id}:{record.repeat}"
         for record in prior
+        if record.completes_matrix_entry
     }
     remaining_entries = [entry for entry in entries if entry.key not in prior_keys]
     gaia_runs = sum(entry.suite in GAIA_SUITES for entry in remaining_entries)
@@ -692,6 +702,12 @@ class EvaluationRecord:
     @property
     def accounted_agent_cost(self) -> float:
         return self.agent_cost if self.agent_cost is not None else self.agent_cost_reserve
+
+    @property
+    def completes_matrix_entry(self) -> bool:
+        return not (
+            self.suite in GAIA_SUITES and self.terminal_cause in NON_EVALUABLE_GAIA_TERMINAL_CAUSES
+        )
 
     @classmethod
     def example(

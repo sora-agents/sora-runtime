@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from examples.gaia2.evaluation.core import (
+    GAIA_SUITES,
+    NON_EVALUABLE_GAIA_TERMINAL_CAUSES,
     EvaluationRecord,
     decide_acceptance_expansion,
     load_manifests,
@@ -14,6 +16,18 @@ from examples.gaia2.evaluation.core import (
 )
 
 STATISTICAL_BOOTSTRAP_SEED = 20260831
+
+
+def _quality_score(record: EvaluationRecord) -> float | None:
+    """Return only scores produced by a complete, quality-evaluable run.
+
+    ``None`` remains accepted for old records that predate terminal-cause reporting. A known bad
+    Gaia terminal cause is different: ARE may still return a final-validation verdict for the
+    truncated environment, but that verdict does not measure the requested trajectory.
+    """
+    if record.suite in GAIA_SUITES and record.terminal_cause in NON_EVALUABLE_GAIA_TERMINAL_CAUSES:
+        return None
+    return record.score
 
 
 def _paired_runs(records: list[EvaluationRecord]) -> list[dict[str, Any]]:
@@ -32,9 +46,11 @@ def _paired_runs(records: list[EvaluationRecord]) -> list[dict[str, Any]]:
         baseline, candidate = arms.get("baseline"), arms.get("candidate")
         if baseline is None or candidate is None:
             continue
+        baseline_score = _quality_score(baseline)
+        candidate_score = _quality_score(candidate)
         delta = (
-            candidate.score - baseline.score
-            if candidate.score is not None and baseline.score is not None
+            candidate_score - baseline_score
+            if candidate_score is not None and baseline_score is not None
             else None
         )
         pairs.append(
@@ -44,8 +60,8 @@ def _paired_runs(records: list[EvaluationRecord]) -> list[dict[str, Any]]:
                 "capability": key[2],
                 "case_id": key[3],
                 "repeat": key[4],
-                "baseline_score": baseline.score,
-                "candidate_score": candidate.score,
+                "baseline_score": baseline_score,
+                "candidate_score": candidate_score,
                 "score_delta": delta,
                 "new_safety_violations": max(
                     0, candidate.safety_violations - baseline.safety_violations
@@ -116,7 +132,7 @@ def _pass_at_1(records: list[EvaluationRecord]) -> list[dict[str, Any]]:
         grouped.setdefault((record.arm, record.profile, record.suite), []).append(record)
     rows: list[dict[str, Any]] = []
     for key, runs in sorted(grouped.items()):
-        scores = [float(run.score) for run in runs if run.score is not None]
+        scores = [float(score) for run in runs if (score := _quality_score(run)) is not None]
         rows.append(
             {
                 "arm": key[0],

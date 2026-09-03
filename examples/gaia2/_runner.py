@@ -2,8 +2,8 @@
 
 Both the single-scenario correctness gate (``run_benchmark.py``) and the batch harness
 (``batch.py``) need the same thing: take one already-loaded ARE scenario (judge attached if
-scoring), run S-ORA against it to *timeline completion*, and score it. That logic — the turn-aware
-``stop_when`` predicate especially — lives here once so the two entry points can't drift.
+scoring), run S-ORA through its final reply, and score it. That logic — the turn-aware ``stop_when``
+predicate especially — lives here once so the two entry points can't drift.
 
 ARE (and the LLM client) are optional dependency groups, so every import of them is lazy, done
 inside the functions rather than at module top; the pure ``dataclass`` below is importable without
@@ -85,8 +85,6 @@ class _StopController:
                 return True
             return False
         self.paused_since = None
-        if self.simulation.is_running():
-            return False
         from sora.activity import ActivityState
         from sora.types import ConditionWait, InputWait
 
@@ -101,6 +99,10 @@ class _StopController:
             )
             for activity in activities
         )
+        final_reply_probe = getattr(self.simulation, "all_turns_answered", None)
+        final_reply_sent = bool(final_reply_probe()) if callable(final_reply_probe) else False
+        if self.simulation.is_running() and not (done and final_reply_sent):
+            return False
         if done:
             self.reason = "verification_completion"
         return done
