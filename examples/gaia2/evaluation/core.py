@@ -221,6 +221,79 @@ def load_profiles(path: Path) -> dict[str, ModelProfile]:
 
 
 @dataclass(frozen=True)
+class JudgeProfile:
+    name: str
+    implementation: str
+    provider: str
+    model: str
+    endpoint: str | None
+    credential_env: str
+    settings: dict[str, SettingValue]
+    offline_validation: bool
+    relax_verdict_case: bool
+
+    @classmethod
+    def from_dict(cls, raw: object) -> JudgeProfile:
+        if not isinstance(raw, dict):
+            raise ValueError("judge profile must be an object")
+        required = {
+            "name",
+            "implementation",
+            "provider",
+            "model",
+            "endpoint",
+            "credential_env",
+            "settings",
+            "offline_validation",
+            "relax_verdict_case",
+        }
+        if set(raw) != required:
+            raise ValueError(
+                "judge profile fields mismatch; "
+                f"unknown={sorted(set(raw) - required)}, missing={sorted(required - set(raw))}"
+            )
+        settings_raw = raw["settings"]
+        if not isinstance(settings_raw, dict) or set(settings_raw) != set(SETTING_NAMES):
+            raise ValueError(f"judge profile settings must name exactly {SETTING_NAMES}")
+        settings = {name: SettingValue.from_dict(settings_raw[name]) for name in SETTING_NAMES}
+        if any(setting.status == "sent" for setting in settings.values()):
+            raise ValueError("the ARE judge seam does not support sent per-request settings")
+        if raw["implementation"] != "are.graph_per_event":
+            raise ValueError("unsupported judge implementation")
+        return cls(
+            name=str(raw["name"]),
+            implementation=str(raw["implementation"]),
+            provider=str(raw["provider"]),
+            model=str(raw["model"]),
+            endpoint=str(raw["endpoint"]) if raw["endpoint"] is not None else None,
+            credential_env=str(raw["credential_env"]),
+            settings=settings,
+            offline_validation=bool(raw["offline_validation"]),
+            relax_verdict_case=bool(raw["relax_verdict_case"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "implementation": self.implementation,
+            "provider": self.provider,
+            "model": self.model,
+            "endpoint": self.endpoint,
+            "credential_env": self.credential_env,
+            "settings": {name: asdict(value) for name, value in self.settings.items()},
+            "offline_validation": self.offline_validation,
+            "relax_verdict_case": self.relax_verdict_case,
+        }
+
+
+def load_judge_profile(path: Path) -> JudgeProfile:
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"unsupported judge profile schema in {path}")
+    return JudgeProfile.from_dict(raw.get("judge"))
+
+
+@dataclass(frozen=True)
 class ManifestCase:
     capability: str
     case_id: str
@@ -607,6 +680,7 @@ class EvaluationRecord:
     agent_cost_reserve: float = 0.0
     agent_cost_upper_bound: bool = False
     judge_reserve: float = 0.0
+    judge_profile: dict[str, Any] | None = None
     call_records: tuple[dict[str, Any], ...] = ()
     prompt: str | None = None
     oracle: str | None = None

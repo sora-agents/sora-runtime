@@ -166,10 +166,27 @@ def build_report(
     harness_dirty_diff_sha256: str | None = None,
     manifest_digests: dict[str, str] | None = None,
     selected_profiles: list[dict[str, Any]] | None = None,
+    judge_profile: dict[str, Any] | None = None,
     safety_sensitive: bool = False,
     reduces_tool_catalog: bool = False,
     fresh_expansion_payloads_available: bool = False,
 ) -> dict[str, Any]:
+    gaia_records = [
+        record for record in records if record.suite in {"familiar", "development", "acceptance"}
+    ]
+    if judge_profile is not None:
+        mismatched = [
+            record
+            for record in gaia_records
+            if record.judge_profile is not None and record.judge_profile != judge_profile
+        ]
+        if mismatched:
+            raise ValueError("Gaia records contain a judge profile that differs from the report")
+    matching_judge_records = sum(
+        record.judge_profile == judge_profile
+        for record in gaia_records
+        if judge_profile is not None
+    )
     run_pairs = _paired_runs(records)
     pairs = _cluster_pairs(run_pairs)
     deltas = [float(pair["score_delta"]) for pair in pairs if pair["score_delta"] is not None]
@@ -267,6 +284,12 @@ def build_report(
             "prompt_snapshot": prompt_snapshot,
             "manifest_digests": manifest_digests or {},
             "selected_profiles": selected_profiles or [],
+            "judge_profile": judge_profile,
+            "judge_profile_coverage": {
+                "gaia_records": len(gaia_records),
+                "matching_records": matching_judge_records,
+                "complete": matching_judge_records == len(gaia_records),
+            },
             "actual_sdk_model_observations": observations,
             "price_sheet_date": price_sheet_date,
             "price_sheet_digest": price_sheet_digest,

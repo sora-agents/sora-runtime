@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "judge": {
+    "name": "gpt-5.1-openai-prompt-judge",
+    "implementation": "are.graph_per_event",
+    "provider": "openai",
+    "model": "gpt-5.1-2025-11-13",
+    "endpoint": null,
+    "credential_env": "OPENAI_API_KEY",
+    "settings": {
+      "reasoning_effort": {"status": "intentionally_omitted", "value": null},
+      "reasoning": {"status": "intentionally_omitted", "value": null},
+      "temperature": {"status": "intentionally_omitted", "value": null},
+      "top_p": {"status": "intentionally_omitted", "value": null},
+      "seed": {"status": "intentionally_omitted", "value": null},
+      "verbosity": {"status": "intentionally_omitted", "value": null},
+      "max_output_tokens": {"status": "intentionally_omitted", "value": null},
+      "service_tier": {"status": "intentionally_omitted", "value": null},
+      "provider_routing": {"status": "intentionally_omitted", "value": null},
+      "router_metadata": {"status": "intentionally_omitted", "value": null}
+    },
+    "offline_validation": false,
+    "relax_verdict_case": true
+  }
+}

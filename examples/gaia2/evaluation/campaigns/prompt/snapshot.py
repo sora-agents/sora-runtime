@@ -7,7 +7,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from examples.gaia2.evaluation.core import SCHEMA_VERSION, load_profiles, sha256_text
+from examples.gaia2.evaluation.core import (
+    SCHEMA_VERSION,
+    load_judge_profile,
+    load_profiles,
+    sha256_text,
+)
 from sora.activity import Activity
 from sora.llm import CompletionRequest
 from sora.memory import FileMemoryBackend, PerceptSnapshot, ProceduralMemory
@@ -188,6 +193,9 @@ def build_frozen_baseline(
         "request_profile_applied_per_semantic_call": False,
     }
     snapshot["evaluation_profiles"] = [profiles[name].to_dict() for name in sorted(profiles)]
+    snapshot["judge_profile"] = load_judge_profile(
+        root / "campaigns" / "prompt" / "judge.json"
+    ).to_dict()
     snapshot["notes"] = {
         "campaigns": ["prompt", "aamas2027"],
         "contains_live_model_output": False,

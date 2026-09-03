@@ -448,6 +448,58 @@
       "stream": true
     }
   ],
+  "judge_profile": {
+    "credential_env": "OPENAI_API_KEY",
+    "endpoint": null,
+    "implementation": "are.graph_per_event",
+    "model": "gpt-5.1-2025-11-13",
+    "name": "gpt-5.1-openai-prompt-judge",
+    "offline_validation": false,
+    "provider": "openai",
+    "relax_verdict_case": true,
+    "settings": {
+      "max_output_tokens": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "provider_routing": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "reasoning": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "reasoning_effort": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "router_metadata": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "seed": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "service_tier": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "temperature": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "top_p": {
+        "status": "intentionally_omitted",
+        "value": null
+      },
+      "verbosity": {
+        "status": "intentionally_omitted",
+        "value": null
+      }
+    }
+  },
   "notes": {
     "campaigns": [
       "prompt",
@@ -608,8 +660,8 @@
   ],
   "provenance": {
     "prompt_source_dirty_diff_sha256": null,
-    "source_dirty_diff_sha256": "6129921c2747dfef2f2af91f2c50f348ed726fba973b67d2be9a93fe60724722",
-    "source_revision": "c2c49fc369aec0d62a9c8bea73a36b4c00a55e16"
+    "source_dirty_diff_sha256": "c8625d6a7a72dab53d1c0a2b95503aa1f868123687c58bdbfca0d43752638fa3",
+    "source_revision": "333848c9dabaf54b9a04c529dd0cbf4853665156"
   },
   "schema_version": 1
 }

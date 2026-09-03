@@ -29,6 +29,7 @@ from examples.gaia2.evaluation.core import (
     BudgetPolicy,
     CallUsage,
     EvaluationRecord,
+    JudgeProfile,
     ManifestLockedError,
     ModelProfile,
     PriceSheet,
@@ -37,6 +38,7 @@ from examples.gaia2.evaluation.core import (
     build_run_matrix,
     calculate_call_cost,
     canonical_json,
+    load_judge_profile,
     load_manifests,
     load_profiles,
     record_from_dict,
@@ -118,6 +120,7 @@ def _check_scenario_availability(root: Path, manifests: dict[str, Any]) -> tuple
 
 def _check_command(args: argparse.Namespace) -> int:
     profiles = load_profiles(EVAL_ROOT / "profiles.json")
+    judge_profile = load_judge_profile(PROMPT_ROOT / "judge.json")
     manifests = load_manifests(PROMPT_ROOT / "manifests")
     sheets = [PriceSheet.load(path) for path in sorted((EVAL_ROOT / "price_sheets").glob("*.json"))]
     if not sheets:
@@ -132,6 +135,8 @@ def _check_command(args: argparse.Namespace) -> int:
     expected_profiles = [profiles[name].to_dict() for name in sorted(profiles)]
     if frozen.get("evaluation_profiles") != expected_profiles:
         raise ValueError("the frozen evaluation profiles no longer match profiles.json")
+    if frozen.get("judge_profile") != judge_profile.to_dict():
+        raise ValueError("the frozen judge profile no longer matches judge.json")
     contract = run_contract_suite()
     neutral = run_neutral_suite()
     if contract.failed or neutral.failed:
@@ -154,7 +159,7 @@ def _check_command(args: argparse.Namespace) -> int:
     if missing and args.require_scenarios:
         raise FileNotFoundError("missing ignored scenarios: " + ", ".join(missing))
     # Exercise report serialization and its schema without any scenario/model content.
-    report = build_report([], prompt_snapshot=frozen)
+    report = build_report([], prompt_snapshot=frozen, judge_profile=judge_profile.to_dict())
     json.loads(canonical_json(report))
     print(
         f"check passed: {len(profiles)} profiles, {len(manifests)} Gaia manifests, "
@@ -172,6 +177,7 @@ def _matrix_dict(
     completed: set[str] | None = None,
     *,
     max_agent_llm_calls: int,
+    judge_profile: JudgeProfile,
 ) -> dict[str, Any]:
     completed = completed or set()
     return {
@@ -187,6 +193,7 @@ def _matrix_dict(
             "max_agent_llm_calls": max_agent_llm_calls,
             "unit": "logical_agent_llm_call",
         },
+        "judge_profile": judge_profile.to_dict(),
         "entries": [
             asdict(entry)
             | {
@@ -402,15 +409,13 @@ def _live_gaia_record(
     config_path: Path,
     profile: ModelProfile,
     sheet: PriceSheet,
-    judge_model: str | None,
-    judge_provider: str | None,
-    judge_endpoint: str | None,
+    judge_profile: JudgeProfile,
     max_wall_seconds: float,
     max_agent_llm_calls: int,
 ) -> EvaluationRecord:
     # Every ARE/provider import is below all dry-run and budget gates.
     from examples.gaia2._runner import run_scenario
-    from sora.adapters.are_sim import attach_judge, load_scenario, populate_oracle_events
+    from sora.adapters.are_sim import attach_judge, load_scenario
 
     path = resolve_scenario(
         scenario_root,
@@ -420,20 +425,19 @@ def _live_gaia_record(
         ack_locked_acceptance=ack_locked_acceptance,
     )
     scenario = load_scenario(str(path))
-    if judge_model:
-        attach_judge(
-            scenario,
-            model=judge_model,
-            provider=judge_provider,
-            endpoint=judge_endpoint,
-            relax_verdict_case=True,
-        )
-    else:
-        populate_oracle_events(scenario)
+    attach_judge(
+        scenario,
+        model=judge_profile.model,
+        provider=judge_profile.provider,
+        endpoint=judge_profile.endpoint,
+        offline_validation=judge_profile.offline_validation,
+        relax_verdict_case=judge_profile.relax_verdict_case,
+    )
     result = run_scenario(
         scenario,
         config=str(config_path),
         max_wall_seconds=max_wall_seconds,
+        read_stdin=False,
     )
     calls, agent_cost, upper_bound = _call_records_and_cost(result.llm_report, profile, sheet)
     missing = surplus = 0
@@ -472,6 +476,7 @@ def _live_gaia_record(
         agent_cost_reserve=entry.reserved_agent_cost,
         agent_cost_upper_bound=upper_bound,
         judge_reserve=entry.reserved_judge_cost,
+        judge_profile=judge_profile.to_dict(),
         call_records=calls,
         status=(f"error: {result.exception}" if result.exception else "complete"),
         terminal_cause=cast(Any, result.terminal_cause),
@@ -610,10 +615,25 @@ def _live_neutral_record(
     )
 
 
+def _validate_judge_overrides(args: argparse.Namespace, judge_profile: JudgeProfile) -> None:
+    pinned = {
+        "judge_model": judge_profile.model,
+        "judge_provider": judge_profile.provider,
+        "judge_endpoint": judge_profile.endpoint,
+    }
+    for argument, expected in pinned.items():
+        supplied = getattr(args, argument)
+        if supplied is not None and supplied != expected:
+            flag = "--" + argument.replace("_", "-")
+            raise ValueError(f"{flag} must match the pinned judge value {expected!r}")
+
+
 def _run_command(args: argparse.Namespace) -> int:
     if args.max_agent_llm_calls <= 0:
         raise ValueError("--max-agent-llm-calls must be positive")
     profiles = load_profiles(EVAL_ROOT / "profiles.json")
+    judge_profile = load_judge_profile(PROMPT_ROOT / "judge.json")
+    _validate_judge_overrides(args, judge_profile)
     unknown = sorted(set(args.profile) - set(profiles))
     if unknown:
         raise ValueError(f"unknown profiles: {', '.join(unknown)}")
@@ -641,6 +661,17 @@ def _run_command(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     checkpoint = output_dir / "checkpoint.jsonl"
     completed, records = _checkpoint_records(checkpoint)
+    expected_judge = judge_profile.to_dict()
+    incompatible_judge_records = [
+        record
+        for record in records
+        if record.suite in GAIA_SUITES and record.judge_profile != expected_judge
+    ]
+    if incompatible_judge_records:
+        raise ValueError(
+            "checkpoint contains Gaia records without the pinned judge profile; use a separate "
+            "output directory or remove those Gaia rows"
+        )
     matrix = build_run_matrix(selection, policy, manifests, prior_records=records)
     projected_campaign_spend = matrix.prior_spend + matrix.total_reserve
     if args.confirm_budget + 1e-9 < projected_campaign_spend:
@@ -654,6 +685,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 matrix,
                 completed,
                 max_agent_llm_calls=args.max_agent_llm_calls,
+                judge_profile=judge_profile,
             )
         ),
         end="",
@@ -695,6 +727,15 @@ def _run_command(args: argparse.Namespace) -> int:
         credential = profiles[profile_name].credential_env
         if not os.environ.get(credential):
             raise ValueError(f"profile {profile_name} requires environment variable {credential}")
+    pending_gaia = any(
+        entry.key not in completed and entry.suite in GAIA_SUITES for entry in matrix.entries
+    )
+    if pending_gaia and not os.environ.get(judge_profile.credential_env):
+        raise ValueError(
+            f"judge profile {judge_profile.name} requires environment variable "
+            f"{judge_profile.credential_env}"
+        )
+    gaia_filesystem_staged = False
     for entry in matrix.entries:
         if entry.key in completed:
             continue
@@ -716,6 +757,13 @@ def _run_command(args: argparse.Namespace) -> int:
                 sheet=sheet,
             )
         else:
+            if not gaia_filesystem_staged:
+                # ARE binds DEMO_FS_PATH while importing its config module. Stage once, as late as
+                # possible after every no-spend gate but before _live_gaia_record imports ARE.
+                from examples.gaia2._local_fs import ensure_local_fallback_fs
+
+                ensure_local_fallback_fs()
+                gaia_filesystem_staged = True
             config = _write_profile_config(
                 output_dir,
                 profiles[entry.profile],
@@ -729,9 +777,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 config_path=config,
                 profile=profiles[entry.profile],
                 sheet=sheet,
-                judge_model=args.judge_model,
-                judge_provider=args.judge_provider,
-                judge_endpoint=args.judge_endpoint,
+                judge_profile=judge_profile,
                 max_wall_seconds=args.max_wall_seconds,
                 max_agent_llm_calls=args.max_agent_llm_calls,
             )
@@ -758,6 +804,7 @@ def _read_records(paths: list[str]) -> list[EvaluationRecord]:
 def _report_command(args: argparse.Namespace) -> int:
     records = _read_records(args.input)
     profiles = load_profiles(EVAL_ROOT / "profiles.json")
+    judge_profile = load_judge_profile(PROMPT_ROOT / "judge.json")
     manifests = load_manifests(PROMPT_ROOT / "manifests")
     sheet = PriceSheet.load(Path(args.price_sheet)) if args.price_sheet else None
     snapshot = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
@@ -774,6 +821,7 @@ def _report_command(args: argparse.Namespace) -> int:
         harness_dirty_diff_sha256=_dirty_diff_hash(),
         manifest_digests={name: manifest.digest for name, manifest in manifests.items()},
         selected_profiles=[profiles[name].to_dict() for name in selected_names],
+        judge_profile=judge_profile.to_dict(),
         safety_sensitive=args.safety_sensitive,
         reduces_tool_catalog=args.reduces_tool_catalog,
         fresh_expansion_payloads_available=args.expansion_payloads_available,
@@ -819,9 +867,17 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--judge-reserve", type=float, default=0.5)
     run.add_argument("--neutral-reserve", type=float, default=0.5)
     run.add_argument("--live-neutral", action="store_true")
-    run.add_argument("--judge-model")
-    run.add_argument("--judge-provider")
-    run.add_argument("--judge-endpoint")
+    run.add_argument(
+        "--judge-model", help="optional assertion; must match the campaign's pinned judge model"
+    )
+    run.add_argument(
+        "--judge-provider",
+        help="optional assertion; must match the campaign's pinned judge provider",
+    )
+    run.add_argument(
+        "--judge-endpoint",
+        help="optional assertion; must match the campaign's pinned judge endpoint",
+    )
     run.add_argument("--max-wall-seconds", type=float, default=1200.0)
     run.add_argument("--max-agent-llm-calls", type=int, default=200)
     run.set_defaults(handler=_run_command)

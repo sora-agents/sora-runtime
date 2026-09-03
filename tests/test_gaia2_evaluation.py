@@ -37,6 +37,7 @@ from examples.gaia2.evaluation.core import (
     build_run_matrix,
     calculate_call_cost,
     decide_acceptance_expansion,
+    load_judge_profile,
     load_manifests,
     load_profiles,
     record_from_dict,
@@ -110,6 +111,20 @@ def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
         "intentionally_omitted",
         "provider_observed",
     }
+
+
+def test_prompt_judge_profile_pins_gpt_5_1_snapshot_and_are_policy() -> None:
+    judge = load_judge_profile(PROMPT_ROOT / "judge.json")
+
+    assert judge.model == "gpt-5.1-2025-11-13"
+    assert judge.provider == "openai"
+    assert judge.endpoint is None
+    assert judge.credential_env == "OPENAI_API_KEY"
+    assert judge.implementation == "are.graph_per_event"
+    assert judge.offline_validation is False
+    assert judge.relax_verdict_case is True
+    assert judge.settings["reasoning_effort"].status == "intentionally_omitted"
+    assert judge.settings["temperature"].status == "intentionally_omitted"
 
 
 def test_profile_validation_rejects_unknown_setting_status() -> None:
@@ -325,6 +340,7 @@ def test_frozen_snapshot_has_all_seven_exact_prompts_and_matches_runtime() -> No
         "kimi-k2.5-prompt",
     }
     assert frozen["notes"]["campaigns"] == ["prompt", "aamas2027"]
+    assert frozen["judge_profile"] == load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
     for row in frozen["prompts"]:
         assert len(row["system_sha256"]) == len(row["user_sha256"]) == 64
         assert row["system"] and row["user"]
@@ -357,6 +373,31 @@ def test_report_redacts_acceptance_details_and_marks_new_safety_violation_hard()
     assert "locked oracle" not in serialized
     assert '"private": true' not in serialized
     assert report["provenance"]["statistical_bootstrap_seed"] == 20260831
+
+
+def test_report_preserves_pinned_judge_profile_and_checkpoint_coverage() -> None:
+    judge = load_judge_profile(PROMPT_ROOT / "judge.json")
+    record = EvaluationRecord(
+        arm="baseline",
+        profile="example",
+        suite="development",
+        capability="search",
+        case_id="case",
+        repeat=0,
+        score=1.0,
+        passed=True,
+        judge_profile=judge.to_dict(),
+    )
+
+    report = build_report([record], judge_profile=judge.to_dict())
+
+    assert report["provenance"]["judge_profile"] == judge.to_dict()
+    assert report["provenance"]["judge_profile_coverage"] == {
+        "gaia_records": 1,
+        "matching_records": 1,
+        "complete": True,
+    }
+    assert report["cases"][0]["judge_profile"] == judge.to_dict()
 
 
 def test_report_collects_runtime_model_and_sdk_observations() -> None:
@@ -869,6 +910,7 @@ def test_completed_checkpoint_resume_needs_no_removed_provider_credential(
     tmp_path: Path,
 ) -> None:
     profile_name = "gpt-5.4-medium-prompt"
+    judge_profile = load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
     manifests = load_manifests(PROMPT_ROOT / "manifests")
     matrix = build_run_matrix(
         RunSelection(
@@ -893,8 +935,13 @@ def test_completed_checkpoint_resume_needs_no_removed_provider_credential(
                 repeat=entry.repeat,
                 score=1.0,
                 passed=True,
+                judge_profile=judge_profile,
             ),
         )
+    monkeypatch.setattr(
+        "examples.gaia2._local_fs.ensure_local_fallback_fs",
+        lambda: pytest.fail("completed Gaia entries must not stage the filesystem"),
+    )
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     args = _parser().parse_args(
         [
