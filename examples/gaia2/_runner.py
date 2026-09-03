@@ -211,6 +211,7 @@ def run_scenario(
     log_file: str | None = None,
     max_wall_seconds: float = 1200.0,
     exit_when_idle: float | None = None,
+    read_stdin: bool = True,
 ) -> RunResult:
     """Run S-ORA against one loaded scenario to completion, then score it. Attach the judge (via
     ``are_sim.attach_judge``) *before* calling this if a real score is wanted; without it the run is
@@ -236,6 +237,7 @@ def run_scenario(
         initial_task=None,  # the Gaia2 scenario delivers its own task via the AUI timeline
         exit_when_idle=exit_when_idle,
         stop_when=stop_when,
+        read_stdin=read_stdin,
         log_file=log_file,
     )
 

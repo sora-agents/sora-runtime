@@ -763,6 +763,30 @@ async def test_stop_when_predicate_ends_the_session_and_is_polled(
         stdin.close()
 
 
+async def test_scripted_session_can_run_without_reading_process_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = _build_agent(tmp_path)
+    agent.working.activities["a1"] = Activity(
+        id="a1", goal="what time is it?", context={}, state=ActivityState.TERMINATED
+    )
+
+    class _ClosedStdin:
+        def fileno(self) -> int:
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(sys, "stdin", _ClosedStdin())
+    session = TerminalSession(
+        agent,
+        poll_interval=0.0,
+        stop_when=lambda: True,
+        read_stdin=False,
+    )
+
+    await asyncio.wait_for(session.run(), timeout=2)
+    assert session.llm_report is not None
+
+
 async def test_log_file_captures_the_trace_and_is_written_to_disk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

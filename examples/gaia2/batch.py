@@ -361,6 +361,7 @@ def _run_one_scenario(
             config=args.config,
             verbose=args.verbose,
             max_wall_seconds=args.max_wall_seconds,
+            read_stdin=False,
         )
     except Exception as e:  # this scenario's judge/preprocess failed — record it, keep sweeping
         return _jsonl_record(

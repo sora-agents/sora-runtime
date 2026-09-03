@@ -525,21 +525,38 @@ def _live_neutral_record(
     from sora.cli import TerminalSession
 
     agent = build_agent(str(config_path))
+    synthetic_tool: SyntheticTool | None = None
+
+    def stop_when_done() -> bool:
+        nonlocal synthetic_tool
+        if synthetic_tool is None:
+            try:
+                candidate = agent.registry.get(TOOL_ID)
+            except KeyError:
+                pass  # The session may poll before Agent.run() finishes joining workspaces.
+            else:
+                if not isinstance(candidate, SyntheticTool):
+                    raise TypeError(
+                        "live neutral workspace returned an unexpected tool implementation"
+                    )
+                synthetic_tool = candidate
+        return _headless_neutral_done(agent)
+
     session = TerminalSession(
         agent,
         color=False,
         initial_task=LIVE_TASKS[entry.case_id],
-        stop_when=lambda: _headless_neutral_done(agent),
+        stop_when=stop_when_done,
+        read_stdin=False,
     )
     started = time.monotonic()
     asyncio.run(session.run())
     duration = time.monotonic() - started
-    tool = agent.registry.get(TOOL_ID)
-    if not isinstance(tool, SyntheticTool):
-        raise TypeError("live neutral workspace returned an unexpected tool implementation")
+    if synthetic_tool is None:
+        raise RuntimeError("live neutral session ended before its synthetic tool became available")
     scored_passed, authorization_violations, safety_violations = score_live_case(
         entry.case_id,
-        tool.invocations,
+        synthetic_tool.invocations,
         cast(Any, agent.communication).sent,
     )
     case = next(case for case in NEUTRAL_CASES if case.case_id == entry.case_id)

@@ -661,6 +661,8 @@ def test_live_neutral_reports_admitted_logical_calls_not_provider_round_trips(
 ) -> None:
     from examples.gaia2.evaluation.campaigns.prompt.synthetic import SyntheticTool
 
+    from sora.activity import ActivityState
+
     tool = SyntheticTool()
     tool.invocations.append(SyntheticInvocation("lookup", {"query": "blue"}))
     report = SimpleNamespace(
@@ -674,20 +676,45 @@ def test_live_neutral_reports_admitted_logical_calls_not_provider_round_trips(
         output_tokens=0,
         thinking_tokens=0,
     )
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.joined = True
+
+        def all_tools(self) -> list[SyntheticTool]:
+            return [tool] if self.joined else []
+
+        def get(self, _tool_id: str) -> SyntheticTool:
+            if not self.joined:
+                raise KeyError("prompt-eval.synthetic")
+            return tool
+
+    registry = _Registry()
     agent = SimpleNamespace(
         procedural=SimpleNamespace(logical_calls_admitted=1),
-        registry=SimpleNamespace(get=lambda _tool_id: tool),
+        registry=registry,
         communication=SimpleNamespace(sent=_sent("blue-1")),
-        working=SimpleNamespace(activities={}),
+        working=SimpleNamespace(
+            activities={
+                "activity": SimpleNamespace(
+                    state=ActivityState.TERMINATED,
+                    blocked_on=None,
+                    replan_count=0,
+                )
+            }
+        ),
         cycle=SimpleNamespace(external_action_count=1),
     )
 
     class _Session:
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
             self.llm_report = report
+            assert kwargs["read_stdin"] is False
+            self._stop_when = cast(Callable[[], bool], kwargs["stop_when"])
 
         async def run(self) -> None:
-            return None
+            assert self._stop_when()
+            registry.joined = False
 
     monkeypatch.setattr("sora.bootstrap.build_agent", lambda _config: agent)
     monkeypatch.setattr("sora.cli.TerminalSession", _Session)

@@ -239,6 +239,7 @@ class TerminalSession:
         initial_task: str | None = None,
         exit_when_idle: float | None = None,
         stop_when: Callable[[], bool] | None = None,
+        read_stdin: bool = True,
         log_file: str | Path | None = None,
     ) -> None:
         communication = agent.communication
@@ -280,6 +281,10 @@ class TerminalSession:
         # precedence over exit_when_idle; both are None for an interactive session, which is then
         # unchanged (it ends on stdin EOF / '/exit').
         self._stop_when = stop_when
+        # Scripted callers can supply an initial task and stop predicate without attaching an
+        # asyncio pipe transport to process-wide stdin. That matters when several sessions run in
+        # succession: closing one event loop may close the pipe object its read transport owns.
+        self._read_stdin_enabled = read_stdin
         # A full, always-verbose trace mirror written to a file regardless of the terminal's own
         # --verbose setting — the complete execution log (prompts, results, plans) that was
         # previously only obtainable by running --verbose and copy-pasting the terminal.
@@ -337,7 +342,11 @@ class TerminalSession:
 
         runner = asyncio.create_task(self._agent.run())
         stop_reading = asyncio.Event()
-        reader = asyncio.create_task(self._read_stdin(stop_reading, console))
+        reader = (
+            asyncio.create_task(self._read_stdin(stop_reading, console))
+            if self._read_stdin_enabled
+            else None
+        )
         printed_trajectories: set[str] = set()
         idle_since: float | None = None
         try:
@@ -390,12 +399,13 @@ class TerminalSession:
                     log.debug("agent.run() raised while shutting down after cancel: %r", exc)
             else:
                 await runner  # finished on its own — a real failure here should propagate
-            if not reader.done():
-                reader.cancel()
-            try:
-                await reader  # connect_read_pipe-based, so this responds to cancel immediately
-            except asyncio.CancelledError:
-                pass
+            if reader is not None:
+                if not reader.done():
+                    reader.cancel()
+                try:
+                    await reader  # connect_read_pipe-based, so this responds to cancel immediately
+                except asyncio.CancelledError:
+                    pass
             sora_log.removeHandler(presenter)
             sora_log.removeHandler(meter)
             if file_presenter is not None:
