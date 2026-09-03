@@ -12,7 +12,7 @@
       "settings": {
         "reasoning_effort": {"status": "sent", "value": "medium"},
         "reasoning": {"status": "intentionally_omitted", "value": null},
-        "temperature": {"status": "sent", "value": 0.5},
+        "temperature": {"status": "intentionally_omitted", "value": null},
         "top_p": {"status": "intentionally_omitted", "value": null},
         "seed": {"status": "intentionally_omitted", "value": null},
         "verbosity": {"status": "intentionally_omitted", "value": null},
@@ -70,7 +70,7 @@
       "settings": {
         "reasoning_effort": {"status": "sent", "value": "high"},
         "reasoning": {"status": "intentionally_omitted", "value": null},
-        "temperature": {"status": "sent", "value": 0.5},
+        "temperature": {"status": "intentionally_omitted", "value": null},
         "top_p": {"status": "intentionally_omitted", "value": null},
         "seed": {"status": "intentionally_omitted", "value": null},
         "verbosity": {"status": "intentionally_omitted", "value": null},

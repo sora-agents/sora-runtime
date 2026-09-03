@@ -85,8 +85,8 @@
           "value": true
         },
         "temperature": {
-          "status": "sent",
-          "value": 0.5
+          "status": "intentionally_omitted",
+          "value": null
         },
         "top_p": {
           "status": "intentionally_omitted",
@@ -128,8 +128,8 @@
           "value": null
         },
         "temperature": {
-          "status": "sent",
-          "value": 0.5
+          "status": "intentionally_omitted",
+          "value": null
         },
         "top_p": {
           "status": "intentionally_omitted",
@@ -226,8 +226,8 @@
           "value": true
         },
         "temperature": {
-          "status": "sent",
-          "value": 0.5
+          "status": "intentionally_omitted",
+          "value": null
         },
         "top_p": {
           "status": "intentionally_omitted",
@@ -269,8 +269,8 @@
           "value": null
         },
         "temperature": {
-          "status": "sent",
-          "value": 0.5
+          "status": "intentionally_omitted",
+          "value": null
         },
         "top_p": {
           "status": "intentionally_omitted",
@@ -461,6 +461,7 @@
     "decision_cycles_are_benchmark_steps": false,
     "gaia_limit_unit": "logical_agent_llm_call",
     "gaia_logical_agent_llm_call_limit": 200,
+    "gpt_5_4_temperature": "intentionally omitted; the reasoning profiles support only the default value 1",
     "kimi_provider": "DeepInfra endpoint pinned after Moonshot AI retired its route",
     "kimi_reasoning": "OpenRouter unified reasoning enabled with provider pinned",
     "kimi_snapshot_status": "stable alias; no dated OpenRouter snapshot",
@@ -607,8 +608,8 @@
   ],
   "provenance": {
     "prompt_source_dirty_diff_sha256": null,
-    "source_dirty_diff_sha256": "9cd853dc71938ad9f3b93365ee01e736de220dfafcd4b9b2d8dfc0732ea8da1e",
-    "source_revision": "a28175262159a854ca68c8eccaac4d0778cf2c08"
+    "source_dirty_diff_sha256": "6129921c2747dfef2f2af91f2c50f348ed726fba973b67d2be9a93fe60724722",
+    "source_revision": "c2c49fc369aec0d62a9c8bea73a36b4c00a55e16"
   },
   "schema_version": 1
 }

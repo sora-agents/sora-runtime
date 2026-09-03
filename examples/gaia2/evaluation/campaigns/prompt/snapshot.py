@@ -205,6 +205,9 @@ def build_frozen_baseline(
         "prompt_profile": "gpt-5.4-medium-prompt",
         "cross_family_profile": "kimi-k2.5-prompt",
         "paper_transfer_profile": "gpt-5.4-high-paper",
+        "gpt_5_4_temperature": (
+            "intentionally omitted; the reasoning profiles support only the default value 1"
+        ),
         "kimi_snapshot_status": "stable alias; no dated OpenRouter snapshot",
         "kimi_provider": "DeepInfra endpoint pinned after Moonshot AI retired its route",
         "kimi_reasoning": "OpenRouter unified reasoning enabled with provider pinned",

@@ -384,6 +384,8 @@ def _call_records_and_cost(
                 ],
                 "provider_observations": list(call.provider_observations),
                 "latency_seconds": call.latency_seconds,
+                "outcome": getattr(call, "outcome", None),
+                "error": getattr(call, "error", None),
                 "discarded": call.discarded,
                 "cost": aggregate_cost,
                 "terminal_parse_failures": getattr(call, "terminal_parse_failures", 0),
@@ -477,6 +479,34 @@ def _live_gaia_record(
     )
 
 
+def _headless_neutral_done(agent: Any) -> bool:
+    """Stop once no activity can advance without another user message."""
+    from sora.activity import ActivityState
+    from sora.types import InputWait
+
+    activities = list(agent.working.activities.values())
+    if not activities:
+        return False
+    unfinished = [
+        activity for activity in activities if activity.state is not ActivityState.TERMINATED
+    ]
+    return not unfinished or all(
+        activity.state is ActivityState.BLOCKED and isinstance(activity.blocked_on, InputWait)
+        for activity in unfinished
+    )
+
+
+def _input_wait_prompts(agent: Any) -> tuple[str, ...]:
+    from sora.activity import ActivityState
+    from sora.types import InputWait
+
+    return tuple(
+        activity.blocked_on.prompt or ""
+        for activity in agent.working.activities.values()
+        if activity.state is ActivityState.BLOCKED and isinstance(activity.blocked_on, InputWait)
+    )
+
+
 def _live_neutral_record(
     entry: Any,
     *,
@@ -484,6 +514,7 @@ def _live_neutral_record(
     profile: ModelProfile,
     sheet: PriceSheet,
 ) -> EvaluationRecord:
+    from examples.gaia2._runner import _terminal_cause, _terminal_inference_errors
     from examples.gaia2.evaluation.campaigns.prompt.synthetic import (
         LIVE_TASKS,
         TOOL_ID,
@@ -498,7 +529,7 @@ def _live_neutral_record(
         agent,
         color=False,
         initial_task=LIVE_TASKS[entry.case_id],
-        exit_when_idle=0.2,
+        stop_when=lambda: _headless_neutral_done(agent),
     )
     started = time.monotonic()
     asyncio.run(session.run())
@@ -506,7 +537,7 @@ def _live_neutral_record(
     tool = agent.registry.get(TOOL_ID)
     if not isinstance(tool, SyntheticTool):
         raise TypeError("live neutral workspace returned an unexpected tool implementation")
-    passed, authorization_violations, safety_violations = score_live_case(
+    scored_passed, authorization_violations, safety_violations = score_live_case(
         entry.case_id,
         tool.invocations,
         cast(Any, agent.communication).sent,
@@ -514,6 +545,22 @@ def _live_neutral_record(
     case = next(case for case in NEUTRAL_CASES if case.case_id == entry.case_id)
     calls, agent_cost, upper_bound = _call_records_and_cost(session.llm_report, profile, sheet)
     llm_report = session.llm_report
+    inference_errors = _terminal_inference_errors(llm_report)
+    input_wait_prompts = _input_wait_prompts(agent)
+    passed = None if inference_errors else scored_passed
+    if inference_errors:
+        status = f"error: {' | '.join(inference_errors)}"
+    elif input_wait_prompts:
+        status = f"awaiting input: {' | '.join(input_wait_prompts)}"
+    else:
+        status = "complete"
+    terminal_cause = _terminal_cause(
+        None,
+        False,
+        None,
+        passed,
+        inference_errors=inference_errors,
+    )
     return EvaluationRecord(
         arm=entry.arm,
         profile=entry.profile,
@@ -521,7 +568,7 @@ def _live_neutral_record(
         capability=case.topic,
         case_id=entry.case_id,
         repeat=entry.repeat,
-        score=float(passed),
+        score=float(passed) if isinstance(passed, bool) else None,
         passed=passed,
         replan_count=sum(activity.replan_count for activity in agent.working.activities.values()),
         terminal_parse_failures=(llm_report.terminal_parse_failures if llm_report else 0),
@@ -541,6 +588,8 @@ def _live_neutral_record(
         agent_cost_reserve=entry.reserved_agent_cost,
         agent_cost_upper_bound=upper_bound,
         call_records=calls,
+        status=status,
+        terminal_cause=cast(Any, terminal_cause),
     )
 
 

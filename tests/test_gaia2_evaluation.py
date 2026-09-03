@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from examples.gaia2.evaluation.campaigns.prompt.contracts import run_contract_suite
@@ -19,6 +21,7 @@ from examples.gaia2.evaluation.campaigns.prompt.synthetic import (
 from examples.gaia2.evaluation.cli import (
     _append_checkpoint,
     _call_records_and_cost,
+    _headless_neutral_done,
     _live_neutral_record,
     _parser,
     _run_command,
@@ -56,11 +59,16 @@ def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
     assert medium.model == "gpt-5.4-2026-03-05"
     assert medium.campaigns == ("prompt",)
     assert medium.settings["reasoning_effort"].value == "medium"
-    assert medium.settings["temperature"].value == 0.5
+    assert medium.settings["temperature"].status == "intentionally_omitted"
+    assert medium.settings["temperature"].value is None
+    assert "temperature" not in medium.client_settings()
     assert medium.settings["max_output_tokens"].value == 16384
     high = profiles["gpt-5.4-high-paper"]
     assert high.campaigns == ("prompt", "aamas2027")
     assert high.settings["reasoning_effort"].value == "high"
+    assert high.settings["temperature"].status == "intentionally_omitted"
+    assert high.settings["temperature"].value is None
+    assert "temperature" not in high.client_settings()
     kimi = profiles["kimi-k2.5-prompt"]
     assert kimi.model == "moonshotai/kimi-k2.5"
     assert kimi.campaigns == ("prompt",)
@@ -702,6 +710,131 @@ def test_live_neutral_reports_admitted_logical_calls_not_provider_round_trips(
     )
     assert record.agent_llm_calls == 1
     assert record.provider_round_trips == 0
+
+
+def test_headless_neutral_stops_when_only_input_waits_remain() -> None:
+    from sora.activity import ActivityState
+    from sora.types import InputWait
+
+    waiting = SimpleNamespace(
+        state=ActivityState.BLOCKED,
+        blocked_on=InputWait(prompt="How should I proceed?"),
+    )
+    terminated = SimpleNamespace(state=ActivityState.TERMINATED, blocked_on=None)
+    ready = SimpleNamespace(state=ActivityState.READY, blocked_on=None)
+
+    assert _headless_neutral_done(SimpleNamespace(working=SimpleNamespace(activities={}))) is False
+    assert (
+        _headless_neutral_done(
+            SimpleNamespace(working=SimpleNamespace(activities={0: terminated, 1: waiting}))
+        )
+        is True
+    )
+    assert (
+        _headless_neutral_done(
+            SimpleNamespace(working=SimpleNamespace(activities={0: ready, 1: waiting}))
+        )
+        is False
+    )
+
+
+def test_live_neutral_checkpoints_provider_failure_as_infrastructure_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from examples.gaia2.evaluation.campaigns.prompt.synthetic import SyntheticTool
+
+    from sora.activity import ActivityState
+    from sora.types import InputWait
+
+    error = (
+        "BadRequestError(\"Error code: 400 - {'error': {'message': "
+        "\"Unsupported value: 'temperature' does not support 0.5 with this model. "
+        'Only the default (1) value is supported."}}")'
+    )
+    inference = SimpleNamespace(
+        round_trips=1,
+        usages=(),
+        semantic_label="plan",
+        prompt_version="1",
+        prompt_hashes=(),
+        system_prompt_sha256="system-hash",
+        user_prompt_sha256="user-hash",
+        finish_reasons=(),
+        cached_input_tokens=0,
+        input_tokens=0,
+        cache_unknown_input_tokens=0,
+        output_tokens=0,
+        reasoning_tokens=0,
+        reasoning_tokens_exact=None,
+        observed_models=(),
+        sdk_observations=(),
+        provider_observations=(),
+        latency_seconds=0.0,
+        discarded=False,
+        terminal_parse_failures=0,
+        outcome="error",
+        error=error,
+    )
+    report = SimpleNamespace(
+        calls=1,
+        inferences=(inference,),
+        terminal_parse_failures=0,
+        latency_seconds=0.0,
+        input_tokens=0,
+        cached_input_tokens=0,
+        cache_unknown_input_tokens=0,
+        output_tokens=0,
+        thinking_tokens=0,
+    )
+    activity = SimpleNamespace(
+        state=ActivityState.BLOCKED,
+        blocked_on=InputWait(prompt="How should I proceed?"),
+        replan_count=1,
+    )
+    tool = SyntheticTool()
+    agent = SimpleNamespace(
+        procedural=SimpleNamespace(logical_calls_admitted=1),
+        registry=SimpleNamespace(get=lambda _tool_id: tool),
+        communication=SimpleNamespace(sent=[]),
+        working=SimpleNamespace(activities={"activity": activity}),
+        cycle=SimpleNamespace(external_action_count=0),
+    )
+
+    class _Session:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            self.llm_report = report
+            self._stop_when = cast(Callable[[], bool], kwargs["stop_when"])
+
+        async def run(self) -> None:
+            assert self._stop_when()
+
+    monkeypatch.setattr("sora.bootstrap.build_agent", lambda _config: agent)
+    monkeypatch.setattr("sora.cli.TerminalSession", _Session)
+    profile = load_profiles(EVAL_ROOT / "profiles.json")["gpt-5.4-medium-prompt"]
+    sheet = PriceSheet.load(EVAL_ROOT / "price_sheets" / "2026-09-02.json")
+    entry = SimpleNamespace(
+        arm="baseline",
+        profile=profile.name,
+        suite="neutral",
+        case_id="lookup-ordinary",
+        repeat=0,
+        reserved_agent_cost=0.5,
+    )
+
+    record = _live_neutral_record(
+        entry,
+        config_path=tmp_path / "agent.yaml",
+        profile=profile,
+        sheet=sheet,
+    )
+
+    assert record.score is None
+    assert record.passed is None
+    assert record.terminal_cause == "infrastructure_error"
+    assert record.status == f"error: {error}"
+    assert record.call_records[0]["outcome"] == "error"
+    assert record.call_records[0]["error"] == error
 
 
 def test_completed_checkpoint_resume_needs_no_removed_provider_credential(
