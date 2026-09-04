@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from sora._strategies.conditions import (
     _body_exhausted,
+    _clock_owns_retirement,
     _condition_watches,
     _conditions_hold_frame,
     _eligible_conditions,
@@ -491,26 +492,32 @@ class DefaultReasonStrategy:
         # that lands while the call is in flight gets a higher sequence number and so earns its own
         # evaluation later; advancing on resolve instead would either re-judge the same signal (a
         # spin) or swallow one that arrived mid-flight.
+        # Past exactly the change being judged (`_Match.marks_for`) and no further. The mark used to
+        # jump to the whole log's high-water mark, which is the same thing only when nothing is
+        # queued — and a queue is exactly what builds while the agent is too busy to judge. On the
+        # run that found this, six changes arrived during one sub-plan call, the oldest was judged,
+        # and the five behind it were marked judged unseen.
         # Keeping where they stood is what lets a judgement that ERRORS give the change back
         # (see `PendingConditionState.fired_from_signals`); a call that answers never reads them.
-        for state, percept in eligible:
+        for state, match in eligible:
             state.fired_from_signals = state.evaluated_through
             state.fired_from_derived = state.derived_through
-            state.evaluated_through = wm.signals_appended
-            state.derived_through = wm.property_changes_appended
+            state.evaluated_through, state.derived_through = match.marks_for(state)
             # Keep the change that opened this gate, for the `then` plan to reference mechanically
             # (see `_pursue_fired_condition`). Recorded here because this is the last moment it is
             # in hand: the judgement is off-cycle, and by the time its verdict is applied the tick
             # that carried the change has passed.
             state.fired_changes = tuple(
-                (percept.source, change) for change in changes_of(percept.payload)
+                (match.percept.source, change) for change in changes_of(match.percept.payload)
             )
         # Paired with the source that reported them, not flattened into a bare list: a `Change`
         # names the path that moved but not the tool it moved on, and the judgement needs both to
         # dereference the ids back into records (see ProceduralMemory.render_changes).
         changes: list[tuple[str, Change]] = []
-        for _, percept in eligible:
-            changes.extend((percept.source, change) for change in changes_of(percept.payload))
+        for _, match in eligible:
+            changes.extend(
+                (match.percept.source, change) for change in changes_of(match.percept.payload)
+            )
         observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
         evaluate = cycle.actions.internal(EvaluateConditionsAction.name)
         await evaluate.execute(
@@ -539,23 +546,40 @@ class DefaultReasonStrategy:
         four-step fan-out of deletes had executed one when that delete opened the gate it was
         watching, and the remaining three never ran. Nothing is lost by waiting — the fire sits in
         `condition_fired` and Reflect keeps the activity READY for it (see its own comment).
+
+        The two halves of a verdict are answers to different questions and are applied
+        independently. `fired` says the awaited thing happened, so the `then` is owed; `retired`
+        says only that nothing further is being waited for. One verdict naming the same condition
+        in both is the ordinary **one-shot** answer, not a contradiction — and reading the
+        retirement as cancelling the fire drops committed work silently, since the judgement is
+        already paid for and the mark advanced at fire time, so nothing re-fires it. (The
+        `_conditions_hold_frame` "committed work" branch exists for exactly that shape: a queued
+        fire outliving the condition that produced it.) Seen on the 2026-09-04 Gaia2 "Time" smoke
+        run as `{"fired": [0], "retired": [0]}` — the `then` that deletes the conflicting calendar
+        events never ran, against five the oracle deleted.
         """
         verdict = activity.condition_verdict or ConditionVerdict()
         activity.condition_verdict = None
         judged = activity.condition_batch
         activity.condition_batch = []
+        # A window the clock owns is not this judge's to close (ADR-0027 §5): it is answered every
+        # tick by comparison in `retire_expired`, and the judge is never told what domain time it
+        # is. Dropped before anything is applied, so the retirement record cannot pick it up either.
+        retiring = [
+            i
+            for i in verdict.retired
+            if i < len(judged) and not _clock_owns_retirement(wm, judged[i])
+        ]
         # Identity, not equality: PendingConditionState is mutable (its mark advances), so it is
         # unhashable, and two conditions can compare equal while being distinct waiters.
-        retired = {id(judged[i]) for i in verdict.retired if i < len(judged)}
+        retired = {id(judged[i]) for i in retiring}
         if retired:
             activity.pending_conditions = [
                 state for state in activity.pending_conditions if id(state) not in retired
             ]
             # Remember WHAT retired, not just that something did: the declaration survives on the
             # frozen Plan.pending, so the next lift would otherwise put it straight back on watch.
-            activity.retired_conditions.update(
-                judged[i].condition for i in verdict.retired if i < len(judged)
-            )
+            activity.retired_conditions.update(judged[i].condition for i in retiring)
             log.info("reason: retired %d pending condition(s) on %s", len(retired), activity.id)
         fired = [
             ConditionFiring(
@@ -563,7 +587,7 @@ class DefaultReasonStrategy:
                 fired_changes=judged[i].fired_changes,
             )
             for i in verdict.fired
-            if i < len(judged) and id(judged[i]) not in retired
+            if i < len(judged)
         ]
         # Queue every fire, pursue one. The verdict is plural on purpose — one call judges the whole
         # eligible batch, and a single reply can satisfy two gates — so keeping only the first would

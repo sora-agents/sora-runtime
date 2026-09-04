@@ -55,6 +55,7 @@ from sora.strategies import (
     TickResult,
 )
 from sora.types import (
+    ConditionVerdict,
     ConditionWait,
     PendingCondition,
     PendingConditionState,
@@ -449,6 +450,117 @@ async def test_mechanical_retirement_releases_the_maintenance_frame_it_was_holdi
     resumed = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
     assert resumed.step is report
     assert activity.parent_frames == []
+
+
+# ------------------------------------------------------------------------------------------------
+# The clock's answer beats a model's guess at it
+# ------------------------------------------------------------------------------------------------
+# Both judges are *shown* the `until` prose — the batched one needs it to read the `when` in context
+# — and neither is ever told what domain time it is. So a `retired` either returns for a window the
+# clock owns is a guess against a reading it cannot see, and retiring early ends a window that is
+# still open: the exact failure ADR-0027 was written to fix.
+
+
+async def test_the_batched_judge_cannot_retire_a_window_the_clock_owns(tmp_path: Path) -> None:
+    """Seen on the 2026-09-04 Gaia2 "Time" smoke run: the batched condition judge closed a declared
+    four-minute monitoring window about one minute in, and the calendar events injected over the
+    remaining three were never observed — two of six oracle additions seen, none of its five
+    deletes made."""
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    cycle, working, registry = _cycle(tmp_path, clock=clock)
+    await registry.join(_ORIGIN)
+    activity = _blocked_on(Activity(id="a", goal="watch", context={}), _monitoring())
+    state = activity.pending_conditions[0]
+    state.declared_at = clock.now()
+    activity.state = ActivityState.READY
+    activity.blocked_on = None
+    activity.plan = Plan(id="p", goal="watch", steps=[Step("wait", {})], pending=(_monitoring(),))
+    activity.step_index = 1
+    activity.condition_batch = [state]
+    activity.condition_verdict = ConditionVerdict(retired=(0,))
+    working.activities["a"] = activity
+
+    clock.advance(60)  # one minute into four
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.pending_conditions == [state]
+    assert state.condition not in activity.retired_conditions
+
+
+async def test_the_batched_judge_still_retires_a_window_no_clock_can_close(
+    tmp_path: Path,
+) -> None:
+    """The guard is "the clock owns this one", not "it mentions time". A timed `until` watching a
+    workspace that cannot tell domain time is precisely the residue the mechanical pass leaves
+    behind — refusing the judge there would strand the condition, and its frame, forever."""
+    cycle, working, registry = _cycle(tmp_path)  # no clock on the workspace
+    await registry.join(_ORIGIN)
+    activity = _blocked_on(Activity(id="a", goal="watch", context={}), _monitoring())
+    state = activity.pending_conditions[0]
+    activity.state = ActivityState.READY
+    activity.blocked_on = None
+    activity.plan = Plan(id="p", goal="watch", steps=[Step("wait", {})], pending=(_monitoring(),))
+    activity.step_index = 1
+    activity.condition_batch = [state]
+    activity.condition_verdict = ConditionVerdict(retired=(0,))
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.pending_conditions == []
+    assert state.condition in activity.retired_conditions
+
+
+async def test_the_quiet_sweep_is_never_asked_about_a_window_the_clock_owns(
+    tmp_path: Path,
+) -> None:
+    """The same guard on the other judge, and here it also saves the call outright: the condition
+    is already answered every tick for free by `retire_expired`, so putting it in front of a model
+    buys nothing but the chance of a wrong answer."""
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    llm = FakeLLMClient(json.dumps({"retired": [0]}))
+    cycle, working, registry = _cycle(tmp_path, clock=clock, llm=llm)
+    await registry.join(_ORIGIN)
+    activity = _blocked_on(Activity(id="a", goal="watch", context={}), _monitoring())
+    activity.pending_conditions[0].declared_at = clock.now()
+    working.activities["a"] = activity
+
+    clock.advance(60)
+    for _ in range(3):
+        await cycle.strategies.observe.observe(cycle)
+        for _ in range(6):
+            await asyncio.sleep(0)
+
+    assert len(activity.pending_conditions) == 1
+    assert llm.calls == []
+
+
+async def test_the_quiet_sweep_still_judges_the_conditions_the_clock_abstained_on(
+    tmp_path: Path,
+) -> None:
+    """A mixed activity: one window the clock owns, one event-shaped condition beside it. Filtering
+    the batch must not cost the second condition its sweep — that sweep is the only thing that ever
+    ends it."""
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    llm = FakeLLMClient(json.dumps({"retired": [0]}))
+    cycle, working, registry = _cycle(tmp_path, clock=clock, llm=llm)
+    await registry.join(_ORIGIN)
+    event_shaped = _monitoring(Until(text="the Film Production Day has taken place"))
+    activity = _blocked_on(Activity(id="a", goal="watch", context={}), _monitoring(), event_shaped)
+    for state in activity.pending_conditions:
+        state.declared_at = clock.now()
+    working.activities["a"] = activity
+
+    clock.advance(60)
+    for _ in range(2):  # one pass spawns the judgement, the next applies the parked verdict
+        await cycle.strategies.observe.observe(cycle)
+        for _ in range(6):
+            await asyncio.sleep(0)
+
+    # Index 0 of the *judged* batch is the event-shaped one, since the timed one never entered it —
+    # the clock-owned window is still on watch and the judged condition is the one that retired.
+    assert [s.condition for s in activity.pending_conditions] == [_monitoring()]
+    assert event_shaped in activity.retired_conditions
 
 
 # ------------------------------------------------------------------------------------------------

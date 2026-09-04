@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -80,8 +80,18 @@ class _NullTransport:
 
 
 class _FixedClock:
+    """Domain time these tests can move independently of host wall-clock. Advanceable because a
+    step-declared window is time-bounded, and a time-bounded window is closed by the clock rather
+    than by a judged verdict (ADR-0027 §5) — so a test that needs one closed has to move it."""
+
+    def __init__(self) -> None:
+        self._now = datetime(2024, 10, 15, 9, 0, tzinfo=UTC)
+
     def now(self) -> datetime:
-        return datetime(2024, 10, 15, 9, 0, tzinfo=UTC)
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += timedelta(seconds=seconds)
 
 
 def _cycle(
@@ -673,7 +683,8 @@ async def test_a_step_owned_window_holds_an_empty_deliberative_child_until_retir
     tmp_path: Path,
 ) -> None:
     llm = FakeLLMClient(json.dumps({"steps": []}))
-    cycle, working = _cycle(tmp_path, llm, clock=_FixedClock())
+    clock = _FixedClock()
+    cycle, working = _cycle(tmp_path, llm, clock=clock)
     await cycle.registry.join(_ORIGIN)
     parent = Plan(
         id="p",
@@ -692,11 +703,12 @@ async def test_a_step_owned_window_holds_an_empty_deliberative_child_until_retir
     assert activity.state is ActivityState.BLOCKED
     assert isinstance(activity.blocked_on, ConditionWait)
 
-    activity.condition_batch = list(activity.pending_conditions)
-    activity.condition_verdict = ConditionVerdict(retired=(0,))
-    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    # Closed the way a declared window is actually closed: the clock, in Observe, not a verdict.
+    clock.advance(241)
+    await cycle.strategies.observe.observe(cycle)
     result = await cycle.strategies.reason.reason(activity, working, cycle, _tick())
 
+    assert activity.pending_conditions == []
     assert activity.parent_frames == []
     assert result.step == parent.steps[1]
 

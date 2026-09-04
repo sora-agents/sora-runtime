@@ -127,10 +127,15 @@ def _exhausted(plan_pending: tuple[PendingCondition, ...] = ()) -> Activity:
     return Activity(id="a1", goal="book it and tell them", context={}, plan=plan, step_index=1)
 
 
-def _signal(working: WorkingMemory, path: str, source: str = "insim:are/Emails") -> None:
+def _signal(
+    working: WorkingMemory,
+    path: str,
+    source: str = "insim:are/Emails",
+    added: str = "e9",
+) -> None:
     working.signals.append(
         Percept(
-            source, Signal("state_changed", {"changes": [Change(path=path, added=("e9",))]}), 0.0
+            source, Signal("state_changed", {"changes": [Change(path=path, added=(added,))]}), 0.0
         )
     )
     working.signals_appended += 1
@@ -374,6 +379,43 @@ async def test_an_already_judged_signal_does_not_wake_it_again(tmp_path: Path) -
     await cycle.strategies.observe.observe(cycle)
 
     assert activity.state is ActivityState.BLOCKED
+
+
+async def test_a_change_queued_behind_the_one_being_judged_is_not_swallowed(
+    tmp_path: Path,
+) -> None:
+    """Each matching change earns its own judgement, including one that arrived before the fire.
+
+    `_match_signal` hands back the OLDEST unjudged match, but the mark used to jump to the log's
+    high-water mark — marking every change already queued *behind* that one as judged without ever
+    looking at it. A backlog only builds while nothing can judge it, which is precisely when the
+    agent is busy: on the run that found this, six calendar events were added while a single
+    sub-plan call was in flight and only five were ever judged. The sixth happened to need no
+    action, so it cost that run nothing, which is the whole problem with it.
+    """
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    activity = _blocked_with_condition(working)
+    _signal(working, "folders.INBOX.emails", added="e1")
+    _signal(working, "folders.INBOX.emails", added="e2")  # queues behind e1, judged by nothing yet
+
+    async def judge_once() -> None:
+        await cycle.strategies.observe.observe(cycle)
+        situated = await cycle.strategies.situate.situate([activity], working, cycle, _tick())
+        await cycle.strategies.reason.reason(activity, working, cycle, situated)
+        pending = activity.pending_inference
+        assert pending is not None
+        await asyncio.sleep(0)  # let the off-cycle judgement resolve
+        await cycle.strategies.observe.observe(cycle)
+        await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    await judge_once()
+    assert "e1" in llm.calls[0][1]
+    assert _eligible_conditions(activity, working)  # e2 is still owed a judgement
+
+    await judge_once()
+    assert "e2" in llm.calls[1][1]  # ... and gets its own, rather than re-judging e1
+    assert not _eligible_conditions(activity, working)
 
 
 async def test_a_failed_judgement_gives_the_change_back_so_the_wake_is_not_lost(
@@ -1050,6 +1092,44 @@ async def test_a_hallucinated_index_cannot_retire_a_live_condition(tmp_path: Pat
     await cycle.strategies.reason.reason(activity, working, cycle, _tick())
 
     assert activity.pending_conditions == [state]
+
+
+async def test_a_condition_retired_by_the_verdict_that_fired_it_still_runs_its_then(
+    tmp_path: Path,
+) -> None:
+    """One verdict naming ONE condition in both lists is the ordinary one-shot answer, not a
+    contradiction: `fired` says the awaited thing happened, `retired` only that nothing further is
+    being waited for. Reading the retirement as cancelling the fire drops committed work silently —
+    the judgement was already paid for and the mark advanced at fire time, so nothing re-fires it.
+
+    Seen on the 2026-09-04 Gaia2 "Time" smoke run: the judge answered `{"fired": [0], "retired":
+    [0]}` to calendar events being added, the `then` that deletes the conflicting preexisting
+    events never ran, and the agent went straight to telling the user it was done — against five
+    deletes the oracle made. The `_conditions_hold_frame` "committed work" branch and Reflect's
+    `condition_fired` guard were both written for exactly this shape, and neither was reachable for
+    a lone condition while the fire was being dropped here.
+    """
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm))
+    condition = _condition()
+    activity = _exhausted(plan_pending=(condition,))
+    state = PendingConditionState(condition=condition, evaluated_through=99)
+    activity.pending_conditions = [state]
+    activity.condition_batch = [state]
+    activity.condition_verdict = _verdict(fired=(0,), retired=(0,))
+    working.activities[activity.id] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    # Retirement still takes it off watch and records WHAT retired, so the frozen Plan.pending
+    # cannot re-arm it. The two halves are answers to different questions; both hold.
+    assert activity.pending_conditions == []
+    assert condition in activity.retired_conditions
+    # And the `then` is being planned: the work the fire committed to is owed either way.
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "then"
+    assert condition.then in "\n".join(prompt for _, prompt in llm.calls)
 
 
 # --------------------------------------------------------------------------------------------------

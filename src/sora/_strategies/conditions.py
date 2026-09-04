@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -197,6 +198,55 @@ def _domain_now(wm: WorkingMemory, source: str | None) -> datetime | None:
     return clock.now() if clock is not None else None
 
 
+def _clock_verdict(wm: WorkingMemory, state: PendingConditionState) -> bool | None:
+    """Has this condition's window closed? ``None`` when the clock cannot answer at all.
+
+    The three-valued answer is the point, and it is why this is one function rather than a
+    `has_expired` predicate: "the window is still open" and "this is not a question for the clock"
+    are opposite instructions to every caller. The first says the clock has *ruled* and the model
+    must not overrule it; the second says the clock abstained and the retirement judge is the only
+    thing that can end the wait. Collapsing them to False either strands the abstained condition
+    forever or lets a model close a window it cannot see the clock for.
+
+    ``None`` covers exactly the residue ADR-0027 §5 leaves to the judge: an event-shaped `until`
+    (no `seconds`, nothing to resolve), a declared bound with no anchor because the workspace could
+    not tell domain time when it was lifted, a watch whose workspace has no clock, and a clock
+    answering with a naive instant — which names no point two clocks could be compared on. None of
+    them may fall back to `time.time()`, whose answer under a simulation is off by decades.
+
+    An inherited deadline is consulted even when this condition declares no `until` at all: a
+    replan that drops the clause entirely is the same lost bound as one that restates it
+    event-shaped, and neither makes the window it was given eternal.
+    """
+    until = state.condition.until
+    declared = until.deadline(state.declared_at) if until else None
+    deadline = declared or state.inherited_deadline
+    if deadline is None:
+        return None
+    now = _domain_now(wm, state.condition.watch.source)
+    if now is None or now.tzinfo is None or deadline.tzinfo is None:
+        return None
+    return now >= deadline
+
+
+def _clock_owns_retirement(wm: WorkingMemory, state: PendingConditionState) -> bool:
+    """Is retiring this condition the clock's call rather than a model's? (ADR-0027 §5)
+
+    A time-bounded `until` is a comparison, not a judgement — `retire_expired` resolves it against
+    the watched workspace's own clock, every tick, at no model cost. Both judges are nonetheless
+    *shown* the `until` prose (the batched one needs it to read the `when` in context) and neither
+    is ever told what domain time it is, so a `retired` either returns for such a condition is a
+    guess against a clock it cannot see. The clock's answer wins and the guess is dropped.
+
+    Erring in this direction is the same choice `retire_expired` makes: retiring early ends a
+    window that is still open, which is precisely the failure ADR-0027 was written to fix. Seen on
+    the 2026-09-04 Gaia2 "Time" smoke run — the batched judge retired a declared four-minute
+    monitoring window about one minute in, and the calendar events injected after that were never
+    observed.
+    """
+    return _clock_verdict(wm, state) is not None
+
+
 def _unclosable_window(activity: Activity, sub_plan: Plan, wm: WorkingMemory) -> str | None:
     """Plan validation for a maintenance sub-goal whose window nothing could ever close — the
     defect string for a replan, or None when the plan is fine (ADR-0027 §6).
@@ -344,8 +394,35 @@ def _condition_watches(activity: Activity) -> tuple[SignalWait, ...]:
     return tuple(seen)
 
 
-def _match_signal(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> Percept | None:
-    """Return the first retained signal satisfying a declared wait."""
+@dataclass(frozen=True)
+class _Match:
+    """One change that opened a condition's gate, and how far judging it advances that condition.
+
+    The marks are the point. A condition reads two independently-appended logs, and a match comes
+    from exactly one of them: `marks_for` clears the matched entry alone and leaves the other log's
+    cursor untouched, so anything queued elsewhere — or behind this entry in the same log — still
+    earns its own judgement. Advancing to a log's high-water mark instead is what swallowed a
+    backlog (see the fire-time advance in `DefaultReasonStrategy._evaluate_pending_conditions`).
+    """
+
+    percept: Percept
+    sequence: int
+    derived: bool
+
+    def marks_for(self, state: PendingConditionState) -> tuple[int, int]:
+        """This condition's (evaluated_through, derived_through) once this match has been judged."""
+        cleared = self.sequence + 1
+        if self.derived:
+            return state.evaluated_through, cleared
+        return cleared, state.derived_through
+
+
+def _match_signal(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> _Match | None:
+    """Return the first retained signal satisfying a declared wait, with its sequence number.
+
+    The sequence, not just the percept, because "first" is load-bearing: what the caller owes this
+    match is a mark that clears exactly it and nothing standing behind it (see `_Match`).
+    """
     first_seq = wm.signals_appended - len(wm.signals)
     for offset, percept in enumerate(wm.signals):
         if first_seq + offset < since:
@@ -355,11 +432,11 @@ def _match_signal(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> Per
             and (wait.source is None or percept.source == wait.source)
             and watch_matches(wait.path, wait.kind, changes_of(percept.payload))
         ):
-            return percept
+            return _Match(percept=percept, sequence=first_seq + offset, derived=False)
     return None
 
 
-def _match_derived(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> Percept | None:
+def _match_derived(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> _Match | None:
     """Return the first retained derived change satisfying a declared wait."""
     first_seq = wm.property_changes_appended - len(wm.property_changes)
     for offset, percept in enumerate(wm.property_changes):
@@ -368,13 +445,13 @@ def _match_derived(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> Pe
         if wait.source is not None and percept.source != wait.source:
             continue
         if watch_matches(wait.path, wait.kind, list(percept.payload.changes)):
-            return percept
+            return _Match(percept=percept, sequence=first_seq + offset, derived=True)
     return None
 
 
 def _eligible_conditions(
     activity: Activity, wm: WorkingMemory
-) -> list[tuple[PendingConditionState, Percept]]:
+) -> list[tuple[PendingConditionState, _Match]]:
     """The conditions whose gate has opened on a signal they have not already judged.
 
     This is the whole cost control: a condition is only ever evaluated against a change that
@@ -389,7 +466,7 @@ def _eligible_conditions(
     addition. `SignalWait.kind` is what separates the two, and it degrades open (see
     `_kind_matches_one`), so a watch stays correct on an adapter that cannot report direction.
     """
-    eligible: list[tuple[PendingConditionState, Percept]] = []
+    eligible: list[tuple[PendingConditionState, _Match]] = []
     for state in activity.pending_conditions:
         match = _match_signal(wm, state.condition.watch, since=state.evaluated_through)
         if match is None:
@@ -464,10 +541,25 @@ class ConditionRetirement:
         activity = self._candidate(cycle.working)
         if activity is None:
             return
-        judged = list(activity.pending_conditions)
+        # Only what the clock abstained on. A condition `retire_expired` owns is already answered
+        # every tick for free, and showing it here buys a guess against a clock the judge is never
+        # told the reading of (`_clock_owns_retirement`).
+        judged = [
+            state
+            for state in activity.pending_conditions
+            if not _clock_owns_retirement(cycle.working, state)
+        ]
         _checked, misses, _seen = self._marks.get(activity.id, (0.0, 0, 0))
         # Marked at fire time, not on resolve, so a slow call cannot be re-fired underneath itself.
+        # `seen` counts what was *judged*, not what is pending: a clock-owned condition arriving
+        # later is not a reason to re-ask a question it is not part of.
         self._marks[activity.id] = (time.time(), misses, len(judged))
+        if not judged:
+            # Nothing for the judge on this activity. Take the miss rather than returning bare, or
+            # `_candidate` re-picks it every tick for a call that is never made — and, worse, keeps
+            # picking it over an activity that does have a question outstanding.
+            self._marks[activity.id] = (time.time(), misses + 1, len(judged))
+            return
         # Agent-level, like both other judges and unlike a `_ground_`/`_select_` call: retirement
         # asks whether waiting is over, and the evidence for that ("the slot has taken place") is
         # routinely on a tool the waiting activity never touches.
@@ -585,22 +677,9 @@ class ConditionRetirement:
 
     @staticmethod
     def _has_expired(wm: WorkingMemory, state: PendingConditionState) -> bool:
-        until = state.condition.until
-        # An inherited deadline is consulted even when this condition declares no `until` at all: a
-        # replan that drops the clause entirely is the same lost bound as one that restates it
-        # event-shaped, and neither makes the window it was given eternal.
-        declared = until.deadline(state.declared_at) if until else None
-        deadline = declared or state.inherited_deadline
-        if deadline is None:
-            # Either event-shaped (the judge's question, not the clock's), or a declared bound with
-            # no anchor because the workspace could not tell domain time when it was lifted.
-            return False
-        now = _domain_now(wm, state.condition.watch.source)
-        if now is None or now.tzinfo is None or deadline.tzinfo is None:
-            # No clock to ask, or one answering with a naive instant — which names no point two
-            # clocks could be compared on. Either way this is not the pass that guesses.
-            return False
-        return now >= deadline
+        # Only a definite "the window is spent" retires here. An abstention (`None` — event-shaped,
+        # or a bound with no clock behind it) is the judge's question, not this pass's guess.
+        return _clock_verdict(wm, state) is True
 
     async def _drop_retired(
         self, cycle: DecisionCycle, activity: Activity, retiring: list[PendingConditionState]

@@ -2547,9 +2547,10 @@ class ProceduralMemory:
 
         There is no `changes` argument for the same reason: the input to this judgement is the
         world as it currently stands, not an event, because the case it exists for is the one where
-        no event ever arrives. What it can answer without a domain clock is an event-shaped `until`
-        ("the Film Production Day has taken place"); a time-bounded one is answered here too for
-        now, but wants resolving mechanically against the workspace's clock at no model cost.
+        no event ever arrives. What it answers is an event-shaped `until` ("the Film Production Day
+        has taken place"). A time-bounded one never reaches here at all — the caller resolves it
+        against the watched workspace's clock, at no model cost, and does not put a window the
+        clock owns in front of a model it never tells the time to (ADR-0027 §5).
 
         Retire-only is enforced at the boundary, not merely asked for: a `fired` in the reply is
         dropped, so a model that answers the wrong question cannot make the agent redo work.
