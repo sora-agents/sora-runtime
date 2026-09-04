@@ -104,7 +104,8 @@ and X2's adaptive policy will plug in later). The shipped levels:
   is cheaper than "every cycle."
 
 `before_writes` is framed as the **default checkpoint policy**: its implicit checkpoint is "every
-side-effecting op." Author-declared checkpoints (ROADMAP D5) generalize it for dense-write/embodied
+side-effecting op." Author-declared checkpoints — a deferred generalization letting a manual name where
+re-checking is worthwhile — generalize it for dense-write/embodied
 tools where that implicit rule degenerates to a check almost every cycle — so this scale is
 forward-compatible, not a retrofit.
 
@@ -281,8 +282,8 @@ sub-goal makes the parent's next write revalidate rather than skip), so it stand
   [ADR-0022](0022-plan-representation-context-guard-and-subgoals.md)'s "reconsideration is
   cycle-owned, never a plan keyword" boundary is *restored*, not softened.
 * The reconsideration policy is a **Protocol** (protocol-over-inheritance), wired via
-  `agent.yaml`'s `strategies.context_adaptation`. **Per-agent now; per-activity later** (ROADMAP D4:
-  a delegated/background sub-task may commit differently from its parent).
+  `agent.yaml`'s `strategies.context_adaptation`. **Per-agent now; per-activity later** is deferred
+  (a delegated/background sub-task may commit differently from its parent).
 * The **post-completion** "did the world change such that my finished plan is now wrong" check is
   **Reflect's** job — Reflect already owns completion judgment — not a `context_adaptation` tier.
 * The model judgment is **best-effort, not a guarantee** (same reliability class as the planner). For
@@ -316,10 +317,10 @@ thesis) at the centre rather than a bespoke signal handler.
 * The revalidation is best-effort — it can miss a subtle invalidation or over-fire; the deterministic
   app-level override exists precisely for cases where that is unacceptable.
 * `before_writes` assumes side-effecting ops are sparse commitment points; a dense-write/embodied
-  tool degenerates it toward a per-cycle revalidation (ROADMAP D5's author-declared checkpoints are the
+  tool degenerates it toward a per-cycle revalidation (author-declared checkpoints, deferred, are the
   planned generalization).
-* A static setting approximates an unknown, possibly time-varying world-change rate (ROADMAP X2's
-  adaptive policy is the planned refinement).
+* A static setting approximates an unknown, possibly time-varying world-change rate (a policy that
+  adapts the commitment level to the observed world-change rate is the planned refinement, deferred).
 * New machinery: a pluggable reconsideration-policy seam, a pluggable `ChangeGate` seam
   (`strategies.change_gate`, default `PerceptionSignatureGate`), an
   `OperationSpecification.side_effecting` flag, and a per-plan baseline snapshot on the
@@ -380,5 +381,5 @@ thesis) at the centre rather than a bespoke signal handler.
 * Reuses the [ADR-0023](0023-structured-value-data-ops.md) mechanical-vs-`$decide` split in spirit:
   the change-gate is the cheap mechanical tier; the relevance re-check is the escalation, throttled by
   the commitment dial rather than run every cycle.
-* ROADMAP: D4 (per-activity override), D5 (author-declared checkpoints for dense-write tools), X2
-  (adaptive commitment tuned to the world-change rate).
+* Deferred follow-on work: a per-activity policy override, author-declared checkpoints for
+  dense-write tools, and adaptive commitment tuned to the observed world-change rate.

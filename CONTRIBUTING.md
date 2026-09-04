@@ -1,6 +1,6 @@
 # Contributing to S-ORA
 
-Thanks for your interest in the S-ORA runtime. This project is currently in **README-driven design** — see [README.md](README.md) for the conceptual model, [docs/reference/python-api.md](docs/reference/python-api.md) for the exact type/signature reference, [EXAMPLES.md](EXAMPLES.md) for worked scenarios, and [docs/architecture/adrs/](docs/architecture/adrs/) for why specific decisions were made before implementation started. [ROADMAP.md](ROADMAP.md) tracks where implementation currently stands.
+Thanks for your interest in the S-ORA runtime. This project is currently in active development — see [README.md](README.md) for pointers to the conceptual model, [docs/reference/python-api.md](docs/reference/python-api.md) for the exact type/signature reference, [EXAMPLES.md](EXAMPLES.md) for worked scenarios, and [docs/architecture/adrs/](docs/architecture/adrs/) for why specific decisions were made before implementation started. [ROADMAP.md](ROADMAP.md) tracks the open work remaining before the first release.
 
 ## Getting set up
 
@@ -26,7 +26,7 @@ If a change reverses or refines an accepted decision in [docs/architecture/adrs/
 
 ## Testing
 
-This project follows TDD where practical: write a failing test that captures the expected behavior, implement against it, then refactor. See [ROADMAP.md](ROADMAP.md) for the current phase and feature order — fakes and determinism come before real network adapters or model-backed strategies, so keep new tests in that spirit (prefer a fake `WorkspaceAdapter`/deterministic `ReasonStrategy` over a real one unless the real one is specifically what's being tested).
+This project follows TDD where practical: write a failing test that captures the expected behavior, implement against it, then refactor. Fakes and determinism come before real network adapters or model-backed strategies, so keep new tests in that spirit (prefer a fake `WorkspaceAdapter`/deterministic `ReasonStrategy` over a real one unless the real one is specifically what's being tested).
 
 ## Code style
 

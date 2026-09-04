@@ -60,7 +60,7 @@ MCP push surface at all, and belongs on the transport seam, not the adapter's re
 So **in-process won**, because the two channels MCP makes hard become direct method calls on shared
 objects, with no ARE changes and no framework-fighting. **ARE-over-MCP (option b) is not discarded** —
 it is retained as a backlog/exploratory item (a launcher + poll-on-observe spike whose findings feed
-protocol-interop discussion in the WebAgents CG); it does not gate the release. See ROADMAP.md.
+protocol-interop discussion in the WebAgents CG); it does not gate the release.
 
 Trade-offs accepted with (a): it gives up exercising a real MCP wire for the dynamic path (the static
 seeded MCP demo keeps that), and it carries the ARE thread-safety burden documented under Findings.
@@ -159,8 +159,8 @@ undo/modify rather than duplicating" instruction is a commitment-aware
 **plan prompt** (`reconciling_plan_prompt`, wired via `agent.yaml`'s `procedural.plan_prompt`), *not*
 BDI-style commitment machinery (single-minded/open-minded reconsideration as a first-class pluggable
 policy) — that is deferred. Hard-interrupt preemption itself is now *shipped*
-([ADR-0020](../adrs/0020-hard-interrupt-and-await-input.md), the `DecisionCycle.interrupt()` item in
-ROADMAP.md); what remains deferred is only the *timing* — an off-cycle ARE push would turn today's
+([ADR-0020](../adrs/0020-hard-interrupt-and-await-input.md), via `DecisionCycle.interrupt()`); what
+remains deferred is only the *timing* — an off-cycle ARE push would turn today's
 Observe-cadence preemption into true mid-Reason abandonment. The policy and handler are pinned by
 deterministic fakes in `tests/test_are_sim_strategies.py`.
 
@@ -253,4 +253,4 @@ Four claims were checked directly against ARE's source (`environment.py`, `apps/
 * Applies [ADR-0012](../adrs/0012-percepts-vs-messages.md) (USER messages stay on the transport, not the
   signal/percept path) and [ADR-0003](../adrs/0003-adapters-not-tool-authoring.md) (the adapter imports
   ARE's tools, it does not author them).
-* The ARE-over-MCP alternative (shape b) is tracked as a backlog/exploratory item in ROADMAP.md.
+* The ARE-over-MCP alternative (shape b) remains a backlog/exploratory item, not discarded.

@@ -2,7 +2,7 @@
 
 A runtime for practical agents in dynamic and asynchronous environments.
 
-> **Status:** this project is under active development. The core runtime — the five-phase decision cycle, activities, memory modules, the action registry, and the terminal CLI — is implemented and covered by an extensive test suite (see [ROADMAP.md](ROADMAP.md) for the phase-by-phase build-out); advanced features (richer dynamic-environment handling, additional protocol adapters, multimodal perception, full benchmark coverage) are still in progress. [EXAMPLES.md](EXAMPLES.md) remains a worked spec scenario, [docs/reference/python-api.md](docs/reference/python-api.md) is the exact type/signature reference, and [docs/architecture/adrs/](docs/architecture/adrs/) records why specific decisions were made.
+> **Status:** this project is under active development. The core runtime — the five-phase decision cycle, activities, memory modules, the action registry, and the terminal CLI — is implemented and covered by an extensive test suite; advanced features (richer dynamic-environment handling, additional protocol adapters, multimodal perception, full benchmark coverage) are still in progress — [ROADMAP.md](ROADMAP.md) tracks what remains before the first release. [EXAMPLES.md](EXAMPLES.md) remains a worked spec scenario, [docs/reference/python-api.md](docs/reference/python-api.md) is the exact type/signature reference, and [docs/architecture/adrs/](docs/architecture/adrs/) records why specific decisions were made.
 
 Key features of a S-ORA agent:
 - asynchronous at all levels: uses tools and communicates asynchronously

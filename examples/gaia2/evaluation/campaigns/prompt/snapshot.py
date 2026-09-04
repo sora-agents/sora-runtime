@@ -167,7 +167,7 @@ def build_prompt_snapshot(*, source_revision: str) -> dict[str, Any]:
         "provenance": {
             "source_revision": source_revision,
             # The isolated baseline was captured before any prompt source changed. Task-owned
-            # harness/roadmap changes do not make the source prompt dirty.
+            # harness or planning-document changes do not make the source prompt dirty.
             "prompt_source_dirty_diff_sha256": None,
         },
         "prompts": _prompt_rows(),

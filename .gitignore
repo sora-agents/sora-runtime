@@ -55,3 +55,9 @@ examples/gaia2/scenarios/
 
 # Documentation
 site/
+
+# Local working notes: session-scoped design analysis and in-flight campaign task lists
+# (prompt-consolidation, release analyses, failure write-ups). Deliberately untracked — these
+# churn per session and their conclusions are distilled into tracked ADRs, design notes under
+# docs/architecture/, or ROADMAP.md when they land. Delete a note once it has been distilled.
+notes/
