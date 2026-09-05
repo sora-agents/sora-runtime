@@ -868,3 +868,72 @@ async def test_the_remembered_deadline_survives_a_replan(tmp_path: Path) -> None
     assert activity.window_deadlines[_condition_window_key(_monitoring())] == datetime(
         2024, 10, 15, 9, 4, tzinfo=UTC
     )
+
+
+async def test_a_clock_owned_condition_does_not_defeat_the_retirement_backoff(
+    tmp_path: Path,
+) -> None:
+    """The sweep's pacing counts must compare like with like, or the backoff never accumulates.
+
+    `retire_quiet` marks `seen` with what it actually put in front of the judge — the conditions
+    the clock abstained on. `_candidate` compared that against the *unfiltered* pending set, so a
+    single time-bounded window sitting beside an event-shaped condition made "a condition was
+    declared since the last look" true on every tick, zeroing `misses` forever. The judge was then
+    re-asked every interval for the whole life of the window, which is exactly the model spend the
+    backoff exists to ration.
+    """
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    llm = FakeLLMClient(json.dumps({"retired": []}))
+    cycle, working, registry = _cycle(tmp_path, clock=clock, llm=llm)
+    await registry.join(_ORIGIN)
+    observe = DefaultObserveStrategy(retirement_interval=3600.0)
+    activity = _blocked_on(
+        Activity(id="a", goal="watch", context={}),
+        _monitoring(),  # time-bounded: the clock owns it, so it never reaches the judge
+        _monitoring(Until(text="the Film Production Day has taken place")),  # event-shaped
+    )
+    for state in activity.pending_conditions:
+        state.declared_at = clock.now()
+    working.activities["a"] = activity
+
+    clock.advance(60)  # inside the four-minute window, so nothing expires mechanically
+    for _ in range(2):  # one pass spawns the judgement, the next applies the parked verdict
+        await observe.observe(cycle)
+        for _ in range(6):
+            await asyncio.sleep(0)
+
+    assert observe._retirement._marks["a"][1] == 1  # the empty verdict earned a miss
+
+    await observe.observe(cycle)
+
+    assert observe._retirement._marks["a"][1] == 1  # ... and the clock-owned window keeps it
+
+
+async def test_an_all_clock_owned_activity_is_never_picked_for_the_sweep(tmp_path: Path) -> None:
+    """Nothing to ask means nothing to spend the tick's one candidate slot on. Picking it anyway
+    consumed the slot for a call that is never made, and — since the sweep takes one activity per
+    pass, longest-unchecked first — kept shadowing an activity that did have a question."""
+    clock = FakeClock(datetime(2024, 10, 15, 9, 0, tzinfo=UTC))
+    llm = FakeLLMClient(json.dumps({"retired": [0]}))
+    cycle, working, registry = _cycle(tmp_path, clock=clock, llm=llm)
+    await registry.join(_ORIGIN)
+    observe = DefaultObserveStrategy(retirement_interval=3600.0)
+    timed = _blocked_on(Activity(id="timed", goal="watch the window", context={}), _monitoring())
+    timed.pending_conditions[0].declared_at = clock.now()
+    event_shaped = _blocked_on(
+        Activity(id="event", goal="watch for the day", context={}),
+        _monitoring(Until(text="the Film Production Day has taken place")),
+    )
+    event_shaped.pending_conditions[0].declared_at = clock.now()
+    working.activities["timed"] = timed
+    working.activities["event"] = event_shaped
+
+    clock.advance(60)
+    for _ in range(2):  # one pass spawns the judgement, the next applies the parked verdict
+        await observe.observe(cycle)
+        for _ in range(6):
+            await asyncio.sleep(0)
+
+    assert "timed" not in observe._retirement._marks  # never a candidate, so never marked
+    assert event_shaped.pending_conditions == []  # the activity with a real question got the slot
+    assert timed.pending_conditions  # ... and the clock keeps its own window on watch

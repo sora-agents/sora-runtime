@@ -170,8 +170,9 @@ def _lift_step_conditions(
             continue
         known.add(condition)
         log.info(
-            "reason: sub-goal step declares a pending condition -> %r (until %r)",
+            "reason: sub-goal step declares a pending condition -> %r (watching %r, until %r)",
             condition.when,
+            condition.watch,
             condition.until.text if condition.until else None,
         )
         activity.pending_conditions.append(_lifted(condition, activity, wm, owner))
@@ -538,28 +539,16 @@ class ConditionRetirement:
             return
         if self._in_flight:
             return
-        activity = self._candidate(cycle.working)
-        if activity is None:
+        picked = self._candidate(cycle.working)
+        if picked is None:
             return
-        # Only what the clock abstained on. A condition `retire_expired` owns is already answered
-        # every tick for free, and showing it here buys a guess against a clock the judge is never
-        # told the reading of (`_clock_owns_retirement`).
-        judged = [
-            state
-            for state in activity.pending_conditions
-            if not _clock_owns_retirement(cycle.working, state)
-        ]
+        activity, judged = picked
         _checked, misses, _seen = self._marks.get(activity.id, (0.0, 0, 0))
         # Marked at fire time, not on resolve, so a slow call cannot be re-fired underneath itself.
         # `seen` counts what was *judged*, not what is pending: a clock-owned condition arriving
-        # later is not a reason to re-ask a question it is not part of.
+        # later is not a reason to re-ask a question it is not part of. `_candidate` compares
+        # against the same filtered count for exactly that reason — see `_judgeable`.
         self._marks[activity.id] = (time.time(), misses, len(judged))
-        if not judged:
-            # Nothing for the judge on this activity. Take the miss rather than returning bare, or
-            # `_candidate` re-picks it every tick for a call that is never made — and, worse, keeps
-            # picking it over an activity that does have a question outstanding.
-            self._marks[activity.id] = (time.time(), misses + 1, len(judged))
-            return
         # Agent-level, like both other judges and unlike a `_ground_`/`_select_` call: retirement
         # asks whether waiting is over, and the evidence for that ("the slot has taken place") is
         # routinely on a tool the waiting activity never touches.
@@ -574,8 +563,27 @@ class ConditionRetirement:
         )
         _spawn_tracked(self._tasks, self._judge(cycle, activity, judged, observed))
 
-    def _candidate(self, wm: WorkingMemory) -> Activity | None:
-        """The one activity to sweep this tick, or None.
+    @staticmethod
+    def _judgeable(wm: WorkingMemory, activity: Activity) -> list[PendingConditionState]:
+        """The activity's conditions this sweep could actually put in front of the judge.
+
+        Only what the clock abstained on. A condition `retire_expired` owns is already answered
+        every tick for free, and showing it to the judge buys a guess against a clock it is never
+        told the reading of (`_clock_owns_retirement`).
+
+        Computed in `_candidate` rather than after the pick, because *every* decision the sweep
+        makes about an activity has to be made on this set: the pick itself (an activity with
+        nothing to ask must not spend the tick's one slot, nor shadow one that does), the `seen`
+        mark, and the backoff's "something new arrived" comparison against it. Comparing a filtered
+        `seen` against the unfiltered pending count is what silently defeated the backoff — a
+        single time-bounded window beside an event-shaped condition made the reset fire forever.
+        """
+        return [
+            state for state in activity.pending_conditions if not _clock_owns_retirement(wm, state)
+        ]
+
+    def _candidate(self, wm: WorkingMemory) -> tuple[Activity, list[PendingConditionState]] | None:
+        """The one activity to sweep this tick and the conditions to ask about, or None.
 
         One per tick, longest-unchecked first. The sweep's whole cost argument is that it comes out
         of slack, and N calls fired together on a single idle tick is not slack — nor would it stay
@@ -591,14 +599,23 @@ class ConditionRetirement:
             return None  # something can advance; the sweep never competes with it
         assert self._interval is not None  # guarded by the caller
         now = time.time()
-        due: list[tuple[float, Activity]] = []
+        due: list[tuple[float, Activity, list[PendingConditionState]]] = []
         for activity in wm.activities.values():
             if activity.state is ActivityState.TERMINATED or not activity.pending_conditions:
                 continue
+            judgeable = self._judgeable(wm, activity)
+            if not judgeable:
+                # Every condition here is the clock's to retire, so there is no question to ask.
+                # Skipping outright rather than picking and bailing: the sweep takes one activity
+                # per pass, so an activity that could never fire a call must not consume that pass
+                # — it would shadow, forever, an activity that does have a question outstanding.
+                continue
             checked, misses, seen = self._marks.get(activity.id, (0.0, 0, 0))
-            if misses and len(activity.pending_conditions) > seen:
+            if misses and len(judgeable) > seen:
                 # A condition declared since the last check deserves a prompt look — the backoff's
                 # premise ("the last look bought nothing") says nothing about one never looked at.
+                # Counted over the judgeable set alone, to match what `seen` was marked with: a
+                # clock-owned condition is not a question, so its arrival is not a reason to ask.
                 # Persisted, not just local: the stored count is what the next mark is built from,
                 # so a local reset makes the look prompt exactly once and then restores the whole
                 # accumulated backoff.
@@ -606,10 +623,11 @@ class ConditionRetirement:
                 self._marks[activity.id] = (checked, misses, seen)
             if checked and now - checked < self._interval * 2 ** min(misses, _RETIREMENT_BACKOFF):
                 continue
-            due.append((checked, activity))
+            due.append((checked, activity, judgeable))
         if not due:
             return None
-        return min(due, key=lambda entry: entry[0])[1]
+        checked, activity, judgeable = min(due, key=lambda entry: entry[0])
+        return activity, judgeable
 
     async def _judge(
         self,
