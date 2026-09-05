@@ -722,3 +722,58 @@ They now log `kept N of M`.
 
 **`PLAN_SYSTEM_PROMPT` changed again on this date** (where a maintenance sub-goal's `until` goes),
 so the same non-comparability applies.
+
+## Update (2026-09-05): a clock-freeze convention was built, then removed
+
+Kept as a record of what was learned, because the finding about ARE outlives the code: **a clock
+convention was implemented here and has been taken back out again.** Nothing in the harness freezes
+or fast-forwards the simulated clock any more. Runs are wall-paced, as stock ARE is.
+
+### The finding that stands
+
+ARE's own reference agent brackets every generation in `pause_env()` / `resume_env(offset)`
+(`agents/default_agent/base_agent.py:627,689`) and reads the offset from `completion_duration`.
+**No shipped engine ever sets that field** — both `litellm_engine.py` and `hf/hf_engine.py` end in
+`return res, None` — so `base_agent.py` logs "LLM Engine did not return any metadata", defaults the
+duration to `0`, and resumes with a zero offset. Generation costs the reference agent exactly
+nothing, and every published row therefore belongs to an agent that thinks instantaneously.
+
+This is the same failure family as the case-sensitive verdict parse and the `sanity_checker` prefix
+defect: a scoring-relevant path that is elaborate, was clearly live internally, and is inert in the
+public release. That pattern — not any single bug — is the argument that Gaia2 results have to be
+re-run rather than cited.
+
+Two incidental facts about ARE's clock, worth having if this is ever revisited: `TimeManager` guards
+`pause()` with `if not self.is_paused` but does **not** depth-count `resume()`, so the first resume
+ends everyone's window and the three ARE paths that already pause (the per-turn judge bracket, the
+reference agent's generation bracket, `wait_for_next_notification`) cannot nest. And `time_passed()`
+gates its frozen branch on `if self.is_paused and self.pause_passed_time:` — truthiness — so a
+window opened at exactly `t == 0.0` does not freeze at all.
+
+### Why it came out
+
+Two reasons, either sufficient on its own.
+
+**It broke event delivery.** The freeze shipped alongside an idle fast-forward that advanced the
+clock to the next scheduled event whenever the agent had nothing to do. That watcher called
+`SystemApp.wait_for_notification` on a worker thread while holding `AreSimulation`'s lock, and
+`Environment.wait_for_next_notification` pauses the time manager and drains ARE's event loop. In
+`logs/smoke-eval/sep5-time-smoke2.log` the oracle scheduled six calendar events inside a four-minute
+window (t = 31/65/91/121/183/221s) and the agent perceived exactly one — the t=31 event, which
+landed while it was busy planning and therefore *not* idle. The other five arrived while it was
+waiting on its condition, which is precisely when the watcher fires. The run was structurally
+healthy end to end (signal → condition fired → sub-plan → delete → wait → window expiry → retire →
+report) and still failed the write-count gate 1-against-5, because the events never reached it.
+
+**The harness it was built for is being replaced.** Evaluation is moving to the container-based
+gaia2-cli stack, whose event daemon advances the clock on every poll and never freezes. A freeze
+convention cannot be applied there, and no number from that harness is comparable to a published
+Gaia2 number regardless — so finishing this one would have bought a comparability it cannot deliver.
+
+### What was kept
+
+The pending-condition fixes that shared the branch: the fire-time high-water advance, the
+retirement-backoff accounting that stopped a clock-owned window from zeroing the miss counter, and
+the candidate filter that stops an all-clock-owned activity from consuming the sweep's one slot per
+tick. Those are independent of the clock convention and are covered by tests in
+`tests/test_domain_clock.py` and `tests/test_pending_conditions.py`.
