@@ -919,6 +919,36 @@ def test_a_defective_plan_is_not_described_as_merely_stale() -> None:
     assert "add_calendar_event" in user  # the un-run tail is still rendered
 
 
+def test_an_unfillable_gap_is_asked_about_first_and_in_the_plan_s_own_words() -> None:
+    """How the brief tells the planner to ASK, when the gap cannot be routed around at all.
+
+    Three properties, each pinned because dropping it silently reopens a defect that was observed
+    rather than theorized:
+
+    * **First, and alone.** The runtime's principal reads one channel, and a request for input
+      folded into "here is what I did" reads as an update and goes unanswered. Ordering is the
+      load-bearing half — ARE's per-turn scoring splits a run at each `send_message_to_user` and
+      compares the FIRST one, so a report emitted ahead of the ask is what gets read as the answer.
+    * **A literal, not a `$decide`.** The gap is already named in this very prompt, so there is
+      nothing left to phrase at execution time — and a `$decide` would hand the sentence to
+      grounding, whose own prompt carries none of this advice.
+    * **No prohibition on being helpful.** The rule is never to SUBSTITUTE a plausible value; it
+      is deliberately not "do not mention alternatives". Offering the near misses is good behavior
+      and costs nothing, so the default prompt does not spend a sentence forbidding it.
+    """
+    activity = _superseded_activity("product_id: matches is empty")
+    _system, user = default_plan_prompt(activity, {})
+
+    assert "FIRST `send_message_to_user` step" in user
+    assert "before any report on the other work" in user
+    assert "never folded into one" in user
+    # Literal wording, decided here rather than deferred to the grounder.
+    assert "literal sentence rather than a `$decide`" in user
+    # The correctness rule survives; the taste rule it is often confused with is not stated.
+    assert "Never substitute a value that merely looks plausible" in user
+    assert "alternative" not in user.lower()
+
+
 def test_a_stale_plan_keeps_the_reconsideration_brief() -> None:
     """The other half: nothing changes for a plan dropped because the world moved."""
     _system, user = default_plan_prompt(_superseded_activity(None), {})
@@ -926,6 +956,9 @@ def test_a_stale_plan_keeps_the_reconsideration_brief() -> None:
     assert "the world moved" in user
     assert "stale, not wrong throughout" in user
     assert "will fail in the same place" not in user
+    # The asking brief is defect-only: a plan overtaken by events has no gap to ask about, and
+    # telling this planner to open with a clarification would stall a replan that can just proceed.
+    assert "FIRST `send_message_to_user` step" not in user
 
 
 async def test_an_unresolvable_grounding_tags_the_bundle_with_its_defect(tmp_path: Path) -> None:
