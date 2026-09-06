@@ -133,7 +133,7 @@ class InterruptHandler(Protocol):
 
 
 class ReconsiderationPolicy(Protocol):
-    def should_check(self, side_effecting: bool | None) -> bool: ...
+    def decide(self, side_effecting: bool | None) -> ReconsiderationOutcome: ...  # SKIP|CHECK|REPLAN
 
 
 class ChangeGate(Protocol):

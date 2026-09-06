@@ -34,7 +34,9 @@ from sora._strategies.reconsideration import (
     ChangeGate,
     NoneReconsideration,
     PerceptionSignatureGate,
+    ReconsiderationOutcome,
     ReconsiderationPolicy,
+    ReplanOnChange,
 )
 from sora._strategies.reflect import DefaultReflectStrategy
 from sora._strategies.relevance import DefaultRelevanceJudge, RelevanceJudge
@@ -45,9 +47,11 @@ __all__ = [
     "DEFAULT_INFERENCE_DEADLINE",
     "DEFAULT_RETIREMENT_INTERVAL",
     "ReconsiderationPolicy",
+    "ReconsiderationOutcome",
     "NoneReconsideration",
     "BeforeWrites",
     "BeforeEachOp",
+    "ReplanOnChange",
     "ChangeGate",
     "PerceptionSignatureGate",
     "TickResult",

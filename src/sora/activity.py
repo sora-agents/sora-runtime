@@ -145,6 +145,14 @@ class Activity:
     # state, cleared on reset_for_replan.
     reconsider_baseline: object | None = None
     reconsider_verdict: bool | None = None
+    # Where the percept append logs stood when this plan's assumptions were fixed — the positional
+    # companion to reconsider_baseline, carried because the signature is opaque and so can say that
+    # perception moved but never *where*. Only the judge-free discard path reads it, to scope a
+    # replan to changes on tools the plan actually references; the model revalidation stays
+    # agent-level on purpose. Captured at infer time like the baseline (a plan installed a cycle
+    # later must still answer for a change that landed during its own inference), with an
+    # entry-time fallback for a reused plan.
+    reconsider_scope: tuple[int, int] | None = None
     # The plan the last reset_for_replan() discarded, kept for exactly one inference: the planning
     # prompt renders its un-run tail so the replacement is written against the intent it replaces
     # rather than from nothing (ADR-0024). Cleared by Observe once that replacement installs, so it
@@ -259,6 +267,7 @@ class Activity:
         # so the next plan re-baselines against its own starting world rather than a stale one.
         self.reconsider_baseline = None
         self.reconsider_verdict = None
+        self.reconsider_scope = None
         # Runaway-replan bookkeeping. Counting only — the cap, and what to do when it trips, belong
         # to the Reason strategy (as with the sub-goal depth breaker), not to a value type. Progress
         # since the last replan forgives everything before it: only replans that got *nowhere*

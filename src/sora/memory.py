@@ -209,6 +209,16 @@ class WorkingMemory:  # transient, in-process, fast
     # focused_tools: focusing a tool is an external action, loading its manual is internal.
     loaded_manuals: dict[str, Manual] = field(default_factory=dict)
 
+    def perception_cursor(self) -> tuple[int, int]:
+        """Where both append logs stand — the positional companion to a change-gate signature.
+
+        A signature answers *whether* perception moved; it is deliberately opaque (a pluggable gate
+        may return anything comparable), so it cannot answer *what* moved. A consumer that must
+        scope a reaction to its own sources needs the second question, and these counters are the
+        cheapest thing that survives the retention cap: they are monotonic, so a sequence number
+        keeps meaning the same thing after eviction."""
+        return (self.signals_appended, self.property_changes_appended)
+
     def drop_properties(self, keep: Callable[[str], bool]) -> None:
         """Prune `properties` in place to entries whose tool id satisfies `keep` — the shared
         mechanism behind `_unfocus_` (drop one tool) and `_filter_` (keep only the relevant set)."""

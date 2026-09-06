@@ -27,7 +27,7 @@ agent:
     # specific. The static MCP showcase, which never emits signals, keeps the simpler
     # ScheduleFromEmailStrategy and needs no reconsideration at all.
     reason: sora.strategies.DefaultReasonStrategy  # required; the model-backed default does the (re-)planning
-    context_adaptation: before_writes  # re-validate before each write; none | before_writes | before_each_op
+    context_adaptation: before_writes  # re-validate before each write; none | before_writes | before_each_op | replan_on_change
     # The pre-revalidation change-gate (WHETHER the world moved, vs context_adaptation's WHEN). The
     # runtime default (PerceptionSignatureGate) trips on ANY observable movement, so the agent's own
     # reply / read-flags / calendar writes would each spend a revalidation. This domain gate projects

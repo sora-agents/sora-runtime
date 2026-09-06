@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.action import (
@@ -30,10 +31,26 @@ if TYPE_CHECKING:
 # the *act* of reconsidering stays cycle-owned (ADR-0022/0019) — the policy only decides WHEN.
 
 
+class ReconsiderationOutcome(Enum):
+    """What a policy wants done at a commitment point whose change-gate has gone hot.
+
+    Three-valued rather than a bool because the *resolution* is a second axis from the *timing*: a
+    model revalidation is only worth its price when the percepts it will be shown carry enough to
+    answer with. In an environment whose perception is announcements rather than evidence (a signal
+    that says the world moved but not to what), the judge is asked to rule on the thing that woke
+    it and can only say "maybe" — so the call buys nothing the gate did not already know, and
+    discarding the plan outright is both cheaper and more honest.
+    """
+
+    SKIP = "skip"  # proceed: this step is not a commitment point worth guarding
+    CHECK = "check"  # spend a model revalidation and act on its verdict
+    REPLAN = "replan"  # discard the plan on a relevant change, with no model call
+
+
 class ReconsiderationPolicy(Protocol):
-    def should_check(self, side_effecting: bool | None) -> bool:
+    def decide(self, side_effecting: bool | None) -> ReconsiderationOutcome:
         """Given the side-effecting-ness of the step Reason is about to commit (True write, False
-        read, None unknown), decide whether to run the (gated) validity check before it."""
+        read, None unknown), decide whether to guard it and, if so, how."""
         ...
 
 
@@ -41,8 +58,8 @@ class NoneReconsideration:
     """``context_adaptation: none`` — never reconsider on ambient percepts (blind commitment).
     Failure-driven re-planning stays orthogonal and always on."""
 
-    def should_check(self, side_effecting: bool | None) -> bool:
-        return False
+    def decide(self, side_effecting: bool | None) -> ReconsiderationOutcome:
+        return ReconsiderationOutcome.SKIP
 
 
 class BeforeWrites:
@@ -50,16 +67,50 @@ class BeforeWrites:
     where acting on a stale plan does damage. Skips reads (side_effecting is False); an unknown
     (None) is treated as a write, so it is checked (conservative)."""
 
-    def should_check(self, side_effecting: bool | None) -> bool:
-        return side_effecting is not False
+    def decide(self, side_effecting: bool | None) -> ReconsiderationOutcome:
+        if side_effecting is False:
+            return ReconsiderationOutcome.SKIP
+        return ReconsiderationOutcome.CHECK
 
 
 class BeforeEachOp:
     """``context_adaptation: before_each_op`` — check before EVERY external step, read or write.
     Maximum caution; still op-gated, so it skips planning/grounding/waiting cycles."""
 
-    def should_check(self, side_effecting: bool | None) -> bool:
-        return True
+    def decide(self, side_effecting: bool | None) -> ReconsiderationOutcome:
+        return ReconsiderationOutcome.CHECK
+
+
+class ReplanOnChange:
+    """``context_adaptation: replan_on_change`` — guard the same points ``before_writes`` guards,
+    but resolve a hot gate by discarding the plan outright instead of asking a model whether it
+    still holds.
+
+    For environments whose perception is *announcement* rather than *evidence*. Where a tool
+    publishes observable state, a revalidation is worth its price: shown the changed state, the
+    judge can genuinely answer "that email is a newsletter, proceed" and save the replan. Where the
+    only percept is a signal saying something moved — no identifiers, no values — the judge is
+    handed the announcement that woke it and nothing else, so it can rarely do better than "maybe",
+    and the call is spent to learn what the gate already established. Replanning directly costs one
+    fewer model call and, unlike the judge, cannot rubber-stamp a plan it had no evidence about.
+
+    The trade is real and runs the other way on a rich environment: this policy never proceeds on a
+    change a judge would have dismissed, so on a noisy world it replans where ``before_writes``
+    would not. That is why the discard is scoped to changes on tools the plan actually references
+    (see `relevant_change_since`) — without that scope an unrelated app's signal would discard a
+    plan that never touched it.
+
+    **Precondition, and the reason this is not the default:** it is unsound on an adapter whose
+    signals include the agent's *own* writes. Such a signal lands on a tool the plan references by
+    construction, so every write would discard the plan that issued it. A judge filters that out by
+    reading the change; a mechanical trigger cannot. Use this only where perception is
+    environment-initiated, or where self-writes are otherwise excluded.
+    """
+
+    def decide(self, side_effecting: bool | None) -> ReconsiderationOutcome:
+        if side_effecting is False:
+            return ReconsiderationOutcome.SKIP
+        return ReconsiderationOutcome.REPLAN
 
 
 # WM/attention actions and WAIT never mutate the world, so they are never "writes"; every other
@@ -123,3 +174,36 @@ class PerceptionSignatureGate:
 
     def signature(self, wm: WorkingMemory) -> object:
         return _perception_signature(wm)
+
+
+def relevant_change_since(
+    wm: WorkingMemory, cursor: tuple[int, int] | None, sources: set[str] | None
+) -> bool:
+    """Did a percept from one of ``sources`` land at or after ``cursor``?
+
+    The scope a mechanical discard needs and a judged one deliberately does not have: a model
+    revalidation is shown the whole world *because* it has to reason about the change that woke it
+    (see the checkpoint's own note), whereas a discard with no reader would otherwise throw away a
+    calendar plan because a shopping app spoke.
+
+    Fails OPEN three ways, all for the same reason — a spurious replan costs one plan call, a
+    missed one costs the scenario. No cursor (the plan predates scope tracking) or no scope (the
+    activity has no plan, so every tool is potentially in play) means relevant. So does a cursor the
+    retention cap has outrun: entries between it and the oldest retained percept are gone, and
+    absence of evidence there is not evidence of absence."""
+    if cursor is None or sources is None:
+        return True
+    signals_from, changes_from = cursor
+    for log, appended, since in (
+        (wm.signals, wm.signals_appended, signals_from),
+        (wm.property_changes, wm.property_changes_appended, changes_from),
+    ):
+        first = appended - len(log)
+        if first > since:
+            return True  # the cap evicted part of the window; cannot rule the change out
+        if any(
+            first + offset >= since and percept.source in sources
+            for offset, percept in enumerate(log)
+        ):
+            return True
+    return False

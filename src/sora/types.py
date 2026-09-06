@@ -541,6 +541,11 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     # during the call's flight then earns its own reconsideration). None for "ground"/"select" and
     # for a reused plan (no fresh inference), which falls back to an entry-time baseline.
     baseline: object | None = None
+    # Where the percept append logs stood at fire time, alongside `baseline` and for the same
+    # reason: the signature says perception moved, this says where to look. Only a plan-installing
+    # kind carries it (the judge-free discard path scopes against the plan being installed); None
+    # for the others and for a reused plan.
+    scope: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", InferenceKind.parse(self.kind))

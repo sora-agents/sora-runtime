@@ -164,6 +164,7 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                 kind = activity.pending_inference.kind
                 out = activity.pending_inference.out  # set only for kind=="select"
                 baseline = activity.pending_inference.baseline  # set for plan/subgoal (ADR-0024)
+                scope = activity.pending_inference.scope  # its positional companion
                 activity.pending_inference = None
                 if res.unresolvable is not None:
                     # An escalation asked to resolve a reference reported that it names data
@@ -293,8 +294,13 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                     activity.superseded = None
                     # Anchor the context-adaptation gate to the world this plan was inferred
                     # against (ADR-0024), so a change that landed *during* inference is caught
-                    # at the first checkpoint rather than folded into a later baseline.
+                    # at the first checkpoint rather than folded into a later baseline. The scope
+                    # cursor is anchored to the same instant and for the same reason: anchoring it
+                    # at install time instead would put a change that arrived mid-inference behind
+                    # the cursor, and a scoped re-check would then rule out the very change the
+                    # plan never saw.
                     activity.reconsider_baseline = baseline
+                    activity.reconsider_scope = scope
                     activity.state = ActivityState.READY
                     log.info("observe: resolved inferred plan for activity %s", activity.id)
                     # The plan body itself only at DEBUG: it belongs in the full --log-file
@@ -340,6 +346,7 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                     activity.history_mark = len(activity.history)
                     # Re-anchor the gate to the sub-plan's own infer-time world (ADR-0024).
                     activity.reconsider_baseline = baseline
+                    activity.reconsider_scope = scope
                     activity.state = ActivityState.READY
                     log.info(
                         "observe: entered %s for activity %s",

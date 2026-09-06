@@ -21,6 +21,7 @@ from sora._strategies.interaction import (
     _await_input,
 )
 from sora._strategies.observe import (
+    referenced_tools,
     scoped_snapshot,
 )
 from sora._strategies.parameters import (
@@ -29,7 +30,9 @@ from sora._strategies.parameters import (
     _undeclared_params,
 )
 from sora._strategies.reconsideration import (
+    ReconsiderationOutcome,
     _step_side_effecting,
+    relevant_change_since,
 )
 from sora._strategies.subgoals import (
     _DEFAULT_MAX_SUBGOAL_DEPTH,
@@ -310,6 +313,47 @@ class DefaultReasonStrategy:
             activity.step_index += 1
             return replace(result, activity=activity, step=grounded)
 
+    def _invalidate(self, activity: Activity, cause: str) -> None:
+        """Discard the current plan at a context-adaptation checkpoint and record why.
+
+        Shared by both resolutions of a hot gate — a judge returning "invalid" and a judge-free
+        policy discarding directly — because everything after the decision is identical: the same
+        reset, the same churn breaker, the same superseded bundle handed to the replanning prompt.
+        Only ``cause`` differs, and it exists so a trace can say which resolution took the plan."""
+        log.info("reason: plan invalidated by %s for %r", cause, activity.goal)
+        activity.reset_for_replan()  # -> re-infer next cycle against the current world
+        # A moving world no longer counts toward the replan breaker (see
+        # _replanning_would_loop), so this is the only place the pile-up shows: the agent is
+        # re-planning honestly each time and still never reaching its first write.
+        churn = sum(1 for d in activity.replan_trail if d is None)
+        if churn >= self._max_replan_attempts:
+            log.warning(
+                "reason: %d consecutive plans for activity %s invalidated by a moving "
+                "world with no operation run — the world may be changing faster than the "
+                "agent can commit to it",
+                churn,
+                activity.id,
+            )
+        # Trace what was dropped, from the bundle the reset parked (ADR-0024). Every frame's
+        # *whole* body, not the un-run tail the replanning prompt gets: a prompt pays per
+        # token and separately receives what already ran as history, whereas this is read by
+        # a human diffing it against the replacement, which installs logged whole. Suspended
+        # parents included — the reset drops the entire intention stack, so a discard taken
+        # inside a sub-plan throws away more than the frame in hand.
+        if activity.superseded is not None:
+            sup = activity.superseded
+            bodies = [render_steps(sup.plan.steps)]
+            bodies += [
+                f"-- suspended parent, at sub-goal step {i} --\n{render_steps(p.steps)}"
+                for p, i in reversed(sup.parent_frames)
+            ]
+            log.debug(
+                "reason: discarded plan for activity %s (was at step %d)\n%s",
+                activity.id,
+                sup.step_index,
+                "\n".join(bodies),
+            )
+
     async def _reconsider(
         self,
         step: Step,
@@ -329,39 +373,7 @@ class DefaultReasonStrategy:
             valid = activity.reconsider_verdict
             activity.reconsider_verdict = None
             if not valid:
-                log.info("reason: plan invalidated by context-adaptation for %r", activity.goal)
-                activity.reset_for_replan()  # -> re-infer next cycle against the current world
-                # A moving world no longer counts toward the replan breaker (see
-                # _replanning_would_loop), so this is the only place the pile-up shows: the agent is
-                # re-planning honestly each time and still never reaching its first write.
-                churn = sum(1 for d in activity.replan_trail if d is None)
-                if churn >= self._max_replan_attempts:
-                    log.warning(
-                        "reason: %d consecutive plans for activity %s invalidated by a moving "
-                        "world with no operation run — the world may be changing faster than the "
-                        "agent can commit to it",
-                        churn,
-                        activity.id,
-                    )
-                # Trace what was dropped, from the bundle the reset parked (ADR-0024). Every frame's
-                # *whole* body, not the un-run tail the replanning prompt gets: a prompt pays per
-                # token and separately receives what already ran as history, whereas this is read by
-                # a human diffing it against the replacement, which installs logged whole. Suspended
-                # parents included — the reset drops the entire intention stack, so a discard taken
-                # inside a sub-plan throws away more than the frame in hand.
-                if activity.superseded is not None:
-                    sup = activity.superseded
-                    bodies = [render_steps(sup.plan.steps)]
-                    bodies += [
-                        f"-- suspended parent, at sub-goal step {i} --\n{render_steps(p.steps)}"
-                        for p, i in reversed(sup.parent_frames)
-                    ]
-                    log.debug(
-                        "reason: discarded plan for activity %s (was at step %d)\n%s",
-                        activity.id,
-                        sup.step_index,
-                        "\n".join(bodies),
-                    )
+                self._invalidate(activity, "a context-adaptation verdict")
                 return result
             # Valid: proceed. The baseline was already advanced by Observe to the world the re-check
             # was fired against (not now) — so a change that landed during its flight stays outside
@@ -373,14 +385,34 @@ class DefaultReasonStrategy:
         # reference the first write compares against (entry-time, not first-write-time).
         if activity.reconsider_baseline is None:
             activity.reconsider_baseline = cycle.change_gate.signature(wm)
-        # 3) Does the policy want a check before this step?
-        if not cycle.reconsideration.should_check(_step_side_effecting(step, wm)):
+            activity.reconsider_scope = wm.perception_cursor()
+        # 3) Does the policy want this step guarded, and if so how?
+        outcome = cycle.reconsideration.decide(_step_side_effecting(step, wm))
+        if outcome is ReconsiderationOutcome.SKIP:
             return None
         # 4) Cheap mechanical gate: has anything observable moved since the plan was baselined?
         current = cycle.change_gate.signature(wm)
         if current == activity.reconsider_baseline:
             return None  # nothing moved -> proceed (free when the world is static)
-        # 5) Gate hot: fire the revalidation off-cycle (RUNNING); the verdict lands a later cycle.
+        # 5a) Gate hot, and the policy resolves it without a model call: discard the plan if the
+        # change was on a tool this plan actually references. The scope is what a judge would
+        # otherwise supply — read the change, decide it is irrelevant, proceed — so a policy that
+        # spends no judge has to answer the same question mechanically or discard on every
+        # unrelated app that speaks. Deliberately narrower than the judge's world below, which is
+        # agent-level for the opposite reason.
+        if outcome is ReconsiderationOutcome.REPLAN:
+            joined = {tool.id for tool in wm.registry.all_tools()}
+            if not relevant_change_since(
+                wm, activity.reconsider_scope, referenced_tools(activity, joined)
+            ):
+                # Irrelevant. Re-baseline to now: nothing relevant is behind this cursor by
+                # construction, so advancing it absorbs nothing and spares the next write the scan.
+                activity.reconsider_baseline = current
+                activity.reconsider_scope = wm.perception_cursor()
+                return None
+            self._invalidate(activity, "a change on a tool the plan references")
+            return result
+        # 5b) Gate hot: fire the revalidation off-cycle (RUNNING); the verdict lands a later cycle.
         # Carry the fire-time signature so Observe advances the baseline to *this* world on resolve:
         # a change landing mid-flight then earns its own reconsideration rather than being absorbed.
         # Agent-level on purpose, unlike ground/select: the gate above fires on ANY

@@ -123,6 +123,7 @@ nav:
           - Cross-Workspace Tool Sharing: architecture/notes/cross-workspace-tool-sharing.md
           - Jason Plan Representation: architecture/notes/jason-plan-representation.md
           - Mechanical Predicates over Model Filters: architecture/notes/mechanical-predicates-over-model-filters.md
+          - Perception Tiers and Judge-Free Replan: architecture/notes/perception-tiers-and-judge-free-replan.md
           - "Plan Control Structures: Collection References": architecture/notes/plan-control-structures-collection-references.md
           - Reasoning Strategy Extension: architecture/notes/reasoning-strategy-extension.md
           - Restore Drift Reconciliation: architecture/notes/restore-drift-reconciliation.md

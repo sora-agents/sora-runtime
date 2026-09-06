@@ -413,9 +413,14 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # fire time and carried through to plan install so the context-adaptation gate baselines
         # against the assumptions the plan was formed in. Absent for grounding fires.
         baseline = kwargs.get("baseline")
+        # Read here rather than passed in: it must be the same instant the caller sampled the
+        # signature, and nothing appends to the percept logs between Reason computing that and this
+        # line — the sinks drain in Observe. Only alongside a baseline, so grounding fires (which
+        # install no plan, and so have nothing to scope against) stay unscoped.
+        scope = cycle.working.perception_cursor() if baseline is not None else None
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind=kind, requested_at=time.time(), baseline=baseline
+            id=inf_id, kind=kind, requested_at=time.time(), baseline=baseline, scope=scope
         )
         activity.state = ActivityState.RUNNING  # off-cycle, like _invoke_ — immediate, never blocks
         # `superseded` is dropped on the sub-goal copy (ADR-0024): the bundle is context for

@@ -63,12 +63,13 @@ _DEFAULT_STRATEGIES = {
 }
 
 # context_adaptation (ADR-0024): how eagerly to re-validate an in-progress plan against new
-# perception. Selected by a level name — none | before_writes | before_each_op — or a dotted
-# path to a custom ReconsiderationPolicy; the agent-facing default is before_writes.
+# perception. Selected by a level name — none | before_writes | before_each_op | replan_on_change
+# — or a dotted path to a custom ReconsiderationPolicy; the agent-facing default is before_writes.
 _RECONSIDERATION_LEVELS = {
     "none": "sora.strategies.NoneReconsideration",
     "before_writes": "sora.strategies.BeforeWrites",
     "before_each_op": "sora.strategies.BeforeEachOp",
+    "replan_on_change": "sora.strategies.ReplanOnChange",
 }
 
 

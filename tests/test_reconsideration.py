@@ -25,7 +25,11 @@ from fakes import (
     plan_json,
 )
 from sora._strategies.reason import _DEFAULT_MAX_REPLAN_ATTEMPTS
-from sora._strategies.reconsideration import _perception_signature, _step_side_effecting
+from sora._strategies.reconsideration import (
+    _perception_signature,
+    _step_side_effecting,
+    relevant_change_since,
+)
 from sora.action import (
     FocusAction,
     InferAction,
@@ -42,6 +46,7 @@ from sora.memory import (
     REVALIDATE_SYSTEM_PROMPT,
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptSnapshot,
     ProceduralMemory,
     SemanticMemory,
     WorkingMemory,
@@ -57,6 +62,8 @@ from sora.strategies import (
     DefaultSituateStrategy,
     NoneReconsideration,
     PerceptionSignatureGate,
+    ReconsiderationOutcome,
+    ReplanOnChange,
     Strategies,
     TickResult,
 )
@@ -70,6 +77,7 @@ from sora.types import (
     OperationInvocation,
     PendingInference,
     Plan,
+    PropertyChange,
     Signal,
     Step,
 )
@@ -142,21 +150,33 @@ async def _resolve_revalidate(cycle: DecisionCycle) -> None:
 # ── Policy truth table ──────────────────────────────────────────────────────────────────────────
 
 
+_SKIP = ReconsiderationOutcome.SKIP
+_CHECK = ReconsiderationOutcome.CHECK
+_REPLAN = ReconsiderationOutcome.REPLAN
+
+
 def test_none_reconsideration_never_checks() -> None:
     policy = NoneReconsideration()
-    assert not any(policy.should_check(s) for s in (True, False, None))
+    assert all(policy.decide(s) is _SKIP for s in (True, False, None))
 
 
 def test_before_writes_checks_writes_and_unknowns_not_known_reads() -> None:
     policy = BeforeWrites()
-    assert policy.should_check(True) is True  # a write
-    assert policy.should_check(None) is True  # unknown -> treated as a write (conservative)
-    assert policy.should_check(False) is False  # a known read is skipped
+    assert policy.decide(True) is _CHECK  # a write
+    assert policy.decide(None) is _CHECK  # unknown -> treated as a write (conservative)
+    assert policy.decide(False) is _SKIP  # a known read is skipped
 
 
 def test_before_each_op_always_checks() -> None:
     policy = BeforeEachOp()
-    assert all(policy.should_check(s) for s in (True, False, None))
+    assert all(policy.decide(s) is _CHECK for s in (True, False, None))
+
+
+def test_replan_on_change_gates_like_before_writes_but_resolves_without_a_judge() -> None:
+    policy = ReplanOnChange()
+    assert policy.decide(True) is _REPLAN
+    assert policy.decide(None) is _REPLAN  # unknown -> treated as a write, same as before_writes
+    assert policy.decide(False) is _SKIP  # a known read is still skipped
 
 
 # ── side-effecting classification + change-gate ──────────────────────────────────────────────────
@@ -945,3 +965,165 @@ async def test_answering_the_halt_lets_the_activity_plan_again(tmp_path: Path) -
     after = activity.state
     assert after is not ActivityState.BLOCKED
     assert activity.pending_inference is not None
+
+
+# ── judge-free replan (context_adaptation: replan_on_change) ─────────────────────────────────────
+
+
+def _append_signal(working: WorkingMemory, source: str) -> None:
+    working.signals.append(Percept(source, Signal("env_notification", {}), 0.0))
+    working.signals_appended += 1
+
+
+def test_relevance_sees_a_change_on_a_referenced_tool() -> None:
+    working = WorkingMemory(registry=EnvironmentRegistry(adapters={}))
+    cursor = working.perception_cursor()
+    _append_signal(working, "t")
+    assert relevant_change_since(working, cursor, {"t"}) is True
+
+
+def test_relevance_ignores_a_change_on_a_tool_the_plan_does_not_reference() -> None:
+    working = WorkingMemory(registry=EnvironmentRegistry(adapters={}))
+    cursor = working.perception_cursor()
+    _append_signal(working, "other")
+    assert relevant_change_since(working, cursor, {"t"}) is False
+
+
+def test_relevance_ignores_a_change_that_predates_the_cursor() -> None:
+    working = WorkingMemory(registry=EnvironmentRegistry(adapters={}))
+    _append_signal(working, "t")  # already accounted for by the plan being executed
+    cursor = working.perception_cursor()
+    assert relevant_change_since(working, cursor, {"t"}) is False
+
+
+def test_relevance_reads_derived_property_changes_too() -> None:
+    working = WorkingMemory(registry=EnvironmentRegistry(adapters={}))
+    cursor = working.perception_cursor()
+    working.property_changes.append(Percept("t", PropertyChange("state", ()), 0.0))
+    working.property_changes_appended += 1
+    assert relevant_change_since(working, cursor, {"t"}) is True
+
+
+def test_relevance_fails_open_without_a_cursor_or_a_scope() -> None:
+    working = WorkingMemory(registry=EnvironmentRegistry(adapters={}))
+    _append_signal(working, "other")
+    # No cursor: the plan predates scope tracking. No scope: the activity has no plan, so every
+    # tool is potentially in play. Both mean "cannot rule it out" -> reconsider.
+    assert relevant_change_since(working, None, {"t"}) is True
+    assert relevant_change_since(working, working.perception_cursor(), None) is True
+
+
+def test_relevance_fails_open_when_retention_outran_the_cursor() -> None:
+    working = WorkingMemory(registry=EnvironmentRegistry(adapters={}))
+    # The cap front-evicted everything between the cursor and the oldest retained signal, so the
+    # window this is asked about is simply gone — absence of evidence is not evidence of absence.
+    working.signals_appended = 10  # ten ever appended, none retained
+    assert relevant_change_since(working, (2, 0), {"t"}) is True
+
+
+async def test_replan_on_change_discards_the_plan_with_no_model_call(tmp_path: Path) -> None:
+    cycle, working = await _cycle(tmp_path, reconsideration=ReplanOnChange())
+    activity = _write_activity(working)  # plan invokes tool "t"
+    activity.reconsider_baseline = _perception_signature(working)
+    activity.reconsider_scope = working.perception_cursor()
+    _append_signal(working, "t")  # a change on the tool the plan references
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is None  # nothing committed
+    assert activity.plan is None  # discarded outright -> Reason re-infers next cycle
+    assert activity.pending_inference is None  # and it cost no revalidation
+    assert activity.state is ActivityState.READY  # never parked on an off-cycle call
+
+
+async def test_replan_on_change_ignores_a_change_on_an_unreferenced_tool(tmp_path: Path) -> None:
+    cycle, working = await _cycle(tmp_path, reconsideration=ReplanOnChange())
+    activity = _write_activity(working)
+    activity.reconsider_baseline = _perception_signature(working)
+    activity.reconsider_scope = working.perception_cursor()
+    _append_signal(working, "shopping")  # an unrelated app spoke: gate hot, but irrelevant
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step == invoke_step("t", "write_op")  # committed anyway
+    assert activity.plan is not None
+    assert activity.pending_inference is None
+
+
+async def test_an_irrelevant_change_rebaselines_so_the_next_write_does_not_rescan(
+    tmp_path: Path,
+) -> None:
+    cycle, working = await _cycle(tmp_path, reconsideration=ReplanOnChange())
+    activity = _write_activity(working)
+    activity.reconsider_baseline = _perception_signature(working)
+    activity.reconsider_scope = working.perception_cursor()
+    _append_signal(working, "shopping")
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    # Advancing absorbs nothing: nothing relevant was behind the old cursor by construction.
+    assert activity.reconsider_baseline == _perception_signature(working)
+    assert activity.reconsider_scope == working.perception_cursor()
+
+
+async def test_replan_on_change_skips_a_known_read(tmp_path: Path) -> None:
+    cycle, working = await _cycle(tmp_path, reconsideration=ReplanOnChange())
+    plan = Plan(id="p", goal="g", steps=[invoke_step("t", "read_op")])
+    activity = Activity(id="a", goal="g", context={}, plan=plan, step_index=0)
+    working.activities["a"] = activity
+    activity.reconsider_baseline = _perception_signature(working)
+    activity.reconsider_scope = working.perception_cursor()
+    _append_signal(working, "t")  # relevant, but the step ahead is a read
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step == invoke_step("t", "read_op")  # a read commits; nothing is at risk
+    assert activity.plan is not None
+
+
+async def test_a_discarded_plan_is_still_parked_for_the_replanning_prompt(tmp_path: Path) -> None:
+    """The judge-free path reuses the judged path's whole aftermath, superseded bundle included."""
+    cycle, working = await _cycle(tmp_path, reconsideration=ReplanOnChange())
+    activity = _write_activity(working)
+    activity.reconsider_baseline = _perception_signature(working)
+    activity.reconsider_scope = working.perception_cursor()
+    _append_signal(working, "t")
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.superseded is not None
+    assert activity.superseded.plan.steps == [invoke_step("t", "write_op")]
+
+
+async def test_the_scope_cursor_is_captured_at_infer_time_not_install_time(tmp_path: Path) -> None:
+    """A change landing *during* the planning call must stay in front of the cursor.
+
+    Anchoring the scope at install time instead would put it behind, and the scoped re-check would
+    then rule out the very change the plan never saw — a silent miss in exactly the dynamic
+    scenarios this policy exists for."""
+    cycle, working = await _cycle(
+        tmp_path,
+        reconsideration=ReplanOnChange(),
+        llm=FakeLLMClient(plan_json({"tool_id": "t", "operation_name": "write_op"})),
+    )
+    activity = Activity(id="a", goal="g", context={})
+    working.activities["a"] = activity
+    infer = cycle.actions.internal(InferAction.name)
+    await infer.execute(
+        cycle,
+        activity_id="a",
+        tools=[],
+        observed=PerceptSnapshot([], []),
+        messages=[],
+        baseline=cycle.change_gate.signature(working),
+    )
+    assert activity.pending_inference is not None
+    fire_time = activity.pending_inference.scope
+    assert fire_time == (0, 0)
+
+    _append_signal(working, "t")  # lands mid-flight, after the prompt was built
+    await asyncio.gather(*list(infer._tasks))  # type: ignore[attr-defined]
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.reconsider_scope == fire_time  # not the drifted install-time cursor
+    assert relevant_change_since(working, activity.reconsider_scope, {"t"}) is True
