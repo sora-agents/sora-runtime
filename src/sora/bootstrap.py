@@ -100,10 +100,18 @@ def _observe_strategy_for(config: AgentConfig) -> Any:
     silent cost regression, and one that asked for the opposite is a silent blindness.
     """
     observe = import_object(config.strategies.get("observe", _DEFAULT_STRATEGIES["observe"]))
+    kwargs: dict[str, Any] = {}
     focus = config.strategies.get("focus")
-    if focus is None:
-        return observe()
-    return observe(focus=import_object(_FOCUS_POLICIES.get(focus, focus))())
+    if focus is not None:
+        kwargs["focus"] = import_object(_FOCUS_POLICIES.get(focus, focus))()
+    deadline = config.strategies.get("inference_deadline")
+    if deadline is not None:
+        # `none` disables the watchdog (an unbounded interactive session, a client on a
+        # breakpoint); anything else is a float in seconds. Passed as a keyword only when named,
+        # for the same reason `focus` is: an agent that asked for a bound and silently did not get
+        # one would stall on a hung provider exactly as if it had never asked.
+        kwargs["inference_deadline"] = None if deadline == "none" else float(deadline)
+    return observe(**kwargs) if kwargs else observe()
 
 
 _DEFAULT_LLM_CLIENT = "sora.adapters.anthropic_llm.AnthropicLLMClient"

@@ -180,6 +180,36 @@ def test_naming_a_focus_policy_an_observe_strategy_cannot_take_raises() -> None:
         )
 
 
+# strategies.inference_deadline — the stalled-inference watchdog's bound, forwarded the same way
+# the focus policy is: a sub-strategy setting of Observe, not a phase resolved on its own.
+
+
+def test_the_inference_deadline_defaults_to_the_observe_strategys_own_bound() -> None:
+    from sora._strategies.inference import DEFAULT_INFERENCE_DEADLINE
+
+    observe = _observe_strategy_for(_focus_config())
+    assert observe._inference_deadline == DEFAULT_INFERENCE_DEADLINE
+
+
+def test_a_named_inference_deadline_reaches_the_observe_strategy() -> None:
+    observe = _observe_strategy_for(_focus_config(inference_deadline="45"))
+    assert observe._inference_deadline == 45.0
+
+
+def test_the_inference_deadline_can_be_switched_off() -> None:
+    """For a deliberately unbounded interactive session, or a client sitting on a breakpoint."""
+    observe = _observe_strategy_for(_focus_config(inference_deadline="none"))
+    assert observe._inference_deadline is None
+
+
+def test_the_focus_policy_and_the_inference_deadline_are_forwarded_together() -> None:
+    observe = _observe_strategy_for(
+        _focus_config(focus="intention-scoped", inference_deadline="30")
+    )
+    assert isinstance(observe._focus, IntentionScopedFocus)
+    assert observe._inference_deadline == 30.0
+
+
 class _NoPolicyObserve:
     def __init__(self) -> None: ...
 

@@ -29,6 +29,8 @@ default and fails loud (`ValueError`) if omitted.
 | `interrupt_policy` | `sora.strategies.NeverInterruptPolicy` | Which pushed signals preempt (none, by default). |
 | `change_gate` | `sora.strategies.PerceptionSignatureGate` | The pre-revalidation change gate (ADR-0024). |
 | `context_adaptation` | `before_writes` | A *level name* (`none` \| `before_writes` \| `before_each_op`) or a dotted path to a custom `ReconsiderationPolicy`. Not a dotted-path-only key like the others — see [Extension Protocols — Auxiliary seams](extension-protocols.md#auxiliary-seams). |
+| `focus` | `sora.strategies.FocusAllJoined` | Which joined tools Observe attends to: the alias `all-joined` or `intention-scoped`, or a dotted path to a custom `FocusPolicy`. A sub-strategy of Observe, passed as a keyword — naming one against an Observe strategy that cannot take it raises rather than being silently dropped. |
+| `inference_deadline` | `300` (seconds) | How long a fired inference may stay unresolved before the watchdog expires it with a synthetic errored result. A number, or `none` to disable the watchdog entirely (an unbounded interactive session, a client on a breakpoint). Forwarded to Observe like `focus`. |
 | `relevance` | — (absent: the seam is `None`) | Undeclared-relevance recovery ([ADR-0026](../architecture/adrs/0026-undeclared-relevance-recovery.md)). The one key whose absence disables a layer rather than selecting a default — see below. |
 
 Omitting `relevance` does not fall back to a shipped default the way every other row does: it leaves
