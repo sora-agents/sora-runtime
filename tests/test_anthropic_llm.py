@@ -152,3 +152,33 @@ async def test_request_profile_overrides_output_cap_and_ignores_unsupported_hint
     assert messages.kwargs["system"] == "system"
     assert messages.kwargs["messages"] == [{"role": "user", "content": "user"}]
     assert "reasoning" not in messages.kwargs
+
+
+def test_a_stall_timeout_is_configured_rather_than_left_to_the_sdk_default() -> None:
+    # The SDK's own default is a 600s read timeout with two retries — up to ~30 minutes of silence
+    # on one dead socket, against a simulated clock that keeps running while the agent thinks.
+    from anthropic import Timeout
+
+    from sora.adapters.anthropic_llm import DEFAULT_CONNECT_TIMEOUT, DEFAULT_STREAM_STALL_TIMEOUT
+
+    client = AnthropicLLMClient(model="m", api_key="test")
+    timeout = client._client.timeout
+    assert isinstance(timeout, Timeout)
+    assert timeout.read == DEFAULT_STREAM_STALL_TIMEOUT
+    assert timeout.connect == DEFAULT_CONNECT_TIMEOUT
+
+
+def test_the_stall_timeout_can_be_disabled() -> None:
+    """A target that legitimately stays quiet past the default (a reasoning model, a local runtime
+    doing prompt eval over a long context) turns it off in config rather than in code."""
+    from anthropic import Timeout
+
+    from sora.adapters.anthropic_llm import DEFAULT_STREAM_STALL_TIMEOUT
+
+    client = AnthropicLLMClient(model="m", api_key="test", stall_timeout=None)
+    timeout = client._client.timeout
+    assert not isinstance(timeout, Timeout) or timeout.read != DEFAULT_STREAM_STALL_TIMEOUT
+
+
+def test_max_retries_is_forwarded_when_configured() -> None:
+    assert AnthropicLLMClient(model="m", api_key="test", max_retries=0)._client.max_retries == 0

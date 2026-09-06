@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, Timeout
 from anthropic import __version__ as ANTHROPIC_SDK_VERSION
 
 from sora.llm import CompletionRequest, LLMUsage, log_llm_usage
@@ -21,6 +21,19 @@ from sora.llm import CompletionRequest, LLMUsage, log_llm_usage
 # Only a fallback: the model id is a configuration value (a ctor arg, wired from agent.yaml), never
 # baked in — swapping Opus/Sonnet/versions must not require a code change.
 DEFAULT_MODEL = "claude-opus-4-8"
+
+# Seconds of SILENCE tolerated between streamed chunks, not a cap on how long a completion may take
+# — ``complete`` always streams, so a legitimately long answer keeps resetting this while a stalled
+# socket does not. Without it the SDK's own default applies: 600s read with two retries, so one
+# dead request costs up to ~30 minutes of silence during which the activity holds an inference that
+# nothing else can resolve. That is survivable in an interactive session and is not against a
+# simulated clock that runs while the agent thinks, where it consumes the whole scenario.
+#
+# The first chunk is the one place this does bound duration rather than silence: nothing has
+# streamed yet, so a model that stays quiet while it reasons is measured against it. 90s clears
+# what the shipped configs do; a slower target raises it (or passes None to disable) in config.
+DEFAULT_STREAM_STALL_TIMEOUT = 90.0
+DEFAULT_CONNECT_TIMEOUT = 10.0
 
 
 class AnthropicLLMClient:
@@ -47,9 +60,20 @@ class AnthropicLLMClient:
         api_key: str | None = None,
         max_tokens: int = 8192,
         instrument: bool = False,
+        stall_timeout: float | None = DEFAULT_STREAM_STALL_TIMEOUT,
+        max_retries: int | None = None,
     ) -> None:
         # api_key=None lets the SDK resolve credentials from the environment / an `ant` profile.
-        self._client = AsyncAnthropic(api_key=api_key) if api_key else AsyncAnthropic()
+        client_kwargs: dict[str, Any] = {}
+        if api_key:
+            client_kwargs["api_key"] = api_key
+        if max_retries is not None:
+            client_kwargs["max_retries"] = max_retries
+        if stall_timeout is not None:
+            # Explicit per-phase timeout rather than a scalar: a scalar would spend the same budget
+            # on connect, and a slow TLS handshake is not the failure being bounded here.
+            client_kwargs["timeout"] = Timeout(stall_timeout, connect=DEFAULT_CONNECT_TIMEOUT)
+        self._client = AsyncAnthropic(**client_kwargs)
         self.model = model  # public: bootstrap's metered wrapper reports it in the run trace
         self._max_tokens = max_tokens
         self._instrument = instrument
