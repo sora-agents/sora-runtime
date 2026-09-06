@@ -40,6 +40,7 @@ from sora.memory import (
     render_bindings,
     render_history,
     render_messages,
+    render_noop_subgoals,
     render_properties,
     render_signals,
     render_tools,
@@ -1249,3 +1250,64 @@ def test_plan_prompt_says_nothing_about_provenance_for_a_top_level_goal() -> Non
     _, user = default_plan_prompt(_activity("reconcile the shortlist"), {}, PerceptSnapshot(), [])
     assert "NOT a request from the user" not in user
     assert "send_message_to_user" not in user
+
+
+# --------------------------------------------------------------------------------------------------
+# Grounding against the execution record — what committed, and what ran and committed nothing
+#
+# A report is a grounded parameter like any other, and the goal in the prompt states what was
+# INTENDED. When a mechanical sub-goal's collection turns out empty it fans out to zero steps, runs
+# no operation, and leaves `history` untouched — so the only thing left in the prompt describing
+# that work is the goal, and a report phrased from it asserts work that nothing performed. The
+# no-op record is the counter-evidence; these pin that it reaches the prompt and that the prompt
+# tells the grounder what to do with it.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_default_ground_prompt_names_planned_work_that_performed_no_operation() -> None:
+    activity = _activity_with_history("shortlist", "search_apartments", [])
+    activity.noop_subgoals.append("Send each matching relative an individual email")
+
+    _system, user = default_ground_prompt(activity, "send_message_to_user", None, {})
+
+    assert render_noop_subgoals(activity.noop_subgoals) in user
+    assert "Send each matching relative an individual email" in user
+
+
+def test_default_ground_prompt_says_none_when_every_step_that_ran_did_something() -> None:
+    activity = _activity_with_history("reply", "search_emails", {"emails": [{"id": 42}]})
+
+    _system, user = default_ground_prompt(activity, "reply_to_email", None, {})
+
+    assert render_noop_subgoals([]) == "(none)"
+    assert "performed NO operation" in user  # the section is always present, so absence is stated
+
+
+def test_the_no_op_record_is_not_folded_into_the_execution_history() -> None:
+    """`history` is what a `$from`/`$decide` resolves a reference against, so an entry for an
+    operation that never ran would corrupt the one thing history is trusted for. The two are
+    rendered as separate sections and the no-op goal must not appear inside the history one."""
+    activity = _activity_with_history("shortlist", "search_apartments", [])
+    activity.noop_subgoals.append("Send each matching relative an individual email")
+
+    assert "matching relative" not in render_history(activity.history)
+
+
+def test_render_noop_subgoals_elides_whole_entries_never_half_a_goal() -> None:
+    goals = [f"do the {i}th long thing " + "x" * 200 for i in range(10)]
+
+    rendered = render_noop_subgoals(goals, budget=300)
+
+    assert "(… " in rendered and "more not shown" in rendered
+    for line in rendered.splitlines():
+        assert line.startswith("(… ") or line.endswith(
+            "expanded to no steps, so nothing was done for it"
+        )
+
+
+def test_ground_system_prompt_separates_what_was_intended_from_what_happened() -> None:
+    """The rule has to be about TEXT generally, not about one operation: an email body claiming
+    work that did not happen is wrong in exactly the same way a user report is, and the grounder
+    never learns which operation it is filling in for."""
+    assert "EXECUTION RECORD" in GROUND_SYSTEM_PROMPT
+    assert "what was INTENDED, never what happened" in GROUND_SYSTEM_PROMPT

@@ -1070,3 +1070,117 @@ async def test_subgoal_prompt_is_told_it_is_a_subgoal_without_mutating_the_activ
 
     await DefaultObserveStrategy().observe(cycle)
     assert activity.parent_frames == [(parent, 0, 0)]  # pushed exactly once, by Observe
+
+
+async def test_an_empty_fan_out_is_recorded_as_work_that_committed_nothing(tmp_path: Path) -> None:
+    """Zero elements is a legitimate answer for the plan, but an invisible one for anything that
+    later has to describe what the agent did: no operation runs, so `history` gains no entry, and
+    a report phrased against history alone cannot tell "there was nothing to do" from "it was
+    done". The run this comes from told the user it had sent individual emails while the fan-out
+    that would have sent them expanded to nothing."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    subgoal = _mechanical_subgoal()
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[subgoal]),
+        step_index=0,
+        history=[_history("search_apartments", [])],  # nothing to iterate
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.noop_subgoals == [subgoal.params["goal"]]
+
+
+async def test_a_fan_out_that_expands_records_nothing(tmp_path: Path) -> None:
+    """The record is for absence only — a sub-goal that produced steps is described by the results
+    those steps put in `history`, and listing it here too would make every fan-out look suspect."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[_mechanical_subgoal()]),
+        step_index=0,
+        history=[_history("search_apartments", [{"id": "a1"}, {"id": "a2"}])],
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.noop_subgoals == []
+
+
+async def test_an_unreadable_collection_replans_rather_than_recording_a_no_op(
+    tmp_path: Path,
+) -> None:
+    """The two zero-step outcomes must not converge here either. A collection that could not be
+    READ already replans as a defect; recording it as work that legitimately did nothing would
+    hand the grounder a confident "there was nothing to do" for a sub-goal whose collection the
+    runtime never managed to look at."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[_mechanical_subgoal()]),
+        step_index=0,
+        history=[],  # the $from names a step that never ran -> unreadable, not empty
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.noop_subgoals == []
+    assert activity.plan is None  # reset_for_replan
+
+
+async def test_the_report_after_an_empty_fan_out_is_grounded_against_the_gap(
+    tmp_path: Path,
+) -> None:
+    """The whole defect, end to end, at the layer that produces the false sentence.
+
+    A fan-out finds nothing and performs no operation; the plan's next step is the report to the
+    user, phrased at execution time with a `$decide`. Every other thing in that grounding prompt
+    — the activity goal, the sub-goal's own goal — describes work that was *intended*, and the
+    execution history is silent about work that never ran. Without the no-op record the only
+    evidence in front of the grounder points at success, which is how a run came to tell the user
+    it had sent emails that nothing sent.
+    """
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    llm = FakeLLMClient(json.dumps({"params": {"text": "No relatives matched; nothing was sent."}}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    cycle, working, registry = _cycle(tmp_path, procedural, tool)
+    await registry.join(_ORIGIN)
+    report = invoke_step(
+        "realestate", "save_apartment", apartment_id={"$decide": "report what was done"}
+    )
+    activity = Activity(
+        id="a",
+        goal="save the cheap flats and email each matching relative about them",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[_mechanical_subgoal(), report]),
+        step_index=0,
+        history=[_history("search_apartments", [])],  # the fan-out finds nothing
+    )
+    working.activities["a"] = activity
+
+    # Tick 1: the sub-goal fans out to zero steps and the plan advances to the report.
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    # Tick 2: the report's `$decide` cannot resolve mechanically, so it escalates to the model.
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)  # let the off-cycle _ground_ task build and send its prompt
+
+    assert llm.calls, "the report's $decide should have escalated to a grounding call"
+    _system, prompt = llm.calls[0]
+    assert "save each apartment" in prompt  # the sub-goal that ran and did nothing, by name
+    assert "performed NO operation" in prompt

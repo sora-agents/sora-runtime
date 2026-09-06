@@ -1622,7 +1622,17 @@ GROUND_SYSTEM_PROMPT = (
     "less than the step asked for, which reads as success and is not; the runtime rejects it.\n"
     "That is only for missing DATA. A value you can compute or phrase from what you WERE given is "
     "resolvable, so produce it: a $decide asking for a sentence about a result that is present, or "
-    "a date derived from a clock reading in the history, are ordinary work, not gaps."
+    "a date derived from a clock reading in the history, are ordinary work, not gaps.\n"
+    "Some parameters are natural-language TEXT you are asked to phrase — a report back to the "
+    "user, an email body. Phrase those from the EXECUTION RECORD: the results of operations "
+    "already executed, plus the note of planned steps that performed no operation. The goal tells "
+    "you what was INTENDED, never what happened. Do NOT state that an action was performed unless "
+    "the record shows the operation that performed it — a planned step can legitimately expand to "
+    "nothing when the collection it iterates turns out empty, and then the thing it would have "
+    "done was not done by anyone. Where the record shows such a step, say so plainly and say which "
+    "work it was, rather than omitting it or reporting the intent as achieved. The user has no "
+    "other view of what the agent did, so a report that overstates it is not something they can "
+    "catch or recover from."
 )
 
 
@@ -1658,6 +1668,10 @@ _HISTORY_CHAR_BUDGET = 60_000
 # a filter/take), so it is expected to be small, and letting it compete with history for one pooled
 # budget would let a single wide binding evict the operation results grounding resolves against.
 _BINDINGS_CHAR_BUDGET = 20_000
+
+# Sub-goal goal strings are short and few (one per fan-out that found nothing), so this is a
+# backstop against a pathological plan rather than a bound anyone expects to hit.
+_NOOP_SUBGOALS_CHAR_BUDGET = 4_000
 
 
 def _one_line(value: Any) -> str:
@@ -1724,6 +1738,33 @@ def render_history(
         args = json.dumps(completed.invocation.params)
         entries.append((completed.invocation.operation_name, args, _one_line(outcome)))
     lines.extend(_fit_to_budget(entries, budget))
+    return "\n".join(lines)
+
+
+def render_noop_subgoals(goals: list[str], *, budget: int = _NOOP_SUBGOALS_CHAR_BUDGET) -> str:
+    """Render the sub-goals that ran and committed nothing (``Activity.noop_subgoals``) for a
+    grounding prompt. Public so a custom ``GroundPrompt`` can reuse it, and rendered as its own
+    section rather than folded into ``render_history``: history is the record of operations that
+    *executed* and is what a ``$from``/``$decide`` resolves a reference against, so admitting an
+    entry for an operation that never ran would corrupt exactly the thing history is trusted for.
+
+    These read as absence, and absence is what a report gets wrong — a fan-out over an empty
+    collection performs nothing, leaves history untouched, and is then indistinguishable from a
+    fan-out that did the work. Naming it is the whole fix: the grounder can only decline to claim
+    the work if something tells it the work has a name and did not happen."""
+    if not goals:
+        return "(none)"
+    lines: list[str] = []
+    spent = 0
+    for goal in goals:
+        line = f"- {goal!r} — expanded to no steps, so nothing was done for it"
+        # Never cut a goal mid-string: a half-rendered goal reads as a different, smaller piece of
+        # work. Elide whole entries under a count, like the history walk does.
+        if lines and spent + len(line) > budget:
+            lines.append(f"(… {len(goals) - len(lines)} more not shown)")
+            break
+        spent += len(line)
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -1868,10 +1909,11 @@ def default_ground_prompt(
     observed: PerceptSnapshot | None = None,
 ) -> tuple[str, str]:
     """The built-in ``GroundPrompt``: goal + the operation schema + the partial params + the
-    agent's currently observed world state + the named data-op bindings + the execution history
-    (``observed`` is omittable — an unrelated caller isn't forced to supply one). Reuse
-    ``GROUND_SYSTEM_PROMPT`` / ``render_history`` / ``render_bindings`` / ``render_properties`` /
-    ``render_signals`` in a custom one."""
+    agent's currently observed world state + the named data-op bindings + the execution history +
+    the sub-goals that ran and performed no operation (``observed`` is omittable — an unrelated
+    caller isn't forced to supply one). Reuse ``GROUND_SYSTEM_PROMPT`` / ``render_history`` /
+    ``render_noop_subgoals`` / ``render_bindings`` / ``render_properties`` / ``render_signals`` in
+    a custom one."""
     observed = observed or PerceptSnapshot()
     user = (
         # No goal-provenance notice here, unlike default_plan_prompt: it is advice about how to end
@@ -1888,7 +1930,13 @@ def default_ground_prompt(
         f"{render_bindings(activity.bindings)}\n\n"
         # Deliberately unwindowed: a $from/$decide reference may name any past result, and hiding
         # the entry that holds the referent fails the same way truncating it mid-record does.
-        f"Results of operations already executed:\n{render_history(activity.history)}"
+        f"Results of operations already executed:\n{render_history(activity.history)}\n\n"
+        # The other half of the record, and the half a report gets wrong. Everything above says
+        # what happened; only this says what was planned, ran, and did nothing — without it the
+        # grounder has no way to distinguish that from success and falls back on the goal's intent.
+        f"Planned steps that ran but performed NO operation (nothing above relates to them, "
+        f"because nothing was invoked for them):\n"
+        f"{render_noop_subgoals(activity.noop_subgoals)}"
     )
     return GROUND_SYSTEM_PROMPT, user
 

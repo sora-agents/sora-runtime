@@ -721,6 +721,13 @@ def goal_kind_of(step: Step) -> str:
 TOOL_ID = "tool_id"
 OPERATION_NAME = "operation_name"
 
+# The operation name of the agent's own reply channel to the user (`runtime-io`'s tool implements
+# it; `sora.adapters.runtime_io.SEND_MESSAGE_TO_USER` re-exports this). Shared here for the same
+# reason USER_STOP below is: core already depends on this literal — PLAN_SYSTEM_PROMPT names it in
+# prose, and grounding scopes the report re-check to it — so the alternative is the same string
+# written in three places with nothing keeping them equal, not an absence of coupling.
+SEND_MESSAGE_TO_USER = "send_message_to_user"
+
 # The Signal.name a CLI /stop raises through DecisionCycle.interrupt() — the one interrupt the
 # runtime default DefaultInterruptHandler recognizes and routes (pause to await input). Shared here
 # so the producer (cli.py) and the consumer's guard (strategies.py) agree on one literal, not two.

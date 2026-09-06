@@ -153,6 +153,65 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
       terminate-on-failure is the default policy and the opt-in is the extension point. Distinct from
       `T4` (sub-plan *inference* failure) and from `A5` (guarded steps).
 
+- [x] **V3.3** **A sub-goal that fans out to zero steps reports as success, and the final message
+      then asserts the work happened.** Observed on the first gaia2-cli run: a mechanical filter
+      (`matching_relatives`) kept 0 of 8, the sub-goal *"Send each matching relative an individual
+      email..."* fanned out to **0 steps**, and the run finished by telling the user it had *"sent
+      individual emails titled 'Properties List'"*. Nothing was sent, nothing failed, and the
+      trajectory reads as a clean success. Two separable defects, and the second is the worse one:
+      an empty fan-out is indistinguishable from a completed one, and `send_message_to_user` is
+      grounded from the plan's *intent* rather than from what the activity actually committed — so
+      the agent's own report is not evidence about its own behaviour. A judge scoring the transcript
+      would be scoring a claim. Relates to the mechanical-filter-misses-everything family (an exact
+      match against a snapshot dropping every candidate), but that filter is only how this one was
+      *triggered*; the reporting gap stands on its own. Same class as V3.1 — a composition nothing
+      in a phase-isolated test can see.
+
+      **Done (the grounded path):** an empty fan-out is now recorded on the activity
+      (`Activity.noop_subgoals`, appended at the splice site in `_dispatch_subgoal`) and rendered
+      into the grounding prompt as its own section, beside — never inside — the execution history:
+      history is what a `$from`/`$decide` resolves a reference against, so admitting an entry for an
+      operation that never ran would corrupt the one thing history is trusted for.
+      `GROUND_SYSTEM_PROMPT` gained the rule the record exists to support, written about
+      natural-language TEXT generally rather than about one operation — an email body claiming work
+      that did not happen is wrong in exactly the same way a user report is, and the grounder is
+      never told which operation it is filling in for. The rule separates what the goal says was
+      *intended* from what the record shows *happened*, and requires naming the work that did
+      nothing rather than omitting it. Deliberately **not** put in the revalidation prompt: that
+      call judges whether the remaining steps are still the right ones to run, and a fan-out that
+      found nothing does not make them wrong — it makes the report's wording wrong, which is a
+      grounding question. Routing it through revalidation would also have missed the observed run
+      entirely, since both shipped Gaia2 configs set `context_adaptation: none`.
+
+      **Done (the literal path):** a report whose `text` the planner wrote as a *literal* has no
+      references, so grounding's cheap path returned it unexamined and the sentence reached the user
+      having been checked against nothing. `DefaultReasonStrategy._resolve` now takes a `force`
+      flag, and the invoke branch sets it for exactly one case: the operation is
+      `SEND_MESSAGE_TO_USER` **and** the activity has a no-op sub-goal on record. That escalates the
+      report to `_ground_` even with nothing to resolve, so it is re-phrased against the record by
+      the rule above. The trigger is the *evidence of a gap*, not the step being a report — a run
+      where every planned step did something keeps the cheap path and pays no model call, which
+      matters because call count is a reported result axis. Scoped to the reply channel rather than
+      to every step following a no-op deliberately: re-grounding a write would hand its concrete
+      arguments back to a model with no reason to change them and every opportunity to, a worse
+      trade than the report it protects. `SEND_MESSAGE_TO_USER` moved to `sora/types.py` to make
+      that check possible without core importing an adapter — core already depended on the literal
+      (`PLAN_SYSTEM_PROMPT` names it in prose), so this removes a duplicated string rather than
+      adding coupling; `sora.adapters.runtime_io` re-exports it. Same precedent as `USER_STOP`.
+      Costs **no** further re-baseline: it is a pure runtime change and moves no prompt row.
+
+      **Not verified on a live scenario.** Both halves are pinned by unit tests, including one that
+      reproduces the observed shape end to end (empty fan-out, then the report). Neither has been
+      re-run against a real gaia2-cli scenario, and the run that produced the finding is gone.
+
+      **Re-baselines the ground prompt.** `examples/gaia2/evaluation/campaigns/prompt/baseline.json`
+      was regenerated (`python -m examples.gaia2.evaluation prompt snapshot --output ...`). Exactly
+      one of the seven frozen rows moved — `ground`, its system and user text and both hashes; the
+      other six are byte-identical, so the blast radius is provably confined to grounding. Taken now
+      rather than deferred precisely because the freeze has not happened and no sweep result exists
+      to invalidate — which is the ordering §3 describes, though note the claim there that the V3
+      fixes cost no re-baseline was written about V3.1/V3.2 and does not hold for this one.
+
 ### 2.5 Gate V4 — Release mechanics
 
 - [ ] **V4.1** Write the real `CHANGELOG.md` entry — it still says *"No code has been released yet"*.

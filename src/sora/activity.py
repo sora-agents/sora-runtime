@@ -129,6 +129,16 @@ class Activity:
     # against it (last_operation keeps only the newest, overwritten each step). Transient:
     # not persisted, and episodic learn() captures selectively, not a blind asdict(activity).
     history: list[CompletedOperation] = field(default_factory=list)
+    # Sub-goals that ran and committed nothing. A mechanical fan-out whose collection resolves to
+    # empty expands to zero steps, which is the correct answer for the plan — there was nothing to
+    # do — but it leaves no trace anywhere a later step can read. `history` records only operations
+    # that *executed*, so a report phrased against history alone reads that silence as "it
+    # happened": the run this comes from told the user it had sent individual emails when the
+    # fan-out that would have sent them expanded to nothing. Holds the sub-goal's own goal string.
+    # Append-only for the life of the activity and deliberately NOT cleared on replan, for the same
+    # reason `history` is not — a step that did nothing stays a thing that did nothing, and the
+    # report is written after the replan.
+    noop_subgoals: list[str] = field(default_factory=list)
     # Named bindings a data-op step writes and a later step reads via {"$bind": "<name>"} (ADR-0023)
     # — the imperative pipeline's intermediate values (a filtered/deduped/sorted collection, a
     # reduced scalar). Transient run state like `history`/`grounded_params` (not persisted); cleared

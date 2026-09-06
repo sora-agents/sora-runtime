@@ -48,6 +48,7 @@ from sora.strategies import (
 )
 from sora.transport import MessageTransport
 from sora.types import (
+    SEND_MESSAGE_TO_USER,
     CompletedOperation,
     ObservableProperty,
     OperationAck,
@@ -1416,3 +1417,117 @@ def test_the_check_fails_open_wherever_the_schema_is_not_explicit() -> None:
 
     no_such_op = _manual_with_types("t", "different_op", {"s": {"type": "string"}})
     assert _mistyped_params(no_such_op, "op", {"s": 1}, {}) == []
+
+
+# --------------------------------------------------------------------------------------------------
+# The report the planner wrote as a LITERAL
+#
+# Grounding's cheap path is "no references -> no model call", which is right for almost everything
+# and wrong for exactly one thing: a report to the user phrased at PLAN time, before the work it
+# describes ran. Nothing resolves, so nothing is checked, and a sentence asserting work that a
+# zero-step fan-out never performed reaches the user unexamined. The escalation is triggered by the
+# evidence of a gap (`Activity.noop_subgoals`), not by the step being a report — so a run where
+# every planned step did something keeps the cheap path and pays nothing.
+# --------------------------------------------------------------------------------------------------
+
+
+def _report_step(text: str) -> Step:
+    return invoke_step("runtime/UserChannel", SEND_MESSAGE_TO_USER, text=text)
+
+
+def _report_activity(text: str, *, noop: list[str] | None = None) -> Activity:
+    activity = Activity(
+        id="a",
+        goal="save the cheap flats and email each matching relative",
+        context={},
+        plan=Plan(id="p", goal="report", steps=[_report_step(text)]),
+        step_index=0,
+        history=[_history("search_apartments", [])],
+    )
+    activity.noop_subgoals.extend(noop or [])
+    return activity
+
+
+async def test_a_literal_report_is_reground_when_planned_work_did_nothing(tmp_path: Path) -> None:
+    tool = FakeTool("runtime/UserChannel", invoke_results={SEND_MESSAGE_TO_USER: None})
+    spy = ScriptedProcedural(ground_result={"text": "Nothing matched, so no email was sent."})
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    activity = _report_activity(
+        "I've sent individual emails titled 'Properties List'.",
+        noop=["Send each matching relative an individual email"],
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+
+    assert [name for name, _ in spy.ground_calls] == [SEND_MESSAGE_TO_USER]
+
+
+async def test_a_literal_report_stays_on_the_cheap_path_when_nothing_was_skipped(
+    tmp_path: Path,
+) -> None:
+    """The cost guard. Re-grounding every plan's final report would buy a model call per activity
+    for the runs that need it least; with no no-op on record the report and the record cannot
+    disagree about work that silently did not happen."""
+    tool = FakeTool("runtime/UserChannel", invoke_results={SEND_MESSAGE_TO_USER: None})
+    spy = ScriptedProcedural()  # would raise if ground() were reached
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    activity = _report_activity("Saved 5 apartments.")
+    working.activities["a"] = activity
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is not None
+    assert result.step.params["text"] == "Saved 5 apartments."
+    assert spy.ground_calls == []
+
+
+async def test_a_literal_write_is_not_reground_just_because_something_was_skipped(
+    tmp_path: Path,
+) -> None:
+    """Scoped to the user's own reply channel, not to every step that follows a no-op. Re-grounding
+    a write would hand its concrete arguments back to a model that has no reason to change them and
+    every opportunity to — a far worse trade than the report it is protecting."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    spy = ScriptedProcedural()  # would raise if ground() were reached
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    step = invoke_step("realestate", "save_apartment", apartment_id="a1")
+    activity = Activity(
+        id="a",
+        goal="save",
+        context={},
+        plan=Plan(id="p", goal="save", steps=[step]),
+        step_index=0,
+    )
+    activity.noop_subgoals.append("email each matching relative")
+    working.activities["a"] = activity
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is step
+    assert spy.ground_calls == []
+
+
+async def test_the_reground_report_is_what_gets_dispatched(tmp_path: Path) -> None:
+    """End of the path: the rewrite has to replace the planned sentence, not sit beside it."""
+    tool = FakeTool("runtime/UserChannel", invoke_results={SEND_MESSAGE_TO_USER: None})
+    spy = ScriptedProcedural(ground_result={"text": "No relative matched; nothing was sent."})
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    activity = _report_activity(
+        "I've sent individual emails titled 'Properties List'.",
+        noop=["Send each matching relative an individual email"],
+    )
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+    await DefaultObserveStrategy().observe(cycle)
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is not None
+    assert result.step.params["text"] == "No relative matched; nothing was sent."

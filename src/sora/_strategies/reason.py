@@ -74,6 +74,7 @@ from sora.references import (
 )
 from sora.types import (
     OPERATION_NAME,
+    SEND_MESSAGE_TO_USER,
     SUBGOAL,
     TOOL_ID,
     Change,
@@ -776,6 +777,13 @@ class DefaultReasonStrategy:
         # on a rejected mechanical step belong to no plan and must not survive its replan.
         _lift_step_conditions(step, activity, wm, mode)
         activity.plan = replace(plan, steps=plan.steps[:i] + expanded + plan.steps[i + 1 :])
+        if not expanded:
+            # Zero steps is a legitimate answer (the collection was genuinely empty — an unreadable
+            # one already replanned above), but it is one nothing downstream can see: no operation
+            # runs, so `history` gains no entry, and a later report phrased against history alone
+            # cannot tell "nothing needed doing" from "it was done". Record it as its own kind of
+            # outcome so grounding can state the gap instead of inheriting the plan's intent.
+            activity.noop_subgoals.append(str(step.params.get("goal", "")))
         log.info(
             "reason: sub-goal %r fanned out to %d step(s)", step.params.get("goal"), len(expanded)
         )
@@ -872,7 +880,16 @@ class DefaultReasonStrategy:
             op_params = {k: v for k, v in step.params.items() if k not in (TOOL_ID, OPERATION_NAME)}
             manual = _manual_for(wm, routing.get(TOOL_ID))
             resolved = await self._resolve(
-                activity, wm, cycle, op_params, routing[OPERATION_NAME], manual
+                activity,
+                wm,
+                cycle,
+                op_params,
+                routing[OPERATION_NAME],
+                manual,
+                # The one step whose params a *plan-time literal* can already be wrong about (see
+                # _resolve): a report the planner phrased before the work it describes ran.
+                force=routing[OPERATION_NAME] == SEND_MESSAGE_TO_USER
+                and bool(activity.noop_subgoals),
             )
             if resolved is None:
                 return None  # escalated to _ground_; RUNNING now
@@ -928,6 +945,7 @@ class DefaultReasonStrategy:
         params: dict[str, Any],
         operation_name: str,
         manual: Manual | None,
+        force: bool = False,
     ) -> dict[str, Any] | None:
         """Mechanically resolve ``params`` against history; if anything can't be, escalate to the
         off-cycle ``_ground_`` action and return ``None``. When a prior escalation already resolved
@@ -942,7 +960,7 @@ class DefaultReasonStrategy:
         resolved, unresolved = resolve_references(
             params, activity.history, activity.bindings, wm.properties
         )
-        if not unresolved:
+        if not unresolved and not force:
             return resolved  # cheap path — resolved mechanically, no model call
         # Prompt context only (the mechanical resolve above already read the whole store), so
         # narrowing it to this activity's own tools costs nothing and is where the tokens are.

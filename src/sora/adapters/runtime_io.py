@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from sora.environment import HostClock
 from sora.manual import Manual, OperationSpecification
-from sora.types import OperationAck
+from sora.types import SEND_MESSAGE_TO_USER, OperationAck
 
 if TYPE_CHECKING:
     from sora.environment import DomainClock, Tool, Workspace, WorkspaceOrigin
@@ -29,7 +29,10 @@ if TYPE_CHECKING:
 RUNTIME_IO_ADAPTER = "runtime-io"  # matches WorkspaceOrigin.adapter
 RUNTIME_IO_ADDRESS = "runtime"  # the origin address; also the tool-id namespace
 RUNTIME_IO_WORKSPACE = "runtime-io"
-SEND_MESSAGE_TO_USER = "send_message_to_user"
+# Re-exported from sora.types, where core can see it: the planner prompt names this
+# operation, and grounding scopes its report re-check to it, so it cannot be this module's
+# private literal.
+__all__ = ["SEND_MESSAGE_TO_USER"]
 
 _USER_CHANNEL_MANUAL = "RuntimeUserChannel"
 _USER_CHANNEL_TOOL = f"{RUNTIME_IO_ADDRESS}/UserChannel"
