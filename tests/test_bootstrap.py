@@ -543,12 +543,19 @@ def test_shipped_adapter_names_match_bootstrap_dispatch_kinds() -> None:
     # makes a rename on either side fail loudly instead of silently missing dispatch.
     from sora.adapters.are_mcp import AreMcpWorkspaceAdapter
     from sora.adapters.are_sim import AreInProcessWorkspaceAdapter
+    from sora.adapters.gaia2_cli import Gaia2CliWorkspaceAdapter
     from sora.adapters.mcp import McpWorkspaceAdapter
-    from sora.bootstrap import _ADAPTER_ARE_MCP, _ADAPTER_ARE_SIM, _ADAPTER_MCP
+    from sora.bootstrap import (
+        _ADAPTER_ARE_MCP,
+        _ADAPTER_ARE_SIM,
+        _ADAPTER_GAIA2_CLI,
+        _ADAPTER_MCP,
+    )
 
     assert McpWorkspaceAdapter.name == _ADAPTER_MCP
     assert AreMcpWorkspaceAdapter.name == _ADAPTER_ARE_MCP
     assert AreInProcessWorkspaceAdapter.name == _ADAPTER_ARE_SIM
+    assert Gaia2CliWorkspaceAdapter.name == _ADAPTER_GAIA2_CLI
 
 
 # --------------------------------------------------------------------------------------------------

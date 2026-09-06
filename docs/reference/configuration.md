@@ -78,7 +78,7 @@ agent:
 
 | Key | Type | Notes |
 | --- | --- | --- |
-| `origin.adapter` | `str` | Built-in kinds: `mcp`, `are-mcp`, `are-sim`. Anything else requires `factory:`. |
+| `origin.adapter` | `str` | Built-in kinds: `mcp`, `are-mcp`, `are-sim`, `gaia2-cli`. Anything else requires `factory:`. |
 | `origin.address` | `str` | An MCP server URI, a WoT directory base href, or a nominal label for a locally-spawned subprocess. |
 | `workspace_id` | `str` | |
 
@@ -89,6 +89,8 @@ Adapter-specific keys:
 | `command`, `args`, `env` | `mcp`, `are-mcp` | Presence of `command` selects a locally-spawned **stdio** subprocess; absence means connect to the already-running server at `origin.address` (SSE by default, or `transport: streamable-http`). |
 | `transport` | `mcp`, `are-mcp` (remote only) | `streamable-http`, otherwise SSE. |
 | `manuals` | `mcp`, `are-mcp`, `are-sim` | Directory path wired into a `DirectoryManualSource`, paired with the adapter's synthesized manuals by `Manual.id` (ADR-0018). |
+| `polls` | `gaia2-cli` | `{binary: [{name, command, params}]}` — which read command produces each observable property. Omitted for a binary, the adapter falls back to every read command that takes no required argument. |
+| `binaries`, `timeout`, `poll_interval` | `gaia2-cli` | Which app binaries to probe (default: whichever of the ten are present on `origin.address`), the per-subprocess timeout, and the off-cycle polling period. |
 | `factory` | any custom adapter | Dotted path to a `(origin) -> WorkspaceAdapter` callable — the escape hatch for anything not built in. |
 
 `are-sim` needs the runtime-injected `simulation` object (see `agent.transport` below and
@@ -102,6 +104,7 @@ Adapter-specific keys:
 | --- | --- |
 | absent | `InProcessTransport` (in-process inbox, no network). |
 | `{kind: are}` | `AreTransport` — user messages flow through the running ARE scenario's `AgentUserInterface`; shares the injected `simulation` with an `are-sim` workspace. |
+| `{kind: gaia2-cli}` | `Gaia2CliTransport` — user turns and replies over the containerised Gaia2 harness's worker socket. Built from config alone; the host reaches it back through `agent.communication`. |
 | `{peers: [...]}` | Raises `NotImplementedError` — agent-to-agent transport is not implemented yet. |
 
 ## `agent.llm`

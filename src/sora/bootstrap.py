@@ -127,7 +127,9 @@ _DEFAULT_LLM_CLIENT = "sora.adapters.anthropic_llm.AnthropicLLMClient"
 _ADAPTER_MCP = "mcp"
 _ADAPTER_ARE_MCP = "are-mcp"
 _ADAPTER_ARE_SIM = "are-sim"
+_ADAPTER_GAIA2_CLI = "gaia2-cli"
 _TRANSPORT_ARE = "are"
+_TRANSPORT_GAIA2_CLI = "gaia2-cli"
 
 
 @dataclass(frozen=True)
@@ -286,6 +288,19 @@ def adapter_for(
             simulation=sim,
             manual_source=manual_source,
         )
+    if kind == _ADAPTER_GAIA2_CLI:
+        from sora.adapters.gaia2_cli import Gaia2CliWorkspaceAdapter, PollSpec
+
+        polls = {
+            binary: [PollSpec(**spec) for spec in specs]
+            for binary, specs in (entry.get("polls") or {}).items()
+        }
+        return origin, Gaia2CliWorkspaceAdapter(
+            workspace_id=entry["workspace_id"],
+            origin=origin,
+            polls=polls or None,
+            **{k: entry[k] for k in ("timeout", "poll_interval", "binaries") if k in entry},
+        )
     if kind in (_ADAPTER_MCP, _ADAPTER_ARE_MCP):
         if kind == _ADAPTER_MCP:
             from sora.adapters.mcp import McpWorkspaceAdapter as _Adapter
@@ -380,7 +395,8 @@ def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]:
 def transport_for(config: AgentConfig, simulation: Any | None = None) -> MessageTransport:
     """The single-agent default is an in-process inbox. ``transport: { kind: are }`` selects the ARE
     in-process transport (user messages via the running scenario's ``AgentUserInterface``)
-    — it shares the injected ``simulation`` with the ``are-sim`` workspace. An agent-to-agent
+    — it shares the injected ``simulation`` with the ``are-sim`` workspace; ``kind: gaia2-cli``
+    selects the containerised Gaia2 CLI harness's worker-socket transport. An agent-to-agent
     transport (A2A/HTTP, driven by ``transport.peers``) is the multi-agent case, deferred, so a
     ``peers`` config raises rather than silently running peerless."""
     if config.transport and config.transport.get("kind") == _TRANSPORT_ARE:
@@ -388,6 +404,13 @@ def transport_for(config: AgentConfig, simulation: Any | None = None) -> Message
         from sora.adapters.are_sim import AreTransport
 
         return AreTransport(sim)
+    if config.transport and config.transport.get("kind") == _TRANSPORT_GAIA2_CLI:
+        from sora.adapters.gaia2_cli import Gaia2CliTransport
+
+        # Constructed from config alone, unlike `are`: whoever hosts the agent reaches it back
+        # through ``agent.communication`` to hand in the socket writer and to submit turns, so
+        # there is nothing to inject at build time.
+        return Gaia2CliTransport()
     if config.transport and config.transport.get("peers"):
         raise NotImplementedError(
             "agent-to-agent transport (transport.peers) is not implemented yet; single-agent runs "

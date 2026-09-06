@@ -89,6 +89,13 @@ files = ["src/sora", "tests", "examples"]
 module = ["are.*", "huggingface_hub"]
 ignore_missing_imports = true
 
+# The Gaia2 container assets import modules that exist only inside the image: the harness's own
+# adapter base (copied to /opt at build time) and its CLI package. Neither is installable on a
+# developer host, so their symbols are Any here — the files still type-check for everything else.
+[[tool.mypy.overrides]]
+module = ["gaia2_adapter_base", "gaia2_cli.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
