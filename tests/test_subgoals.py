@@ -1184,3 +1184,33 @@ async def test_the_report_after_an_empty_fan_out_is_grounded_against_the_gap(
     _system, prompt = llm.calls[0]
     assert "save each apartment" in prompt  # the sub-goal that ran and did nothing, by name
     assert "performed NO operation" in prompt
+
+
+def test_mechanical_fan_out_over_a_literal_offset_list_drives_a_paginated_sweep() -> None:
+    """The only loop-shaped construct a plan has for a paginated scan, and the shape
+    ``PLAN_SYSTEM_PROMPT`` now tells the planner to write. Where no observable property publishes
+    the collection, this is the *sole* route to the whole of it, so the literal-list ``in`` and the
+    bare ``{"$bind": <name>}`` over a scalar element both have to keep working: a deliberative
+    sub-goal saying "keep paging until the match turns up" restates its parent, trips the recursion
+    guard, and stalls the run outright."""
+    from sora._strategies.subgoals import _expand_mechanical
+
+    step = step_from_raw(
+        {
+            "action": "subgoal",
+            "mode": "mechanical",
+            "in": [0, 20, 40],  # a literal list — no operation has to produce the offsets
+            "as": "offset",
+            "template": {
+                "action": "invoke",
+                "tool_id": "contacts",
+                "operation_name": "get_contacts",
+                "params": {"offset": {"$bind": "offset"}},
+            },
+        }
+    )
+    steps, defect = _expand_mechanical(step, [], {}, {})
+
+    assert defect is None
+    assert [s.params["offset"] for s in steps] == [0, 20, 40]
+    assert {s.params["operation_name"] for s in steps} == {"get_contacts"}

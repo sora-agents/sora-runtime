@@ -1668,3 +1668,124 @@ async def test_a_mechanical_filter_reports_how_much_it_kept(
 
     assert activity.bindings["kept"] == [{"v": 9}]
     assert "data-op: filter 'kept' kept 1 of 2 (mechanical)" in caplog.text
+
+
+# --------------------------------------------------------------------------------------------------
+# flatten — concatenate a collection of collections into one (the paginated-sweep gather)
+# --------------------------------------------------------------------------------------------------
+
+
+# The shape a windowed list operation returns once per page, as `collect` hands it on: the payload
+# list, the operation's own pagination metadata, and the `offset` argument the call was made with
+# (collect enriches each result with its invoking params). Modelled on gaia2-cli's `get_contacts`,
+# whose metadata is a NESTED dict — unlike ARE's flat
+# `{"events": [...], "range": ..., "total": ...}`.
+def _page(offset: int, records: list[dict[str, object]], total: int) -> dict[str, object]:
+    return {
+        "offset": offset,
+        "contacts": records,
+        "metadata": {"range": [offset, offset + len(records)], "total": total},
+    }
+
+
+async def test_flatten_concatenates_page_payloads(tmp_path: Path) -> None:
+    """The gap that made a paginated sweep silently wrong: `collect` yields one item per CALL, so a
+    downstream `filter` on a record field matched pages rather than records and bound empty — which
+    reads downstream as "no such record" rather than as a question."""
+    pages = [
+        _page(0, [{"name": "a", "job": "Baker"}, {"name": "b", "job": "Film Producer"}], 4),
+        _page(2, [{"name": "c", "job": "Welder"}, {"name": "d", "job": "Film Producer"}], 4),
+    ]
+    step = Step(next_action="flatten", params={"in": pages, "out": "all"})
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert [r["name"] for r in activity.bindings["all"]] == ["a", "b", "c", "d"]
+
+
+async def test_flatten_reads_an_explicit_path(tmp_path: Path) -> None:
+    """`path` names the payload field explicitly — the escape hatch for an envelope the mechanical
+    coercion refuses, and the only option when a tool publishes no `returns:` shape to read."""
+    pages = [
+        {"rows": [1, 2], "junk": {"anything": "at all"}},
+        {"rows": [3], "junk": {"anything": "at all"}},
+    ]
+    step = Step(next_action="flatten", params={"in": pages, "out": "n", "path": "rows"})
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert activity.bindings["n"] == [1, 2, 3]
+
+
+async def test_flatten_leaves_an_already_flat_collection_unchanged(tmp_path: Path) -> None:
+    """An element that is not itself a collection contributes itself, so a defensively-placed
+    flatten over records is a no-op rather than an error — and never DROPS an element, which would
+    reintroduce the silent-loss failure it exists to fix."""
+    records = [{"id": "r1"}, {"id": "r2"}]
+    step = Step(next_action="flatten", params={"in": records, "out": "f"})
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert activity.bindings["f"] == records
+
+
+async def test_flatten_path_matching_no_element_is_a_defect_not_an_empty_binding(
+    tmp_path: Path,
+) -> None:
+    """The likeliest way to get this wrong where operations publish no `returns:` shape: the
+    planner guesses the payload field name. A path that misses EVERY element is unreadable, not
+    empty — same stance as an unresolvable membership set."""
+    pages = [{"contacts": [{"id": "c1"}]}, {"contacts": [{"id": "c2"}]}]
+    step = Step(next_action="flatten", params={"in": pages, "out": "all", "path": "people"})
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert "all" not in activity.bindings
+    assert activity.plan is None
+    assert activity.replan_trail[-1] is not None
+
+
+async def test_flatten_empty_input_is_an_answer_not_a_defect(tmp_path: Path) -> None:
+    step = Step(next_action="flatten", params={"in": [], "out": "all", "path": "contacts"})
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert activity.bindings["all"] == []
+    assert activity.plan is not None
+
+
+async def test_paginated_sweep_collect_flatten_filter_finds_the_record(tmp_path: Path) -> None:
+    """The whole shape end to end, as a plan must write it where no observable property publishes
+    the collection: sweep the list operation over bounded offsets -> `collect` the runs ->
+    `flatten` the pages into records -> filter mechanically. Before flatten existed the filter ran
+    against 3 pages, matched nothing, and the agent reported the contact did not exist."""
+    history = [
+        _history("get_contacts", _page(0, [{"name": "a", "job": "Baker"}], 3)),
+        _history("get_contacts", _page(1, [{"name": "b", "job": "Film Producer"}], 3)),
+        _history("get_contacts", _page(2, [{"name": "c", "job": "Welder"}], 3)),
+    ]
+    steps = [
+        Step(next_action="collect", params={"from": "get_contacts", "out": "pages"}),
+        Step(next_action="flatten", params={"in": {"$bind": "pages"}, "out": "people"}),
+        Step(
+            next_action="filter",
+            params={
+                "in": {"$bind": "people"},
+                "out": "match",
+                "where": {"path": "job", "op": "eq", "value": "Film Producer"},
+            },
+        ),
+    ]
+    tool = FakeTool("contacts")
+    cycle, working, _ = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    activity = _activity_with_plan(steps, history)
+    working.activities["a"] = activity
+    for _ in steps:
+        await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert [r["name"] for r in activity.bindings["match"]] == ["b"]
+
+
+def test_paginated_envelope_with_nested_metadata_unwraps() -> None:
+    """ARE's windowed operations put their pagination metadata in flat scalar siblings; gaia2-cli's
+    nest it under `metadata`. Both are the same envelope, and refusing the nested one made even a
+    SINGLE page unfilterable."""
+    assert _as_collection(_page(0, [{"id": "c1"}], 1)) == [{"id": "c1"}]
+    assert _as_collection({"contacts": [], "metadata": {"range": [0, 0], "total": 0}}) == []
+
+
+def test_a_record_with_a_nested_dict_field_is_still_not_a_collection() -> None:
+    """The vocabulary check is what separates an envelope from a record that happens to carry one
+    list field — widening it to any nested dict would read a contact's `attendees` as the
+    payload."""
+    assert _as_collection({"contacts": [{"id": "c1"}], "address": {"city": "Stockholm"}}) is None
+    assert _as_collection({"event_id": "e1", "attendees": ["a"], "organizer": {"id": "u"}}) is None

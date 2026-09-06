@@ -804,6 +804,19 @@ class CollectAction:  # predefined data-op: _collect_ — the map-invoke's MapRe
         activity.bindings[kwargs["out"]] = list(kwargs["collection"])
 
 
+class FlattenAction:  # predefined data-op: _flatten_ — the paginated sweep's gather
+    name = "flatten"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        # Reason has already concatenated the pages (and replanned instead of dispatching if the
+        # `path` was unreadable), for the same reason it pre-gathers a `collect`: the transform can
+        # fail in a way that must drop the plan, and only Reason may do that.
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        collection = list(kwargs["collection"])
+        activity.bindings[kwargs["out"]] = collection
+        log.info("data-op: flatten %r -> %d items", kwargs["out"], len(collection))
+
+
 class ReduceAction:  # predefined data-op: _reduce_
     name = "reduce"
 
@@ -835,7 +848,7 @@ class ReduceAction:  # predefined data-op: _reduce_
 
 def default_action_registry() -> ActionRegistry:
     """The predefined action space, assembled once: the six external actions, the eight internal
-    working-memory levers/model calls, plus the six plan-composable data-ops (ADR-0023). bootstrap
+    working-memory levers/model calls, plus the seven plan-composable data-ops (ADR-0023). bootstrap
     and test harnesses register everything through this rather than naming each action inline."""
     registry = ActionRegistry()
     for external in (
@@ -866,6 +879,7 @@ def default_action_registry() -> ActionRegistry:
         SortAction(),
         TakeAction(),
         CollectAction(),
+        FlattenAction(),
         ReduceAction(),
     ):
         registry.register_data_op(data_op)

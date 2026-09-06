@@ -59,7 +59,7 @@ computation *visible as ordinary plan steps* and the concurrency model intact.
 
 Concretely:
 
-* **Six built-in ops**: `filter`, `distinct`, `sort`, `take`, `collect`, `reduce`. Each reads an
+* **Seven built-in ops**: `filter`, `distinct`, `sort`, `take`, `collect`, `flatten`, `reduce`. Each reads an
   `in` collection — a `$from` reference (history), a `$bind` reference (a prior binding), or a
   literal — and writes a named result into a new **`Activity.bindings[out]`**, which a later step
   reads via `{"$bind": "<name>", "path": …}`. `$bind` is thereby **generalized** from ADR-0022's
@@ -94,6 +94,20 @@ Concretely:
   otherwise sweep up a finished plan's stale results alongside its own; a replan resets that span
   with the plan, so a `collect` naming an operation that ran only *before* it is reported as a plan
   defect (re-invoke it here) rather than silently binding empty.
+* **`flatten` is `collect`'s other half, for a paginated sweep.** `collect` gathers one item per
+  *call*, so sweeping a windowed list operation across N offsets binds N **pages**, not the records
+  in them; a `filter` on a record field then tests the pages, matches none, and binds empty — which
+  reads downstream as "no such record" rather than as a question. `flatten` concatenates a
+  collection *of* collections into one. It is not the pure-projection `map` refused above: the
+  refusal holds because projection folds into a consuming op's key-path, and a key-path reads one
+  field of one element — it can never concatenate *across* elements, so this cardinality change has
+  no other home. An element that is not itself a collection contributes itself (so a defensive
+  flatten over records is a no-op and nothing is ever dropped); an explicit `path` that misses on
+  *every* element is a plan defect, not an empty result, because guessing the payload field's name
+  is the likeliest mistake wherever the adapted ecosystem publishes no `returns:` shape to read it
+  off. The same gap widened `_as_collection`'s paginated-envelope tier to accept a **nested**
+  metadata block (`{"contacts": [...], "metadata": {"range": …, "total": …}}`) beside the flat
+  sibling form it already took, under the same closed-vocabulary check.
 
 Named bindings are transient run state (a sibling of `history`/`grounded_params`, **not** a new
 memory module) and are cleared on replan, since they are coupled to the plan that produced them.

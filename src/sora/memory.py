@@ -470,6 +470,23 @@ PLAN_SYSTEM_PROMPT = (
     'judgement rather than a uniform template, use "mode": "deliberative" with just the "goal" — '
     "the runtime plans "
     "that sub-goal separately when it is reached.\n"
+    "A deliberative sub-goal must be strictly NARROWER than the goal it appears in: one PART of "
+    "the remaining work, never that same goal restated with extra qualifiers. Restating reduces "
+    "nothing, and the runtime treats a sub-goal that largely repeats the goal it was planned "
+    "under as runaway recursion — it refuses to plan it and stops to ask the user how to "
+    "proceed, so the plan makes no further progress at all. Two shapes in particular are not "
+    "sub-goals. Do NOT defer 'now find / identify / pick the one that matches' to one: that is a "
+    "`filter` over results you already have, and the filtered collection IS the answer. And do "
+    "NOT write 'keep calling the operation until the match turns up' — there is no loop-until-"
+    "found step, and phrasing one as a sub-goal is the commonest way to trip the recursion check. "
+    "To scan a paginated collection, fan the list operation out over a LITERAL list of offsets "
+    'with a MECHANICAL sub-goal ("in": [0, 20, 40, ...] — a literal list is a valid "in" — "as": '
+    '"offset", and a template that passes {"$bind": "offset"} to the operation), then `collect` '
+    "those runs, `flatten` the pages into records, and `filter` those records. Pick the offsets "
+    "from the page size the operation documents, and sweep PAST where you expect the data to end "
+    "rather than stopping short: an offset beyond the last record returns an empty page and costs "
+    "one call, whereas stopping short drops records silently and the filter then reports that "
+    "nothing matched.\n"
     'A `subgoal` step MAY also carry "goal_kind": "achievement" | "maintenance" (default '
     '"achievement"). It answers a different question from "mode": "mode" says how the sub-plan is '
     'produced, "goal_kind" says WHEN the sub-goal is finished, so either kind can be planned '
@@ -556,6 +573,13 @@ PLAN_SYSTEM_PROMPT = (
     "doesn't echo them back — e.g. after get_condition_score per gallery, `collect` yields items "
     "with both the returned score AND the gallery_id it was called for, so a mechanical `between` "
     "then an `in`/`not_in` membership join on gallery_id needs no $decide,\n"
+    '  {"action": "flatten", "in": ..., "out": "<name>", "path": "<payload field>"}  concatenate a '
+    "collection OF collections into one flat collection. This is what turns a paginated sweep into "
+    "records: `collect` yields one item per CALL — one per PAGE — so a `filter` placed straight "
+    "after it tests the pages, matches none of them, and keeps nothing. Omit `path` when each "
+    "element is already a list or a recognisable page envelope; give `path` to name the payload "
+    "field when you know it. Flattening an already-flat collection changes nothing, so it is safe "
+    "to include whenever the elements might be pages,\n"
     '  {"action": "reduce", "in": ..., "out": "<name>", "op": "<sum|min|max|count|mean>", '
     '"by": "<field>"}  aggregate to a single value.\n'
     "So the 'catalogue each QUALIFYING artifact' shape is: search -> `filter` the results into a "

@@ -49,6 +49,7 @@ from sora.action import (
     CollectAction,
     EvaluateConditionsAction,
     FilterAction,
+    FlattenAction,
     GroundAction,
     InferAction,
     InvokeAction,
@@ -58,6 +59,7 @@ from sora.action import (
 from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
 from sora.data_ops import (
     _enrich_with_params,
+    _flatten,
     _resolve_collection,
     _resolve_predicate_value,
 )
@@ -485,6 +487,14 @@ class DefaultReasonStrategy:
                 passthrough, defect = _resolve_predicate_value(
                     passthrough, activity.history, activity.bindings, cycle.working.properties
                 )
+            if defect is None and step.next_action == FlattenAction.name:
+                # Concatenated here rather than in the action for the same reason a `collect` is
+                # gathered here: a `path` that names a field no element carries is a plan defect
+                # that has to drop the plan, and only Reason may do that.
+                resolved, defect = _flatten(
+                    resolved if resolved is not None else [], passthrough.get("path")
+                )
+                passthrough = {k: v for k, v in passthrough.items() if k != "path"}
             if defect is not None:
                 # Same reason as the fan-out: a data-op over an unreadable input would write an
                 # empty binding, and an empty binding reads downstream as a real answer ("no such

@@ -187,18 +187,37 @@ _PAGE_META = frozenset(
 )
 
 
+# The names an operation uses for a NESTED metadata block, when it groups its pagination fields
+# under one key instead of spreading them as siblings — gaia2-cli's `get_contacts` returns
+# `{"contacts": [...], "metadata": {"range": [...], "total": N}}` where ARE's windowed operations
+# return `{"events": [...], "range": ..., "total": N}`. Same envelope, one level of nesting apart.
+# Closed for the same reason `_PAGE_META` is: accepting *any* nested dict beside a list would read a
+# calendar event's `{"attendees": [...], "organizer": {...}}` as a collection of attendees.
+_PAGE_META_ENVELOPE = frozenset({"meta", "metadata", "page_info", "pagination"})
+
+
 def _paginated_payload(value: dict[str, Any]) -> list[Any] | None:
     """The payload list out of ``{"events": [...], "range": ..., "total": ...}``, or ``None`` when
-    this is not that shape: exactly one list-valued key, every other key a ``_PAGE_META`` scalar.
-    The vocabulary check is the whole load-bearing part — without it a one-list-field record
-    qualifies (see ``_as_collection`` tier 3)."""
+    this is not that shape: exactly one list-valued key, every other key either a ``_PAGE_META``
+    scalar or a ``_PAGE_META_ENVELOPE`` dict holding nothing but ``_PAGE_META`` keys. The vocabulary
+    check is the whole load-bearing part — without it a one-list-field record qualifies (see
+    ``_as_collection`` tier 3)."""
     payload: list[Any] | None = None
     for key, item in value.items():
         if isinstance(item, list):
             if payload is not None:
                 return None  # two candidate payloads: which one was meant is not mechanical
             payload = item
-        elif isinstance(item, dict) or key not in _PAGE_META:
+        elif isinstance(item, dict):
+            # A nested metadata block: the key must be one of the envelope names AND every field
+            # inside it must be pagination vocabulary. Both halves are needed — the key alone would
+            # admit a record field that happens to be called `meta`, and the contents alone would
+            # admit any small dict whose keys collide with the vocabulary.
+            if key not in _PAGE_META_ENVELOPE or not item:
+                return None
+            if any(inner not in _PAGE_META for inner in item):
+                return None
+        elif key not in _PAGE_META:
             return None
     return payload
 
@@ -406,6 +425,50 @@ def _resolve_collection(
     if collection is None:
         return None, _collection_defect(ref, value, history, properties)
     return collection, None
+
+
+def _flatten(collection: list[Any], path: str | None = None) -> tuple[list[Any] | None, str | None]:
+    """Concatenate a collection *of collections* into one flat collection, returning
+    ``(flattened, defect)`` on the same contract as ``_resolve_collection``.
+
+    This is the gather a paginated sweep needs and no other op provides. ``collect`` yields one item
+    per *call*, so sweeping a windowed list operation over N offsets binds N **pages**; a downstream
+    ``filter`` on a record field then matches none of them and binds empty — which reads downstream
+    as "no such record" rather than as a question, the exact silent-wrong-answer shape this layer
+    legislates against everywhere else. Projection cannot fix it: a consuming op's key-path reads
+    one field of one element and can never concatenate *across* elements, which is why this is a
+    seventh op rather than folded into `sort by` / `filter where.path` like an ordinary projection.
+
+    Each element contributes ``pluck(element, path)`` when ``path`` is given, else itself, coerced
+    through ``_as_collection``. An element that is not a collection contributes **itself**, so a
+    defensively-placed flatten over records is a no-op rather than an error and no element is ever
+    dropped. A ``path`` that misses on *every* element is the exception: that is unreadable, not
+    empty — the planner named a field the data does not have, which is the likeliest mistake where
+    the ecosystem publishes no ``returns:`` shape to read the payload's name off — so it comes back
+    as a defect to replan on, with the real field names named so the retry is informed."""
+    if not collection:
+        return [], None  # an empty sweep is an answer (nothing was there), not an unreadable input
+    flattened: list[Any] = []
+    matched = 0
+    for element in collection:
+        value = pluck(element, path) if path else element
+        if path and value is None:
+            continue  # this element has no such field; only ALL of them missing is a defect
+        matched += 1
+        inner = _as_collection(value)
+        if inner is None:
+            flattened.append(value)  # not a collection: contribute it whole rather than drop it
+        else:
+            flattened.extend(inner)
+    if path and matched == 0:
+        available = sorted(
+            {k for e in collection if isinstance(e, dict) for k in e}
+        )  # name what IS there: a blind retry would re-guess from the same nothing
+        return None, (
+            f"the flatten step reads path {path!r}, which no element of its input has"
+            + (f" (their fields are: {', '.join(available)})" if available else "")
+        )
+    return flattened, None
 
 
 def _enrich_with_params(result: Any, params: dict[str, Any]) -> Any:
