@@ -1,0 +1,20 @@
+# The image build sends this whole directory to the Docker daemon as the build context. Nothing in
+# examples/gaia2/cli/Dockerfile copies a secret into a layer — every COPY names an explicit path —
+# but the context itself is worth keeping clean: a later `COPY . ` would otherwise bake whatever is
+# sitting in the working tree into the image, and `.env` holds real API keys.
+.env
+.env.*
+!.env.example
+
+# Never needed by the build, and large: uploading them slows every build for nothing.
+.git/
+.venv/
+venv/
+.claude/
+notes/
+**/__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+site/

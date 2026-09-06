@@ -1,13 +1,22 @@
 # Gaia2 benchmark harness
 
 Running S-ORA against Meta's [Gaia2](https://huggingface.co/datasets/meta-agents-research-environments/gaia2)
-scenarios, on top of the ARE simulator. Three entry points:
+scenarios. There are two harnesses, and they are not interchangeable.
+
+**This page is the in-process one**: S-ORA and the ARE simulator in one Python process, driven by
+three entry points. It is the fast path for development — no container, a scenario in seconds, the
+whole trajectory in your own log.
 
 | Script | Use it to |
 |---|---|
 | `scripts/fetch_scenario.py` | Pull one scenario JSON down to inspect or replay locally |
 | `run_benchmark.py` | Run **one** scenario, print the judge verdict |
 | `batch.py` | Run a whole capability, emit leaderboard artifacts, report pass@1 |
+
+**[`cli/`](cli/README.md) is the container one** — Meta's own `gaia2-cli` harness, one container per
+scenario, the agent driving ten command-line apps behind a setuid wrapper. Slower to iterate on, and
+the one *reported* numbers should come from: the in-process path diverges from stock ARE in ways a
+published Gaia2 result cannot absorb, most consequentially on the clock. Keep both.
 
 ## Setup
 

@@ -1,0 +1,55 @@
+# S-ORA on the containerised Gaia2 CLI harness. Scenario-agnostic, like its in-process sibling
+# (../agent.yaml): the scenario is mounted into the container by the runner, never named here.
+#
+# The `llm:` block is intentionally thin. The worker fills in client/model/api_key/base_url from
+# the PROVIDER/MODEL/API_KEY/BASE_URL variables the runner sets per invocation — see
+# sora_worker.py for why this one harness inverts the usual "agent.yaml is the only model
+# selector" rule. Everything below the model is config as usual.
+agent:
+  name: gaia2-cli
+  strategies:
+    reason: sora.strategies.DefaultReasonStrategy
+    # These apps publish no observable state (see the adapter's module docstring), so the only
+    # percept of world change is the daemon's notification — an announcement with no ids and no
+    # values. A revalidation judge shown that and nothing else can rarely do better than "maybe",
+    # so it would spend a model call to learn what the change-gate already established. This level
+    # gates at the same points before_writes does and resolves a hot gate by discarding the plan,
+    # scoped to changes on tools the plan actually references. Sound here specifically because the
+    # notification formatters are all on environment functions: the agent's own writes never
+    # announce themselves, so a plan can never invalidate itself.
+    context_adaptation: replan_on_change
+    # Attend to every joined tool rather than narrowing to the live plan. Narrowing costs nothing
+    # in latency here (nothing is polled), but a tool the plan never mentions would stop receiving
+    # notifications — its adapter stops producing signals when unfocused — and the announcement is
+    # this environment's only channel for world change. Going quiet fails silently.
+    focus: all-joined
+    # Bound a stalled model call. The container's clock is the scenario's clock and it runs while
+    # the agent thinks, so a hung provider spends the scenario's own budget, not just wall time.
+    inference_deadline: 300
+  memory:
+    semantic: file:///tmp/sora/semantic
+    procedural: file:///tmp/sora/procedural
+    episodic: file:///tmp/sora/episodic
+  llm:
+    instrument: true
+    max_logical_calls: 200
+    # A multi-step plan behind adaptive thinking overruns the 8192 default; both shipped clients
+    # stream, so a large cap does not trip a non-streaming duration guard.
+    max_tokens: 16384
+    # Seconds of silence tolerated between streamed chunks. Both shipped clients take these two.
+    stall_timeout: 300.0
+    max_retries: 0
+  transport:
+    kind: gaia2-cli
+  workspaces:
+    - origin: { adapter: gaia2-cli, address: "/home/agent/bin" }
+      workspace_id: gaia2
+      # No `polls:` on purpose, so nothing is polled and no manual declares an observable property.
+      # These CLIs expose state only by running a command, which is an operation and not an
+      # observation; nominating one per app and publishing its output as observed state invents an
+      # affordance the environment does not have. It also degenerates — `calendar` has no
+      # zero-argument read that represents its state — and it costs a subprocess per tool per
+      # second to obtain what the sibling harnesses get by deciding to look. The agent perceives
+      # world change through `env_notification` and reads the detail as a plan step, which is what
+      # those harnesses do on a wake. A declared poll remains supported for an ecosystem that
+      # genuinely offers one.
