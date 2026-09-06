@@ -51,6 +51,8 @@ For local development, **copy `.env.example` to `.env`** and set `ANTHROPIC_API_
 loads a local `.env` automatically when present, so you don't need to `export` it each time. `.env`
 is gitignored, and **real environment variables still take precedence** (a `.env` value is used only
 when the variable isn't already set), so it never silently overrides a key you exported deliberately.
+The test suite loads the same file, so a variable an opt-in test is gated on — `.env.example` lists
+them — is picked up from `.env` rather than needing an `export` in front of `pytest`.
 
 For OpenAI proper, `OpenAICompatLLMClient` likewise uses the SDK-standard `OPENAI_API_KEY` when
 `base_url` is absent. For a hosted OpenAI-compatible endpoint, name a dedicated environment
