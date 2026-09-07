@@ -34,13 +34,25 @@ agent:
     episodic: file://./.sora/gaia2/episodic
   llm:
     # Hold this constant between the S-ORA run and the ReAct baseline for a fair same-model
-    # comparison; the driver's --model flag can override it per run.
-    model: claude-opus-4-8
+    # comparison. This is the *only* thing that selects the model — the batch driver's --model is
+    # just the label stamped into the exported trace, and it refuses to run if it names another one.
+    # model: claude-opus-4-8
+    client: sora.adapters.openai_llm.OpenAICompatLLMClient
+    model: gpt-5.4-2026-03-05
+    # model: moonshotai/kimi-k2.5
+    # base_url: https://openrouter.ai/api/v1
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    stream: true
+    stall_timeout: 300.0
+    max_retries: 0
+    reasoning_effort: medium
     # A multi-step plan behind adaptive thinking overruns the 8192 default (thinking can take ~95%
     # of the budget, truncating the plan JSON mid-serialization). The client streams the completion,
     # so a large cap doesn't trip the SDK's non-streaming 10-minute guard.
-    max_tokens: 32000
+    max_tokens: 16384
     instrument: true
+    max_logical_calls: 200
   transport:
     # ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies via
     # send_message_to_user (the per-turn boundary Gaia2's online judge keys on).
