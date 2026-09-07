@@ -67,6 +67,35 @@ def test_the_real_failing_plan_is_recovered() -> None:
     assert recovered["pending"][0]["until"] == "the day has passed"
 
 
+def test_a_surplus_closer_mid_document_is_repaired_not_mined_for_a_fragment() -> None:
+    """A surplus closer *inside* the document balances it early, so everything after that point
+    scans as a top-level object of its own — and the first of those that parses is a single step:
+    a perfectly valid object that is not the plan. The caller then dies on a missing ``steps`` key,
+    handed a "repair" that discarded the plan it was repairing.
+
+    Recorded from the 2026-09-07 gaia2-cli time-scenario run: a three-step plan, its maintenance
+    sub-goal and pending condition intact, came back as its own last step and the run terminated on
+    ``KeyError('steps')`` — with the one retry reproducing the same output verbatim, so the free
+    repair was the only thing that could have saved it. It could: reading this document is what it
+    is for, and it never got the chance. Ordering is the whole defect."""
+    raw = (
+        '{"steps":[{"action":"focus","tool_id":"/home/agent/bin/calendar"},'
+        '{"action":"subgoal","goal":"delete events overlapping the added ones",'
+        '"mode":"mechanical","goal_kind":"maintenance",'
+        '"pending":[{"watch":{"signal":"env_notification","source":"/home/agent/bin/calendar"},'
+        '"when":"events were added","then":"delete the conflicting ones",'
+        '"until":{"text":"four minutes have passed","seconds":240}}}]},'  # the surplus brace
+        '{"action":"invoke","tool_id":"runtime/UserChannel",'
+        '"operation_name":"send_message_to_user","params":{"text":"done"}}]}'
+    )
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)
+    recovered = _load_json_object(raw)
+    assert [step["action"] for step in recovered["steps"]] == ["focus", "subgoal", "invoke"]
+    condition = recovered["steps"][1]["pending"][0]
+    assert condition["until"] == {"text": "four minutes have passed", "seconds": 240}
+
+
 def test_a_closer_inside_a_string_is_never_dropped() -> None:
     assert _load_json_object('{"a": "}]}"}') == {"a": "}]}"}
 
@@ -90,8 +119,15 @@ def test_an_unclosed_tail_is_not_completed() -> None:
 
 
 def test_repair_does_not_shadow_prose_wrapped_json() -> None:
-    """The repair runs last, so the existing prose fallback still wins where it applies."""
+    """The repair runs first, but it declines on anything it has no reading for: prose has no
+    surplus closer, so it returns None and the scan over balanced groups still wins here."""
     assert _load_json_object('Here is the plan: {"steps": []}') == {"steps": []}
+
+
+def test_a_stray_closer_in_the_prose_does_not_cost_the_embedded_object() -> None:
+    """Both fallbacks in sequence: the repair removes the stray closer, the remaining text is still
+    prose rather than JSON, and the scan then finds the object that was embedded in it."""
+    assert _load_json_object('oops } — here is the plan: {"steps": []}') == {"steps": []}
 
 
 # --------------------------------------------------------------------------------------------------

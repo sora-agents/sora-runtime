@@ -1590,32 +1590,42 @@ def _drop_surplus_closers(text: str) -> str | None:
 
 def _load_json_object(text: str, *, record_repair: bool = True) -> Any:
     """Parse a JSON value from model output, tolerating both a code-fence wrapper and surrounding
-    prose. Fast path: parse the fence-stripped text directly (the common clean case). Fallback: try
-    each balanced ``{...}`` in order and return the first that parses, so a prose-wrapped
-    ``{"keep": []}`` (or plan/params object) no longer dies on a bare ``json.loads`` — and a prose
-    lead-in that *itself* contains a brace-group (``"use the {tag} format: {...}"``) doesn't shadow
-    the real object the way betting on the first balanced group would. Re-raises the last
-    ``json.JSONDecodeError`` when nothing yields valid JSON — the callers' anti-corruption boundary
-    converts it to a ``ValueError`` as before."""
+    prose. Fast path: parse the fence-stripped text directly (the common clean case).
+
+    Two fallbacks follow, and their **order is load-bearing**. First ``_drop_surplus_closers``,
+    which deletes characters that had no valid reading at all and so cannot change which document
+    was meant. Only then the scan over balanced ``{...}`` groups, which returns the first that
+    parses — that one recovers a prose-wrapped ``{"keep": []}`` (or plan/params object) and, by
+    trying each group rather than betting on the first, is not shadowed by a prose lead-in that
+    itself contains braces (``"use the {tag} format: {...}"``).
+
+    The scan must run second because it is a *guess*: a surplus closer in the MIDDLE of a document
+    balances it early, so every later step scans as a top-level object of its own and the first of
+    those parses cleanly — a plausible fragment of the very document that failed, returned in place
+    of the whole. That is how a three-step plan came back as its own last step and the caller died
+    on a missing ``steps`` key, counted as a repair on the way out. Run the repair first and the
+    same input reads correctly, because a mid-document surplus closer is precisely what the repair
+    is for. Re-raises the last ``json.JSONDecodeError`` when nothing yields valid JSON — the
+    callers' anti-corruption boundary converts it to a ``ValueError`` as before."""
     stripped = _strip_code_fences(text)
     try:
         return json.loads(stripped)
     except json.JSONDecodeError as first_err:
         last_err: json.JSONDecodeError = first_err
-    # Fallback runs outside the except so the eventual re-raise isn't exception-chained onto the
+    # Fallbacks run outside the except so the eventual re-raise isn't exception-chained onto the
     # fast-path error (they're the same failure viewed twice, not a handler bug).
-    for span in _iter_json_objects(stripped):
+    repaired = _drop_surplus_closers(stripped)
+    if repaired is not None:
         try:
-            value = json.loads(span)
+            value = json.loads(repaired)
             if record_repair:
                 log_llm_malformed(repaired=1)
             return value
         except json.JSONDecodeError as exc:
             last_err = exc
-    repaired = _drop_surplus_closers(stripped)
-    if repaired is not None:
+    for span in _iter_json_objects(stripped):
         try:
-            value = json.loads(repaired)
+            value = json.loads(span)
             if record_repair:
                 log_llm_malformed(repaired=1)
             return value
