@@ -166,9 +166,53 @@ def get_health_info() -> dict[str, Any]:
     return {"backend": "sora", "worker_connected": _connected, "activeRun": _active_run_id}
 
 
+# The daemon writes daemon_status.json and exits when the scenario ends — and tells no one else.
+# This HTTP server serves forever and the worker's agent loop has no reason to stop, so a standalone
+# `docker run` sits there looking busy long after the last turn was judged. Saying so is
+# unconditional. *Acting* on it is opt-in, because the runner learns about completion by polling
+# `GET /status` from this very process: exiting the moment the daemon does would race the poll that
+# was going to read the result.
+_TERMINAL_STATUSES = frozenset({"complete", "error", "stopped"})
+_EXIT_ON_COMPLETE = (os.environ.get("SORA_EXIT_ON_COMPLETE") or "").lower() in {"1", "true", "yes"}
+_EXIT_GRACE_SECONDS = 15.0
+
+
+def _read_daemon_status(path: str) -> str:
+    with open(path) as handle:
+        return str(json.load(handle).get("status", ""))
+
+
+async def _watch_for_scenario_end() -> None:
+    status_file = os.path.join(STATE_DIR, "daemon_status.json")
+    while True:
+        await asyncio.sleep(2.0)
+        try:
+            status = await asyncio.to_thread(_read_daemon_status, status_file)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue  # not written yet, or caught mid-write
+        if status not in _TERMINAL_STATUSES:
+            continue
+        print(f"[gaia2-adapter] the daemon finished (status={status}); the scenario is over")
+        if not _EXIT_ON_COMPLETE:
+            print(
+                "[gaia2-adapter] the container stays up so the runner can still poll GET /status — "
+                "stop it with `docker stop`, or pass -e SORA_EXIT_ON_COMPLETE=1 to have a "
+                "standalone run shut itself down"
+            )
+            return
+        print(
+            f"[gaia2-adapter] SORA_EXIT_ON_COMPLETE is set; exiting in {_EXIT_GRACE_SECONDS:.0f}s"
+        )
+        await asyncio.sleep(_EXIT_GRACE_SECONDS)  # a window for the runner's last poll to land
+        if _writer is not None:
+            _writer.close()  # EOF on the worker's socket: it unwinds, and the container with it
+        os._exit(0)
+
+
 async def backend_connect() -> None:
     # Return at once; the worker comes up later via entrypoint.sh.
     asyncio.create_task(_worker_listener())
+    asyncio.create_task(_watch_for_scenario_end())
 
 
 def _on_notify_sent(text: str) -> None:

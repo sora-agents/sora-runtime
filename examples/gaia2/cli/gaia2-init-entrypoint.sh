@@ -20,8 +20,22 @@ CUSTOM_SCENARIO="${GAIA2_SCENARIO:-/var/gaia2/custom_scenario.json}"
 ADAPTER_PORT="${GAIA2_ADAPTER_PORT:-8090}"
 
 # ── 1. Initialise Gaia2 state ───────────────────────────────────────────────────────────────────
-if [ ! -f "$CUSTOM_SCENARIO" ]; then
-    echo "[gaia2-init] no scenario at $CUSTOM_SCENARIO, skipping init" >&2
+# Without a scenario nothing downstream runs — no state, no daemon, no adapter — and the worker then
+# waits out its connect timeout against a socket no one will ever open. That is a guaranteed-dead
+# container, so refuse it here rather than let it look like a slow agent. The directory case is
+# called out separately because it is the one that actually happens: `docker run -v` silently
+# CREATES an empty directory when the host path does not exist, and the documented command mounts
+# `$PWD/examples/gaia2/scenarios/...`, which is gitignored — so running it from a git worktree, or
+# from anywhere but the checkout holding the scenarios, produces exactly this.
+if [ -d "$CUSTOM_SCENARIO" ]; then
+    echo "[gaia2-init] FATAL: $CUSTOM_SCENARIO is a directory, not a scenario file." >&2
+    echo "[gaia2-init]   docker created it because the host path in your -v flag does not exist." >&2
+    echo "[gaia2-init]   Check the source path (scenarios are gitignored — they live in the main" >&2
+    echo "[gaia2-init]   checkout only, so \$PWD from a worktree will not find them)." >&2
+    exit 1
+elif [ ! -f "$CUSTOM_SCENARIO" ]; then
+    echo "[gaia2-init] FATAL: no scenario at $CUSTOM_SCENARIO — mount one with -v <host>.json:$CUSTOM_SCENARIO:ro" >&2
+    exit 1
 else
     echo "[gaia2-init] initialising from $CUSTOM_SCENARIO ..." >&2
     rm -rf /var/gaia2/state/*
@@ -104,10 +118,29 @@ if [ -f "$CUSTOM_SCENARIO" ]; then
         export PATH=/usr/local/bin:/usr/bin:/bin
         export GAIA2_STATE_DIR=/var/gaia2/state
         export GAIA2_ADAPTER_PORT='$ADAPTER_PORT'
+        ${SORA_EXIT_ON_COMPLETE:+export SORA_EXIT_ON_COMPLETE='$SORA_EXIT_ON_COMPLETE'}
         PYTHONUNBUFFERED=1 /usr/local/bin/python3 /opt/gaia2_adapter.py \
             >> /tmp/gaia2-adapter.log 2>&1 &
     "
     echo "[gaia2-init] adapter launched (log: /tmp/gaia2-adapter.log)" >&2
+
+    # Wait for the worker socket before dropping to the agent user. The worker retries the connect
+    # too, so this is not what makes the startup order safe — but only this side still runs as root,
+    # and so only this side can read the adapter's log. Waiting here is what turns a dead adapter
+    # into a message naming the reason, instead of the worker timing out against silence. It costs
+    # nothing when the adapter is healthy (the socket appears in well under a second) and it is
+    # deliberately not fatal: a scenario is better attempted than aborted at the door.
+    _SOCK="${SORA_WORKER_SOCK:-/tmp/sora-worker.sock}"
+    for _ in $(seq 1 60); do
+        if [ -S "$_SOCK" ]; then break; fi
+        sleep 0.5
+    done
+    if [ -S "$_SOCK" ]; then
+        echo "[gaia2-init] adapter listening on $_SOCK" >&2
+    else
+        echo "[gaia2-init] WARNING: no $_SOCK after 30s — the adapter is not listening. Its log:" >&2
+        tail -20 /tmp/gaia2-adapter.log >&2 || true
+    fi
 fi
 
 # ── 3. Drop to the agent user ───────────────────────────────────────────────────────────────────

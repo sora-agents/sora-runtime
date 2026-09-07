@@ -140,7 +140,7 @@ one-directional judge defects. The gate is `T11` — the run happening and its f
       in-process ARE integration but not the gaia2-cli path the numbers came from. It is free to take
       at any time *and* it does not repair the reported result — so record which harness a finding was
       observed on, or a fix will be credited to a sweep it cannot have affected.
-- [ ] **V2.8** **Integrate against `gaia2-cli`, and make it the harness the reported numbers come
+- [x] **V2.8** **Integrate against `gaia2-cli`, and make it the harness the reported numbers come
       from.** *(Parallelizable — see §3.)* The in-process integration diverges from stock ARE, so no
       number it produces is comparable to any published result; gaia2-cli is the path OpenClaw and
       Hermes-Agent already took, and it feeds a real submission target (the Hugging Face
@@ -180,10 +180,25 @@ one-directional judge defects. The gate is `T11` — the run happening and its f
       `context_adaptation: replan_on_change` resolves a hot change-gate without spending a judge on
       an announcement it cannot rule on. Same perception the sibling harnesses get, which is also
       what makes the two integrations a tier contrast rather than two variants of one.
-      Still open before the sweep: per-capability settings have no host→container channel, for which
-      the seam is one thin image tag per capability — sharper now, since `search`/`execution` want no
-      reconsideration at all while `adaptability`/`time` need it. And the new level has not yet run a
-      live scenario.
+
+      **Done:** a `time` scenario ran end to end on 2026-09-07 — `All turns judged (1/1) — scenario
+      complete`, with the agent paging the whole 409-event calendar, taking six environment
+      notifications as they arrived, deleting the five preexisting events that conflicted with them,
+      and reporting what it had actually done. Three harness defects fell out of getting there, all
+      fixed: an unmounted scenario file left the container with no daemon and no adapter while
+      looking like a hung agent (now refused by name, since `docker run -v` answers a missing host
+      path by creating an empty directory); the worker's single un-retried connect to the adapter
+      socket made the startup order fatal; and nothing propagated the daemon's exit, so a standalone
+      `docker run` sat there looking busy long after the last turn was judged. For the sweep's
+      arithmetic: **33 model calls, 1.16M input tokens** on one scenario, dominated by 18 plan calls
+      (~38k input each — every fired change-gate replans from a full manual set) and 8 `$decide`
+      filters serialising all 409 events. That is the cost shape to attack before spending on 160.
+      Two things hand off to the sweep rather than back to this entry. Per-capability settings still
+      have no host→container channel, for which the seam is one thin image tag per capability —
+      sharper now, since `search`/`execution` want no reconsideration at all while `adaptability`/
+      `time` need it. And a **single-turn scenario is scored only if `GAIA2_JUDGE_FINAL_TURN` is
+      set**: below two turns the daemon builds no judge at all, whatever judge model it was given,
+      so a split containing single-turn scenarios silently returns fewer verdicts than scenarios.
 
 ### 2.4 Gate V3 — Correctness fixes worth taking before the tag
 

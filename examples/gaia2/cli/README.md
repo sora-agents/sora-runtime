@@ -5,9 +5,11 @@ event daemon, the ten app CLIs, the in-container judge, and the agent behind an 
 is the path the *reported* numbers should come from: the [in-process harness](../README.md) diverges
 from stock ARE in ways a published Gaia2 result cannot absorb, most consequentially on the clock.
 
-It is a **walking skeleton**: the full contract runs end to end, and `emails`/`calendar` have
-hand-picked observable properties. The other eight apps work on the mechanical fallback (see
-*Observable properties* below), which is enough to run them and not enough to run them well.
+It runs a scenario end to end — the agent's writes landing in `events.jsonl` under the right app
+class and oracle function name, the daemon gating turns on them, and the run reaching `scenario
+complete`. It is a **tier-2 environment**: operations and signals, and no observable state at all.
+No app declares an observable property and nothing is polled — see *Observable properties* below,
+where that is argued as a property of this environment rather than an unfinished edge.
 
 ## What the agent sees
 
@@ -56,7 +58,23 @@ docker run --rm -p 8090:8090 --platform linux/amd64 \
   localhost/gaia2-sora:latest
 ```
 
-Add `-e GAIA2_JUDGE_MODEL=... -e GAIA2_JUDGE_PROVIDER=... -e GAIA2_JUDGE_API_KEY=...` to score it.
+> The scenario files are gitignored, so they exist only in the checkout that downloaded them — `$PWD`
+> from a git worktree does **not** resolve to them. Docker answers a missing `-v` source by creating
+> an empty *directory* at it rather than failing, which the init script now rejects by name; before
+> it did, the container came up with no daemon and no adapter and the run looked like a hung agent.
+
+Add `-e GAIA2_JUDGE_MODEL=... -e GAIA2_JUDGE_PROVIDER=... -e GAIA2_JUDGE_API_KEY=...` to score it —
+**and `-e GAIA2_JUDGE_FINAL_TURN=1` if the scenario has a single turn.** The judge exists to gate the
+*next* turn, so the daemon builds one only when `nb_turns > 1` or that variable is set; with neither,
+the judge flags are accepted, stored, and never used, and the daemon logs `judge=no` at startup while
+the run still completes normally. The verdict, when there is one, appears as `Final turn judge:
+PASS|FAIL — <reason>` in the daemon log and as `judgment` in `daemon_status.json` (which the adapter
+serves at `GET /status`). Any non-empty value enables it, `0` included.
+
+Add `-e SORA_EXIT_ON_COMPLETE=1` for a standalone run: the daemon exits when the scenario ends but
+nothing else does, so without it the container stays up (which is the default, because under the
+runner it is this process the runner polls `GET /status` on).
+
 Under upstream's runner, pass `--runtime docker` and the image name; the image deliberately avoids
 every substring the runner's profile detection matches (`openclaw`, `gaia2-oc`, `hermes`,
 `gaia2-mini`, `mini-swe-agent`, `oracle`), so it falls through to the default profile — the one that
@@ -70,6 +88,21 @@ Useful inside a running container (its `PATH` is the agent sandbox, so pass a re
 | `/tmp/gaia2-adapter.log` | HTTP adapter: turns in, responses out |
 | `/tmp/gaia2-eventd.log` | The daemon: turn gating, environment events, the judge |
 | `/var/gaia2/state/events.jsonl` | What the judge reads |
+| `/var/gaia2/state/daemon_status.json` | Scenario status and the judgment; served at `GET /status` |
+
+These paths are fixed and **container-local — nothing is written to the host and there is no setting
+that changes that.** So one run never overwrites another's logs (each `docker run` gets its own
+filesystem), and `--rm` destroys them the moment the container exits. The worker log is the one
+exception in reach: `entrypoint.sh` tails it to stdout, so `docker run ... 2>&1 | tee run.log`
+persists the trajectory — but not the daemon or adapter logs, and not `events.jsonl`. To keep those,
+`docker cp` them out **before** stopping the container:
+
+```bash
+for f in /tmp/entrypoint.log /tmp/gaia2-eventd.log /tmp/gaia2-adapter.log \
+         /var/gaia2/state/events.jsonl /var/gaia2/state/daemon_status.json; do
+  docker cp "<container>:$f" "<dest>/"
+done
+```
 
 ## Model selection comes from the environment
 

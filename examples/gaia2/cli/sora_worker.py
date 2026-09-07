@@ -72,6 +72,37 @@ def _write_derived_config() -> str:
     return DERIVED_CONFIG
 
 
+# The adapter's ``backend_connect`` returns *before* its listener exists (it has to: ``/health``
+# must answer while the worker is still coming up), and nothing on either side waits for the socket.
+# So "no such file" here is the ordinary startup order, not a dead adapter — whichever of the
+# adapter's imports and this worker's ``build_agent`` finishes first decides it, which is why it
+# can work for weeks and then not. One un-retried connect made that race fatal: the 2026-09-07
+# time-scenario run died on ``FileNotFoundError`` while a perfectly healthy adapter was still
+# binding. Retry to a deadline, then fail naming the adapter and its log rather than the syscall.
+_CONNECT_TIMEOUT = float(os.environ.get("SORA_WORKER_CONNECT_TIMEOUT", "60"))
+
+
+async def _connect_to_adapter() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _CONNECT_TIMEOUT
+    delay = 0.1
+    announced = False
+    while True:
+        try:
+            return await asyncio.open_unix_connection(WORKER_SOCK)
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    f"the adapter never opened {WORKER_SOCK} within {_CONNECT_TIMEOUT:.0f}s "
+                    "— it is not running; see /tmp/gaia2-adapter.log"
+                ) from exc
+            if not announced:
+                log.info("waiting for the adapter to open %s ...", WORKER_SOCK)
+                announced = True
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 1.0)
+
+
 async def _main() -> None:
     from sora.adapters.gaia2_cli import Gaia2CliTransport
     from sora.bootstrap import build_agent
@@ -84,7 +115,7 @@ async def _main() -> None:
         f"agent.yaml must select `transport: {{kind: gaia2-cli}}`, got {type(transport).__name__}"
     )
 
-    reader, writer = await asyncio.open_unix_connection(WORKER_SOCK)
+    reader, writer = await _connect_to_adapter()
     log.info("connected to the adapter on %s", WORKER_SOCK)
 
     def _emit(message: dict[str, Any]) -> None:
