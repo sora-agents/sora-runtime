@@ -889,3 +889,76 @@ a run whose log shows two `send_email` rejections can store one judged event: th
 was addressed to a different relative than the oracle event it was tried against, and died at the
 hard judge. The recording is a record of the *soft* path — the nondeterministic, unrecoverable half.
 Hard rejections stay re-derivable from the trace, which is why this is a note rather than a fix.
+
+
+### What the first complete recording actually said (2026-09-08)
+
+The re-run of `scenario_universe_25_vetd7u` stored the recording the previous run could not: three
+named checkers, their raw text, their markers, their prompt arguments. The re-scorer reproduced
+ARE's own `False` from it with no model call and raised no self-audit warning. Two findings come
+straight off that file, and the first one only became available *because* it was recorded.
+
+**The rejection was `email_checker`, on a missing qualifier — not on the currency symbol.** Its
+answer, in full reasoning: the agent email "omits the fact that these are the **two cheapest** such
+properties", and separately "omits the currency symbol ($) ... **this is a minor omission**". Its
+conclusion names only the first: "not all semantic information is preserved, since the 'two
+cheapest' qualifier is missing". The `$`-for-a-Belgian-rental oddity is real — the app's own record
+is `"price": 2000` with no currency anywhere, so the symbol is the oracle author's invention — but
+on this event it is not what failed the agent. That distinction was a guess before the recording and
+is now quotable, which is the whole argument for recording.
+
+**The qualifier the oracle demands is not in the user's instruction.** The user asks the agent to
+"find the two cheapest ones and send their prices and names", then to send an email "letting them
+know that these are the properties with the low violent crime rates". *Cheapest* is stated as a
+selection criterion; the sentence describing the email's content is about crime rates. The agent's
+plan tracks that split exactly — the `$decide` predicate selecting the apartments says "choose the
+two cheapest overall", while the `$decide` writing the body says "saying these are the properties
+with low violent crime rates". The oracle's reference email nonetheless restates the selection
+criterion in the body, and `email_checker` requires that *all* semantic information in the reference
+be preserved. So a reference-side embellishment becomes mandatory content, and an agent that follows
+the user's wording loses to one that guesses the oracle author's. That is a defect in the oracle,
+and a sharper one than the currency complaint: it penalises instruction-following.
+
+Worth separating from a defect S-ORA does own on the same event: the body listed the prices as bare
+`2000`, where the user asked for "their prices". A price with no unit is a thin reading of that, and
+the plan's body `$decide` never sees the user's own sentence — the same free-text fidelity loss the
+decomposition costs elsewhere. Fixing that would not have won this event; the missing qualifier
+would still have failed it.
+
+**Both parses still agreed, and that is not the vacuous kind this time.** `signature_checker` and
+`tone_checker` both answered `[[true]]` — lowercased in transit, exactly the failure the two-parse
+split exists to expose. Under the run's relaxed parse both read as approvals, so `email_checker` was
+reached and gave the real verdict. Under stock ARE the chain would have died at `signature_checker`
+with `email_checker` never consulted: the same `False`, from a scorer that never looked at the
+content. The booleans agree; what stands behind them does not, and only the relaxed run produces the
+answer that explains the failure at all. A live divergence off the equality fast path is therefore
+still unobserved, and needs a scenario whose paraphrase the content checker actually approves.
+
+### Five of the seven soft-judged tools cannot pass under the stock parse
+
+The `send_email` finding above is not specific to email. Four soft checkers are `[[True]]`-family —
+`signature_checker`, `sanity_checker`, `cab_checker`, `tone_checker` — and both engines ARE ships
+lowercase `True`/`False` on the way out of every model call (`hf_engine.py`, `litellm_engine.py`),
+so under the stock parse none of the four can return a verdict at all. An unparsed answer is `None`,
+which is falsy on the same path a genuine rejection takes. Laid against the per-tool chains in
+`PER_TOOL_TO_SOFT_CHECKER_TYPES`:
+
+| Tool | Soft chain | Stock parse |
+|---|---|---|
+| `EmailClientApp__send_email` | placeholder, **signature**, **tone**, email | rejects unconditionally |
+| `EmailClientApp__reply_to_email` | placeholder, **signature**, **tone**, email | rejects unconditionally |
+| `MessagingApp__send_message` | placeholder, **tone**, message | rejects unconditionally |
+| `CabApp__order_ride` | **cab** | rejects unconditionally |
+| `AgentUserInterface__send_message_to_user` | **sanity**, user_message | rejects unconditionally |
+| `CalendarApp__add_calendar_event` | event | genuinely judged |
+| `MessagingApp__create_conversation` | content | genuinely judged |
+
+So for five of the seven, an event that misses `equality_checker`'s fast path fails whatever it
+contains — including `send_message_to_user`, the most common terminal action in the benchmark. This
+is read off the installed source, but it is also *observed*: the stored recording holds a real judge
+answering `[[true]]`, lowercased in transit.
+
+Two consequences worth keeping straight. Scores produced under the stock parse on those tools
+measure string equality, not a judge, which is a caveat any comparison against published numbers
+has to carry. And the two parses can only disagree where the relaxed one *passes* — so a run with no
+divergence is evidence about the agent, never about the recorder.
