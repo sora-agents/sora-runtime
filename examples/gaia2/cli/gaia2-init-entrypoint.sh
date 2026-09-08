@@ -76,6 +76,71 @@ print(' '.join(r.get('remove', [])))
     echo "[gaia2-init] done" >&2
 fi
 
+# ── 1b. Host-visible artifacts ──────────────────────────────────────────────────────────────────
+# Every log this container writes sits on a fixed path in the container's own filesystem, so
+# `docker run --rm` takes all of them with it and a run that crashes leaves nothing to read. The
+# upstream runner solves that for itself — given --output-dir it copies entrypoint.log, the daemon
+# log and the state files out per scenario — but only for a run it launched, and only if it gets
+# that far. Mount a directory here and a background syncer mirrors the logs into it every few
+# seconds, so what survives does not depend on the container exiting cleanly, or exiting at all.
+#
+# The sources stay exactly where they are: the runner copies /tmp/entrypoint.log and
+# /tmp/gaia2-eventd.log by absolute path, so this mirrors rather than redirects.
+if [ -n "${GAIA2_ARTIFACT_DIR:-}" ]; then
+    # One directory per run, named for the scenario the way the upstream runner names its artifact
+    # directories — by `scenario_id`, not by the mounted filename, which is always
+    # `custom_scenario.json` in here. Ids repeat across capabilities and a scenario gets re-run, so
+    # the timestamp is what actually makes the name unique; `run.json` carries the tags that say
+    # which capability this was, along with the model, since neither is recoverable from a log.
+    _RUN_DIR=$(python3 - "$CUSTOM_SCENARIO" "$GAIA2_ARTIFACT_DIR" <<'PYRUN'
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+scenario, artifacts = sys.argv[1], sys.argv[2]
+definition = json.load(open(scenario)).get("metadata", {}).get("definition", {})
+scenario_id = definition.get("scenario_id") or "unknown-scenario"
+stamp = datetime.datetime.now(datetime.timezone.utc)
+run_dir = pathlib.Path(artifacts) / f"{scenario_id}-{stamp.strftime('%Y%m%dT%H%M%SZ')}"
+run_dir.mkdir(parents=True, exist_ok=True)
+(run_dir / "run.json").write_text(
+    json.dumps(
+        {
+            "scenario_id": scenario_id,
+            "tags": definition.get("tags"),
+            "scenario_start_time": definition.get("start_time"),
+            "model": os.environ.get("MODEL"),
+            "provider": os.environ.get("PROVIDER"),
+            "started_at": stamp.isoformat(),
+        },
+        indent=2,
+    )
+    + "\n"
+)
+print(run_dir)
+PYRUN
+)
+
+    _SYNC_SECONDS="${GAIA2_ARTIFACT_SYNC_SECONDS:-5}"
+    (
+        while true; do
+            for _f in /tmp/entrypoint.log /tmp/gaia2-eventd.log /tmp/gaia2-adapter.log \
+                      /var/gaia2/state/events.jsonl /var/gaia2/state/daemon_status.json \
+                      /var/gaia2/state/judgments.jsonl /var/gaia2/state/user_details.json; do
+                # An explicit `if` on purpose: `[ -f x ] && cp` returns non-zero for every file that
+                # does not exist yet, which under `set -e` would kill the syncer on its first pass.
+                if [ -f "$_f" ]; then
+                    cp -f "$_f" "$_RUN_DIR/" 2>/dev/null || true
+                fi
+            done
+            sleep "$_SYNC_SECONDS"
+        done
+    ) &
+    echo "[gaia2-init] artifacts -> $_RUN_DIR (mirrored every ${_SYNC_SECONDS}s)" >&2
+fi
+
 # ── 2. gaia2-eventd, as the gaia2 user ──────────────────────────────────────────────────────────
 if [ "${GAIA2_DAEMON_DISABLE:-0}" != "1" ] && [ -f "$CUSTOM_SCENARIO" ]; then
     touch /tmp/gaia2-eventd.log && chown gaia2:gaia2 /tmp/gaia2-eventd.log

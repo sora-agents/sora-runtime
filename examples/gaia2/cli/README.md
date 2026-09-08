@@ -53,6 +53,7 @@ into manuals, and that `sora` imports inside the image.
 ```bash
 docker run --rm -p 8090:8090 --platform linux/amd64 \
   -v "$PWD/examples/gaia2/scenarios/execution/<scenario>.json:/var/gaia2/custom_scenario.json:ro" \
+  -v "$PWD/runs:/var/gaia2/artifacts" -e GAIA2_ARTIFACT_DIR=/var/gaia2/artifacts \
   -e PROVIDER=openai -e MODEL=gpt-5.4-2026-03-05 -e API_KEY="$OPENAI_API_KEY" \
   -e BASE_URL=https://api.openai.com/v1 \
   localhost/gaia2-sora:latest
@@ -90,19 +91,29 @@ Useful inside a running container (its `PATH` is the agent sandbox, so pass a re
 | `/var/gaia2/state/events.jsonl` | What the judge reads |
 | `/var/gaia2/state/daemon_status.json` | Scenario status and the judgment; served at `GET /status` |
 
-These paths are fixed and **container-local — nothing is written to the host and there is no setting
-that changes that.** So one run never overwrites another's logs (each `docker run` gets its own
-filesystem), and `--rm` destroys them the moment the container exits. The worker log is the one
-exception in reach: `entrypoint.sh` tails it to stdout, so `docker run ... 2>&1 | tee run.log`
-persists the trajectory — but not the daemon or adapter logs, and not `events.jsonl`. To keep those,
-`docker cp` them out **before** stopping the container:
+### Keeping them
 
-```bash
-for f in /tmp/entrypoint.log /tmp/gaia2-eventd.log /tmp/gaia2-adapter.log \
-         /var/gaia2/state/events.jsonl /var/gaia2/state/daemon_status.json; do
-  docker cp "<container>:$f" "<dest>/"
-done
-```
+Those paths are container-local, so `--rm` destroys every one of them and a crashed run leaves
+nothing behind. **Mount `GAIA2_ARTIFACT_DIR`** — as the run command above does — and a syncer
+started by the init script mirrors the logs onto the host every few seconds
+(`GAIA2_ARTIFACT_SYNC_SECONDS`, default 5). Mirrors rather than redirects, deliberately: the
+upstream runner copies `/tmp/entrypoint.log` and `/tmp/gaia2-eventd.log` by absolute path, so moving
+them would break its extraction. Because it runs on a timer rather than at shutdown, a `docker kill`
+or a container that never exits keeps everything up to the last sync.
+
+One directory per run, `<artifacts>/<scenario_id>-<UTC timestamp>/`, holding `run.json` (scenario id,
+tags, model, start time — none of it recoverable from a log), the three logs, and the state files
+`events.jsonl`, `daemon_status.json`, `user_details.json`, plus `judgments.jsonl` when the judge ran.
+The timestamp is what makes re-running one scenario safe: the second run lands beside the first
+rather than on top of it.
+
+**Under upstream's runner, pass `--output-dir`** and it saves its own per-scenario artifact directory
+— `events.jsonl`, `agent_response.txt`, `result.json`, `trace.jsonl`, and, copied out of the
+container, `entrypoint.log`, `eventd.log`, `daemon_status.json`, `daemon_judgments.jsonl`,
+`user_details.json`. Without that flag it keeps nothing either. Note that `trace.jsonl` — the
+per-LLM-call trace its viewer renders, read from `$GAIA2_TRACE_FILE` — is **not** written by this
+harness, so that one file comes out empty where OpenClaw's and Hermes' do not; the S-ORA trajectory
+in `entrypoint.log` is the equivalent record.
 
 ## Model selection comes from the environment
 
