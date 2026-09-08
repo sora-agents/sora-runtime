@@ -537,6 +537,7 @@ def _patch_seams(monkeypatch: Any) -> list[str]:
             outcome=SimpleNamespace(success=None, rationale=None),
             exception=None,
             write_counts=None,
+            judge_recording=None,
         ),
     )
     return calls

@@ -12,6 +12,7 @@ whole trajectory in your own log.
 | `scripts/fetch_scenario.py` | Pull one scenario JSON down to inspect or replay locally |
 | `run_benchmark.py` | Run **one** scenario, print the judge verdict |
 | `batch.py` | Run a whole capability, emit leaderboard artifacts, report pass@1 |
+| `rescore.py` | Re-score a **stored** run offline, under either judge-verdict parse |
 
 **[`cli/`](cli/README.md) is the container one** — Meta's own `gaia2-cli` harness, one container per
 scenario, the agent driving ten command-line apps behind a setuid wrapper. Slower to iterate on, and
@@ -97,6 +98,8 @@ python -m examples.gaia2.run_benchmark \
 | `--scenario PATH_OR_DOTTED` | **Required.** Scenario `.json`, or a dotted path to a `Scenario` subclass |
 | `--config AGENT_YAML` | Agent config (default `examples/gaia2/agent.yaml`) |
 | `--judge-model` / `--judge-provider` / `--judge-endpoint` | Attach ARE's oracle-graph judge so the run is scored. Omit for an unscored trajectory check |
+| `--judge-recording PATH` | Keep this run's raw judge responses as JSON, so it can be re-scored later |
+| `--no-judge-recording` | Skip recording them (and the both-parse comparison) |
 | `--init-turns` | Deliver every turn of a multi-turn scenario **without** a judge. Excludes `--judge-model` |
 | `--max-wall-seconds` | Safety cap, default 1200 |
 | `--exit-when-idle SECONDS` | Old single-turn quiet-window stop. Only correct for single-turn scenarios |
@@ -125,9 +128,11 @@ python -m examples.gaia2.batch --capability ambiguity --limit 3 \
 python -m examples.gaia2.batch --report-only .sora/gaia2/out
 ```
 
-Writes, under `{output-dir}/standard/{capability}/`, one HF-format trace per (scenario, run) plus
-`output.jsonl` in ARE's own benchmark-result shape. `--report-only` prints per-capability pass@1 and
-the equal-weight overall across the five core capabilities.
+Writes, under `{output-dir}/standard/{capability}/`, one HF-format trace per (scenario, run),
+`output.jsonl` in ARE's own benchmark-result shape, and — for a scored sweep —
+`judge_responses/{scenario}.run{n}.json` per run, named in that row's `metadata.judge_recording`.
+`--report-only` prints per-capability pass@1 and the equal-weight overall across the five core
+capabilities.
 
 Flags mirror `run_benchmark.py`, plus: `--capability` (the dataset config to run), `--split`,
 `--hf-dataset`, `--output-dir`, `--num-runs` (Gaia2 uses 3), `--limit`, and `--model` (the label
@@ -153,6 +158,65 @@ uv run python -m are.simulation.benchmark.gaia2_upload_script \
 
 Use an **absolute** `--output-dir`: each `output.jsonl` row's `trace_id` is a path the uploader has
 to resolve from its own cwd.
+
+## `rescore.py` — re-score a stored run
+
+ARE keeps **one boolean per judged event** and throws the judge's actual answer away, so a sweep run
+without recording can never be re-scored afterwards, at any price. A scored run
+therefore stores, per judged event, the tool name, the agent and oracle arguments as the judge
+selected them, the `equality_checker` outcome, and every raw model response with its `[[…]]`
+markers. `rescore.py` reads those back and re-applies ARE's own rule — equality fast path, else a
+strict conjunction over the soft checkers — **once per verdict parse**, with no model call and
+without ARE installed.
+
+```bash
+# one scenario: run_benchmark prints both parses inline; --judge-recording keeps the file
+python -m examples.gaia2.run_benchmark --scenario ./amb.json \
+    --judge-model claude-sonnet-5 --judge-provider anthropic \
+    --judge-recording ./run.judge.json
+
+# a whole sweep: walk the artifact tree (files or directories, any mix)
+python -m examples.gaia2.rescore .sora/gaia2/out
+
+# the acceptance gate on the recording pipeline itself
+python -m examples.gaia2.rescore .sora/gaia2/out --require-divergence
+```
+
+| Flag | Meaning |
+|---|---|
+| `PATH...` | **Required.** Recording files, or directories to walk — an artifact `--output-dir` works |
+| `--require-divergence` | Exit non-zero unless the two parses differ on an event the equality checker *missed* |
+| `--output PATH` | Also write the summary as JSON |
+
+**Why two scores rather than one.** ARE's engines lowercase `True`/`False` on the way out of every
+model call, while its `[[True]]`-family checkers compare case-sensitively — so those checkers cannot
+return a verdict at all, and the unparsed answer rejects on the same falsy path a genuine rejection
+takes. A single number cannot separate *the agent got it wrong* from *the scorer could not say yes*;
+the two together can. Runs relax the parse by default and record which one they used;
+`--strict-verdict-case` (on either driver) scores under stock ARE instead.
+
+**The re-scorer audits itself.** It re-implements ARE's rule rather than calling into it, so every
+recording is also re-scored under the parse the run *actually* used, where it must reproduce ARE's
+boolean event for event. A mismatch prints a loud `⚠` beside the scores it invalidates and exits
+non-zero — read that line before reading the numbers above it.
+
+**Two things are mechanically enforced**, because the failure mode here is deprioritization rather
+than difficulty:
+
+- A **scored** `batch.py` sweep records by default and *refuses to start* if it cannot arm the
+  recorder. `--no-judge-recording` is the deliberate opt-out and is never the default.
+- `--require-divergence` is strict about *where* divergence falls: it passes only when the parses
+  differ on an event the equality checker missed. A pipeline can record faithfully and still never
+  exercise the checker path — every event settled by the fast path, no model consulted — and that
+  is indistinguishable from genuine agreement in any aggregate. Verify it on a scenario ending in a
+  paraphrased message to the user; those are the events that reach the soft checkers at all.
+
+The recorder is pinned against ARE's own `SoftToolJudge` driven by a fake engine, after an early
+live run caught it storing verdicts with no checker answers behind them. A model-backed run has
+since stored a complete recording end to end. A recording whose events carry an empty `checkers`
+list is still the signature of that failure rather than of an easy verdict, so it is worth a glance
+before reading any scores; [NOTES.md](NOTES.md) has the detail, including why `send_email` is
+unwinnable under the stock parse.
 
 ## Notes
 

@@ -479,6 +479,10 @@ relaxed is a different artifact from one obtained under stock ARE, and the disti
 has to survive being pasted somewhere without the log. Remove the patch once ARE fixes
 this upstream.
 
+**Both parses are now recoverable from a stored run** rather than fixed at run time — see
+the 2026-09-08 update below on judge-response recording. That is what turns the choice
+above from a fork in the road into a reported pair.
+
 **Still unexplained:** `aug25` and `aug26` ran the same two-turn scenario with
 near-identical turn-0 work and got *opposite* gate verdicts. The mangling is
 deterministic, so the earlier "nondeterministic casing / coin flip" reading of that pair
@@ -777,3 +781,111 @@ retirement-backoff accounting that stopped a clock-owned window from zeroing the
 the candidate filter that stops an all-clock-owned activity from consuming the sweep's one slot per
 tick. Those are independent of the clock convention and are covered by tests in
 `tests/test_domain_clock.py` and `tests/test_pending_conditions.py`.
+
+
+## Update (2026-09-08): the judge's answers are recorded, and a stored run re-scores offline
+
+**ARE's graph judge keeps one boolean per judged event, so a completed sweep could not be
+re-scored afterwards at any price.** Not "was expensive to re-score" — impossible: the model's
+reasoning is discarded in transit, and the only counterfactual left is a fresh, paid,
+nondeterministic judge pass that is no longer paired event-for-event with the original. That made
+this the one piece of scoring plumbing whose window *closes* rather than slips, and it is now built.
+
+**What is stored.** `sora/adapters/are_judge.py` arms an observational patch over ARE's
+`SoftToolJudge.compare` and `LLMChecker.judge` and records, per judged event: the tool name, the
+agent and oracle arguments *as the judge itself selected them*, the `equality_checker` outcome, and
+every raw model response with the checker's own `[[…]]` markers beside it. Both wrappers return the
+original result untouched and swallow their own failures, so recording cannot change a trajectory or
+cost a run its score — an unattributable answer is dropped rather than allowed to fail a judge call.
+The bracket spans the whole run, not just `validate()`: under online validation the judge is also
+each turn's release gate, so on a multi-turn scenario most events are decided mid-run.
+
+Two capture points rather than one, and neither is arbitrary. `compare` is the only place that sees
+an event the equality fast path settled — no model is consulted there, so a checker-level hook alone
+would silently under-count the denominator. And shadowing `equality_checker` on the instance for the
+duration of one `compare` is what makes the capture signature-agnostic: it yields the fast path's
+outcome *and* the exact argument subset ARE compared, without this code having to know what
+`compare` takes.
+
+**What it buys.** `python -m examples.gaia2.rescore <artifact-dir>` re-applies ARE's own rule —
+equality fast path, else a strict conjunction over the soft checkers in which an unparsed `None`
+rejects exactly like a `False` — once per verdict parse, with no model and no ARE installed. The
+two numbers are what separate *the agent got it wrong* from *the scorer could not say yes*: as
+documented above, ARE's engines lowercase `True`/`False` in transit, so its `[[True]]`-family
+checkers are structurally unable to return a verdict, and the unparsed answer rejects on the same
+falsy path a genuine rejection takes. A single score carries that ambiguity unresolvably.
+`run_benchmark.py` prints both parses inline for one scenario; `batch.py` writes
+`judge_responses/{scenario}.run{n}.json` beside each trace and names it in the row's
+`metadata.judge_recording`.
+
+**The re-scorer audits itself.** It re-implements ARE's rule rather than calling into it, so every
+recording is also re-scored under the parse the run *actually* used — where it must reproduce the
+boolean ARE returned, event for event. `disagreements_with_recorded` is that check; a non-zero count
+means the re-implementation is wrong and invalidates the scores printed beside it, and both the CLI
+and the summary say so loudly instead of folding it into an aggregate.
+
+**Two mechanical gates, because the failure mode here is deprioritization, not difficulty.**
+
+- A **scored** `batch.py` sweep records by default and *refuses to start* if recording cannot be
+  armed. `--no-judge-recording` is the deliberate opt-out and is never the default. Spending a
+  sweep's tokens on a run that can never be re-scored is the only failure in this harness with no
+  recovery, so it is a refusal rather than a recommendation.
+- `rescore --require-divergence` is the acceptance gate on the pipeline itself, and it is strict
+  about *where* divergence falls: it passes only when the two parses score at least one event
+  **that `equality_checker` missed** differently. A pipeline can record faithfully and still never
+  exercise the patched checker path — every event settled by the fast path, no model consulted —
+  and that failure is indistinguishable from genuine agreement in any aggregate. Verify it on a
+  scenario ending in a paraphrased message to the user; those are the events that reach the soft
+  checkers at all.
+
+**Not yet verified on a live run.** The recorder's patch points are pinned against stubs of ARE's
+documented surface (`tests/test_are_judge_recording.py`), and the re-scorer is pinned end to end
+without ARE, but the `are` extra is not installed in this working venv, so no recording has been
+produced by the real judge yet. The `--require-divergence` run against one live scenario is what
+closes that, and it is a prerequisite for trusting any number a sweep reports — including a
+re-scored one.
+
+
+### Correction (2026-09-08, same day): the first live run recorded nothing, and said so quietly
+
+The paragraph above was right to hedge, and the first real run cashed the hedge in immediately. On
+the `execution` scenario `scenario_universe_25_vetd7u`, the recorder produced one judged event with
+`"checkers": []` — a rejected email with **no reason attached**, which is the exact state the
+recording exists to prevent.
+
+**The bug.** `SoftToolJudge.soft_checkers` does not hold the checker objects. It maps a checker name
+to a *bound method of the judge* (`self.email_checker`), which forwards to the `LLMChecker` held in
+a second dict, `llm_checkers` — and only that object has `judge`, `success_str`, `failure_str`. The
+recorder shadowed `judge` on the wrong dict, found no such attribute, and skipped each checker on
+its own "a checker with no judge seam" path. Silent by construction: the run still scored, the file
+still wrote, the field was still populated. Fixed by shadowing `llm_checkers`, which is also where
+the markers come from.
+
+The lesson is about the *stubs*, not the patch. Stubbing ARE's surface pins the wiring but cannot
+falsify a wrong belief about that surface, and a stub written from the same wrong belief agrees
+enthusiastically. `tests/test_are_judge_live_surface.py` now builds ARE's own `SoftToolJudge` with a
+fake engine — no network, no model, deterministic — and asserts the recorder against it; the stub
+judge was also corrected to reproduce the two-dict split rather than the imagined one.
+
+**Read the first run's both-parse line as vacuous, not as agreement.** "0.0% / 0.0%, the two parses
+agree on every event" was arithmetic over an empty checker list: with no responses stored there was
+nothing for a parse to vary. It is not evidence that the parse does not matter on that scenario —
+and it is a good argument for keeping `--require-divergence` a gate rather than a report, since the
+run *looked* fine.
+
+**What the same investigation turned up about `send_email` specifically.** Its soft chain is, in
+order, `placeholder_checker`, `signature_checker`, `tone_checker`, `email_checker`, applied as a
+strict conjunction. The middle two are `[[True]]`/`[[False]]`-family. Under **stock** ARE, whose
+engines lowercase `True`/`False` in transit, neither can ever return a verdict — so a non-verbatim
+email is rejected at `signature_checker` and `email_checker` is never consulted at all. Under stock
+ARE, every email that is not string-equal to the oracle's fails, whatever it says. That is a strong
+enough claim to pin: `test_lowercased_verdict_diverges_between_the_two_parses` builds the real
+chain, has every checker approve, and asserts stock still rejects while the relaxed parse passes.
+
+**A second, unfixed gap, noted so the event count is not misread.** `MildToolJudge.compare` runs the
+hard judge first and returns immediately if it fails, so a rejection on a hard-checked argument
+(`recipients`, ids, paths) never reaches `SoftToolJudge.compare` and cannot be recorded. That is why
+a run whose log shows two `send_email` rejections can store one judged event: the second agent email
+was addressed to a different relative than the oracle event it was tried against, and died at the
+hard judge. The recording is a record of the *soft* path — the nondeterministic, unrecoverable half.
+Hard rejections stay re-derivable from the trace, which is why this is a note rather than a fix.

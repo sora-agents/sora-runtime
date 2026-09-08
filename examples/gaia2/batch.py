@@ -6,7 +6,12 @@ One invocation runs S-ORA over every scenario of *one* capability (dataset confi
   * one HF-format trace file per (scenario, run), via ARE's ``JsonScenarioExporter`` — the exact
     artifact ``gaia2_upload_script.py`` consumes, so a run doubles as a leaderboard submission; and
   * ``output.jsonl`` — one line per (scenario, run) in ARE's own
-    ``_export_benchmark_result_jsonl`` shape (``task_id``/``trace_id``/``score``/``metadata``).
+    ``_export_benchmark_result_jsonl`` shape (``task_id``/``trace_id``/``score``/``metadata``); and
+  * ``judge_responses/{scenario}.run{n}.json`` — the judge's raw answers per judged event, which
+    ARE itself discards. A scored sweep writes them by default and **refuses to start if it
+    cannot**: the graph judge keeps a bare boolean, so a run swept without them can never be
+    re-scored afterwards at any price, and that is the only failure here with no recovery. Read
+    them back with ``python -m examples.gaia2.rescore``.
 
 Run each of the five core capabilities once to populate ``{output_dir}/standard/*``, then
 ``--report-only {output_dir}`` prints a per-capability pass@1 table plus the equal-weight overall
@@ -126,6 +131,7 @@ def _jsonl_record(
     write_counts: Any = None,
     timeline_expired: bool = False,
     verdict_parse: str | None = None,
+    judge_recording_path: str | None = None,
 ) -> dict[str, Any]:
     """One ``output.jsonl`` line, matching ARE's ``_export_benchmark_result_jsonl`` exactly:
     ``task_id``/``trace_id``/``score`` at top level, and a ``metadata`` dict with all-None values
@@ -157,6 +163,11 @@ def _jsonl_record(
         # reasoning as run_benchmark printing it: which of the two this is must survive the record
         # being read without the log beside it. None on an unscored run — there were no verdicts.
         "verdict_parse": verdict_parse,
+        # Where this run's judge responses were stored. Recorded because the score above is not
+        # re-derivable without them and ARE keeps nothing: a row that scores a run but cannot say
+        # where its judge answers went is a row nobody can ever re-score. Absolute, for the same
+        # reason `trace_id` is — the re-scorer is a separate step, run from a different cwd.
+        "judge_recording": judge_recording_path,
         # ARE's tool-call-count gate, recomputed offline (no judge model). Recorded only when it
         # FAILS: a failure is conclusive — the judge applies this gate before any per-event
         # matching — so it explains a zero that the rationale otherwise attributes to the
@@ -192,6 +203,50 @@ def _jsonl_record(
     }
     metadata = {k: v for k, v in metadata.items() if v is not None}
     return {"task_id": scenario_id, "trace_id": trace_id, "score": score, "metadata": metadata}
+
+
+def _arm_judge_recording() -> bool:
+    """Install the judge-response patch, and report whether it is in force.
+
+    Named as its own indirection so the batch gate can be tested without ARE: arming is idempotent
+    and returns False on a second call, which is not the same answer as "not armed"."""
+    from sora.adapters.are_judge import arm_judge_recording, judge_recording_armed
+
+    arm_judge_recording()
+    return judge_recording_armed()
+
+
+def _require_judge_recording(args: argparse.Namespace) -> bool:
+    """Whether this sweep records judge responses — refusing to start a scored one that cannot.
+
+    ARE's graph judge keeps a bare boolean, so a scored sweep run without recording can never be
+    re-scored afterwards, at any price: the tokens are spent and the judge's reasoning is gone. That
+    makes it the one failure in the harness with no recovery, and the reason this is a mechanical
+    refusal rather than a documented recommendation. An unscored sweep judges nothing and is
+    unaffected; ``--no-judge-recording`` is the deliberate opt-out, and it is never the default."""
+    if not args.judge_model or args.no_judge_recording:
+        return False
+    if not _arm_judge_recording():
+        raise SystemExit(
+            "judge-response recording could not be armed (is the `are` extra installed?). "
+            "A scored sweep without it cannot be re-scored afterwards — ARE keeps only a boolean "
+            "per judged event. Fix the environment, or pass --no-judge-recording to accept that."
+        )
+    return True
+
+
+def _write_judge_recording(
+    config_dir: str, recording: Any, scenario_id: str, run_number: int
+) -> str | None:
+    """Store one run's judge responses beside its trace. None when there was nothing to store."""
+    if recording is None:
+        return None
+    directory = os.path.join(config_dir, "judge_responses")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{scenario_id}.run{run_number}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(recording.to_dict(), f)
+    return path
 
 
 def _write_jsonl(path: str, records: list[dict[str, Any]]) -> None:
@@ -280,6 +335,12 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
         # patched ARE.
         print(f"judge verdict parse: {_verdict_parse(args)}")
 
+    # Armed once for the sweep, before the first scenario is loaded, and refuses a scored sweep it
+    # cannot record: the window on this closes with the run rather than slipping.
+    record_judge = _require_judge_recording(args)
+    if args.judge_model:
+        print(f"judge-response recording: {'on' if record_judge else 'OFF (--no-judge-recording)'}")
+
     records: list[dict[str, Any]] = []
     # Stream each record to output.jsonl as it's produced (and flush): a long sweep spends real
     # model tokens, so an abort partway through (a bad scenario, Ctrl-C) must leave a valid partial
@@ -304,7 +365,9 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
                 # {scenario_id}.json and later runs silently overwrite earlier ones (leaving their
                 # trace_ids pointing at the wrong trace at upload).
                 scenario.run_number = run_number
-                rec = _run_one_scenario(scenario, run_number, args, config_dir)
+                rec = _run_one_scenario(
+                    scenario, run_number, args, config_dir, record_judge=record_judge
+                )
                 records.append(rec)
                 json.dump(rec, out)
                 out.write("\n")
@@ -322,6 +385,8 @@ def _run_one_scenario(
     run_number: int,
     args: argparse.Namespace,
     config_dir: str,
+    *,
+    record_judge: bool = False,
 ) -> dict[str, Any]:
     """Run + score + export one scenario into a jsonl record. Any error *for this scenario* (an
     attach_judge/oracle-preprocess failure, or an unexpected export error) becomes an ``exception``
@@ -367,6 +432,8 @@ def _run_one_scenario(
             verbose=args.verbose,
             max_wall_seconds=args.max_wall_seconds,
             read_stdin=False,
+            record_judge=record_judge,
+            verdict_parse=_verdict_parse(args),
         )
     except Exception as e:  # this scenario's judge/preprocess failed — record it, keep sweeping
         return _jsonl_record(
@@ -397,6 +464,14 @@ def _run_one_scenario(
             scenario_exception=result.exception,
         )
 
+    recording_path = _write_judge_recording(
+        config_dir, result.judge_recording, scenario.scenario_id, run_number
+    )
+    if record_judge and result.judge_recording is not None and not result.judge_recording.events:
+        # A scored run that judged nothing is the shape the recording exists to catch: the pipeline
+        # looks healthy, the file is written, and there is nothing in it to re-score later.
+        print(f"  {scenario.scenario_id}: warning — scored run recorded no judged events")
+
     return _jsonl_record(
         scenario_id=scenario.scenario_id,
         run_number=run_number,
@@ -406,6 +481,7 @@ def _run_one_scenario(
         trace_id=trace_id,
         awaiting_input=result.awaiting_input,
         write_counts=result.write_counts,
+        judge_recording_path=recording_path,
         timeline_expired=result.timeline_expired,
         verdict_parse=_verdict_parse(args),
     )
@@ -474,6 +550,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Do NOT relax ARE's case-sensitive judge-verdict parse (see run_benchmark for the "
             "defect). The default relaxes it, and every scored record says which of the two it "
             "was; pass this to score a sweep under stock ARE."
+        ),
+    )
+    parser.add_argument(
+        "--no-judge-recording",
+        action="store_true",
+        help=(
+            "Do NOT record the judge's raw responses. A scored sweep records them by default and "
+            "refuses to start if it cannot: ARE keeps only a boolean per judged event, so a run "
+            "swept without them can never be re-scored afterwards, at any price."
         ),
     )
     parser.add_argument(

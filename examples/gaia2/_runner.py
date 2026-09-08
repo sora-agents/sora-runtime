@@ -14,6 +14,7 @@ extra installed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -42,7 +43,9 @@ class RunResult:
     for *unscored* runs too. ``timeline_expired`` is True when ARE's event loop ran out of
     ``scenario.duration`` — a real-time budget, since the loop is wall-clock paced — before the run
     finished; every result below it then describes a world that stopped early, not an agent that
-    chose badly."""
+    chose badly. ``judge_recording`` is a ``sora.adapters.are_judge.JudgeRecording`` when the run
+    asked for one — the judge's raw answers, which ARE itself discards, and the only thing that
+    makes the run re-scorable after the fact."""
 
     outcome: Any
     environment: Any
@@ -57,6 +60,7 @@ class RunResult:
     agent_llm_calls: int = 0
     external_actions: int = 0
     decision_cycles: int = 0
+    judge_recording: Any = None
 
 
 StopReason = Literal["verification_completion", "llm_call_limit", "timeout"]
@@ -214,12 +218,22 @@ def run_scenario(
     max_wall_seconds: float = 1200.0,
     exit_when_idle: float | None = None,
     read_stdin: bool = True,
+    record_judge: bool = False,
+    verdict_parse: str | None = None,
 ) -> RunResult:
     """Run S-ORA against one loaded scenario to completion, then score it. Attach the judge (via
     ``are_sim.attach_judge``) *before* calling this if a real score is wanted; without it the run is
     unscored (``outcome.success is None``). A run-time crash or a ``validate()`` error is captured
     on ``RunResult.exception`` rather than raised, so a batch loop can record it and move on;
-    ``KeyboardInterrupt`` still propagates so an operator can abort."""
+    ``KeyboardInterrupt`` still propagates so an operator can abort.
+
+    ``record_judge`` collects the judge's raw answers into ``RunResult.judge_recording`` (arm the
+    patch with ``are_judge.arm_judge_recording`` first). The bracket spans the run *and*
+    ``validate()``, not just the latter: under online validation the judge is also each turn's
+    release gate, so on a multi-turn scenario most judged events are decided mid-run.
+    ``verdict_parse`` names how those verdicts were read, and is stored with the recording — a
+    recording that does not say which parse produced its verdicts cannot be checked against the run
+    it came from."""
     from sora.adapters.are_sim import AreSimulation, ValidationOutcome, write_count_check
     from sora.bootstrap import build_agent
     from sora.cli import TerminalSession
@@ -243,69 +257,96 @@ def run_scenario(
         log_file=log_file,
     )
 
-    exc: Exception | None = None
-    started = time.monotonic()
-    try:
-        asyncio.run(session.run())
-    except Exception as e:  # a run-time crash: record it, sweep continues (KI still propagates)
-        exc = e
-    duration = time.monotonic() - started
-    # Sampled here, immediately after the session's teardown, rather than in the RunResult below:
-    # everything between is scoring work (a judge pass over the oracle graph, which can take
-    # minutes), and this reads a wall clock. `AreSimulation` latches the verdict at stop() so the
-    # position no longer matters for the real adapter, but a fake or a future Simulation that does
-    # not latch still gets a value measured against the run rather than against the judge.
-    expired = _timeline_expired(simulation)
+    # The bracket spans the run AND validate(): under online validation the judge is also each
+    # turn's release gate, so on a multi-turn scenario most judged events are decided mid-run, and
+    # a bracket around validate() alone would record only the last one. Nothing here is entered
+    # when `record_judge` is off, so an unrecorded run pays nothing.
+    with contextlib.ExitStack() as bracket:
+        collector: Any = None
+        if record_judge:
+            from sora.adapters.are_judge import record_judge_events
 
-    outcome: Any = ValidationOutcome(success=None)
-    if exc is None and getattr(scenario, "judge", None) is not None:
-        # Only trust validate() when a scoring judge is actually attached (attach_judge → ARE's
-        # preprocess_scenario sets scenario.judge). Without one, the scenario falls back to ARE's
-        # base Scenario.validate, which returns ``env.state != FAILED`` — a spurious True for any
-        # run that merely didn't crash, meaningless as a score. So a judge-less run stays unscored
-        # (success=None) rather than reporting a false PASS.
+            collector = bracket.enter_context(record_judge_events())
+
+        exc: Exception | None = None
+        started = time.monotonic()
         try:
-            outcome = simulation.validate()
-        except Exception as e:  # judge/oracle failure surfaces here, not as a silent unscored run
+            asyncio.run(session.run())
+        except Exception as e:  # a run-time crash: record it, sweep continues (KI still propagates)
             exc = e
+        duration = time.monotonic() - started
+        # Sampled here, immediately after the session's teardown, rather than in the
+        # RunResult below: everything between is scoring work (a judge pass over the oracle
+        # graph, which can take minutes), and this reads a wall clock. `AreSimulation`
+        # latches the verdict at stop() so the position no longer matters for the real
+        # adapter, but a fake or a future Simulation that does not latch still gets a value
+        # measured against the run rather than against the judge.
+        expired = _timeline_expired(simulation)
 
-    # Deliberately outside the judge guard and after validate(): it needs no judge and no tokens, so
-    # an unscored dev run — where it is the only pass/fail signal there is — gets it too. Never lets
-    # a reporting failure cost the run's real result.
-    counts: Any = None
-    try:
-        counts = write_count_check(scenario, simulation.environment())
-    except Exception:  # a diagnostic must never cost the run its real result
-        log.warning("write-count check failed", exc_info=True)
+        outcome: Any = ValidationOutcome(success=None)
+        if exc is None and getattr(scenario, "judge", None) is not None:
+            # Only trust validate() when a scoring judge is actually attached (attach_judge
+            # → ARE's preprocess_scenario sets scenario.judge). Without one, the scenario
+            # falls back to ARE's base Scenario.validate, which returns ``env.state !=
+            # FAILED`` — a spurious True for any run that merely didn't crash, meaningless
+            # as a score. So a judge-less run stays unscored (success=None) rather than
+            # reporting a false PASS.
+            try:
+                outcome = simulation.validate()
+            # A judge/oracle failure surfaces here, not as a silent unscored run.
+            except Exception as e:
+                exc = e
 
-    terminal_cause = _terminal_cause(
-        exc,
-        expired,
-        stop_when.reason if stop_when is not None else None,
-        outcome.success if isinstance(outcome.success, bool) else None,
-        inference_errors=_terminal_inference_errors(session.llm_report),
-    )
+        # Deliberately outside the judge guard and after validate(): it needs no judge and no
+        # tokens, so an unscored dev run — where it is the only pass/fail signal there is —
+        # gets it too. Never lets a reporting failure cost the run's real result.
+        counts: Any = None
+        try:
+            counts = write_count_check(scenario, simulation.environment())
+        except Exception:  # a diagnostic must never cost the run its real result
+            log.warning("write-count check failed", exc_info=True)
 
-    return RunResult(
-        outcome=outcome,
-        environment=simulation.environment(),
-        duration=duration,
-        exception=exc,
-        # Read after the session returns, so this reflects where the run actually stopped. Not an
-        # error: the agent halting to ask rather than looping is the designed behavior, and the
-        # scenario is still scored normally — this only records *why* it stopped short.
-        awaiting_input=_awaiting_input(agent),
-        write_counts=counts,
-        # Sampled above, right after teardown; never allowed to raise, because it reinterprets
-        # every field beside it and losing it to a probe failure would be worse than losing any
-        # single one of them.
-        timeline_expired=expired,
-        llm_report=session.llm_report,
-        replan_count=sum(
-            getattr(activity, "replan_count", 0) for activity in agent.working.activities.values()
-        ),
-        terminal_cause=terminal_cause,
-        agent_llm_calls=agent.procedural.logical_calls_admitted,
-        external_actions=agent.cycle.external_action_count,
-        decision_cycles=agent.cycle.cycle_count,
-    )
+        terminal_cause = _terminal_cause(
+            exc,
+            expired,
+            stop_when.reason if stop_when is not None else None,
+            outcome.success if isinstance(outcome.success, bool) else None,
+            inference_errors=_terminal_inference_errors(session.llm_report),
+        )
+
+        return RunResult(
+            outcome=outcome,
+            environment=simulation.environment(),
+            duration=duration,
+            exception=exc,
+            # Read after the session returns, so this reflects where the run actually
+            # stopped. Not an error: the agent halting to ask rather than looping is the
+            # designed behavior, and the scenario is still scored normally — this only
+            # records *why* it stopped short.
+            awaiting_input=_awaiting_input(agent),
+            write_counts=counts,
+            # Sampled above, right after teardown; never allowed to raise, because it
+            # reinterprets every field beside it and losing it to a probe failure would be
+            # worse than losing any single one of them.
+            timeline_expired=expired,
+            llm_report=session.llm_report,
+            replan_count=sum(
+                getattr(activity, "replan_count", 0)
+                for activity in agent.working.activities.values()
+            ),
+            terminal_cause=terminal_cause,
+            agent_llm_calls=agent.procedural.logical_calls_admitted,
+            external_actions=agent.cycle.external_action_count,
+            decision_cycles=agent.cycle.cycle_count,
+            # Taken inside the bracket, after validate(), so it holds every event the judge decided
+            # — the mid-run turn gates as well as the final pass. None when recording was off.
+            judge_recording=(
+                None
+                if collector is None
+                else collector.snapshot(
+                    scenario_id=getattr(scenario, "scenario_id", None),
+                    run_number=getattr(scenario, "run_number", None),
+                    verdict_parse=verdict_parse,
+                )
+            ),
+        )

@@ -16,6 +16,12 @@ Correctness gate (one scenario):
         --scenario /path/to/gaia2_scenario.json \
         --judge-model claude-sonnet-5 --judge-provider anthropic --verbose
 
+A scored run also records the judge's raw answers — which ARE itself discards — and prints the same
+events re-scored under *both* verdict parses, because one score cannot separate an agent that got it
+wrong from a scorer that could not say yes (``relax_judge_verdict_case`` has the account). That
+costs no model call: the answers were already paid for. ``--judge-recording PATH`` keeps the file so
+``python -m examples.gaia2.rescore`` can read it later.
+
 The run stops **turn-aware**: it rides through the idle gaps between a scenario's turns, then ends
 as soon as the agent's final reply has settled and calls ``validate()`` once. ARE installs online
 judge gates between turns but not after the final one, so waiting for its event loop to stop would
@@ -93,6 +99,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "what ARE's own Llama reference judge already produces. Pass this to reproduce stock "
             "ARE behavior."
         ),
+    )
+    parser.add_argument(
+        "--judge-recording",
+        metavar="PATH",
+        help=(
+            "Write this run's raw judge responses here as JSON. A scored run records them either "
+            "way and prints both parses' scores; this keeps the file, so "
+            "`python -m examples.gaia2.rescore PATH` can re-score it later. ARE keeps only a "
+            "boolean per judged event, so a run whose responses were not kept is never re-scorable."
+        ),
+    )
+    parser.add_argument(
+        "--no-judge-recording",
+        action="store_true",
+        help="Skip recording the judge's raw responses (and the both-parse comparison below).",
     )
     parser.add_argument(
         "--init-turns",
@@ -180,6 +201,7 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f"loading scenario {args.scenario!r} ...", flush=True)
     scenario: Any = load_scenario(args.scenario)
+    record_judge = bool(args.judge_model) and not args.no_judge_recording
 
     if args.scenario_duration is not None:
         # Set before attach_judge/initialize_turns: both preprocess the scenario, and
@@ -206,6 +228,17 @@ def main(argv: list[str] | None = None) -> None:
             "judge verdict parse: "
             + ("stock ARE (case-sensitive)" if args.strict_verdict_case else "case-insensitive")
         )
+        if record_judge:
+            from sora.adapters.are_judge import arm_judge_recording, judge_recording_armed
+
+            arm_judge_recording()
+            record_judge = judge_recording_armed()
+            if not record_judge:
+                # Not fatal here — this is the single-scenario gate, not a sweep whose tokens are
+                # unrecoverable. Say so, because the both-parse comparison below will be missing.
+                print(
+                    "warning: judge-response recording could not be armed — scores are single-parse"
+                )
     else:
         # No judge, so nothing else would replay the oracle — do it here (deterministic, no model)
         # purely so the run can still be told whether it cleared ARE's tool-call-count gate. Must
@@ -235,12 +268,52 @@ def main(argv: list[str] | None = None) -> None:
             log_file=args.log_file,
             max_wall_seconds=args.max_wall_seconds,
             exit_when_idle=args.exit_when_idle,
+            record_judge=record_judge,
+            verdict_parse="stock" if args.strict_verdict_case else "case-insensitive",
         )
     except KeyboardInterrupt:
         print("\nrun aborted (Ctrl-C) — skipping validation")
         return
 
     _print_score(result, scored=bool(args.judge_model))
+    _report_judge_recording(result.judge_recording, args.judge_recording)
+
+
+def _report_judge_recording(recording: Any, output_path: str | None) -> None:
+    """Re-score this run's judged events under both verdict parses, and optionally keep them.
+
+    Printed next to the verdict because a single score cannot distinguish an agent that got it
+    wrong from a scorer that could not say yes — ARE's engines make its ``[[True]]``-family checkers
+    unable to return a verdict, and an unparsed answer rejects on the same falsy path a real
+    rejection takes (see ``relax_judge_verdict_case``). The two numbers together do distinguish
+    them, and cost nothing: no model, no ARE, pure re-parsing of answers already paid for."""
+    if recording is None:
+        return
+    import json
+
+    from sora.adapters.are_judge import VERDICT_PARSES, compare_parses
+
+    if not recording.events:
+        print("\njudge recording: no judged events (nothing to re-score)")
+        return
+    comparison = compare_parses(recording)
+    print(f"\njudge recording: {len(recording.events)} judged events")
+    for parse in VERDICT_PARSES:
+        score = comparison.score(parse)
+        print(f"    {parse:<18} {'n/a' if score is None else f'{score:.1%}'} of events pass")
+    if comparison.divergent_off_equality_fast_path:
+        print(
+            f"    the two parses disagree on events {list(comparison.divergent_events)}, at least "
+            "one of which the equality checker missed — so this run's score depends on the parse"
+        )
+    elif comparison.divergent_events:
+        print("    the two parses disagree only on equality-fast-path events (no model consulted)")
+    else:
+        print("    the two parses agree on every event")
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(recording.to_dict(), f)
+        print(f"    wrote {output_path}")
 
 
 def _print_score(result: Any, *, scored: bool) -> None:

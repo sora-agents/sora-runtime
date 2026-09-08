@@ -19,9 +19,22 @@ everything that changes a trajectory lands before the suites are debugged**, bec
 diagnosed under the old semantics may not survive the change — and worse, a prompt tuned in Phase 2 to
 compensate for one gets frozen at R3.
 
-- [ ] **W1** *(V2.9)* Record the judge's raw responses; add the offline re-parse. **First.** The only
+- [x] **W1** *(V2.9)* Record the judge's raw responses; add the offline re-parse. **First.** The only
       item whose window *closes* rather than slips — a sweep run without it can never be re-scored.
-      Recording only; changes no trajectory.
+      Recording only; changes no trajectory. **Machinery landed 2026-09-08** — recorder, re-scorer,
+      the `--require-divergence` gate and the batch refusal. The first live run the same day proved
+      the stubs wrong: the recorder shadowed `soft_checkers` (bound methods of the judge) instead of
+      `llm_checkers` (the objects holding the raw answers), so it stored a rejected email with no
+      reason and reported a vacuous both-parse agreement. Fixed, and now pinned against ARE's own
+      `SoftToolJudge` driven by a fake engine, which also proves the divergence mechanically on the
+      real `send_email` chain. A model-backed run the same day then stored a complete recording —
+      three named checkers, raw text, markers, prompt args — and the re-scorer reproduced ARE's
+      verdict from it with no model call. Nothing in the machinery is outstanding. A *live* two-parse
+      divergence remains unobserved, but that is a benchmark outcome rather than a gap: on the five
+      soft-judged tools whose chain contains a `[[True]]`-family checker, stock rejects every event
+      that misses the equality fast path, so the parses diverge exactly when an event *passes* under
+      the relaxed one. It will fall out of the first sweep that wins a soft-judged event; check it
+      with `rescore.py --require-divergence` rather than holding this item open for it.
 - [ ] **W2** *(V2.10)* Rebuild the simulated-clock freeze with a fixed non-zero per-call charge.
       No idle fast-forward. **Trajectory-changing:** it moves when oracle events fire relative to the
       agent's own writes, which is exactly what the judge's time budget is measured against. Every
@@ -408,6 +421,18 @@ deleting the evidence.
       path, which fails silently and looks like agreement. Verify on a scenario ending in a
       paraphrased message to the user. Worth gating the batch runner on this mechanically, since the
       failure mode is deprioritization, not difficulty.
+      **Built 2026-09-08** (`sora/adapters/are_judge.py`, `examples/gaia2/rescore.py`, wired through
+      `_runner.py` / `batch.py` / `run_benchmark.py`; `tests/test_are_judge_recording.py`,
+      `tests/test_gaia2_rescore.py`). Both mechanical gates are in: a scored `batch.py` sweep records
+      by default and **refuses to start** if it cannot arm (`--no-judge-recording` is the explicit
+      opt-out), and `rescore --require-divergence` fails unless the two parses differ on an event
+      `equality_checker` missed. The re-scorer also audits itself — re-scored under the parse the run
+      actually used, it must reproduce ARE's own boolean per event, and says so loudly when it does
+      not. **What remains is the exit criterion itself:** the `are` extra is not installed in the
+      working venv, so the recorder's patch points are pinned only against stubs of ARE's documented
+      surface, and no recording has been produced by the real judge. Run one scored scenario ending
+      in a paraphrased message to the user, then `python -m examples.gaia2.rescore <path>
+      --require-divergence`.
 - [ ] **V2.10** **Rebuild the simulated-clock freeze, with a fixed non-zero per-call charge.** *(New
       2026-09-07; supersedes "remove the freeze" — see V2.8's clock bullet. Must precede V2.6, and
       must precede V2.5's prompt freeze only in the sense that every timing number produced before it
