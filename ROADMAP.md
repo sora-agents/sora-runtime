@@ -533,12 +533,12 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
       the documentation-architecture proposals. They churn per session and their conclusions are
       distilled into tracked ADRs, `docs/architecture/notes/`, or this file when they land — so the
       standing rule is **delete a note once it has been distilled**.
-- [x] **V4.4** ROADMAP citations removed from durable files. Per CLAUDE.md, ADRs, design notes,
+- [x] **V4.4** ROADMAP citations removed from durable files. Per AGENTS.md, ADRs, design notes,
       source, and documentation pages must not cite roadmap task IDs or phase labels at all — they
       dangle the moment the roadmap is restructured, which is exactly what happened here. Those
       citations now describe the deferred work itself. A pointer to this file survives only in the
-      project's own front matter (`README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `CLAUDE.md`), where
-      a roadmap link is the point rather than a dangling cross-reference. `src/sora/__init__.py`'s
+      project's own front matter (`README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `AGENTS.md`,
+      `CLAUDE.md`), where a roadmap link is the point rather than a dangling cross-reference. `src/sora/__init__.py`'s
       docstring, which called the package a *"packaging placeholder"* with *"no public re-exports
       yet"*, was corrected at the same time.
 - [ ] **V4.5** Docs sweep against the shipped surface — README claims, `docs/index.md` maturity

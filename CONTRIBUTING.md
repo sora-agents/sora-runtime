@@ -30,7 +30,7 @@ This project follows TDD where practical: write a failing test that captures the
 
 ## Code style
 
-See [CLAUDE.md](CLAUDE.md) for the architectural habits and code style this project follows (Protocol over inheritance, `@dataclass(frozen=True)` value types, async-first, sparse docstrings). Formatting and linting are enforced by `ruff`, not manually — if `ruff format`/`ruff check` pass, style is fine.
+See [AGENTS.md](AGENTS.md) for the architectural habits and code style this project follows (Protocol over inheritance, `@dataclass(frozen=True)` value types, async-first, sparse docstrings). Formatting and linting are enforced by `ruff`, not manually — if `ruff format`/`ruff check` pass, style is fine.
 
 ## Reporting bugs / requesting features
 

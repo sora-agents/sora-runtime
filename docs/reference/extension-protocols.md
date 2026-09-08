@@ -1,6 +1,6 @@
 # Extension Protocols Reference
 
-Every extension seam is a `Protocol`, not a base class to subclass (see `CLAUDE.md`'s "Protocol
+Every extension seam is a `Protocol`, not a base class to subclass (see `AGENTS.md`'s "Protocol
 over inheritance" habit) — implement the methods below with matching signatures and your type
 satisfies the seam structurally, no inheritance required. This page collects the exact contracts
 for the five kinds this design calls out as extension points: adapters, phase strategies, memory
