@@ -1,0 +1,103 @@
+{
+  "AgentUserInterface": [
+    "messages"
+  ],
+  "ApartmentListingApp": [
+    "apartments",
+    "saved_apartments"
+  ],
+  "CabApp": [
+    "d_service_config",
+    "quotation_history",
+    "ride_history"
+  ],
+  "Calendar": [
+    "events"
+  ],
+  "CalendarApp": [
+    "events"
+  ],
+  "CalendarV2": [
+    "events"
+  ],
+  "CityApp": [
+    "api_call_limit",
+    "crime_data"
+  ],
+  "Contacts": [
+    "contacts",
+    "view_limit"
+  ],
+  "ContactsApp": [
+    "contacts",
+    "view_limit"
+  ],
+  "EmailClientApp": [
+    "folders",
+    "user_email",
+    "view_limit"
+  ],
+  "EmailClientV2": [
+    "folders",
+    "user_email",
+    "view_limit"
+  ],
+  "Files": [
+    "files",
+    "tmpdir"
+  ],
+  "InternalContacts": [
+    "contacts",
+    "view_limit"
+  ],
+  "Mail": [
+    "folders",
+    "user_email",
+    "view_limit"
+  ],
+  "MessagingApp": [
+    "conversation_view_limit",
+    "conversations",
+    "messages_view_limit"
+  ],
+  "MessagingAppV2": [
+    "conversation_view_limit",
+    "conversations",
+    "current_user_id",
+    "current_user_name",
+    "id_to_name",
+    "messages_view_limit",
+    "mode",
+    "name_to_id"
+  ],
+  "ReminderApp": [
+    "<non-dict state>"
+  ],
+  "RentAFlat": [
+    "apartments",
+    "saved_apartments"
+  ],
+  "SandboxLocalFileSystem": [
+    "files",
+    "tmpdir"
+  ],
+  "Shopping": [
+    "cart",
+    "discount_codes",
+    "orders",
+    "products"
+  ],
+  "ShoppingApp": [
+    "cart",
+    "discount_codes",
+    "orders",
+    "products"
+  ],
+  "SystemApp": [
+    "<non-dict state>"
+  ],
+  "VirtualFileSystem": [
+    "files",
+    "tmpdir"
+  ]
+}

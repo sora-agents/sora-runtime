@@ -97,6 +97,49 @@ def _internal_app_names() -> frozenset[str]:
     return _INTERNAL_APPS_FLOOR | names
 
 
+# An app's `state` publishes only what some operation on that same app can return.
+#
+# The snapshot is a *cheaper* route to what a step-loop agent reaches by calling — that difference
+# is the architecture and is measured (see `PropertyReadMeter`). These keys are not that: no
+# operation returns them at any call count, so publishing them would make a paired run a comparison
+# of information rather than of architectures, contaminating task accuracy and not just cost. Same
+# reasoning as `_internal_app_names` one level down — that withholds a whole app ARE hides from its
+# own agent; this withholds a field ARE's own tool surface never exposes.
+#
+# Hand-authored per key, not derived: deciding whether an operation *can* return a field means
+# reading operations that need arguments, which no probe can enumerate. Each entry names what was
+# checked. `tests/fixtures/are_app_state_census.json` pins every app's key set so a new upstream
+# key is a red test rather than a silently reopened hole.
+_UNREACHABLE_STATE_KEYS: dict[str, frozenset[str]] = {
+    # `get_crime_rate(zip_code)` is deliberately rate-limited (100 calls / 30 min; its
+    # `_enforce_rate_limit` raises past that). The metering is a designed scenario constraint, and
+    # publishing the whole table bypasses it. `api_call_limit` stays — `get_api_call_limit` returns
+    # it.
+    "CityApp": frozenset({"crime_data"}),
+    # `d_service_config` (price_per_km, base_delay_min, max_distance_km, nb_seats) is consumed
+    # internally by `calculate_price`; no operation returns it, so the snapshot would let an agent
+    # price and feasibility-check a route without ever calling `get_quotation`. `quotation_history`
+    # has no getter either — `get_ride_history` covers only `ride_history`, which stays.
+    "CabApp": frozenset({"d_service_config", "quotation_history"}),
+    # All 16 operations resolve a name or id one at a time (`get_user_id`, `lookup_user_id`,
+    # `get_user_name_from_id`); none enumerates the directory. Same shape as the `InternalContacts`
+    # leak, arriving through an ARE-provided API rather than a hidden app — so withholding the app
+    # is not available as a fix. `current_user_id` / `current_user_name` stay: they are the agent's
+    # own identity, which every send operation already reveals.
+    "MessagingAppV2": frozenset({"id_to_name", "name_to_id"}),
+}
+
+
+def _publishable_state(app_name: str, state: Any) -> Any:
+    """Drop the keys no operation on ``app_name`` can return. A non-dict state passes through: ARE
+    builds every app state with ``asdict()``, so a non-dict is an upstream shape change rather than
+    a case to guess at, and guessing would silently publish what this exists to withhold."""
+    withheld = _UNREACHABLE_STATE_KEYS.get(app_name)
+    if not withheld or not isinstance(state, dict):
+        return state
+    return {k: v for k, v in state.items() if k not in withheld}
+
+
 # ARE mutates app state on its own event-loop thread with no lock we can share (see AreSimulation),
 # so a ``get_state()`` that iterates a dict the event loop is concurrently growing can raise
 # "changed size during iteration". Mutation happens in sub-second bursts, so an immediate re-read
@@ -1109,7 +1152,13 @@ class _AreTool:
                 # then fails against <Gender.FEMALE: 'Female'>, and the value defeats JSON rendering
                 # in prompts. Observed state is ground for the same comparisons an op result is, so
                 # it has to arrive in the same shape.
-                return _to_serializable(self._sim.run(self._app.get_state))
+                # Filtered HERE, at the single read, so the published property, the `changed`
+                # comparison and the `state_changed` diff below all derive from the same narrowed
+                # snapshot. Narrowing at observe()'s return instead would leak every withheld key
+                # straight back out through the signal payload.
+                return _publishable_state(
+                    self._app.app_name(), _to_serializable(self._sim.run(self._app.get_state))
+                )
             except RuntimeError as exc:  # concurrent modification by the ARE event-loop thread
                 last = exc
         assert last is not None
