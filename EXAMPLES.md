@@ -583,6 +583,18 @@ activity.pending_operation = None
 activity.state = ActivityState.READY
 ```
 
+A rejected acknowledgement resolves through that same automatic path; it is still the uniquely
+matched result of the in-flight call. The difference appears in Reflect: the default keeps the failed
+invocation and error in `history`, abandons the current plan with that error as its defect, clears the
+one-shot `last_operation` trigger, and leaves the activity ready for a replacement plan. Unless the
+manual declares the operation a read, the defect also warns that the rejection is no proof the effect
+did not land — a timeout after delivery reads exactly like a rejected argument — so the replacement
+plan is expected to check the current state before repeating a write. Failed calls do not count as
+progress toward clearing the replan trail, so with nothing else on the trail, repeating the same
+failure twice — or reaching the configured cap with different failures — pauses to ask the user
+instead of retrying without bound. A failed call never enters the completion-signal wait described
+below.
+
 This is where the *second*, independent kind of waiting comes in: `robotic-arm`'s manual declares that `move_to`'s completion is marked by the `target_reached` signal (`OperationSpecification.completion_signal`, from the operation's `completes_on:` interface block) — a condition about the arm's physical state, separate from whether `move_to`'s own ack has returned. This is handled *mechanically, in Observe, layered on top of the automatic resolve above* — not by a strategy and not in `reason()`. In the same `observe()` that resolved `move_to` to `ready`, a suspend pass notices the completed op declares a completion signal that hasn't arrived yet and calls the internal `_suspend_` action, moving `pick-up-block` from `ready` to `blocked` and recording `blocked_on=SignalWait("target_reached", source="robotic-arm")`. The two waits compose — implicit-and-automatic, then a separate mechanical block — rather than being the same mechanism. A few cycles later the signal arrives:
 
 ```python

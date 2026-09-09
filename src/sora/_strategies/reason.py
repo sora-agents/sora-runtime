@@ -99,10 +99,11 @@ log = logging.getLogger("sora.strategies")
 
 # Circuit breaker for runaway *replanning* — the same failure mode one level out. A plan is dropped
 # (a defect found in it, or reconsideration invalidating it), the replacement is dropped too, and
-# nothing ever executes; each turn of that loop costs a full planning inference, which on a local
-# model was minutes apiece in an observed run. Counted against `Activity.replan_trail`, which holds
-# only replans with no operation between them, so this never limits an agent adapting to a world
-# that keeps moving — the design center — and limits only one that is getting nowhere. Two
+# nothing successfully produces a novel result; each turn of that loop costs a full planning
+# inference, which on a local model was minutes apiece in an observed run. Counted against
+# `Activity.replan_trail`, which holds only replans with no successful novel operation between them,
+# so this never limits an agent adapting to a world that keeps moving — the design center — and
+# limits only one that is getting nowhere. Two
 # mechanical detectors, tripped before the _infer_ spend, mirroring the sub-goal breaker above:
 # a repeated *defect* (the planner was told what was wrong and wrote it again — no third attempt
 # will differ, so this trips at two), and a plain count as the coarse backstop for the case where
@@ -815,8 +816,9 @@ class DefaultReasonStrategy:
     def _replanning_would_loop(self, activity: Activity) -> str | None:
         """Whether inferring another plan for this activity now would be a loop rather than an
         attempt — the reason string if so (for the log and the await-input prompt), else ``None``.
-        Read off ``Activity.replan_trail``, which accumulates only across replans that executed no
-        operation, so adapting to a world that keeps moving is never what trips this.
+        Read off ``Activity.replan_trail``, which accumulates only across replans that completed no
+        successful novel operation, so adapting to a world that keeps moving is never what trips
+        this.
 
         Both checks read only the *defect-bearing* entries. A defect-free entry is a
         reconsideration (ADR-0024): the plan was fine and the world moved under it, so the next plan
@@ -842,8 +844,8 @@ class DefaultReasonStrategy:
             )
         if len(defects) >= self._max_replan_attempts:
             return (
-                f"{len(defects)} plans in a row were abandoned with a defect and without a single "
-                f"operation running (>= {self._max_replan_attempts})"
+                f"{len(defects)} plans in a row were abandoned with a defect without a successful "
+                f"novel operation between them (>= {self._max_replan_attempts})"
             )
         return None
 
@@ -911,8 +913,8 @@ class DefaultReasonStrategy:
             undeclared = _undeclared_params(manual, routing[OPERATION_NAME], resolved)
             if undeclared:
                 # A param the operation does not take. Invoking would raise an unexpected-keyword
-                # TypeError at the wire, and a failed op terminates the activity (DefaultReflect) —
-                # so a plan that is otherwise right dies on a name. It IS a plan defect: the model
+                # TypeError at the wire and buy a failed-operation replan that the runtime can
+                # avoid before dispatch. It IS a plan defect: the model
                 # had the schema and wrote past it (a real run took `limit` from get_contacts' prose
                 # description, which mentions a view limit it does not accept). Dropping the key
                 # instead was rejected — silently changing what an operation is asked to do is worse

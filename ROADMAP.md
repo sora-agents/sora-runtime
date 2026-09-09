@@ -79,11 +79,12 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
 - [ ] **V3.1** **Stale `last_operation` survives an interrupt landing between Observe and Reflect.**
       A failed ack resolves the activity to `READY`; a hard interrupt at the `_preempted()` checkpoint
       aborts the tick before Reflect judges; the activity is parked on an `InputWait`; the user's next
-      message resumes it — and Reflect's first judgment terminates it on the *old* failure before the
-      new instruction is ever acted on. `last_operation` has exactly one writer and is cleared by
-      neither `reset_for_replan` nor `_resume_on_input`. Narrow (needs a `/stop` in that window) but
-      real, and exactly the cross-phase composition class that phase-isolated tests never catch.
-- [ ] **V3.2** **Decide the policy for a failed external operation** (may be documentation, not code).
+      message resumes it — and Reflect's first judgment treats the *old* failure as a fresh plan
+      defect, adding a redundant replan and a stale entry to the breaker trail before the new
+      instruction is acted on. `last_operation` has exactly one writer and is cleared by neither
+      `reset_for_replan` nor `_resume_on_input`. Narrow (needs a `/stop` in that window) but real, and
+      exactly the cross-phase composition class that phase-isolated tests never catch.
+- [x] **V3.2** **Decide the policy for a failed external operation** (may be documentation, not code).
       Today a not-ok ack terminates the activity in Reflect — never a replan, never a retry — so a plan
       that is otherwise right dies on one bad tool argument. The replan machinery already exists and
       already carries a defect string; it is simply not wired to tool-level execution failures, and a
@@ -91,6 +92,31 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
       replan-on-failure (the `replan_trail` breaker already bounds retries) or state explicitly that
       terminate-on-failure is the default policy and the opt-in is the extension point. Distinct from
       `T4` (sub-plan *inference* failure) and from `A5` (guarded steps).
+
+      **Done:** the default now performs bounded replan-on-failure. Reflect retains the failed
+      invocation in execution history, resets the plan with a short operation defect, and clears
+      the handled `last_operation` trigger so the replacement survives the next tick. Failed calls
+      no longer count as progress that forgives `replan_trail`; with no other progress on the trail,
+      identical failures stop at two and distinct failures stop at the configured backstop, both
+      through the existing ask-the-user terminus — but a successful call the activity has not made
+      before still clears it, and that hole is `V3.6`. Custom Reflect strategies retain the policy
+      seam and may still terminate. The defect string carries a write-safety warning (see
+      `ADR-0025` §5), so replan-prompt *content* moved even though no pinned prompt constant did:
+      benchmark numbers that predate it are not strictly comparable across a run that replans on a
+      failed write.
+
+- [ ] **V3.6** **A failed operation's retry bound is forgiven by progress on a different step.**
+      `Activity._progressed_since_replan` clears the whole `replan_trail` as soon as any successful
+      call the activity has not made before follows the mark — a rule calibrated when a rejected
+      operation *terminated* the activity, so the trail only ever had to bound plans that made no
+      calls at all. `V3.2` routed execution failures onto the same trail, where the rule has a
+      weakness the old role never exposed: the call that decides progress is not the call that is
+      failing. A plan shaped `[read → ok, write → rejected]` can vary its read every round, clear
+      the trail every round, and replan without bound — a path that terminated on the first
+      rejection before `V3.2`. `ADR-0025` is self-consistent (it defines a novel successful call as
+      progress), so this is a scope decision the ADR has to make explicitly, not a patch: decide
+      whether progress forgives a defect on a *different* step, and say so where the progress rule
+      is stated.
 
 - [x] **V3.3** **A sub-goal that fans out to zero steps reports as success, and the final message
       then asserts the work happened.** Observed on the first gaia2-cli run: a mechanical filter

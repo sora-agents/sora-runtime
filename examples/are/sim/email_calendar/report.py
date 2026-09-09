@@ -21,12 +21,24 @@ def report(agent: Agent, simulation: Any | None) -> None:
     # "Failed" is a judgment call owned by whichever ReflectStrategy this agent.yaml configures
     # (see ReflectStrategy.failed) — going through agent.cycle.strategies.reflect rather than a
     # hardcoded rule means this line keeps working if that strategy is ever swapped for one with
-    # different failure semantics. Only asked of TERMINATED activities: reflect() itself only ever
-    # makes this judgment for a READY activity transitioning to TERMINATED, so calling it on a
-    # still-RUNNING/BLOCKED activity would read a verdict its own strategy never validated there.
+    # different terminal-failure semantics. Ask it only about TERMINATED activities: live work is
+    # reported by state below, rather than treating a transient failed operation as the outcome of
+    # the whole activity.
     reflect = agent.cycle.strategies.reflect
     failed = any(reflect.failed(a) for a in activities if a.state is ActivityState.TERMINATED)
-    print(f"\nagent outcome: {'❌ FAILED' if failed else 'completed'}")
+    if failed:
+        outcome = "❌ FAILED"
+    elif any(a.state is ActivityState.BLOCKED for a in activities):
+        # Deliberately the state, not a diagnosis of why: an activity waits on a completion signal,
+        # on a declared condition, or on the user (a bounded-recovery breaker asking for guidance),
+        # and this line does not distinguish them. What it does say is that work is parked rather
+        # than finished — which reporting it as completed would hide, and `incomplete` would blur.
+        outcome = "⏸ BLOCKED"
+    elif any(a.state is not ActivityState.TERMINATED for a in activities):
+        outcome = "incomplete"
+    else:
+        outcome = "completed"
+    print(f"\nagent outcome: {outcome}")
 
     if simulation is None:
         return

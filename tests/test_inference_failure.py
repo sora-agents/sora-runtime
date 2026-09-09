@@ -162,7 +162,7 @@ async def test_a_second_identical_failure_asks_the_user_instead_of_inferring_aga
     retry or a silent death. No new policy knob: `_replanning_would_loop` already trips at two
     identical defects, which is why the defect string is normalized."""
     cycle, working, transport = _cycle(tmp_path)
-    # One failure already on the trail, no operation run since (so nothing forgives it).
+    # One failure already on the trail, with no successful novel operation since to forgive it.
     activity = _inferring(InferenceKind.PLAN, replan_trail=[_PLAN_DEFECT])
     working.activities["a1"] = activity
     cycle.inference_sink.push("inf-1", InferenceResult(id="inf-1", error="ValueError('again')"))

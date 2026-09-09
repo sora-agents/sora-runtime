@@ -361,8 +361,8 @@ class DefaultObserveStrategy:
                         log.info("observe: resolved %s -> ok", op)
                         log.debug("observe: %s result\n%r", op, ack.result)
                     else:
-                        # Surface *why*: a failed op terminates the activity in Reflect, and without
-                        # the error the trace just says failed with no cause (e.g. a schema error).
+                        # Surface *why*: Reflect turns a failed op into a defect-bearing replan, and
+                        # without the error the trace would name neither what failed nor why.
                         log.warning("observe: resolved %s -> FAILED: %s", op, _truncate(ack.result))
                     break
         # Drain first: a provider result may already be queued even though Observe starts after its
@@ -533,7 +533,7 @@ class DefaultObserveStrategy:
     ) -> None:
         """For each activity whose op just resolved: if the op's manual declares a completion signal
         that hasn't already arrived, suspend the activity until it does. Layered on the automatic
-        RUNNING->READY resolve above (a failed op still terminates in Reflect; only a successful,
+        RUNNING->READY resolve above (a failed op replans in Reflect; only a successful,
         signal-declaring op suspends). If the signal already arrived (it beat the ack), stay READY
         without blocking — the two waits compose, they don't deadlock. The signal itself is never
         consumed here: it's left in `wm.signals` for `_resume_on_signal` (or any other activity

@@ -10,7 +10,7 @@ A plan is *synthesized* by a model rather than selected from an authored library
 cost of every termination guarantee a plan library gives for free. An authored library cannot
 recurse forever because a human wrote the reductions; a model can satisfy "plan for goal G" with a
 plan whose body is another sub-goal for ~G, or answer a rejected plan with the same plan again, and
-each turn of either loop costs a full inference. Three failure modes were observed in Gaia2 runs,
+each turn of either loop costs a full inference. Five failure modes were observed in Gaia2 runs,
 all of them the same shape — the runtime spending or *acting* on deliberation that could not
 succeed:
 
@@ -32,6 +32,10 @@ succeed:
    episode was written, and the user was told nothing. Unlike the three above this is not the
    runtime *spending* on hopeless deliberation; it is the runtime destroying an activity that
    nothing had gone wrong with.
+5. **A rejected external operation killing an otherwise-correct goal.** A bad tool argument is
+   definite evidence that the current plan cannot continue as written, but not that the goal is
+   unreachable. Terminating in Reflect discarded the remaining work instead of giving the planner
+   the operation error it needed to route around the bad step.
 
 The question this ADR answers: **when does the runtime stop and ask a person, instead of spending
 another inference, committing another act, or giving up on the activity entirely?**
@@ -70,9 +74,9 @@ single budget cannot tell a productive long task from a stuck short one — whic
 distinction that matters — while each specific detector can, at essentially no cost.
 
 Five detectors across three breakers, all evaluated **before** the spend or the act they guard, none
-of them involving a model call — plus a fourth failure mode (below) that has no detector because it
-needs none: it announces itself by raising, and is routed into breaker 2 rather than given a budget
-of its own.
+of them involving a model call — plus two explicit failure results below that need no detector: a
+failed deliberation announces itself with an error, and a rejected operation with a not-ok ack. Both
+are routed into breaker 2 rather than given budgets of their own.
 
 ### 1. Sub-goal recursion (realizes ADR-0022's deferred overflow valve)
 
@@ -99,14 +103,18 @@ Counted against `Activity.replan_trail`, which holds **only replans with no prog
 * **Plain count** (`max_replan_attempts`, default 5) as the coarse backstop for the case where every
   attempt fails differently.
 
-**Progress is a call this activity has not already made** — same tool, same operation, same params.
+**Progress is a successful call this activity has not already completed successfully** — same tool,
+same operation, same params.
 The obvious alternative, "did `history` grow", is too generous and was observed failing: five plans
 each re-issued one identical `get_contacts(offset=0)`, so every replan looked like progress, the
 trail cleared each time, and the breaker never came near its cap while the agent went nowhere.
-Re-running a call whose arguments already appear in history yields no fact the next plan did not
-already have, so it cannot be what forgives a replan. The test deliberately errs toward *not*
-forgiving — re-reading state that has since changed scores as no progress even though the result may
-differ — because the trail only ever counts, and what it counts toward is asking the user.
+Re-running a call that already succeeded yields no fact the next plan did not already have, so it
+cannot be what forgives a replan. A rejected call also does not forgive the trail: it is the defect
+being recovered from, and counting it as progress would let a sequence of differently-parameterized
+failures reset its own retry bound forever. A later success after an identical failed invocation does
+count, because it produced the result the earlier call did not. The test deliberately errs toward
+*not* forgiving — re-reading state that has since changed scores as no progress even though the
+result may differ — because the trail only ever counts, and what it counts toward is asking the user.
 
 ### 3. Acting on a dead plan (the irreversibility guard)
 
@@ -190,6 +198,34 @@ and **told the user nothing** (so an activity born from an instruction ended wit
 Both are now done before the activity is handed back, and awaited rather than dispatched: it is the
 activity's last cycle, so there is no later pass on which to finish.
 
+### 5. An external operation that is rejected
+
+A not-ok `OperationAck` is evidence that the current plan cannot continue as written, but it is not
+evidence that the activity's goal is impossible. Default Reflect therefore keeps the failed
+invocation and error in `Activity.history`, resets the plan with a short defect naming the tool and
+operation, and clears the handled `last_operation` trigger so the replacement is not discarded again
+on the next tick. The replacement planner sees the full failed invocation in history — rendered as
+its own `ERROR:` line — and, where there was a plan to supersede, the normalized defect beside it.
+An activity with no plan to drop (hand-built, or one whose plan a prior reset already cleared) has
+no superseded bundle to carry the defect, so there the error line in history is the whole brief.
+
+A rejection is not proof the effect did not land: an adapter turns a timeout, a transport error, or
+a post-write validation failure into the same not-ok ack as a rejected argument, and the runtime
+cannot tell those apart. Re-issuing a write blindly can therefore duplicate an effect that already
+happened. The defect says so unless the manual declares the operation a read
+(`OperationSpecification.side_effecting is False`) — an operation that never declared it counts as a
+write, the same conservative reading `before_writes` takes. This is a warning carried to the
+planner, not a refusal to replan: only a read establishes what the world now holds, and only the
+planner can put that read in front of the retry. Declining to retry writes at all was the
+alternative, and it was rejected because it reinstates exactly the failure this section exists to
+fix for every write-shaped goal.
+
+The retry has no counter of its own. Failed calls do not count as progress, so consecutive
+operation-failure replans accumulate on the same `replan_trail` as every other defective plan. Two
+identical failures trip the repeated-defect check; different failures reach the configured coarse
+cap. A successful novel operation clears the trail as before. A custom `ReflectStrategy` remains
+free to terminate, retry in place, or apply a domain-specific partial-success rule.
+
 ### The shared terminus
 
 All of them pause the activity to **await-input** (ADR-0020) rather than terminating it, carrying a
@@ -206,9 +242,9 @@ transport `runtime-io`'s `send_message_to_user` uses, called directly because at
 is no plan left to route through. The hard-interrupt pause deliberately does not report: the user
 caused that one and does not need to be told they did.
 
-They compose into one escalation path rather than four parallel ones: a failed inference or the
-viability guard replans; replans that learn nothing new accumulate on the trail; the trail trips the
-replan breaker; the breaker asks the user.
+They compose into one escalation path rather than parallel ones: a failed inference, rejected
+operation, or viability guard replans; replans that learn nothing new accumulate on the trail; the
+trail trips the breaker; the breaker asks the user.
 
 ### Positive Consequences
 

@@ -741,18 +741,20 @@ async def test_revalidate_between_grounding_and_invoke_does_not_force_a_reground
 
 # ── Runaway-replan breaker ──────────────────────────────────────────────────────────────────────
 #
-# A plan is dropped, its replacement is dropped too, and nothing ever runs — each turn costing a
-# full planning inference (minutes apiece on a local model in the run that motivated this). The
-# bound is deliberately progress-relative: replanning without limit is what an agent in a dynamic
-# environment is *for*, so what gets counted is only replans that executed no operation at all.
+# A plan is dropped, its replacement is dropped too, and nothing successfully produces a novel
+# result — each turn costing a full planning inference (minutes apiece on a local model in the run
+# that motivated this). The bound is deliberately progress-relative: replanning without limit is
+# what an agent in a dynamic environment is *for*, so only replans without successful novel work
+# accumulate.
 
 
-def _ran_an_op(page: int = 0) -> CompletedOperation:
+def _ran_an_op(page: int = 0, *, ok: bool = True) -> CompletedOperation:
     """One completed call. ``page`` varies the arguments: only a call the activity has not already
     made counts as progress, so a fixture that re-ran one identical call would be modelling the
     stuck agent rather than the working one."""
     return CompletedOperation(
-        OperationInvocation("t", "read_op", {"page": page}), OperationAck(ok=True, result="ok")
+        OperationInvocation("t", "read_op", {"page": page}),
+        OperationAck(ok=ok, result="ok" if ok else "rejected"),
     )
 
 
@@ -791,6 +793,29 @@ def test_an_operation_running_between_replans_forgives_the_trail() -> None:
     _replanned(activity, None)
 
     assert activity.replan_trail == [None]  # only the latest; every earlier one was forgiven
+
+
+def test_a_failed_operation_does_not_forgive_the_replan_trail() -> None:
+    """A rejected attempt is the defect being bounded, not progress that resets its own breaker."""
+    activity = Activity(id="a", goal="g", context={})
+    _replanned(activity, "first failure")
+    activity.history.append(_ran_an_op(1, ok=False))
+
+    _replanned(activity, "second failure")
+
+    assert activity.replan_trail == ["first failure", "second failure"]
+
+
+def test_a_successful_retry_after_a_failed_call_does_forgive_the_trail() -> None:
+    """Deduplication compares successful calls: success after an identical failure is new facts."""
+    activity = Activity(id="a", goal="g", context={})
+    activity.history.append(_ran_an_op(0, ok=False))
+    _replanned(activity, "first failure")
+    activity.history.append(_ran_an_op(0, ok=True))
+
+    _replanned(activity, "later defect")
+
+    assert activity.replan_trail == ["later defect"]
 
 
 def test_re_running_an_already_made_call_does_not_forgive_the_trail() -> None:
@@ -891,6 +916,7 @@ async def test_the_count_backstops_attempts_that_all_fail_differently(tmp_path: 
     # Mechanically rendered (no model call): every attempt is listed, in order, verbatim.
     for i, reason in enumerate(trail, start=1):
         assert f"  {i}. {reason}" in prompt
+    assert "without a successful novel operation between them" in prompt
     assert "How should I proceed?" in prompt
 
 

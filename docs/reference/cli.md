@@ -20,7 +20,7 @@ Starts a persistent terminal session.
 | `--task-file PATH` | str | none | Read the initial user message from this file at startup. Mutually exclusive with `--task`/`--scenario`. |
 | `--scenario REF` | str | none | An ARE scenario reference (dotted `Scenario` subclass path, or a Gaia2 `.json` file) — injected as the runtime `simulation` object for an `are-sim` workspace / `are` transport in `agent.yaml`. Mutually exclusive with `--task`/`--task-file`: the scenario delivers its own task through the `AgentUserInterface` timeline. |
 | `--report DOTTED.PATH` | str | none | Call this `(agent, simulation) -> None` after the session ends — e.g. to print custom scoring/checks. |
-| `--exit-when-idle SECONDS` | float | none (wait for stdin) | Auto-exit once every activity has stayed `TERMINATED` for this many seconds, instead of waiting for stdin — useful for scripted/headless runs. |
+| `--exit-when-idle SECONDS` | float | none (wait for stdin) | Auto-exit once every activity has stayed finished for this many seconds, instead of waiting for stdin — useful for scripted/headless runs. "Finished" is `TERMINATED` or parked on an await-input pause (a deliberation breaker asking the user), since a headless run has nobody to answer it; a signal or condition wait still counts as live. |
 
 `--color`/`--no-color` form one mutually exclusive group; `--task`/`--task-file`/`--scenario` form
 another.

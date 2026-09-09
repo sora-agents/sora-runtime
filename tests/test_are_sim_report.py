@@ -30,22 +30,24 @@ from sora.strategies import (
     DefaultReasonStrategy,
     DefaultReflectStrategy,
     DefaultSituateStrategy,
+    ReflectStrategy,
     Strategies,
+    TickResult,
 )
 from sora.transport import InProcessTransport
-from sora.types import OperationAck
+from sora.types import InputWait
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
 
 
-def _build_agent(tmp_path: Path) -> Agent:
+def _build_agent(tmp_path: Path, *, reflect: ReflectStrategy | None = None) -> Agent:
     workspace = FakeWorkspace("clock", _ORIGIN, [FakeTool("Clock", invoke_results={})])
     registry = EnvironmentRegistry(adapters={_ORIGIN: FakeAdapter("fake", workspace)})
     working = WorkingMemory(registry=registry)
     semantic = SemanticMemory(FileMemoryBackend(tmp_path / "semantic"))
     strategies = Strategies(
         observe=DefaultObserveStrategy(),
-        reflect=DefaultReflectStrategy(),
+        reflect=reflect or DefaultReflectStrategy(),
         situate=DefaultSituateStrategy(),
         reason=DefaultReasonStrategy(),
         act=DefaultActStrategy(),
@@ -106,7 +108,40 @@ def test_report_prints_completed_when_no_activity_failed(
     assert "ARE validation" not in out  # no simulation given -> no ARE-specific line
 
 
-def test_report_prints_failed_when_an_activity_s_last_operation_was_not_ok(
+class _GoalFailureReflect:
+    async def reflect(
+        self,
+        activity: Activity,
+        wm: WorkingMemory,
+        cycle: DecisionCycle,
+        result: TickResult,
+    ) -> TickResult:
+        del wm, cycle
+        if self.failed(activity):
+            activity.state = ActivityState.TERMINATED
+        return result
+
+    def failed(self, activity: Activity) -> bool:
+        return activity.goal == "failed"
+
+
+def test_report_uses_configured_reflect_failure_judgment_for_terminated_activity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    agent = _build_agent(tmp_path, reflect=_GoalFailureReflect())
+    agent.working.activities["a1"] = Activity(
+        id="a1",
+        goal="failed",
+        context={},
+        state=ActivityState.TERMINATED,
+    )
+
+    report(agent, None)
+
+    assert "agent outcome: ❌ FAILED" in capsys.readouterr().out
+
+
+def test_report_prints_blocked_when_bounded_recovery_awaits_input(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     agent = _build_agent(tmp_path)
@@ -114,13 +149,14 @@ def test_report_prints_failed_when_an_activity_s_last_operation_was_not_ok(
         id="a1",
         goal="schedule it",
         context={},
-        state=ActivityState.TERMINATED,
-        last_operation=OperationAck(ok=False, result=None),
+        state=ActivityState.BLOCKED,
+        blocked_on=InputWait(prompt="How should I proceed?"),
+        replan_trail=["Calendar.create_event failed: rejected"] * 2,
     )
 
     report(agent, None)
 
-    assert "agent outcome: ❌ FAILED" in capsys.readouterr().out
+    assert "agent outcome: ⏸ BLOCKED" in capsys.readouterr().out
 
 
 def test_report_prints_are_validation_pass(

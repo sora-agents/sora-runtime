@@ -1198,9 +1198,9 @@ async def test_an_unresolvable_that_is_not_about_an_empty_binding_is_passed_thro
 #
 # A real run planned get_contacts({"offset": 0, "limit": 100}). The manual declares only `offset`;
 # `limit` was picked up from the operation's own prose ("There is a view limit"). The runtime passed
-# it through, the tool raised "unexpected keyword argument 'limit'", and a failed op terminates the
-# activity — so a plan that was otherwise exactly right (get_contacts, then filter on job) died on a
-# name. The schema was there the whole time; nothing checked against it.
+# it through, the tool raised "unexpected keyword argument 'limit'", and the then-current failure
+# policy terminated the activity — so a plan that was otherwise exactly right (get_contacts, then
+# filter on job) died on a name. The schema was there the whole time; nothing checked against it.
 
 
 def _contacts_manual() -> Manual:
@@ -1245,7 +1245,7 @@ async def test_an_undeclared_param_replans_instead_of_invoking(tmp_path: Path) -
     assert emitted.step is None  # no step commits this cycle
     assert tool.invocations == []  # never reached the wire, so never a TypeError
     state = activity.state
-    assert state is ActivityState.READY  # and not TERMINATED, which a failed op would have caused
+    assert state is ActivityState.READY  # preflight defect: replan without invoking first
     assert activity.plan is None  # dropped -> Reason re-infers next cycle
     superseded = activity.superseded
     assert superseded is not None
@@ -1358,8 +1358,9 @@ def test_every_undeclared_param_is_reported_not_just_the_first() -> None:
 # --------------------------------------------------------------------------------------------------
 # The sibling of the undeclared-parameter guard, one line down the same schema. A run died on
 # exactly this: a Calendar record's epoch-float `start_datetime` piped straight into an operation
-# declaring a `YYYY-MM-DD HH:MM:SS` string. The wire raised, and a failed op terminates the
-# activity — so an otherwise-correct plan lost its whole maintenance window to a conversion.
+# declaring a `YYYY-MM-DD HH:MM:SS` string. The wire raised, and the then-current failure policy
+# terminated the activity — so an otherwise-correct plan lost its whole maintenance window to a
+# conversion.
 # Nothing is coerced: "1729375200.0" would satisfy the type and still be the wrong argument.
 
 

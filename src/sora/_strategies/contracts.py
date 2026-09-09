@@ -47,16 +47,18 @@ class ReflectStrategy(Protocol):
     async def reflect(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
-        """Decides whether this activity just completed or failed — deterministic or model-backed,
-        depending on the application — and if so, summarizes and stores to episodic memory. (The
-        default does NOT auto-cache the completed plan to procedural memory — replaying a stored
-        plan verbatim is unsound; distilling reusable procedures from episodes is future work.) The
-        completion judgment is
+        """Decides whether this activity just completed or whether its current plan failed —
+        deterministic or model-backed, depending on the application — and chooses the disposition.
+        The default stores a completed activity but routes a rejected external operation into
+        bounded replanning rather than terminating it. (It does NOT auto-cache the completed plan
+        to procedural memory — replaying a stored plan verbatim is unsound; distilling reusable
+        procedures from episodes is future work.) The completion judgment is
         synchronous — it must land before Situate selects, so a just-completed activity is never
         re-selected the same cycle — while the summarize/store side effects are dispatched
         asynchronously and never block the cycle; several activities may terminate in the same
-        cycle. Passes `result` through, optionally adding to it. Default: performs the completion
-        check and the store-on-success, leaves TickResult's other fields untouched. `cycle` is what
+        cycle. Passes `result` through, optionally adding to it. Default: performs completion and
+        failed-operation recovery, stores on success, and leaves TickResult's other fields
+        untouched. `cycle` is what
         makes these memory calls possible at all — previously missing from this Protocol despite
         the calls it was already documented as making."""
         ...

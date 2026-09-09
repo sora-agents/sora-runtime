@@ -18,7 +18,7 @@ from sora.activity import ActivityState
 from sora.bootstrap import build_agent, import_object
 from sora.llm import LLMMeter, LLMReport
 from sora.perception import Message
-from sora.types import USER_STOP, Signal
+from sora.types import USER_STOP, InputWait, Signal
 
 if TYPE_CHECKING:
     from sora.activity import Activity
@@ -29,7 +29,26 @@ log = logging.getLogger("sora.cli")
 _PHASES = ("observe", "situate", "reason", "reflect", "act")
 _CYCLE_BEGIN = re.compile(r"^\[cycle (\d+)\] begin$")
 _EXIT_COMMANDS = ("/exit", "/quit")
+
 _STOP_COMMAND = "/stop"  # reserved control: a hard interrupt (halt current work), not a Message
+
+
+def _headless_idle(activity: Activity) -> bool:
+    """Whether an activity has stopped for good in a run that nobody is watching.
+
+    TERMINATED is the obvious terminus; an activity parked on an ``InputWait`` is the other one.
+    A deliberation breaker (ADR-0025), and every other await-input pause, ends by asking the user
+    a question — and a headless run has nobody to answer it, since `_read_stdin` deliberately
+    ignores EOF in this mode. Waiting for all-TERMINATED there is waiting forever, which is what
+    a scripted `--exit-when-idle` run is meant never to do.
+
+    Not a claim that the question is unanswerable: an ARE timeline can deliver a message that
+    resumes the activity. The idle *timer* covers that on its own — the run stops being idle and
+    the countdown restarts.
+    """
+    return activity.state is ActivityState.TERMINATED or (
+        activity.state is ActivityState.BLOCKED and isinstance(activity.blocked_on, InputWait)
+    )
 
 
 @runtime_checkable
@@ -375,9 +394,7 @@ class TerminalSession:
                         break
                 elif self._exit_when_idle is not None:
                     activities = list(self._agent.working.activities.values())
-                    idle = bool(activities) and all(
-                        a.state is ActivityState.TERMINATED for a in activities
-                    )
+                    idle = bool(activities) and all(_headless_idle(a) for a in activities)
                     if not idle:
                         idle_since = None
                     else:
@@ -632,8 +649,9 @@ def main() -> None:
         default=None,
         metavar="SECONDS",
         help=(
-            "Auto-exit once every activity has stayed TERMINATED for this many seconds, instead "
-            "of waiting for stdin (useful for scripted/headless runs)"
+            "Auto-exit once every activity has stayed finished — terminated, or parked awaiting "
+            "input nobody is there to give — for this many seconds, instead of waiting for stdin "
+            "(useful for scripted/headless runs)"
         ),
     )
 

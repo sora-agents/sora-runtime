@@ -168,11 +168,11 @@ class Activity:
     # rather than from nothing (ADR-0024). Cleared by Observe once that replacement installs, so it
     # can never leak into a later, unrelated inference. Transient run state; never persisted.
     superseded: SupersededPlan | None = None
-    # Why each of the *consecutive* replans that has run no operation was taken, oldest first (None
+    # Why each consecutive replan with no successful novel operation was taken, oldest first (None
     # = no defect, the plan was sound and the world moved). Reason reads it to decide whether
     # another plan is worth inferring at all. Deliberately progress-relative rather than a lifetime
     # count: an agent in a dynamic environment is *supposed* to replan without limit, so an absolute
-    # budget on adapting would cap the thing the runtime exists to do. Executing a single operation
+    # budget on adapting would cap the thing the runtime exists to do. A successful novel operation
     # clears the trail, which is what separates "kept adjusting while getting somewhere" from
     # "produced N plans and never moved". Transient run state; never persisted.
     replan_trail: list[str | None] = field(default_factory=list)
@@ -201,8 +201,10 @@ class Activity:
         it fails. Five plans in a row each re-issued ``get_contacts(offset=0)``, a call already in
         history, so every replan looked like progress, the trail cleared each time, and the breaker
         never came near its cap while the agent went nowhere and the plans stayed equally stuck.
-        Re-running a call whose arguments already appear in history yields no fact the next plan
-        did not already have, so it cannot be what forgives a replan.
+        A rejected call is the defect recovery is trying to repair, so it cannot forgive its own
+        trail. A successful call does, provided no earlier successful call used the same tool,
+        operation, and params. This means a successful retry after a failure is progress, while
+        re-running an already-successful read remains the observed loop rather than a new fact.
 
         The test is mechanical — same tool, operation and params — and deliberately errs toward
         *not* forgiving: re-reading state that has since changed scores as no progress even though
@@ -210,9 +212,13 @@ class Activity:
         and what it counts toward is asking the user rather than terminating anything.
         """
         for i in range(self.replan_history_mark, len(self.history)):
-            call = self.history[i].invocation
+            completed = self.history[i]
+            if not completed.ack.ok:
+                continue
+            call = completed.invocation
             if not any(
-                done.invocation.tool_id == call.tool_id
+                done.ack.ok
+                and done.invocation.tool_id == call.tool_id
                 and done.invocation.operation_name == call.operation_name
                 and done.invocation.params == call.params
                 for done in self.history[:i]

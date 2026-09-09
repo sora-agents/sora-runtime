@@ -83,8 +83,8 @@ policies, or a dotted path to a custom one (the seam through which D5's author-d
 and X2's adaptive policy will plug in later). The shipped levels:
 
 * **`none`** — never reconsider on ambient percepts. (Blind commitment.) Correct for static tasks
-  (most of Gaia2). Failure-driven re-planning is **orthogonal and still on**: a crashed/`not ok`
-  step re-plans regardless — that is *impossibility*, not adaptation.
+  (most of Gaia2). Failure-driven re-planning is **orthogonal and still on**: a `not ok` step
+  re-plans regardless — that is *impossibility*, not necessarily adaptation.
 * **`before_writes`** (default) — before dispatching a **side-effecting** operation, run the
   reconsideration check. The risk-aligned default: a stale plan is only harmful when it *acts* on the
   staleness, and a write is the commitment point where that harm happens.

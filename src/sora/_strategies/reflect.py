@@ -15,7 +15,9 @@ from sora._strategies.conditions import (
 from sora._strategies.contracts import (
     TickResult,
 )
+from sora._strategies.interaction import _truncate
 from sora.activity import Activity, ActivityState
+from sora.references import _manual_for
 from sora.types import (
     ConditionWait,
 )
@@ -29,11 +31,46 @@ if TYPE_CHECKING:
 log = logging.getLogger("sora.strategies")
 
 
-def _summarize(activity: Activity, *, succeeded: bool) -> str:
+def _summarize(activity: Activity) -> str:
     """A deterministic, no-LLM episode summary. A model-backed ReflectStrategy would substitute a
     richer natural-language summary here; the mechanical default just states outcome and goal."""
-    outcome = "completed" if succeeded else "failed"
-    return f"{outcome}: {activity.goal}"
+    return f"completed: {activity.goal}"
+
+
+def _operation_failure_defect(activity: Activity, wm: WorkingMemory) -> str:
+    """Name a rejected operation for the replacement plan without duplicating its parameters.
+
+    Observe has already appended the full invocation and result to ``history``; the defect is the
+    short, stable reason the replan breaker compares and the planning prompt places beside that
+    execution evidence. The fallback admits a hand-built or custom plan-less activity carrying
+    only ``last_operation`` without pretending an invocation identity is known.
+
+    A not-ok ack is not proof the effect did not land: an adapter turns a timeout, a transport
+    error, or a post-write validation failure into the same rejection as a bad argument, and the
+    runtime cannot tell those apart. So unless the manual declares the operation a read
+    (``side_effecting is False``), the defect says so — an operation that never declared it counts
+    as a write here, the same conservative reading `before_writes` takes. Deliberately a warning to
+    the planner rather than a refusal to replan: only a read can establish what the world now holds,
+    and only the planner can put that read in front of the retry.
+    """
+    failed = activity.last_operation
+    assert failed is not None and not failed.ok
+    operation = "external operation"
+    side_effecting: bool | None = None
+    if activity.history and activity.history[-1].ack is failed:
+        invocation = activity.history[-1].invocation
+        operation = f"{invocation.tool_id}.{invocation.operation_name}"
+        manual = _manual_for(wm, invocation.tool_id)
+        spec = manual.operation(invocation.operation_name) if manual is not None else None
+        side_effecting = spec.side_effecting if spec is not None else None
+    defect = f"{operation} failed: {_truncate(failed.result)}"
+    if side_effecting is not False:
+        # No trailing period: the planning prompt continues the sentence this is spliced into.
+        defect += (
+            " (the rejection does not prove the call had no effect — check the current state "
+            "before repeating it)"
+        )
+    return defect
 
 
 class DefaultReflectStrategy:
@@ -46,13 +83,14 @@ class DefaultReflectStrategy:
     activities may terminate in the same cycle). Strong refs to the in-flight tasks are held so they
     aren't GC'd mid-write — the same pattern as InvokeAction.
 
-    The two rules are deliberately asymmetric. **Failure** fires on any resolved-but-not-ok
-    ``last_operation``, independent of the plan: a failed operation is definite negative evidence,
-    so the activity terminates even mid-plan. **Completion** requires positive evidence that all
-    planned work is done — a plan present and fully consumed (``step_index >= len(plan.steps)``) —
-    so a plan-less activity is never auto-completed here (what a plan-following Reason, and any
-    application driving activities without a plan, relies on). Both outcomes record an episode;
-    neither auto-caches the plan to procedural memory — replaying a stored plan verbatim is unsound,
+    The two rules are deliberately asymmetric. A resolved-but-not-ok ``last_operation`` is definite
+    negative evidence about the current plan, so the default drops that plan with a named defect and
+    lets Reason's existing replan breaker bound recovery. It does not terminate an otherwise-live
+    goal for one rejected call. **Completion** requires positive evidence that all planned work is
+    done — a plan present and fully consumed (``step_index >= len(plan.steps)``) — so a plan-less
+    activity is never auto-completed here (what a plan-following Reason, and any application driving
+    activities without a plan, relies on). Only terminal completion records an episode here, and it
+    never auto-caches the plan to procedural memory — replaying a stored plan verbatim is unsound,
     so plan storage is disabled until reusable procedures are distilled from episodes (Reason still
     consults ``procedural.retrieve``, which simply finds nothing until then)."""
 
@@ -71,15 +109,19 @@ class DefaultReflectStrategy:
         _lift_pending_conditions(activity, wm)
         # Only READY activities are judged: RUNNING has an operation still in flight (nothing to
         # judge yet), BLOCKED is waiting on a signal or on the user, and TERMINATED already recorded
-        # its own episode — every path that sets TERMINATED writes one before handing back (this
-        # strategy below, and Observe's residual inference-failure branch), which is what lets
-        # reflect() skip them and stay idempotent across the cycles it runs on every activity.
+        # its own episode — the completion branch below is the only path left that terminates an
+        # activity, and it writes one before handing back, which is what lets reflect() skip them
+        # and stay idempotent across the cycles it runs on every activity.
         if activity.state is not ActivityState.READY:
             return result
         if self.failed(activity):
-            activity.state = ActivityState.TERMINATED  # synchronous — Situate sees it this cycle
-            log.info("reflect: activity %s failed; storing episode", activity.id)
-            self._dispatch(self._record_failure(cycle, activity))
+            defect = _operation_failure_defect(activity, wm)
+            log.warning("reflect: activity %s replanning after %s", activity.id, defect)
+            activity.reset_for_replan(defect=defect)
+            # The failure remains in history as execution evidence. Clear only the one-shot trigger
+            # Reflect just handled, or the next tick would abandon the replacement before it could
+            # run. The broader stale-last-operation path across InputWait remains separate.
+            activity.last_operation = None
         elif (
             activity.plan is not None
             and activity.step_index >= len(activity.plan.steps)
@@ -143,8 +185,7 @@ class DefaultReflectStrategy:
         return result
 
     def failed(self, activity: Activity) -> bool:
-        """The default rule: a resolved-but-not-ok last_operation is definite negative evidence,
-        independent of the plan (see the class docstring's "asymmetric" rules)."""
+        """Whether a resolved operation rejects the current plan and requires recovery."""
         return activity.last_operation is not None and not activity.last_operation.ok
 
     def _dispatch(self, coro: Coroutine[Any, Any, None]) -> None:
@@ -157,7 +198,4 @@ class DefaultReflectStrategy:
         # memory: auto-caching a plan and replaying it verbatim is unsound (a corrected or
         # observation-coupled plan is not reusable). Distilling reusable procedures from episodes is
         # future work; cycle.procedural.store stays available for that deliberate step.
-        await cycle.episodic.learn(activity, _summarize(activity, succeeded=True), succeeded=True)
-
-    async def _record_failure(self, cycle: DecisionCycle, activity: Activity) -> None:
-        await cycle.episodic.learn(activity, _summarize(activity, succeeded=False), succeeded=False)
+        await cycle.episodic.learn(activity, _summarize(activity), succeeded=True)

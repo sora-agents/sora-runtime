@@ -62,12 +62,13 @@ def _mistyped_params(
     """Params whose resolved value contradicts the type its schema declares, for a planner.
 
     The sibling of `_undeclared_params`, and it exists for the identical reason: the wire raises
-    (ARE answers `Argument 'start_datetime' must be of type <class 'str'>, got <class 'float'>`), a
-    failed op terminates the activity, and so a plan that is otherwise right dies on a conversion.
-    It is a plan defect in the same sense too — the schema was in the catalog and the step wrote
-    past it. The motivating run piped `get_calendar_event`'s epoch-float `start_datetime` straight
-    into `get_calendar_events_from_to`, which declares a `YYYY-MM-DD HH:MM:SS` STRING; the run died
-    there, mid-maintenance-window, on the first firing.
+    (ARE answers `Argument 'start_datetime' must be of type <class 'str'>, got <class 'float'>`),
+    and repairing the value before dispatch avoids spending a failed-operation replan on a
+    conversion the schema already proves wrong. It is a plan defect in the same sense too — the
+    schema was in the catalog and the step wrote past it. The motivating run piped
+    `get_calendar_event`'s
+    epoch-float `start_datetime` straight into `get_calendar_events_from_to`, which declares a
+    `YYYY-MM-DD HH:MM:SS` STRING; the run died there, mid-maintenance-window, on the first firing.
 
     Nothing is coerced. Turning 1729375200.0 into "1729375200.0" would satisfy the type and still be
     the wrong argument — the operation wants a formatted date, and only the planner can know that.

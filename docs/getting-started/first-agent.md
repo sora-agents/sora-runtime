@@ -44,7 +44,8 @@ Three more optional flags, mainly for driving an ARE scenario without a bespoke 
 `--task-file` — the scenario delivers its own task through the `AgentUserInterface`); `--report
 dotted.path` calls a `(agent, simulation) -> None` hook after the session ends, e.g. to print
 custom scoring/checks; `--exit-when-idle SECONDS` auto-exits once every activity has stayed
-`TERMINATED` for that long, instead of waiting on stdin — useful for a scripted/headless run.
+finished for that long — `TERMINATED`, or parked awaiting input, which a headless run has nobody
+to answer — instead of waiting on stdin, useful for a scripted/headless run.
 
 ## Anatomy of `agent.yaml`
 

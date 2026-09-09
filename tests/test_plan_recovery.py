@@ -1,9 +1,9 @@
 """Recovering a plan whose JSON is malformed — the two fallbacks under ``ProceduralMemory.infer``.
 
 An inferred plan is one model call, and on a local reasoning model that call is minutes and tens of
-thousands of tokens. Losing all of it to a syntax slip — and, because a failed inference terminates
-the activity, losing the activity with it — is the failure these two layers exist to stop. They are
-ordered cheapest-first and neither one invents content:
+thousands of tokens. Before failed inference was routed into bounded replanning, losing all of it to
+a syntax slip also lost the activity; that is the failure these two layers exist to stop before the
+runtime-level recovery is needed. They are ordered cheapest-first and neither one invents content:
 
 1. ``_drop_surplus_closers`` deletes closers that have no valid reading at all, and the result is
    still handed to ``json.loads`` rather than trusted. Free.

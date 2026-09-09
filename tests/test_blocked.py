@@ -190,9 +190,10 @@ async def test_synchronous_op_does_not_suspend(tmp_path: Path) -> None:
     assert activity.blocked_on is None
 
 
-async def test_failed_op_terminates_not_blocks(tmp_path: Path) -> None:
-    # A failure isn't a completion to wait past: the op resolved not-ok, so no suspend (Reflect will
-    # terminate it). Guards against blocking forever on a signal a failed op will never emit.
+async def test_failed_op_does_not_block_on_a_completion_signal(tmp_path: Path) -> None:
+    # A failure isn't a completion to wait past: the op resolves not-ok without suspending, then
+    # Reflect routes it into bounded replanning. A signal the failed op will never emit is
+    # irrelevant.
     cycle, working, _ = await _joined_arm(tmp_path)
     activity = _running_move_to("a1", op_id="op-1")
     working.activities["a1"] = activity

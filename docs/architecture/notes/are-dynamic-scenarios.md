@@ -229,12 +229,13 @@ Four claims were checked directly against ARE's source (`environment.py`, `apps/
   all-numeric union (`int | float`) → JSON `number` (admits both). Two residual limits the schema
   *can't* close, by nature: a free-form `dict[str, Any]` maps to an untyped object with no key
   guidance (that's an authored manual's job, [ADR-0018](../adrs/0018-manual-merge-policy-and-authored-interface.md)), and any remaining model deviation surfaces
-  as a failed `OperationAck` that terminates the activity — a graceful failure, not a crash. Related
+  as a failed `OperationAck` that drives a bounded replan — a recoverable failure, not a crash. Related
   reporting fix: ARE's base `Scenario.validate` only checks the environment didn't enter a `FAILED`
   state and runs any oracle validators, so a scenario with no `validate()` override and no oracle
   events reports `PASS` even when the agent failed the task; `examples/are/sim/email_calendar/report.py` (the
-  `sora run --report` hook) reports the agent's own outcome separately and labels the ARE check
-  vacuous whenever that's what the pointed-at scenario is. The bundled default,
+  `sora run --report` hook) reports the agent's own outcome separately (including a bounded-recovery
+  halt as `BLOCKED`, not completed) and labels the ARE check vacuous whenever that's what the
+  pointed-at scenario is. The bundled default,
   `EmailScheduleScenario`, isn't one of those — it overrides `validate()` to check final calendar/
   email state directly (did the meeting land on the corrected day, was Alice replied to), the same
   pattern as the native-ARE port of this scenario; it also declares two `.oracle()` events, but only

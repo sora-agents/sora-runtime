@@ -46,7 +46,7 @@ from sora.strategies import (
     Strategies,
 )
 from sora.transport import InProcessTransport
-from sora.types import Plan, Signal, Step
+from sora.types import InputWait, Plan, Signal, SignalWait, Step
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
 
@@ -734,6 +734,62 @@ async def test_exit_when_idle_stops_the_session_without_stdin_eof(
         assert task.exception() is None
     finally:
         stdin.close()
+
+
+async def test_exit_when_idle_stops_on_an_activity_parked_awaiting_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A headless run has nobody to answer a question, so an await-input pause is a terminus.
+
+    Every deliberation breaker (ADR-0025) ends by asking the user and parking the activity on an
+    `InputWait` — never TERMINATED. Requiring all-TERMINATED here meant a run that tripped a
+    breaker waited forever, since `--exit-when-idle` also ignores stdin EOF.
+    """
+    agent = _build_agent(tmp_path)
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    agent.working.activities["a1"] = Activity(
+        id="a1",
+        goal="what time is it?",
+        context={},
+        state=ActivityState.BLOCKED,
+        blocked_on=InputWait(prompt="How should I proceed?"),
+    )
+
+    session = TerminalSession(agent, poll_interval=0.0, exit_when_idle=0.01)
+    task = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(task, timeout=2)
+        assert task.exception() is None
+    finally:
+        stdin.close()
+
+
+async def test_exit_when_idle_keeps_running_while_an_activity_waits_on_a_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only *await-input* counts as a headless terminus, not BLOCKED in general: a signal wait is
+    resolved by the environment, which a running scenario can still do."""
+    agent = _build_agent(tmp_path)
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    agent.working.activities["a1"] = Activity(
+        id="a1",
+        goal="what time is it?",
+        context={},
+        state=ActivityState.BLOCKED,
+        blocked_on=SignalWait(source="clock", signal_name="tick"),
+    )
+
+    session = TerminalSession(agent, poll_interval=0.0, exit_when_idle=0.01)
+    task = asyncio.create_task(session.run())
+    try:
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        stdin.push_line("/exit")
+        await asyncio.wait_for(task, timeout=2)
 
 
 async def test_stop_when_predicate_ends_the_session_and_is_polled(

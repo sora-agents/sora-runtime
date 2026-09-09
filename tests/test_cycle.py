@@ -12,14 +12,11 @@ and returns an empty ``TickResult()``:
   ``Percept``, no strategy judgment; a non-matching ack is silently dropped);
 * ``communication.receive()`` -> inbound ``messages``.
 
-Reflect (``DefaultReflectStrategy``) runs per activity right after Observe: it judges each ``READY``
-activity **completed** (plan fully consumed) or **failed** (last operation not ``ok``), transitions
-it to ``TERMINATED`` *synchronously* (so Situate, which selects only ``READY`` activities, never
-re-selects it this cycle), and *dispatches* the episodic/procedural stores asynchronously so they
-never block the cycle. Only success stores the plan to procedural memory. The episode learned for
-either outcome carries the enriched record — outcome, the attempted plan (the only surviving copy
-on failure, since procedural memory does not store failed plans), step progress, and the last
-operation result.
+Reflect (``DefaultReflectStrategy``) runs per activity right after Observe. A fully consumed plan
+transitions to ``TERMINATED`` synchronously (so Situate never re-selects it that cycle) and
+dispatches its episodic store asynchronously. A not-ok last operation instead drops the plan with
+a defect and leaves the activity live for bounded replanning in the same tick. Neither path
+auto-caches a plan to procedural memory.
 
 The harness reuses ``tests/fakes.py`` and a real ``FileMemoryBackend`` — one directory per memory
 module (as ``agent.yaml`` wires them), since ``ProceduralMemory.retrieve`` and
@@ -45,6 +42,7 @@ from sora.action import JoinAction, SendAction, default_action_registry, invoke_
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.manual import Manual, OperationSpecification
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -56,6 +54,7 @@ from sora.perception import Message
 from sora.strategies import (
     DefaultActStrategy,
     DefaultObserveStrategy,
+    DefaultReasonStrategy,
     DefaultReflectStrategy,
     DefaultSituateStrategy,
     Strategies,
@@ -66,6 +65,7 @@ from sora.types import (
     TOOL_ID,
     WAIT,
     ActionAck,
+    CompletedOperation,
     InferenceKind,
     InferenceResult,
     ObservableProperty,
@@ -105,6 +105,15 @@ class _RecordingReason:
     ) -> TickResult:
         self.called = True
         return result
+
+
+# The write-safety warning an operation-failure defect carries unless the manual declares the
+# operation a read (ADR-0025 §5). Most activities here reference a tool with no joined manual, so
+# `side_effecting` reads as unknown and the warning applies — the conservative direction.
+_MAY_HAVE_LANDED = (
+    " (the rejection does not prove the call had no effect — check the current state "
+    "before repeating it)"
+)
 
 
 def _joined(tool: FakeTool) -> tuple[EnvironmentRegistry, WorkspaceOrigin]:
@@ -473,33 +482,76 @@ async def test_reflect_terminates_completed_activity_and_records_episode(tmp_pat
     assert await cycle.procedural.retrieve(activity) is None
 
 
-async def test_reflect_terminates_failed_activity_without_storing_plan(tmp_path: Path) -> None:
+async def test_reflect_replans_failed_activity_without_recording_a_terminal_episode(
+    tmp_path: Path,
+) -> None:
     cycle, working = _cycle(tmp_path)
-    # Mid-plan, but the last operation failed -> failed judgment regardless of remaining steps.
+    # Mid-plan, but the last operation failed: preserve the execution evidence and route the
+    # failure through the same bounded replan path as other plan defects.
     activity = _planned_activity("a1", steps=3, step_index=1, last_ok=False)
+    failed = activity.last_operation
+    assert failed is not None
+    activity.history.append(
+        CompletedOperation(
+            OperationInvocation("calendar", "create_event", {"start": "not-a-date"}), failed
+        )
+    )
     working.activities["a1"] = activity
     strategy = DefaultReflectStrategy()
+    old_plan = activity.plan
 
     await strategy.reflect(activity, working, cycle, TickResult())
 
-    assert activity.state is ActivityState.TERMINATED
-    await _drain(strategy)
-    # The failure is recorded to episodic memory — and the failure episode is the *only* surviving
-    # copy of the attempted plan, since procedural deliberately stores no failed plan.
-    episodes = await cycle.episodic.consult(activity)
-    assert len(episodes) == 1
-    episode = episodes[0]
-    assert episode["succeeded"] is False
-    assert activity.plan is not None
-    # Compared through a JSON round-trip, not against asdict() directly: the store flattens to
-    # plain JSON, so Plan.pending's tuple comes back a list. That normalization is the storage
-    # boundary doing its job — ProceduralMemory._from_dict is what rebuilds the dataclass graph.
-    assert episode["plan"] == json.loads(json.dumps(asdict(activity.plan)))
-    assert episode["step_index"] == 1
-    assert episode["step_count"] == 3
-    assert episode["last_result"] == asdict(OperationAck(ok=False))
+    assert activity.state is ActivityState.READY
+    assert activity.plan is None
+    assert activity.last_operation is None  # handled once; the next Reflect cannot re-handle it
+    assert activity.history[-1].ack is failed  # still available to the replacement planner
+    assert activity.superseded is not None
+    assert activity.superseded.plan is old_plan
+    assert activity.superseded.step_index == 1
+    assert activity.superseded.defect == "calendar.create_event failed: None" + _MAY_HAVE_LANDED
+    assert activity.replan_trail == ["calendar.create_event failed: None" + _MAY_HAVE_LANDED]
+    assert not strategy._tasks
+    assert await cycle.episodic.consult(activity) == []
     # A failed plan is never stored for future reuse.
     assert await cycle.procedural.retrieve(activity) is None
+
+
+async def test_a_failed_read_is_replanned_without_the_write_safety_warning(
+    tmp_path: Path,
+) -> None:
+    """A rejection is not proof the call had no effect — except where the manual says the operation
+    is a read, which is the one case the runtime can rule the duplicate out mechanically. Anything
+    that does not declare itself a read keeps the warning (covered by the tests above, whose tools
+    have no joined manual at all)."""
+    manual = Manual(
+        id="calendar",
+        metadata={},
+        description="",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(
+                name="list_events", description="", parameters={}, side_effecting=False
+            )
+        ],
+    )
+    registry, _ = _joined(FakeTool("calendar", manual=manual))
+    await registry.join(WorkspaceOrigin(adapter="fake", address="fake://ws"))
+    cycle, working = _cycle(tmp_path, registry=registry)
+    activity = _planned_activity("a1", steps=3, step_index=1, last_ok=False)
+    failed = activity.last_operation
+    assert failed is not None
+    activity.history.append(
+        CompletedOperation(OperationInvocation("calendar", "list_events", {}), failed)
+    )
+    working.activities["a1"] = activity
+
+    await DefaultReflectStrategy().reflect(activity, working, cycle, TickResult())
+
+    assert activity.superseded is not None
+    assert activity.superseded.defect == "calendar.list_events failed: None"
+    assert activity.replan_trail == ["calendar.list_events failed: None"]
 
 
 async def test_reflect_ignores_incomplete_activity(tmp_path: Path) -> None:
@@ -538,9 +590,9 @@ async def test_reflect_ignores_planless_activity(tmp_path: Path) -> None:
     assert await cycle.episodic.consult(activity) == []
 
 
-async def test_reflect_terminates_planless_failed_activity(tmp_path: Path) -> None:
-    # Failure is independent of the plan: a plan-less activity whose last op failed still
-    # terminates, and the episode logs cleanly with no plan (plan=None, step_count=None).
+async def test_reflect_replans_planless_failed_activity(tmp_path: Path) -> None:
+    # Failure recovery is independent of the plan: a plan-less strategy can use the same default
+    # Reflect policy without losing its activity after one rejected operation.
     cycle, working = _cycle(tmp_path)
     activity = Activity(
         id="a1",
@@ -554,17 +606,13 @@ async def test_reflect_terminates_planless_failed_activity(tmp_path: Path) -> No
 
     await strategy.reflect(activity, working, cycle, TickResult())
 
-    assert activity.state is ActivityState.TERMINATED
-    await _drain(strategy)
-    episodes = await cycle.episodic.consult(activity)
-    assert len(episodes) == 1
-    episode = episodes[0]
-    assert episode["succeeded"] is False
-    assert episode["plan"] is None
-    assert episode["step_index"] == 0
-    assert episode["step_count"] is None
-    assert episode["last_result"] == asdict(OperationAck(ok=False))
-    assert await cycle.procedural.retrieve(activity) is None
+    assert activity.state is ActivityState.READY
+    assert activity.plan is None
+    assert activity.last_operation is None
+    assert activity.superseded is None
+    assert activity.replan_trail == ["external operation failed: None" + _MAY_HAVE_LANDED]
+    assert not strategy._tasks
+    assert await cycle.episodic.consult(activity) == []
 
 
 async def test_reflect_skips_running_activity(tmp_path: Path) -> None:
@@ -612,6 +660,76 @@ async def test_tick_reflect_terminates_completed_activity_and_is_not_reselected(
     await _drain(reflect)
     assert len(await cycle.episodic.consult(activity)) == 1
     assert await cycle.procedural.retrieve(activity) is None  # plan auto-caching is disabled
+
+
+async def test_tick_reflect_replans_failed_activity_and_reselects_it(tmp_path: Path) -> None:
+    """The cross-phase regression: Observe resolves the ack, Reflect drops the failed plan, and
+    Situate selects the still-live activity so Reason can replace it in this same tick."""
+    reflect = DefaultReflectStrategy()
+    reason = _RecordingReason()
+    cycle, working = _cycle(tmp_path, reflect=reflect, reason=reason)
+    activity = _running_activity("a1", "op-1")
+    activity.plan = Plan(
+        id="plan-a1",
+        goal=activity.goal,
+        steps=[Step(next_action="wait", params={}) for _ in range(3)],
+    )
+    activity.step_index = 1
+    working.activities["a1"] = activity
+    cycle.result_sink.push("op-1", OperationAck(ok=False, result="invalid date"))
+
+    await cycle.tick()
+
+    assert activity.state is ActivityState.READY
+    assert activity.plan is None
+    assert activity.last_operation is None
+    assert activity.history[-1].ack == OperationAck(ok=False, result="invalid date")
+    assert activity.replan_trail == [
+        "EmailClientApp.list_emails failed: invalid date" + _MAY_HAVE_LANDED
+    ]
+    assert reason.called is True
+    assert not reflect._tasks
+    assert await cycle.episodic.consult(activity) == []
+
+
+async def test_two_identical_operation_failures_halt_before_a_third_plan(tmp_path: Path) -> None:
+    """The policy is bounded even when each rejected attempt changes its arguments: failures do
+    not forgive the trail, and the existing repeated-defect breaker asks rather than retrying."""
+    transport = ScriptedTransport()
+    cycle, working = _cycle(tmp_path, transport, reason=DefaultReasonStrategy())
+    strategy = DefaultReflectStrategy()
+    activity = _planned_activity("a1", steps=2, step_index=1, last_ok=False)
+    working.activities["a1"] = activity
+
+    first = activity.last_operation
+    assert first is not None
+    activity.history.append(
+        CompletedOperation(OperationInvocation("calendar", "create_event", {"day": "bad"}), first)
+    )
+    await strategy.reflect(activity, working, cycle, TickResult())
+
+    replacement = Plan(id="replacement", goal=activity.goal, steps=[invoke_step("calendar", "x")])
+    second = OperationAck(ok=False, result=None)
+    activity.plan = replacement
+    activity.step_index = 1
+    activity.last_operation = second
+    activity.history.append(
+        CompletedOperation(
+            OperationInvocation("calendar", "create_event", {"day": "still-bad"}), second
+        )
+    )
+    await strategy.reflect(activity, working, cycle, TickResult())
+
+    assert activity.replan_trail == [
+        "calendar.create_event failed: None" + _MAY_HAVE_LANDED,
+        "calendar.create_event failed: None" + _MAY_HAVE_LANDED,
+    ]
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.state is ActivityState.BLOCKED
+    assert activity.pending_inference is None
+    assert len(transport.sent) == 1
+    assert "How should I proceed?" in transport.sent[0][1]["text"]
 
 
 # --------------------------------------------------------------------------------------------------
