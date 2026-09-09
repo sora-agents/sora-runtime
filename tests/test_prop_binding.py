@@ -10,12 +10,15 @@ candidates collide) instead of silently resolving to nothing.
 
 from __future__ import annotations
 
+from collections import Counter
+
 from sora._strategies.subgoals import _expand_mechanical
 from sora.data_ops import _resolve_collection
-from sora.memory import render_properties
+from sora.environment import EnvironmentRegistry
+from sora.memory import WorkingMemory, render_properties
 from sora.perception import Percept
 from sora.strategies import resolve_references
-from sora.types import ObservableProperty, Step
+from sora.types import ObservableProperty, PropertyReadMeter, Step
 
 # A contacts-app state property of the shape ARE actually publishes: an {id -> record} map under a
 # key, alongside a scalar. The motivating run failed with exactly this in working memory.
@@ -238,6 +241,90 @@ def test_mechanical_subgoal_fans_out_over_a_prop_collection() -> None:
     expanded, defect = _expand_mechanical(step, [], None, props)
     assert defect is None
     assert [s.params["to"] for s in expanded] == ["Åke", "Mia"]
+
+
+# --------------------------------------------------------------------------------------------------
+# instrumentation: counting the reads that cost neither a model call nor a tool call
+# --------------------------------------------------------------------------------------------------
+# A `$prop` read is the runtime answering from the observed snapshot what a step-loop agent has to
+# invoke an operation for. That is a call saving separate from plan amortization, so the paper has
+# to be able to report the two apart rather than crediting the total to the second. The meter is
+# optional everywhere and defaults to None precisely so the resolver stays usable (and testable)
+# without one — which is also why these tests pin that the counted paths are the ones that READ.
+
+
+def test_a_resolved_prop_is_counted_against_the_property_it_read() -> None:
+    props = _props(("Contacts", "state", _CONTACTS))
+    meter: PropertyReadMeter = Counter()
+    params = {"n": {"$prop": "Contacts.state", "path": "view_limit"}}
+    resolved, unresolved = resolve_references(params, [], None, props, meter)
+    assert (resolved, unresolved) == ({"n": 10}, [])
+    assert meter == Counter({("Contacts", "state"): 1})
+
+
+def test_a_prop_read_by_a_data_op_and_a_subgoal_is_counted_too() -> None:
+    """The three real read paths share one resolver; all three must reach the same tally, or the
+    number under-reports exactly the bulk reads it exists to measure."""
+    props = _props(("Contacts", "state", _CONTACTS))
+    meter: PropertyReadMeter = Counter()
+    ref = {"$prop": "Contacts.state", "path": "contacts"}
+    collection, defect = _resolve_collection(ref, [], None, props, meter)
+    assert defect is None and collection is not None and len(collection) == 2
+    step = Step(
+        next_action="subgoal",
+        params={
+            "in": ref,
+            "as": "c",
+            "template": {
+                "action": "invoke",
+                "tool_id": "Email",
+                "operation_name": "send_email",
+                "params": {"to": {"$bind": "c", "path": "first_name"}},
+            },
+        },
+    )
+    expanded, defect = _expand_mechanical(step, [], None, props, meter)
+    assert defect is None and len(expanded) == 2
+    assert meter == Counter({("Contacts", "state"): 2})
+
+
+def test_a_prop_that_did_not_resolve_is_not_counted() -> None:
+    """Unobserved and ambiguous both come back as a defect: nothing was read, so nothing is owed."""
+    ambiguous = _props(("Contacts", "state", _CONTACTS), ("Emails", "state", {"a": 1}))
+    meter: PropertyReadMeter = Counter()
+    resolve_references({"x": {"$prop": "Nope.state"}}, [], None, ambiguous, meter)
+    resolve_references({"x": {"$prop": "state"}}, [], None, ambiguous, meter)
+    assert meter == Counter()
+
+
+def test_explaining_a_bad_path_does_not_inflate_the_tally() -> None:
+    """The defect path re-resolves the same reference to say which segment failed. It passes no
+    meter, so a plan defect cannot be mistaken for a read the agent got value from — the count has
+    to mean "a step-loop arm would have paid a tool call here", and a failed read is not that."""
+    props = _props(("Contacts", "state", _CONTACTS))
+    meter: PropertyReadMeter = Counter()
+    ref = {"$prop": "Contacts.state", "path": "no_such_key"}
+    collection, defect = _resolve_collection(ref, [], None, props, meter)
+    assert collection is None and defect is not None
+    assert "no_such_key" in defect
+    assert meter == Counter()
+
+
+def test_the_tally_survives_unfocusing_the_tool_it_counted() -> None:
+    """`drop_properties` prunes the snapshot; the tally is a run-long record of reads that already
+    happened, so pruning must not rewrite history."""
+    wm = WorkingMemory(registry=EnvironmentRegistry())
+    wm.properties.update(_props(("Contacts", "state", _CONTACTS)))
+    resolve_references(
+        {"n": {"$prop": "Contacts.state", "path": "view_limit"}},
+        [],
+        None,
+        wm.properties,
+        wm.prop_reads,
+    )
+    wm.drop_properties(lambda tool_id: False)
+    assert wm.properties == {}
+    assert wm.prop_reads == Counter({("Contacts", "state"): 1})
 
 
 # --------------------------------------------------------------------------------------------------

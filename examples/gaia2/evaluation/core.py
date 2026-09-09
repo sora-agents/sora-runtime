@@ -698,6 +698,11 @@ class EvaluationRecord:
     status: str = "complete"
     terminal_cause: TerminalCause | None = None
     decision_cycles: int = 0
+    # See `_runner.RunResult.prop_reads`: reads the runtime satisfied off the property snapshot,
+    # which a step-loop arm has to pay a tool call plus a model round-trip for. An architecture
+    # diagnostic, never a score input.
+    prop_reads: int = 0
+    distinct_prop_reads: int = 0
 
     @property
     def accounted_agent_cost(self) -> float:

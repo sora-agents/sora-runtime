@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -744,7 +745,10 @@ def test_live_neutral_reports_admitted_logical_calls_not_provider_round_trips(
                     blocked_on=None,
                     replan_count=0,
                 )
-            }
+            },
+            # The live-neutral record reports `$prop`-satisfied reads alongside the call counts;
+            # a fake WorkingMemory that omits the tally is not a WorkingMemory.
+            prop_reads=Counter({("Contacts", "state"): 2}),
         ),
         cycle=SimpleNamespace(external_action_count=1),
     )
@@ -808,6 +812,8 @@ def test_live_gaia_attaches_and_records_pinned_judge(
             write_counts=None,
             llm_report=None,
             replan_count=0,
+            prop_reads=0,
+            prop_reads_by_property={},
             duration=1.0,
             agent_llm_calls=1,
             external_actions=1,
@@ -871,6 +877,8 @@ def test_live_gaia_discards_a_judge_score_from_a_timed_out_run(
             write_counts=None,
             llm_report=None,
             replan_count=0,
+            prop_reads=0,
+            prop_reads_by_property={},
             duration=1000.0,
             agent_llm_calls=1,
             external_actions=1,
@@ -1018,7 +1026,7 @@ def test_live_neutral_checkpoints_provider_failure_as_infrastructure_error(
         procedural=SimpleNamespace(logical_calls_admitted=1),
         registry=SimpleNamespace(get=lambda _tool_id: tool),
         communication=SimpleNamespace(sent=[]),
-        working=SimpleNamespace(activities={"activity": activity}),
+        working=SimpleNamespace(activities={"activity": activity}, prop_reads=Counter()),
         cycle=SimpleNamespace(external_action_count=0),
     )
 

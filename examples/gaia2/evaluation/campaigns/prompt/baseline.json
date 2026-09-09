@@ -524,7 +524,9 @@
     "reasoning_profile_mapping_deferred_to_item": 6,
     "reported_architecture_diagnostics": [
       "external_actions",
-      "decision_cycles"
+      "decision_cycles",
+      "prop_reads",
+      "distinct_prop_reads"
     ],
     "statistical_bootstrap_seed": 20260831
   },
@@ -660,8 +662,8 @@
   ],
   "provenance": {
     "prompt_source_dirty_diff_sha256": null,
-    "source_dirty_diff_sha256": "df480c822661b274ac1a883744f9022a36bbf850a66e5e547c933db5c5f95608",
-    "source_revision": "3b259ddc3a3609f65d8f56500dbaec202f13a00d"
+    "source_dirty_diff_sha256": "25d864d201ba09b1993f1c654ab868de0153464975bd70b2f243c720765af0fe",
+    "source_revision": "edb075f05fa45ea0f997f69c995d94cb1542b697"
   },
   "schema_version": 1
 }

@@ -21,6 +21,7 @@ from sora.references import (
 )
 from sora.types import (
     CompletedOperation,
+    PropertyReadMeter,
     Step,
 )
 
@@ -116,6 +117,7 @@ def _expand_mechanical(
     history: list[CompletedOperation],
     bindings: dict[str, Any] | None = None,
     properties: dict[tuple[str, str], Percept] | None = None,
+    meter: PropertyReadMeter | None = None,
 ) -> tuple[list[Step], str | None]:
     """Fan a mechanical sub-goal out to one concrete ``Step`` per element of its ``in`` collection,
     the element substituted for ``{"$bind": "<as>"}`` in its ``template``. The ``in`` collection may
@@ -127,7 +129,9 @@ def _expand_mechanical(
     not be read expands to no steps too, but means the opposite, so it comes back as a defect for
     the caller to replan on. Collapsing the two is how "cancel each event on Saturday" quietly
     became a no-op in a real run while the event sat in history, correctly fetched, all along."""
-    elements, defect = _resolve_collection(step.params.get("in"), history, bindings, properties)
+    elements, defect = _resolve_collection(
+        step.params.get("in"), history, bindings, properties, meter
+    )
     if defect is not None:
         return [], defect
     if not elements:

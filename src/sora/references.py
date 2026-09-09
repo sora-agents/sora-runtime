@@ -15,6 +15,7 @@ from sora.perception import Percept
 from sora.types import (
     CompletedOperation,
     OperationInvocation,
+    PropertyReadMeter,
     Step,
     walk_path,
 )
@@ -102,8 +103,14 @@ def _latest_result(history: list[CompletedOperation], reference: str) -> Any:
     return _latest(lambda inv: inv.operation_name == tail)
 
 
-def _property_ref(properties: dict[tuple[str, str], Percept], reference: str) -> tuple[Any, str]:
-    """Resolve a ``$prop`` reference to ``(value, residual_path)``, ``_MISSING``, or ``_AMBIGUOUS``.
+def _property_ref(
+    properties: dict[tuple[str, str], Percept], reference: str
+) -> tuple[Any, str, tuple[str, str] | None]:
+    """Resolve a ``$prop`` reference to ``(value, residual_path, key)``, ``_MISSING``, or
+    ``_AMBIGUOUS``. ``key`` is the store key that matched (``None`` when nothing did) — returned
+    rather than metered here because this resolves only the HEAD, and a reference whose head
+    resolves can still fail on its route. Counting a read at this point would tally reads that
+    yielded nothing; the caller counts once the whole reference has produced a value.
 
     Two spellings reach here and both name one value. The canonical one keeps the sub-path in its
     own ``path`` key; a planner that has just read a catalog addressing everything by dotted name
@@ -134,10 +141,10 @@ def _property_ref(properties: dict[tuple[str, str], Percept], reference: str) ->
         if not keys:  # unqualified: the planner named the property without its tool
             keys = [key for key in properties if key[1] == head]
         if len(keys) == 1:
-            return properties[keys[0]].payload.value, residual
+            return properties[keys[0]].payload.value, residual, keys[0]
         if keys:
-            return _AMBIGUOUS, ""
-    return _MISSING, ""
+            return _AMBIGUOUS, "", None
+    return _MISSING, "", None
 
 
 def _resolve_ref(
@@ -145,6 +152,7 @@ def _resolve_ref(
     history: list[CompletedOperation],
     bindings: dict[str, Any],
     properties: dict[tuple[str, str], Percept] | None = None,
+    meter: PropertyReadMeter | None = None,
 ) -> Any:
     """Resolve one *hard* reference — ``$from`` (history) or ``$bind`` (a named binding) — to its
     value, walking the ``path`` into it. ``_MISSING`` when the source is absent (no such op ran / no
@@ -159,13 +167,18 @@ def _resolve_ref(
             return _MISSING
         return _walk_path(bindings[name], ref.get(_REF_PATH, ""))
     if _REF_PROP in ref:
-        value, residual = _property_ref(properties or {}, str(ref[_REF_PROP]))
+        value, residual, key = _property_ref(properties or {}, str(ref[_REF_PROP]))
         if value is _MISSING or value is _AMBIGUOUS:
             return _MISSING  # both escalate; _collection_defect re-reads which, to say why
         # A sub-path folded into the token is walked *before* an explicit `path`, since it names the
         # outer route; the two compose so a half-folded reference resolves the same as either form.
         folded = ".".join(p for p in (residual, str(ref.get(_REF_PATH, ""))) if p)
-        return _walk_path(value, folded)
+        walked = _walk_path(
+            value, folded
+        )  # raises on a bad route — counted below, so never tallied
+        if meter is not None and key is not None:
+            meter[key] += 1
+        return walked
     return _MISSING
 
 
@@ -174,6 +187,7 @@ def _resolve_nested(
     history: list[CompletedOperation],
     bindings: dict[str, Any],
     properties: dict[tuple[str, str], Percept] | None = None,
+    meter: PropertyReadMeter | None = None,
 ) -> tuple[Any, bool]:
     """Resolve every reference *anywhere* in ``value``, returning ``(resolved, fully_resolved)``.
 
@@ -195,18 +209,18 @@ def _resolve_nested(
         if _REF_DECIDE in value:
             return value, False  # soft — always escalates, left in place for the model
         try:
-            got = _resolve_ref(value, history, bindings, properties)
+            got = _resolve_ref(value, history, bindings, properties, meter)
         except (KeyError, IndexError, TypeError, ValueError):
             return value, False  # bad path against a present source
         return (value, False) if got is _MISSING else (got, True)
     if isinstance(value, dict):
         pairs = [
-            (key, _resolve_nested(item, history, bindings, properties))
+            (key, _resolve_nested(item, history, bindings, properties, meter))
             for key, item in value.items()
         ]
         return {key: got for key, (got, _ok) in pairs}, all(ok for _key, (_got, ok) in pairs)
     if isinstance(value, list):
-        items = [_resolve_nested(item, history, bindings, properties) for item in value]
+        items = [_resolve_nested(item, history, bindings, properties, meter) for item in value]
         return [got for got, _ok in items], all(ok for _got, ok in items)
     return value, True
 
@@ -246,6 +260,7 @@ def resolve_references(
     history: list[CompletedOperation],
     bindings: dict[str, Any] | None = None,
     properties: dict[tuple[str, str], Percept] | None = None,
+    meter: PropertyReadMeter | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Resolve a step's operation params against execution history and named bindings. Non-reference
     values pass through; a hard reference (``$from``/``$bind``) is resolved deterministically;
@@ -261,7 +276,7 @@ def resolve_references(
     resolved: dict[str, Any] = {}
     unresolved: list[str] = []
     for key, value in op_params.items():
-        got, ok = _resolve_nested(value, history, binds, properties)
+        got, ok = _resolve_nested(value, history, binds, properties, meter)
         resolved[key] = got
         if not ok:
             unresolved.append(key)

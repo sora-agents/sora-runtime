@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
+
+# Instrumentation, not runtime state: how many times a `$prop` reference RESOLVED off the property
+# snapshot, keyed by the `(tool_id, property_name)` it read. Every hit is a collection read the
+# runtime satisfied mechanically — no model call and no tool call — where a step-loop agent holding
+# the same tools would have had to invoke an operation and feed the result back through the model.
+# That is a call saving distinct from plan amortization, and the two are easy to conflate when only
+# the total is reported, so it is measured rather than argued. Counted at the single resolution site
+# (`sora.references._property_ref`); the defect path re-resolves a reference to explain why it
+# failed, and deliberately passes no meter, because nothing was read there.
+PropertyReadMeter = Counter[tuple[str, str]]
 
 
 def walk_path(value: Any, path: str) -> Any:

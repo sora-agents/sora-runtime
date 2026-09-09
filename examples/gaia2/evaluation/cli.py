@@ -492,6 +492,8 @@ def _live_gaia_record(
         status=status,
         terminal_cause=cast(Any, result.terminal_cause),
         decision_cycles=result.decision_cycles,
+        prop_reads=result.prop_reads,
+        distinct_prop_reads=len(result.prop_reads_by_property),
     )
 
 
@@ -611,6 +613,8 @@ def _live_neutral_record(
         agent_llm_calls=agent.procedural.logical_calls_admitted,
         provider_round_trips=sum(call.get("round_trips", 0) for call in calls),
         external_actions=agent.cycle.external_action_count,
+        prop_reads=sum(agent.working.prop_reads.values()),
+        distinct_prop_reads=len(agent.working.prop_reads),
         latency_seconds=(llm_report.latency_seconds if llm_report else 0.0),
         input_tokens=(llm_report.input_tokens if llm_report else 0),
         cached_input_tokens=(llm_report.cached_input_tokens if llm_report else 0),

@@ -15,6 +15,7 @@ Grounding lives in Reason (deciding a value is reasoning); Act stays mechanistic
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -1039,6 +1040,33 @@ def _shop_activity(steps: list[Step], bindings: dict[str, object]) -> Activity:
     )
     activity.bindings.update(bindings)
     return activity
+
+
+async def test_a_prop_read_by_a_real_reason_phase_reaches_the_run_tally(tmp_path: Path) -> None:
+    """End to end, not just the resolver: the meter is threaded from `DefaultReasonStrategy` through
+    the data-op path, so a wiring slip would leave every unit test green and the reported number
+    zero. That number is what separates the cycle's call saving from plan amortization, and a
+    silently-zero diagnostic argues the opposite of the truth."""
+    tool = FakeTool("shop", manual=_read_manual(), invoke_results={"get_details": {"id": "p1"}})
+    cycle, working, registry = _cycle(tmp_path, ScriptedProcedural(), tool)
+    await registry.join(_ORIGIN)
+    working.properties.update(
+        {
+            ("shop", "state"): Percept(
+                "shop",
+                ObservableProperty("state", {"products": [{"name": "shirt", "id": "p1"}]}),
+                0.0,
+            )
+        }
+    )
+    activity = _shop_activity([_eq_filter("matches", "shirt")], {})
+    activity.step_index = 0
+    working.activities[activity.id] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.bindings["matches"] == [{"name": "shirt", "id": "p1"}]
+    assert working.prop_reads == Counter({("shop", "state"): 1})
 
 
 async def _replan_defect(tmp_path: Path, activity: Activity) -> str:

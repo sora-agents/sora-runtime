@@ -60,6 +60,15 @@ class RunResult:
     agent_llm_calls: int = 0
     external_actions: int = 0
     decision_cycles: int = 0
+    # `$prop`-satisfied reads: how many times a reference resolved off the observed property
+    # snapshot, and over how many distinct properties. Each is a collection read that cost no model
+    # call and no tool call, where ARE's own step-loop agent — which never sees app state — has to
+    # invoke an operation and feed the result back through the model. Reported so the cycle's call
+    # saving can be split between plan amortization and this, instead of being credited wholly to
+    # the first. `prop_reads_by_property` keeps the per-property breakdown, since the distinct-key
+    # count is the one comparable to a tool-call count.
+    prop_reads: int = 0
+    prop_reads_by_property: dict[str, int] = field(default_factory=dict)
     judge_recording: Any = None
 
 
@@ -338,6 +347,11 @@ def run_scenario(
             agent_llm_calls=agent.procedural.logical_calls_admitted,
             external_actions=agent.cycle.external_action_count,
             decision_cycles=agent.cycle.cycle_count,
+            prop_reads=sum(agent.working.prop_reads.values()),
+            prop_reads_by_property={
+                f"{source}.{name}": count
+                for (source, name), count in sorted(agent.working.prop_reads.items())
+            },
             # Taken inside the bracket, after validate(), so it holds every event the judge decided
             # — the mid-run turn gates as well as the final pass. None when recording was off.
             judge_recording=(

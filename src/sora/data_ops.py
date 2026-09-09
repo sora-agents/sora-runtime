@@ -19,6 +19,7 @@ from sora.references import (
 )
 from sora.types import (
     CompletedOperation,
+    PropertyReadMeter,
     walk_path,
 )
 
@@ -349,7 +350,7 @@ def _path_defect(
     the run it exists to recover. Splitting head from route composes the folded and explicit halves
     the same way `_resolve_ref` does, so either spelling reports the same segment."""
     if _REF_PROP in ref:
-        source, residual = _property_ref(properties or {}, str(ref[_REF_PROP]))
+        source, residual, _key = _property_ref(properties or {}, str(ref[_REF_PROP]))
         if source is _MISSING or source is _AMBIGUOUS:
             # The HEAD did not resolve: an unobserved or ambiguous property is a different question
             # from a bad route, and _collection_defect is the one that names focusing/qualifying.
@@ -395,6 +396,7 @@ def _resolve_collection(
     history: list[CompletedOperation],
     bindings: dict[str, Any] | None = None,
     properties: dict[tuple[str, str], Percept] | None = None,
+    meter: PropertyReadMeter | None = None,
 ) -> tuple[list[Any] | None, str | None]:
     """The collection a mechanical sub-goal iterates or a data-op transforms: a ``$from`` reference
     resolved against history, a ``$bind`` reference resolved against named bindings (a prior data-op
@@ -414,7 +416,7 @@ def _resolve_collection(
         if _REF_DECIDE in ref:
             return None, None  # a $decide collection is soft — resolved off-cycle, not a defect
         try:
-            value: Any = _resolve_ref(ref, history, bindings or {}, properties)
+            value: Any = _resolve_ref(ref, history, bindings or {}, properties, meter)
         except (KeyError, IndexError, TypeError, ValueError):
             return None, _path_defect(ref, history, bindings or {}, properties)
         if value is _MISSING:

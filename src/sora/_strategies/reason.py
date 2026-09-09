@@ -481,6 +481,7 @@ class DefaultReasonStrategy:
                 activity.history,
                 activity.bindings,
                 cycle.working.properties,
+                cycle.working.prop_reads,
             )
             passthrough = {k: v for k, v in step.params.items() if k != "in"}
             if defect is None and step.next_action == FilterAction.name:
@@ -770,7 +771,11 @@ class DefaultReasonStrategy:
         assert plan is not None  # reason() only dispatches a step off a set plan
         i = activity.step_index
         expanded, defect = _expand_mechanical(
-            step, activity.history, activity.bindings, cycle.working.properties
+            step,
+            activity.history,
+            activity.bindings,
+            cycle.working.properties,
+            cycle.working.prop_reads,
         )
         if defect is not None:
             # Splicing in zero steps here would mean "this sub-goal had nothing to do", which is a
@@ -968,7 +973,7 @@ class DefaultReasonStrategy:
         if activity.grounded_params is not None:
             return activity.grounded_params  # the escalation resolved; peek (cleared at commit)
         resolved, unresolved = resolve_references(
-            params, activity.history, activity.bindings, wm.properties
+            params, activity.history, activity.bindings, wm.properties, wm.prop_reads
         )
         if not unresolved and not force:
             return resolved  # cheap path — resolved mechanically, no model call

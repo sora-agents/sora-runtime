@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -46,6 +47,7 @@ from sora.types import (
     ConditionVerdict,
     PendingCondition,
     Plan,
+    PropertyReadMeter,
     RelevanceCandidate,
     SignalWait,
     Step,
@@ -208,6 +210,11 @@ class WorkingMemory:  # transient, in-process, fast
     # manuals pulled from SemanticMemory by _load_ (removed by _unload_) — distinct from
     # focused_tools: focusing a tool is an external action, loading its manual is internal.
     loaded_manuals: dict[str, Manual] = field(default_factory=dict)
+    # Instrumentation only — never read by a strategy, and deliberately NOT pruned by
+    # `drop_properties`: it is a run-long tally of reads that happened, not a view of what is
+    # currently observed, so unfocusing a tool must not erase the reads already made against it.
+    # See `PropertyReadMeter` for what the number is for.
+    prop_reads: PropertyReadMeter = field(default_factory=Counter)
 
     def perception_cursor(self) -> tuple[int, int]:
         """Where both append logs stand — the positional companion to a change-gate signature.

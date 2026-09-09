@@ -209,7 +209,12 @@ def build_frozen_baseline(
         "provider_retries_consume_additional_call_admissions": False,
         "parser_repair_consumes_additional_call_admissions": False,
         "decision_cycles_are_benchmark_steps": False,
-        "reported_architecture_diagnostics": ["external_actions", "decision_cycles"],
+        "reported_architecture_diagnostics": [
+            "external_actions",
+            "decision_cycles",
+            "prop_reads",
+            "distinct_prop_reads",
+        ],
         "prompt_profile": "gpt-5.4-medium-prompt",
         "cross_family_profile": "kimi-k2.5-prompt",
         "paper_transfer_profile": "gpt-5.4-high-paper",
