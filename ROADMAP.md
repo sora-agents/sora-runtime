@@ -1,140 +1,5 @@
 # S-ORA Roadmap
 
-## 0. The plan, in three phases
-
-What remains runs in three ordered phases. Two boundaries are hard between phases — **Phase 2 cannot
-start until W6 lands**, and **Phase 3 cannot start until R3 (the prompt freeze) lands** — and one is
-hard *within* Phase 1: every trajectory-changing change — runtime or prompt — precedes the suite
-debugging it would otherwise invalidate. Everything else is a preference.
-
-This section is the plan; everything below the bar is the record. The gate structure there (V1–V4) cuts
-across these phases, so each item points at its detailed entry — and §3's numbered order is the previous
-framing of the same work, superseded by these phases.
-
-### Phase 1 — Development
-
-Runtime, prompt-plumbing, and harness work. All of it lands before the freeze (R3), so a prompt row
-moved here costs a re-baseline but never comparability. **Order within the phase is not arbitrary:
-everything that changes a trajectory lands before the suites are debugged**, because a suite failure
-diagnosed under the old semantics may not survive the change — and worse, a prompt tuned in Phase 2 to
-compensate for one gets frozen at R3.
-
-- [x] **W1** *(V2.9)* Record the judge's raw responses; add the offline re-parse. **First.** The only
-      item whose window *closes* rather than slips — a sweep run without it can never be re-scored.
-      Recording only; changes no trajectory. **Machinery landed 2026-09-08** — recorder, re-scorer,
-      the `--require-divergence` gate and the batch refusal. The first live run the same day proved
-      the stubs wrong: the recorder shadowed `soft_checkers` (bound methods of the judge) instead of
-      `llm_checkers` (the objects holding the raw answers), so it stored a rejected email with no
-      reason and reported a vacuous both-parse agreement. Fixed, and now pinned against ARE's own
-      `SoftToolJudge` driven by a fake engine, which also proves the divergence mechanically on the
-      real `send_email` chain. A model-backed run the same day then stored a complete recording —
-      three named checkers, raw text, markers, prompt args — and the re-scorer reproduced ARE's
-      verdict from it with no model call. Nothing in the machinery is outstanding. A *live* two-parse
-      divergence remains unobserved, but that is a benchmark outcome rather than a gap: on the five
-      soft-judged tools whose chain contains a `[[True]]`-family checker, stock rejects every event
-      that misses the equality fast path, so the parses diverge exactly when an event *passes* under
-      the relaxed one. It will fall out of the first sweep that wins a soft-judged event; check it
-      with `rescore.py --require-divergence` rather than holding this item open for it.
-- [ ] **W2** *(V2.10)* Rebuild the simulated-clock freeze with a fixed non-zero per-call charge.
-      No idle fast-forward. **Trajectory-changing:** it moves when oracle events fire relative to the
-      agent's own writes, which is exactly what the judge's time budget is measured against. Every
-      timing number produced before it is uninterpretable.
-- [ ] **W3** *(V3.2)* Decide the policy for a failed external operation — terminate, or a bounded
-      replan. **Trajectory-changing** (today one bad tool argument kills an otherwise-correct plan).
-      May resolve to documentation rather than code.
-- [ ] **W4** *(V3.1)* Clear the stale `last_operation` that survives a park on an `InputWait`.
-      **Trajectory-changing, and more reachable than V3.1's write-up implies:** that entry describes the
-      hard-interrupt route, but `_resume_on_input` is shared with the *agent's own* ask-the-user park —
-      one writer (`observe.py`), cleared by neither `reset_for_replan` nor the resume — so a failed
-      operation followed by a question to the user is terminated by Reflect on the old failure the
-      moment the user answers. That sequence needs no `/stop` and is ordinary benchmark behaviour.
-- [ ] **W5** **Make the prompt modules tier-conditional.** *(New — tracked nowhere below.)* The rendered
-      prompts are tier-3 shaped: they teach `$prop` and property-backed conditions to every agent,
-      including ones whose environment has no observable properties at all. At tier 2 (`gaia2-cli`:
-      operations + signals) `$prop` is dead vocabulary; at tier 1 the signal-backed waits go with it.
-      Select each call's modules from the environment's declared tier. Not cosmetic: dead vocabulary is
-      a source of invalid plans in precisely the arms the tier study reports on, and prompt tokens are a
-      headline axis of that study — a tier-1 arm carrying tier-3 instructions inflates the number being
-      compared. **Forces one decision to declare:** whether "tier" means perception channels only, or
-      channels *plus* the prompt adapted to them. The latter is the honest configuration — the
-      alternative handicaps the lower tiers with vocabulary they cannot use — but it makes prompt text
-      co-vary with tier, so state it and keep the fixed-prompt variant as the sensitivity check.
-      **Wants the module seam V1.2 builds** (modularize the seven prompts without changing rendered
-      text); that half is text-preserving by construction, so pulling it forward out of R1 is cheap and
-      is the enabler. Re-baselines the rows it touches — free here, costly after R3.
-- [ ] **W6** *(V2.2)* Prompt-eval harness logging: a failing run must be diagnosable without re-running
-      it. **Gates all of Phase 2**, and wanted before the suites so a W2–W5 regression is diagnosable on
-      the first run rather than the third. *(Separate session — it gates none of W2–W5, whose own
-      regression shapes are asserted at unit level.)*
-- [ ] **W7** *(V2.1)* Debug the **familiar** (smoke) suite under GPT-5.4 — five standing regression
-      cases, now measured under the semantics Phase 2 will tune against.
-- [ ] **W8** Debug the **development** suite once familiar is clean. This is the set Phase 2 tunes
-      against, so its failures have to be the prompt's, not the runtime's.
-- [x] **W9** *(V2.8)* Get `gaia2-cli` to **one live tier-2 scenario**, then stop. **Done 2026-09-07**
-      — a `time` scenario ran end to end, all turns judged, after three container-harness defects were
-      fixed. It was independent of W2–W8 (a different harness, so nothing it did moved an in-process
-      trajectory), and it leaves two threads: it is the only live check W5's tier-2 rendering will get,
-      and it measured a per-scenario cost shape that R7 now has to confront.
-
-Debugging the suites is also how further trajectory-changing work gets *discovered*, which reopens this
-loop — that is fine and expected. The rule is only that known changes are not deferred past the
-measurement they would invalidate.
-
-### Phase 2 — Prompt refinement and pre-evaluation
-
-R1–R3 are the refinement path and run in that order. R4–R8 are gates that must clear before Phase 3 but
-do not depend on R1–R3 — take them whenever; none of them is optional.
-
-- [ ] **R1** *(V1.1–V1.5, V2.3)* Work the consolidation campaign against familiar → development, one
-      module or context section per commit, with its quality, safety, latency, and token delta attached.
-      *(V1.2's text-preserving modularization may already have been pulled forward into W5; if so, R1
-      picks up from there rather than repeating it.)*
-- [ ] **R2** *(V2.4)* Run the **locked acceptance** suite once, on the finalist, on both tuning profiles;
-      report the familiarity gap. The five ids stay uninspected until then. **Finalist gate.**
-- [ ] **R3** *(V2.5)* **Freeze the prompts and record the hash.** Hard boundary: everything after it is
-      comparability-critical, and a prompt-touching fix taken later forces a re-run.
-- [ ] **R4** Select the judge model and record its configuration with the results.
-- [ ] **R5** Select the **low-capability** model profile for the capability arm — chosen for its distance
-      from the other two, not for being a third interesting name. Two profiles exist; this is the third.
-- [ ] **R6** Fix the **shared scenario ids** across the model arms. Free now, unrecoverable afterwards:
-      if the arms differ by scenario rather than only by model, the capability reading is forfeited.
-- [ ] **R7** Environment readiness — the ARE extra is not installed in the working venv, and only the
-      `ambiguity` split is materialized locally. **Price one baseline scenario before committing spend,
-      and treat this as a gate rather than a formality:** the one live tier-2 scenario W9 ran cost
-      **33 model calls and 1.16M input tokens**, dominated by 18 plan calls (~38k input each, because
-      every fired change-gate replans from a full manual set) and 8 `$decide` filters serialising 409
-      events. That shape is runtime and prompt behaviour, not a gaia2-cli artefact, so it lands on the
-      in-process sweep too — at that rate the Phase 3 matrix does not cost what it is budgeted at.
-      Attack the shape, or re-cost the matrix, before spending on 160.
-- [ ] **R8** Decide where the *results* live. A released benchmark claim needs its methodology and its
-      numbers committed somewhere citable; `docs/benchmarks/` is the natural home and does not exist yet.
-
-### Phase 3 — Evaluation
-
-The experiment design lives in the evaluation-plan working note (`notes/benchmarks/gaia2/`, untracked)
-and is deliberately not duplicated here; these are listed only so the dependencies are visible, with the
-plan's own experiment ids in parentheses. Matrix ≈1,060 runs at ≈$1.8k — that buys statistical power,
-not release confidence: **one split at n=1 is enough for the tag** (V2.6). The ≈$1.8k is **not yet
-validated against a measured scenario** and W9's run suggests it is optimistic; R7 is where that gets
-settled, before any of this is committed to.
-
-- [ ] **Scorer characterisation** *(plan E0)*. Offline, no agent runs.
-- [ ] **Architecture vs. step loop** *(plan E1)* — the paired sweep, one headline model, and the
-      low-capability arm. Also carries the model-capability reading, which is free *only* if R5 and R6
-      have landed.
-- [ ] **Perception-tier study** *(plan E2)*.
-- [ ] **Plan amortization** *(plan E3)*.
-- [ ] **Judge sensitivity** *(plan E4 — not the legacy `E4` cited in §4.2)*. An offline re-judge, which
-      exists at all only if **W1** landed.
-- [ ] **Tier-2 construct-validity check** *(plan V1 — unrelated to Gate V1 below)*. ~5 unjudged
-      scenarios on `gaia2-cli`; needs **W9**.
-- [ ] **Clock-convention sensitivity arm** on the time-sensitive split. Needs **W2**.
-
-**Then the tag.** V2.7 triage of what the run surfaces — runtime-only fixes land immediately,
-prompt-touching fixes wait or force a re-run — then V4 release mechanics, then v0.1.0.
-
----
-
 Supersedes the phase-structured roadmap, now archived verbatim as the historical record of Phases 0–4
 at [docs/development/roadmap-phases-0-4.md](docs/development/roadmap-phases-0-4.md)
 (tooling, skeleton, the ARE walking skeleton, the TDD rollout, and the advanced-features work that has
@@ -168,18 +33,11 @@ Landed since the phase roadmap was last meaningful (one line each — details in
   and `OpenAICompatLLMClient` (OpenAI direct and OpenRouter-hosted), plus a provider-neutral
   `CompletionRequest`, cached-input accounting, and per-inference metering (`LLMMeter`) attributing
   tokens, latency, round trips, finish reasons, and resolution outcome to a named semantic call.
-- **Evaluation.** The offline-first `examples.gaia2.evaluation` harness, the `prompt` / `aamas2027`
-  campaign boundary, three ID-only Gaia2 manifests (familiar / development / **locked** acceptance,
-  five scenarios each, one per capability), three explicit model profiles, a frozen seven-call prompt
-  baseline, a dated price sheet, budget policy, and the canonical report contract.
+- **Evaluation.** The offline-first `examples.gaia2.evaluation` harness, three ID-only Gaia2
+  manifests (familiar / development / **locked** acceptance, five scenarios each, one per
+  capability), a frozen seven-call prompt baseline, and the canonical report contract.
 - **Documentation.** The MkDocs Material site under [docs/](docs/) with generated API reference; README
   is now a router into it.
-
-Model profiles in use for prompt tuning: **GPT-5.4 medium** and **Kimi K2.5 with reasoning enabled**.
-GPT-5.4 high is retained as a non-default transfer/paper declaration. *(A third profile is now owed:
-the campaign added a model-capability arm, which needs a deliberately **low-capability** model chosen
-for its distance from the other two rather than for being a third interesting name. Not yet selected —
-see V2.6.)*
 
 ---
 
@@ -210,239 +68,9 @@ Revised tag scope: *the reactive/deliberative decision cycle running real, dynam
 scenarios end-to-end against ARE, through a provider-neutral model seam, with its behaviour measured on
 Gaia2 scenarios that never influenced its prompts.*
 
-### 2.2 Gate V1 — Prompt consolidation
-
-Tracked in full in the prompt-consolidation working note (a local, untracked task list with its own
-commit-level sequencing; deliberately not duplicated here, and not a tracked file — its *outcome*, the
-frozen prompt hash and the evaluation results, is what gets committed — see V2.6 on where).
-Items 1–4 are done — cached-input accounting, the provider-neutral
-completion request, call/section attribution, and the evaluation harness with frozen baselines.
-
-- [ ] **V1.1** Items 5–6 — bound verdict-call output with explicit exhaustion handling, then tune
-      verdict-call reasoning profiles. Blocked on the live baseline.
-- [ ] **V1.2** Items 7–8 — modularize the seven prompts without changing rendered text, then move
-      prompt provenance out of phrase pins.
-- [ ] **V1.3** Items 9–10 — record contract ownership across the runtime/environment boundary, then
-      declare and validate the plan action envelope.
-- [ ] **V1.4** Items 11–12 — order dynamic planning context by volatility; scope small-call context by
-      dependency. *(Items 11–12 move ahead of 7–10 if the item-4 cache-coverage measurement lands at
-      ≥75% median fixed-prefix coverage — the priority gate is written into the consolidation plan.)*
-- [ ] **V1.5** Item 13 — audit and ablate planner modules within the fixed six-variant budget.
-- [ ] **V1.6** Item 14 — tool-catalog reduction. **Deferred past the tag** unless the expanded
-      acceptance batch it requires is already being run for another reason; catalog omission has the
-      highest silent-failure risk of anything in the plan.
-
-### 2.3 Gate V2 — Gaia2 evaluation
-
-This is the gate the release hinges on. **Decided 2026-09-04: the tag lands after the benchmark sweep
-has been *run*, not after it reaches a score** — the sweep's real value for a release is that a few
-hundred live scenarios surface minor issues nothing else does, and fixing those is what the tag should
-carry. That places v0.1.0 **after** the `aamas2027` campaign's headline runs rather than before them.
-
-The old `T10` ("Gaia2 all categories pass") is retired as a gate: a 100%-pass claim is stronger than
-any suite here supports, and on the full set it is partly hostage to ARE's two documented
-one-directional judge defects. The gate is `T11` — the run happening and its findings triaged.
-
-**Revised 2026-09-07: the evaluation plan was rewritten and it reverses this gate's harness
-decision.** The plan (`notes/benchmarks/gaia2/evaluation-plan-aamas2027.md`, untracked) is now
-organized around the architecture as the primary claim, with the perception-tier study secondary and
-justifying it. Four consequences land here, and each contradicts something written below under the
-previous plan:
-
-1. **The in-process ARE path is the primary harness again; gaia2-cli is not where the reported
-   numbers come from.** Reversed on capacity and schedule risk, not on principle — see V2.6/V2.8.
-2. **The simulated-clock freeze is being rebuilt, not removed** — with a fixed non-zero per-call
-   charge rather than the structurally-zero offset that made the old one pointless. See V2.10.
-3. **The scorer's own defects are in scope for the campaign**, which adds one harness item with an
-   irreversible deadline: judge-response recording, V2.9.
-4. **Leaderboard submission is ruled out**, not merely deprioritized — there is no scaffold field, so
-   a submitted row attributes scaffold gains to the model.
-
-Everything below is updated to match. Where a bullet recorded a finding that is still true but whose
-*conclusion* has changed, the finding is kept and the conclusion marked superseded, rather than
-deleting the evidence.
-
-- [ ] **V2.1** Debug the **familiar** (smoke) suite under GPT-5.4 — the five scenarios that have always
-      been regression cases, on the primary tuning profile. *Immediate next step.*
-- [ ] **V2.2** Improve prompt-eval harness logging so a failing run is diagnosable without re-running it.
-      *(Being taken up in a separate session.)*
-- [ ] **V2.3** Complete the consolidation campaign (V1) against familiar → **development** suites, one
-      module or context section per commit with its quality, safety, latency, and token delta attached.
-- [ ] **V2.4** Run the **locked acceptance** suite once, on the finalist, on both tuning profiles, and
-      report the acceptance-set familiarity gap. The five acceptance ids are frozen and must stay
-      uninspected until this run. This is the **finalist gate** — it decides which prompt candidate is
-      frozen — not the release gate; the release gate is V2.6/V2.7 below.
-- [ ] **V2.5** **Freeze the prompts before the sweep.** `PLAN_SYSTEM_PROMPT` edits break comparability
-      across dates (threat 7 in the evaluation plan, and the standing re-baseline hazard), so V1 must be
-      *finished*, not in flight, and the prompt hash recorded with every result. This is the hard
-      ordering constraint between the two gates.
-- [ ] **V2.6** **Run the benchmark sweep** — `aamas2027`, planned in the evaluation-plan working note
-      (`notes/benchmarks/gaia2/`, untracked). **Runs on the in-process ARE path**, which also restores
-      `mini` (160 scenarios) as the sweep's split — gaia2-cli had dropped that config, and the
-      arithmetic below is back to what it was before that detour. The reversal is a capacity and
-      schedule judgement, not a change of mind about which integration is better engineering: a
-      container per scenario under amd64 emulation dominated the old plan's throughput risk, and with
-      one month to a submission that risk is the binding constraint. See V2.8 for what gaia2-cli is
-      still for.
-      **Decide before the sweep where the *results* live:** the plan can stay a local note, but a
-      released benchmark claim needs its methodology and numbers committed somewhere citable —
-      `docs/benchmarks/` is the natural home and is currently empty.
-      Scope is a budget call, not a correctness one: the campaign's own matrix is ~1,060 runs at
-      ≈$1.8k, and it buys statistical power for the paper, not release confidence — a single split at
-      n=1 is enough for the release gate.
-      **Prerequisites, all of which now precede this item:** judge selection, V2.9 (judge-response
-      recording — the one with a deadline), V2.10 (the rebuilt clock freeze), and V2.5's prompt
-      freeze. The campaign's three-model arm and its per-experiment design live in the plan and are
-      not duplicated here; only the parts that gate the *tag* are tracked in this file.
-- [ ] **V2.7** **Triage what the sweep surfaces, and split the fixes by comparability.** This is the
-      step that justifies gating the tag on the run at all. A **runtime-only** fix is safe to take
-      immediately — it cannot move a prompt baseline. A **prompt-touching** fix invalidates the numbers
-      already produced, so it either waits until after the paper's results are locked or forces a
-      re-run; decide which per finding rather than by reflex, and record the choice with the result.
-      A third category exists and is easy to misfile: a **harness-only** fix, touching one
-      integration but not the other. Since the reversal (V2.6) the polarity is inverted — the numbers
-      now come from the **in-process** path, so it is a *gaia2-cli-only* fix that is free to take at
-      any time *and* does not repair the reported result. Record which harness a finding was observed
-      on, or a fix will be credited to a sweep it cannot have affected.
-- [x] **V2.8** **Integrate against `gaia2-cli` — as the second perception tier and the independence
-      check, no longer as the source of the reported numbers.** *(Parallelizable — see §3.)*
-      **Checked off for the scope the revision leaves it**: a live tier-2 scenario has now run
-      end to end (below). The one job it does not cover — the OpenClaw third-party arm — is a
-      stretch item in the evaluation plan and is deliberately not gated by this checkbox.
-      **Superseded 2026-09-07:** this item used to read "make it the harness the reported numbers come
-      from". Its premise — that the in-process path's divergence from stock ARE makes its numbers
-      incomparable to published ones — is still true, but the campaign no longer *wants* comparability
-      with published rows: those are self-reported, never re-judged, and produced by a scorer with
-      documented one-directional defects, so the plan re-runs its own baseline arm and publishes the
-      reproduction gap as a measured quantity instead. What gaia2-cli is now for, in the order it is
-      worth the effort:
-      1. **A real tier-2 environment.** The campaign's tier study synthesizes tier 2 in-process by
-         suppressing channels; gaia2-cli is a naturally-occurring one, which is what makes the
-         synthesis a construct-validity question that can actually be checked. The plan schedules a
-         small unjudged behavioural comparison (~5 scenarios) for exactly this, alongside the tier
-         study rather than after it. *(Note the label collision: the plan calls that check "V1", which
-         is unrelated to Gate V1 in this file.)*
-      2. **The only third-party baseline available.** An OpenClaw arm, cost and call count only, is
-         the campaign's sole stretch item and the first thing dropped.
-      The investigation is written up in `notes/benchmarks/gaia2/gaia2-cli.md` (untracked); the
-      load-bearing findings:
-      - **The clock convention differs.** gaia2-cli never freezes simulated time — its event daemon
-        advances on every poll — whereas the in-process path froze during generation and then added an
-        offset that was structurally always zero. **The finding stands; its conclusion is superseded
-        (2026-09-07).** The old conclusion — "match gaia2-cli, charge generation time, remove the
-        freeze rather than finish it" — no longer follows once gaia2-cli stops being the reporting
-        harness, and it was never the neutral choice it looked like: stock ARE charges *nothing* for
-        generation, so every published row belongs to an agent that thinks instantaneously, and an
-        asynchronous agent measured against a clock that runs while it thinks is penalised for the
-        one property the architecture exists to exploit. The campaign therefore adopts a third
-        convention — freeze, plus a **fixed non-zero per-call charge** — and reports the stock
-        convention alongside it on the time-sensitive split as a sensitivity arm. That is V2.10.
-      - **The dataset is the same 800 scenarios**, spot-checked in both directions, but `validation`
-        is renamed `test` and **`mini` and `demo` are gone** — which removes the `noise` and
-        `agent2agent` dimensions from the current benchmark altogether. Anything the evaluation
-        wanted to claim on those needs its own scenarios. *(An earlier reading of this entry also
-        claimed a `default` config of all 800; there is none — the configs are the five splits.)*
-      - **Leaderboard numbers are self-reported and never re-judged**, and rows are qualified by
-        harness. **Conclusion sharpened 2026-09-07: do not submit.** ARE's `--agent` is a choice of
-        one, and the generated report carries model and provider only — there is no scaffold field, so
-        a submitted row reads as a claim about the *model* and credits the architecture's gains to it.
-        Published rows are context in an adjacent column, never evidence, and no delta is ever
-        computed across the scoring-pipeline boundary. The one cheap thing still worth doing (~30 min)
-        is checking whether the gaia2-cli leaderboard has since added a harness/scaffold slot, which
-        would change the related-work framing.
-      - **The integration work itself** turned out to be a perception-tier question, not a plumbing
-        one: these apps expose state only by running a command, so there is no observable property to
-        read and the environment notification is the agent's only channel for world change;
-        containers are amd64-only. Manuals are not scraped from `--help`: every app
-        answers a `schema` subcommand with JSON, so synthesis is a JSON read.
-      Keep the in-process path — it stays the right tool for custom scenarios, demos, and the fast
-      dev-loop signal, none of which need leaderboard parity.
-      **Walking skeleton done** — the contract runs end to end on a real scenario, with the agent's
-      writes landing in `events.jsonl` under the right app class and oracle function name. Shipped:
-      `src/sora/adapters/gaia2_cli.py` (schema→Manual, typed operations over argv, notification→
-      signal routing, the worker-socket transport), its bootstrap dispatch kinds, and
-      `examples/gaia2/cli/` (image, HTTP adapter, worker, config, build/verify targets) — see
-      [its README](examples/gaia2/cli/README.md). Two runtime prerequisites came with it: the
-      Anthropic client had **no** client-side timeout at all (SDK default: 600s read × 2 retries,
-      ~30 minutes of silence against a clock that runs while the agent thinks), and the inference
-      watchdog's deadline was unreachable from `agent.yaml`. Both fixed. *(The prerequisite this
-      entry used to list — adding the watchdog itself — was already done.)*
-      The harness now runs as a **tier-2 environment** — operations and signals, no observable state:
-      polling is gone, the manuals declare only what each app can actually offer, and
-      `context_adaptation: replan_on_change` resolves a hot change-gate without spending a judge on
-      an announcement it cannot rule on. Same perception the sibling harnesses get, which is also
-      what makes the two integrations a tier contrast rather than two variants of one.
-
-      **Done:** a `time` scenario ran end to end on 2026-09-07 — `All turns judged (1/1) — scenario
-      complete`, with the agent paging the whole 409-event calendar, taking six environment
-      notifications as they arrived, deleting the five preexisting events that conflicted with them,
-      and reporting what it had actually done. Three harness defects fell out of getting there, all
-      fixed: an unmounted scenario file left the container with no daemon and no adapter while
-      looking like a hung agent (now refused by name, since `docker run -v` answers a missing host
-      path by creating an empty directory); the worker's single un-retried connect to the adapter
-      socket made the startup order fatal; and nothing propagated the daemon's exit, so a standalone
-      `docker run` sat there looking busy long after the last turn was judged. For the sweep's
-      arithmetic: **33 model calls, 1.16M input tokens** on one scenario, dominated by 18 plan calls
-      (~38k input each — every fired change-gate replans from a full manual set) and 8 `$decide`
-      filters serialising all 409 events. That is the cost shape to attack before spending on 160.
-      Two things hand off to the sweep rather than back to this entry. Per-capability settings still
-      have no host→container channel, for which the seam is one thin image tag per capability —
-      sharper now, since `search`/`execution` want no reconsideration at all while `adaptability`/
-      `time` need it. And a **single-turn scenario is scored only if `GAIA2_JUDGE_FINAL_TURN` is
-      set**: below two turns the daemon builds no judge at all, whatever judge model it was given,
-      so a split containing single-turn scenarios silently returns fewer verdicts than scenarios.
-
-      **What remains, now that the live run has happened.** The revision left this item two jobs and
-      the first is done; neither leftover comes back here. Per-capability settings still have no
-      host→container channel, but the seam is one thin image tag per capability and ~5 scenarios on
-      one capability barely need it. The `GAIA2_JUDGE_FINAL_TURN` behaviour is a scoring-integrity
-      constraint the construct-validity check has to respect, not harness work. The cost shape the run
-      measured, though, does **not** stay behind with this harness: 18 plan calls at ~38k input each
-      and 8 `$decide` filters serialising 409 events are runtime and prompt behaviour, so the same
-      arithmetic lands on the in-process sweep — see R7.
-
-- [ ] **V2.9** **Record the judge's raw responses, and add the offline re-parse.** *(New 2026-09-07.
-      The one item in the release path with an irreversible deadline — it must land before V2.6.)*
-      ARE's graph judge stores a bare boolean per event, and `RunResult` keeps nothing else, so a
-      completed sweep **cannot be re-scored afterwards at any price**. Persist, per judged event: the
-      raw checker response strings, the checker inputs (tool name, oracle args, agent args), and the
-      `equality_checker` outcome; then a re-scorer that reads a stored run back under either verdict
-      parse. gaia2-cli's own port already retains exactly this shape (`LLMChecker.last_response`) —
-      copy it rather than designing one.
-      **Why this is a release item and not only a paper item:** ARE's verdict markers are compared
-      case-sensitively while its own engine lowercases model output in transit, which makes four soft
-      checkers unsatisfiable; they are applied as a strict conjunction, so on five of the seven judged
-      tools any non-verbatim output is rejected with no reasoning recorded. A sweep run without this
-      recording cannot tell a real agent failure from a scorer artefact, which is precisely what V2.7
-      is supposed to triage.
-      **Exit criterion — not "the field is populated".** One stored run must re-score offline under
-      both parses and the two scores must **differ on at least one event that `equality_checker`
-      missed**; otherwise the pipeline may be recording faithfully while never exercising the patched
-      path, which fails silently and looks like agreement. Verify on a scenario ending in a
-      paraphrased message to the user. Worth gating the batch runner on this mechanically, since the
-      failure mode is deprioritization, not difficulty.
-      **Built 2026-09-08** (`sora/adapters/are_judge.py`, `examples/gaia2/rescore.py`, wired through
-      `_runner.py` / `batch.py` / `run_benchmark.py`; `tests/test_are_judge_recording.py`,
-      `tests/test_gaia2_rescore.py`). Both mechanical gates are in: a scored `batch.py` sweep records
-      by default and **refuses to start** if it cannot arm (`--no-judge-recording` is the explicit
-      opt-out), and `rescore --require-divergence` fails unless the two parses differ on an event
-      `equality_checker` missed. The re-scorer also audits itself — re-scored under the parse the run
-      actually used, it must reproduce ARE's own boolean per event, and says so loudly when it does
-      not. **What remains is the exit criterion itself:** the `are` extra is not installed in the
-      working venv, so the recorder's patch points are pinned only against stubs of ARE's documented
-      surface, and no recording has been produced by the real judge. Run one scored scenario ending
-      in a paraphrased message to the user, then `python -m examples.gaia2.rescore <path>
-      --require-divergence`.
-- [ ] **V2.10** **Rebuild the simulated-clock freeze, with a fixed non-zero per-call charge.** *(New
-      2026-09-07; supersedes "remove the freeze" — see V2.8's clock bullet. Must precede V2.6, and
-      must precede V2.5's prompt freeze only in the sense that every timing number produced before it
-      is uninterpretable.)* Depth-counting so concurrent inference nests correctly, and deliberately
-      **no idle fast-forward** — the previous attempt was removed because it regressed event delivery,
-      and the shape that caught it was an oracle scheduling several events inside a short window while
-      the agent waited on a condition. Assert exactly that. Report the stock zero-charge convention
-      alongside on the time-sensitive split, so the choice is visible as an assumption rather than
-      buried as a default. Open question carried from the old attempt: whether `MAX_PAUSE_SECONDS`
-      needs to change once inference pauses the timeline.
+Gates **V1** (prompt consolidation) and **V2** (the Gaia2 evaluation sweep) are sequenced in a separate
+tracker and are not detailed here; their subsection numbers are left in place so the identifiers used
+across both do not shift. What follows are the gates this file owns.
 
 ### 2.4 Gate V3 — Correctness fixes worth taking before the tag
 
@@ -523,6 +151,21 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
       to invalidate — which is the ordering §3 describes, though note the claim there that the V3
       fixes cost no re-baseline was written about V3.1/V3.2 and does not hold for this one.
 
+- [ ] **V3.4** **Make the prompt modules tier-conditional.** The rendered prompts assume an
+      environment with observable properties: they teach `$prop` and property-backed conditions to
+      every agent, including ones whose environment has no properties at all. Where the environment
+      offers only operations and signals, `$prop` is dead vocabulary; where it offers only
+      operations, the signal-backed waits go with it. Select each call's modules from the
+      environment's declared perception channels. Not cosmetic — vocabulary the environment cannot
+      satisfy is a source of invalid plans. **Forces one decision to declare:** whether the
+      environment's declared channels govern perception only, or the prompt as well. The latter is
+      the honest configuration, since the alternative hands an agent instructions it cannot act on,
+      but it makes prompt text co-vary with the environment, so state it rather than letting it be
+      implicit. **Wants a prompt-module seam** — modularizing the seven prompts without changing
+      rendered text is text-preserving by construction, so it is cheap to pull forward and is the
+      enabler. Re-baselines the rows it touches, which is free before the prompt freeze and costly
+      after it.
+
 ### 2.5 Gate V4 — Release mechanics
 
 - [ ] **V4.1** Write the real `CHANGELOG.md` entry — it still says *"No code has been released yet"*.
@@ -546,8 +189,7 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
       `docs/architecture/status-and-stability.md` is still an unwritten scaffolding stub, and it is
       precisely the page a first release needs. `mkdocs build --strict` is
       already CI-enforced, so this is about accuracy, not links.
-- [ ] **V4.6** State the known limitations honestly in the release notes, citing the ARE judge defects
-      and the clock-semantics convention rather than burying them.
+- [ ] **V4.6** State the known limitations honestly in the release notes rather than burying them.
 
 ### 2.6 Explicitly out of scope for v0.1.0
 
@@ -559,39 +201,22 @@ concrete driver rather than a speculative build.
 
 ## 3. Active workstream — immediate order of work
 
-0. **V2.9** — judge-response recording. *Ahead of everything else, because it is the only item here
-   whose window closes rather than slips: a sweep run without it cannot be re-scored later at any
-   price.* Cheap, unglamorous, and pays off only in step 7, which is exactly the profile of something
-   that gets deferred until it is too late.
-1. **V2.1** — debug the familiar suite under GPT-5.4.
-2. **V2.2** — prompt-eval harness logging (separate session).
-3. **V1 / V2.3** — work the consolidation roadmap in its own numbered order, gated by the
-   cache-coverage branch.
-4. **V2.4** — the locked acceptance run, once, on the finalist.
-5. **V2.10** — rebuild the clock freeze with the fixed per-call charge. Before the freeze, not after:
-   it is runtime-only so it costs no re-baseline here, and every timing number produced before it is
-   uninterpretable.
-6. **V2.5** — freeze the prompts and record the hash. Everything after this point is comparability-
-   critical.
-7. **V2.6** — the benchmark sweep, on the **in-process** harness, `mini` (160), one split sufficient
-   for the gate.
-8. **V2.7** — triage its findings; runtime-only fixes land, prompt-touching fixes wait or force a re-run.
-9. **V4** — release mechanics, then tag.
+Release-gate work runs in two tracks. V1 and V2 — prompt consolidation and the benchmark evaluation —
+are sequenced in their own tracker. What this file orders is everything else, plus the one hard
+constraint between the tracks.
 
-**V3** (the correctness fixes) can proceed in parallel with the campaign at any point *before*
-step 6 (the prompt freeze). V3.1 and V3.2 touch no prompt text, so neither costs a re-baseline; **V3.3 does** — its whole
-subject is what the grounding prompt is shown about work that did not happen — and it moved the
-`ground` row of the frozen baseline. That is the argument for taking these early rather than against
-it: before step 5 a prompt-touching correctness fix is free, and after it the same fix forces a
-re-run. V3.1 is additionally a live wrong-answer path the sweep could otherwise hit.
+1. **V3** — the correctness fixes, in any order, but **before the prompt freeze V2 depends on**.
+   V3.1 and V3.2 touch no prompt text, so neither costs a re-baseline; **V3.3 did** — its whole
+   subject is what the grounding prompt is shown about work that did not happen — and it moved the
+   `ground` row of the frozen baseline. That is the argument for taking these early rather than
+   against it: before the freeze a prompt-touching correctness fix is free, and after it the same fix
+   forces a re-run. V3.1 is additionally a live wrong-answer path a benchmark run could otherwise hit.
+   **V3.4 also moves a prompt baseline**, and for the same reason the freeze ordering matters to it.
+2. **V4** — release mechanics, then the tag.
 
-**V2.8** (the gaia2-cli integration) also runs in parallel and is bounded by nothing here. **This
-changed on 2026-09-07 and it changed in the project's favour:** it used to be the harness step 7 ran
-*on*, which made it the single most likely item to make the sweep slip, since it was also the one with
-an unknown-size integration surface. It is now neither — the sweep runs in-process, and gaia2-cli
-supplies a small construct-validity check and an optional third-party arm, both of which can be cut
-without touching the release gate. Get it to one live tier-2 scenario and stop there; anything beyond
-that is paper work, not tag work.
+**The tag lands after the benchmark sweep has been run, not after it reaches a score.** The sweep's
+value for a release is that a few hundred live scenarios surface minor issues nothing else does, and
+fixing those is what the tag should carry.
 
 Nothing in §4 starts before the tag.
 
@@ -709,7 +334,7 @@ finding stands until new evidence arrives.
 - If an implementation step reveals that a design decision needs to change, write a new ADR superseding
   the old one (see [docs/architecture/adrs/README.md](docs/architecture/adrs/README.md)) rather than
   silently diverging from the design documents.
-- Do not reference this file's item labels (`V2.4`, `P7`, …) from durable files — code comments,
+- Do not reference this file's item labels (`V3.1`, `P7`, …) from durable files — code comments,
   docstrings, config, **ADRs, design notes, or documentation pages**. Describe the thing itself;
   roadmaps get restructured and leave the reference dangling, which is exactly what happened to the
   phase roadmap's `D4`/`D5`/`X2` citations.

@@ -56,6 +56,47 @@ log = logging.getLogger("sora.adapters.are_sim")
 
 _AUI_APP = "AgentUserInterface"  # ARE's user-message app; routed via the transport, not as a tool
 
+# ARE withholds its own internal apps from *its* agent — `Scenario.get_tools_by_app` drops their
+# tools and `Environment.get_apps_state` drops their state — because they hold universe ground
+# truth the agent is not meant to read (`InternalContacts` is the full persona set, a superset of
+# the visible `Contacts` app). Importing an app the reference agent cannot see would make any
+# paired comparison a comparison of tool surfaces rather than of architectures, so honour the same
+# withholding. Read ARE's own list rather than restating the names — see ADR-0003 on why every
+# `are.simulation` import here is lazy. The literal below is a floor, not an alternative: it is
+# unioned into whatever ARE reports, never replaced by it.
+_INTERNAL_APPS_FLOOR = frozenset({"InternalContacts"})
+
+
+def _internal_app_names() -> frozenset[str]:
+    """Names of the apps ARE withholds from its own agent, as `app_name()` reports them.
+
+    Read from two attributes and unioned with the floor rather than trusting either alone: every
+    way this can come back short is silent. `INTERNAL_APPS` holds classes and ARE's base `App`
+    assigns `self.name` in ``__init__``, so a member that doesn't also set the class attribute has
+    no ``name`` to read; an upstream rename or move of the constant lands in the ``ImportError``
+    branch; and a withheld app that quietly stops being withheld reopens the leak this function
+    exists to close, with nothing red to show for it — the prompt-freeze gate pins prompt constants,
+    not the tool manifest interpolated into them.
+    """
+    try:
+        from are.simulation.apps import INTERNAL_APPS
+    except ImportError:
+        return _INTERNAL_APPS_FLOOR
+    names = {
+        n
+        for app in INTERNAL_APPS
+        for n in (getattr(app, "name", None), getattr(app, "__name__", None))
+        if isinstance(n, str)
+    }
+    if not names:
+        log.warning(
+            "ARE's INTERNAL_APPS yielded no app names (%d entries); withholding %s",
+            len(INTERNAL_APPS),
+            sorted(_INTERNAL_APPS_FLOOR),
+        )
+    return _INTERNAL_APPS_FLOOR | names
+
+
 # ARE mutates app state on its own event-loop thread with no lock we can share (see AreSimulation),
 # so a ``get_state()`` that iterates a dict the event loop is concurrently growing can raise
 # "changed size during iteration". Mutation happens in sub-second bursts, so an immediate re-read
@@ -1152,7 +1193,8 @@ class AreInProcessWorkspaceAdapter:
         return _AreWorkspace(workspace_record.id, workspace_record.origin, tools, self._sim)
 
     def _tool_apps(self) -> list[Any]:
-        return [a for a in self._sim.apps() if a.app_name() != _AUI_APP]
+        withheld = _internal_app_names() | {_AUI_APP}
+        return [a for a in self._sim.apps() if a.app_name() not in withheld]
 
     async def _build_tool(self, app: Any) -> Tool:
         manual = await self._paired_manual(app.app_name(), self._synth_manual(app))

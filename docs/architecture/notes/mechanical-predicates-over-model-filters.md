@@ -19,9 +19,9 @@ but the prompt paragraph that names it.
 
 ## The measurement that motivated it
 
-From `examples/gaia2/logs/aug28-run1-time-gpt-5.5.log` — the `time` scenario, a maintenance goal
-watching a calendar for additions and deleting whatever they clash with. 28 model calls,
-727,818 input tokens:
+From a `time`-capability Gaia2 run (`aug28-run1`, gpt-5.5) — a maintenance goal watching a
+calendar for additions and deleting whatever they clash with. 28 model calls, 727,818 input
+tokens:
 
 | call site | n | input tokens | share |
 |---|---|---|---|

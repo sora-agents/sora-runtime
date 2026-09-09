@@ -21,6 +21,7 @@ from sora.adapters.are_sim import (
     AreSimulation,
     AreTransport,
     ValidationOutcome,
+    _internal_app_names,
     _params_schema,
     _record_fields,
     _returns_schema,
@@ -92,6 +93,26 @@ class FakeEmailApp:
                 "add_email", self.add_email, args=[FakeArg("subject")], write_operation=True
             ),
         ]
+
+
+class FakeInternalApp:
+    """Stands in for one of ARE's INTERNAL_APPS (`InternalContacts`): a real app with real tools
+    that ARE withholds from its own agent because it holds universe ground truth."""
+
+    def app_name(self) -> str:
+        return "InternalContacts"
+
+    def get_tools(self) -> list[FakeAppTool]:
+        return [
+            FakeAppTool(
+                "InternalContacts__search_contacts",
+                lambda **_: {"contacts": []},
+                write_operation=False,
+            )
+        ]
+
+    def get_state(self) -> dict[str, Any]:
+        return {"contacts": {}}
 
 
 class FlakyStateApp:
@@ -265,6 +286,80 @@ async def test_discover_builds_one_tool_per_app_excluding_aui() -> None:
     }
     assert [p.name for p in manual.observable_properties] == ["state"]
     assert [s.name for s in manual.signals] == ["state_changed"]
+
+
+async def test_discover_withholds_ares_own_internal_apps() -> None:
+    """ARE's reference agent never sees `INTERNAL_APPS` — `Scenario.get_tools_by_app` drops their
+    tools and `Environment.get_apps_state` drops their state — because they carry universe ground
+    truth (`InternalContacts` is the full persona set, a superset of the visible `Contacts` app).
+    Importing one would give an S-ORA agent an operation the reference agent cannot call, which
+    turns any paired benchmark into a comparison of tool surfaces rather than of architectures."""
+    sim = FakeSimulation([FakeEmailApp(), FakeInternalApp(), FakeAui()])
+    tools = (await _adapter(sim).discover())[0].tools()
+    assert [t.id for t in tools] == ["insim:are/EmailClientApp"]
+    # The fake really does contribute an operation — asserted here rather than over `tools`, where
+    # the id equality above already makes any such loop vacuous. Without the withholding this
+    # operation would be reachable, so the assertion above is about `_tool_apps` and not about a
+    # fixture that happens to be empty.
+    assert [t.name for t in FakeInternalApp().get_tools()] == ["InternalContacts__search_contacts"]
+
+
+@pytest.mark.parametrize(
+    ("internal_apps", "expected"),
+    [
+        # ARE not importable at all (the dev/CI venv): the floor is the whole answer.
+        (None, {"InternalContacts"}),
+        # The shape ARE ships today — a class carrying the class-level `name`.
+        (
+            [SimpleNamespace(name="InternalContacts", __name__="InternalContacts")],
+            {"InternalContacts"},
+        ),
+        # A member that only assigns `self.name` in `__init__`, so the class attribute is missing:
+        # read off `__name__` instead of being silently skipped.
+        ([type("InternalLedger", (), {})], {"InternalContacts", "InternalLedger"}),
+        # Neither attribute readable — the floor still withholds the app we know about.
+        ([SimpleNamespace()], {"InternalContacts"}),
+    ],
+)
+def test_internal_app_names_never_comes_back_short(
+    monkeypatch: pytest.MonkeyPatch, internal_apps: list[Any] | None, expected: set[str]
+) -> None:
+    """Every way this can return an under-approximation is silent — an ARE-side rename lands in the
+    ImportError branch, a member without a class-level `name` reads as nothing — and the result
+    reopens the tool-surface leak with no test and no prompt hash to redden. So the floor is unioned
+    in, never replaced."""
+    if internal_apps is None:
+        monkeypatch.setitem(sys.modules, "are.simulation.apps", None)
+    else:
+        monkeypatch.setitem(sys.modules, "are", SimpleNamespace())
+        monkeypatch.setitem(sys.modules, "are.simulation", SimpleNamespace())
+        monkeypatch.setitem(
+            sys.modules, "are.simulation.apps", SimpleNamespace(INTERNAL_APPS=internal_apps)
+        )
+    assert _internal_app_names() == expected
+
+
+async def test_connect_withholds_internal_apps_too() -> None:
+    """`connect` rebuilds from the live apps rather than from a snapshot, so it needs the same
+    withholding — a persisted ToolRecord naming an internal app must not resurrect it."""
+    sim = FakeSimulation([FakeEmailApp(), FakeInternalApp(), FakeAui()])
+    adapter = _adapter(sim)
+    discovered = (await adapter.discover())[0]
+    internal = ToolRecord(
+        id="insim:are/InternalContacts",
+        workspace_id="are",
+        manual_id="InternalContacts",
+        address=None,
+        discovered_at=0.0,
+        last_seen_at=0.0,
+    )
+    manual = discovered.tools()[0].manual
+    workspace = await adapter.connect(
+        WorkspaceRecord(id="are", origin=_origin(), discovered_at=0.0, last_seen_at=0.0),
+        [internal],
+        {"InternalContacts": manual},
+    )
+    assert workspace.tools() == []
 
 
 def test_params_schema_marks_required_and_types() -> None:

@@ -215,9 +215,5 @@ The recorder is pinned against ARE's own `SoftToolJudge` driven by a fake engine
 live run caught it storing verdicts with no checker answers behind them. A model-backed run has
 since stored a complete recording end to end. A recording whose events carry an empty `checkers`
 list is still the signature of that failure rather than of an easy verdict, so it is worth a glance
-before reading any scores; [NOTES.md](NOTES.md) has the detail, including why `send_email` is
-unwinnable under the stock parse.
-
-## Notes
-
-Known gaps, scenario-level findings, and benchmark caveats live in [NOTES.md](NOTES.md).
+before reading any scores. `send_email` is the sharpest case: its checkers are the `[[True]]` family
+that stock ARE cannot parse at all, per *Why two scores rather than one* above.

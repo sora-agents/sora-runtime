@@ -33,7 +33,13 @@ The binding budget is usually neither of those: ARE's event loop sleeps one real
 ``scenario.duration`` (1000s by default) is a **real-time** allowance for the whole run. Overrun it
 and the environment stops mid-run — later turns are never delivered, and the result then looks
 exactly like an agent that did nothing, so the run reports ``timeline_expired`` above its own
-verdict. ``--scenario-duration`` raises it; see NOTES.md for why that is safe and what it costs.
+verdict. ``--scenario-duration`` raises it, which does not distort the scripted world — no Gaia2
+event is pinned to an absolute timestamp, every delay is relative to the dependency that fires it,
+so a larger budget does not shift the schedule. What it does cost is comparability: the simulated
+clock advances one second per real second, so a longer run leaves ``get_current_time`` further along
+than a fast one, and a number produced under an overridden duration is not comparable to a published
+one. It also does not rescue a slow model on the *time* capability, whose events are released on a
+~4-minute real-time cadence measured from the opening user message, not from the budget.
 
 Without ``--judge-model`` the run is unscored (the judge no-op), useful for a quick trajectory
 check — but on a *multi-turn* scenario it also silently stops after turn 1, because the later turns'

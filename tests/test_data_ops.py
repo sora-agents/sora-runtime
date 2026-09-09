@@ -1482,9 +1482,9 @@ async def test_reduce_sum_of_empty_is_none(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------------------------------
 # filter — the $decide predicate is judged against the SAME context grounding gets
 # --------------------------------------------------------------------------------------------------
-# The gaia2 adaptability run (examples/gaia2/logs/aug24-run1-gpt-5.5.log) failed here. The planner
-# is explicitly taught to write predicates referencing an earlier result — "the upcoming Saturday
-# computed from the get_current_time result" — and did exactly that. `select` then rendered only the
+# A gaia2 adaptability run (aug24-run1, gpt-5.5) failed here. The planner is explicitly taught to
+# write predicates referencing an earlier result — "the upcoming Saturday computed from the
+# get_current_time result" — and did exactly that. `select` then rendered only the
 # goal, the predicate and the items, so the clock reading the predicate named was nowhere in the
 # prompt: the model could not compute the date it was being asked to compare against and correctly
 # answered {"keep": []}. An empty binding reads downstream as a real answer ("no appointments that
