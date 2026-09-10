@@ -61,6 +61,8 @@ import os
 import sys
 from typing import Any
 
+from examples.gaia2.llm_calls import LLMCallWriter
+
 _DEFAULT_CONFIG = "examples/gaia2/agent.yaml"
 _DEFAULT_HF_DATASET = "meta-agents-research-environments/gaia2"
 
@@ -346,7 +348,18 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
     # model tokens, so an abort partway through (a bad scenario, Ctrl-C) must leave a valid partial
     # file of the scenarios already completed rather than discarding all of them — records were
     # previously buffered in memory and written only once at the very end.
-    with open(os.path.join(config_dir, "output.jsonl"), "w", encoding="utf-8") as out:
+    # One per-call model record file for the whole capability, accumulated across scenarios and
+    # runs and separated by each row's scenario_id: the charge model is fitted and validated
+    # against these rows, and a per-scenario file would make that a directory walk instead of a
+    # read. Written for unscored sweeps too — it costs no tokens. Truncated once here, like
+    # output.jsonl above: re-running a capability into this directory replaces every other artifact
+    # in it, and rows left over from the previous sweep would carry the same scenario_id and
+    # run_number as the new ones, so the fit would count them a second time.
+    llm_calls = LLMCallWriter(os.path.join(config_dir, "llm_calls.jsonl"), reset=True)
+    with (
+        open(os.path.join(config_dir, "output.jsonl"), "w", encoding="utf-8") as out,
+        llm_calls,
+    ):
         for run_number in range(args.num_runs):
             # Re-create the iterator each run so every run gets fresh, un-run scenario objects (a
             # scenario is stateful once played); HF caches locally, so re-iteration is cheap.
@@ -366,7 +379,12 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
                 # trace_ids pointing at the wrong trace at upload).
                 scenario.run_number = run_number
                 rec = _run_one_scenario(
-                    scenario, run_number, args, config_dir, record_judge=record_judge
+                    scenario,
+                    run_number,
+                    args,
+                    config_dir,
+                    record_judge=record_judge,
+                    llm_calls=llm_calls,
                 )
                 records.append(rec)
                 json.dump(rec, out)
@@ -387,6 +405,7 @@ def _run_one_scenario(
     config_dir: str,
     *,
     record_judge: bool = False,
+    llm_calls: LLMCallWriter | None = None,
 ) -> dict[str, Any]:
     """Run + score + export one scenario into a jsonl record. Any error *for this scenario* (an
     attach_judge/oracle-preprocess failure, or an unexpected export error) becomes an ``exception``
@@ -434,6 +453,9 @@ def _run_one_scenario(
             read_stdin=False,
             record_judge=record_judge,
             verdict_parse=_verdict_parse(args),
+            llm_calls=llm_calls,
+            scenario_id=scenario.scenario_id,
+            run_number=run_number,
         )
     except Exception as e:  # this scenario's judge/preprocess failed — record it, keep sweeping
         return _jsonl_record(

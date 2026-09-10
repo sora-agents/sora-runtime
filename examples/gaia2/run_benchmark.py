@@ -55,6 +55,8 @@ import argparse
 import sys
 from typing import Any
 
+from examples.gaia2.llm_calls import LLMCallWriter
+
 _DEFAULT_CONFIG = "examples/gaia2/agent.yaml"
 
 
@@ -173,6 +175,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--verbose", action="store_true", help="Stream the full trajectory.")
     parser.add_argument("--log-file", metavar="PATH", help="Mirror the full trace to this file.")
+    parser.add_argument(
+        "--llm-calls",
+        metavar="PATH",
+        help=(
+            "Append one JSON line per model call (tokens, cache reads, measured latency) to this "
+            "file. This is what the charge model is fitted and validated against; the run's own "
+            "summary is unaffected."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -266,6 +277,7 @@ def main(argv: list[str] | None = None) -> None:
     # run_scenario owns the turn-aware done condition (ride through the idle gaps between a
     # scenario's turns; stop once the timeline has completed and the agent is idle; a wall-clock cap
     # is the safety valve). --exit-when-idle opts back into the old single-turn heuristic.
+    llm_calls = LLMCallWriter(args.llm_calls) if args.llm_calls else None
     try:
         result = run_scenario(
             scenario,
@@ -276,10 +288,16 @@ def main(argv: list[str] | None = None) -> None:
             exit_when_idle=args.exit_when_idle,
             record_judge=record_judge,
             verdict_parse="stock" if args.strict_verdict_case else "case-insensitive",
+            llm_calls=llm_calls,
+            scenario_id=getattr(scenario, "scenario_id", None),
         )
     except KeyboardInterrupt:
         print("\nrun aborted (Ctrl-C) — skipping validation")
         return
+    finally:
+        if llm_calls is not None:
+            llm_calls.close()
+            print(f"    wrote {llm_calls.written} model calls to {llm_calls.path}")
 
     _print_score(result, scored=bool(args.judge_model))
     _report_judge_recording(result.judge_recording, args.judge_recording)

@@ -89,6 +89,17 @@ files = ["src/sora", "tests", "examples"]
 module = ["are.*", "huggingface_hub"]
 ignore_missing_imports = true
 
+# litellm ships with that same optional group (it is what ARE's LiteLLMEngine calls), so it is
+# present on a developer host and absent in CI. `follow_imports = "skip"` on top of
+# ignore_missing_imports makes it Any in BOTH, deliberately: without it the same file type-checks
+# differently depending on whether the group is installed, and a `type: ignore` needed locally
+# reddens CI as unused — an environment-dependent gate, which is the failure mode this repo has
+# already been bitten by.
+[[tool.mypy.overrides]]
+module = ["litellm.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
 # The Gaia2 container assets import modules that exist only inside the image: the harness's own
 # adapter base (copied to /opt at build time) and its CLI package. Neither is installable on a
 # developer host, so their symbols are Any here — the files still type-check for everything else.

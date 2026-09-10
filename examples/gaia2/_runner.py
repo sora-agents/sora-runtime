@@ -17,8 +17,11 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from examples.gaia2.llm_calls import LLMCallWriter, SoraCallRecorder
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +221,38 @@ def _terminal_inference_errors(llm_report: Any) -> tuple[str, ...]:
     return tuple(reversed(errors))
 
 
+@contextlib.contextmanager
+def _recording_llm_calls(
+    writer: LLMCallWriter,
+    *,
+    model: str | None,
+    scenario_id: str | None,
+    run_number: int | None,
+) -> Iterator[None]:
+    """Attach the per-call recorder for one run and detach it again — a sweep runs many scenarios
+    in one process, and a handler left on the logger would keep attributing later runs to this
+    scenario's id."""
+    recorder = SoraCallRecorder(writer, model=model, scenario_id=scenario_id, run_number=run_number)
+    sora_log = logging.getLogger("sora")
+    # The session raises this to DEBUG for its own presenter, so in practice it is already open —
+    # but a level left at the root default would drop every per-call record *before* any handler
+    # saw it, and a silently empty file is the one failure this artifact cannot afford.
+    previous_level = sora_log.level
+    if not sora_log.isEnabledFor(logging.INFO):
+        sora_log.setLevel(logging.INFO)
+    sora_log.addHandler(recorder)
+    try:
+        yield
+    finally:
+        sora_log.removeHandler(recorder)
+        sora_log.setLevel(previous_level)
+        # Closing is what writes the rows: a logical call can span more than one round trip
+        # (parser repair) and nothing in the stream marks the last one, so the recorder can only
+        # settle its rows once the scenario's stream has ended. In a `finally` because an aborted
+        # scenario still paid for the calls it made.
+        recorder.close()
+
+
 def run_scenario(
     scenario: Any,
     *,
@@ -229,6 +264,9 @@ def run_scenario(
     read_stdin: bool = True,
     record_judge: bool = False,
     verdict_parse: str | None = None,
+    llm_calls: LLMCallWriter | None = None,
+    scenario_id: str | None = None,
+    run_number: int | None = None,
 ) -> RunResult:
     """Run S-ORA against one loaded scenario to completion, then score it. Attach the judge (via
     ``are_sim.attach_judge``) *before* calling this if a real score is wanted; without it the run is
@@ -242,7 +280,12 @@ def run_scenario(
     release gate, so on a multi-turn scenario most judged events are decided mid-run.
     ``verdict_parse`` names how those verdicts were read, and is stored with the recording — a
     recording that does not say which parse produced its verdicts cannot be checked against the run
-    it came from."""
+    it came from.
+
+    ``llm_calls``, when given, receives one row per model call (``examples.gaia2.llm_calls``) —
+    tokens, cache reads and measured latency, which the charge model is fitted and validated
+    against. It is a separate channel from ``llm_report``: that one summarizes this run, this one
+    is the per-call record a later fit reads, and it is written for the *unscored* runs too."""
     from sora.adapters.are_sim import AreSimulation, ValidationOutcome, write_count_check
     from sora.bootstrap import build_agent
     from sora.cli import TerminalSession
@@ -271,6 +314,17 @@ def run_scenario(
     # a bracket around validate() alone would record only the last one. Nothing here is entered
     # when `record_judge` is off, so an unrecorded run pays nothing.
     with contextlib.ExitStack() as bracket:
+        if llm_calls is not None:
+            # On the `sora` logger, the same stream `LLMMeter` and the CLI presenter read; the
+            # session attaches its own handlers to it independently, so ordering does not matter.
+            bracket.enter_context(
+                _recording_llm_calls(
+                    llm_calls,
+                    model=getattr(agent.procedural, "model", None),
+                    scenario_id=scenario_id,
+                    run_number=run_number,
+                )
+            )
         collector: Any = None
         if record_judge:
             from sora.adapters.are_judge import record_judge_events

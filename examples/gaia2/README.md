@@ -104,6 +104,7 @@ python -m examples.gaia2.run_benchmark \
 | `--max-wall-seconds` | Safety cap, default 1200 |
 | `--exit-when-idle SECONDS` | Old single-turn quiet-window stop. Only correct for single-turn scenarios |
 | `--verbose` / `--log-file PATH` | Stream / mirror the full trajectory |
+| `--llm-calls PATH` | Append one JSON line per model call — tokens, cache reads, measured latency |
 
 The run stops **timeline-aware** by default: it rides through the idle gaps between turns and ends
 once ARE's event loop has completed the scenario, then validates once.
@@ -129,14 +130,56 @@ python -m examples.gaia2.batch --report-only .sora/gaia2/out
 ```
 
 Writes, under `{output-dir}/standard/{capability}/`, one HF-format trace per (scenario, run),
-`output.jsonl` in ARE's own benchmark-result shape, and — for a scored sweep —
-`judge_responses/{scenario}.run{n}.json` per run, named in that row's `metadata.judge_recording`.
+`output.jsonl` in ARE's own benchmark-result shape, `llm_calls.jsonl` (below), and — for a scored
+sweep — `judge_responses/{scenario}.run{n}.json` per run, named in that row's
+`metadata.judge_recording`.
 `--report-only` prints per-capability pass@1 and the equal-weight overall across the five core
 capabilities.
 
 Flags mirror `run_benchmark.py`, plus: `--capability` (the dataset config to run), `--split`,
 `--hf-dataset`, `--output-dir`, `--num-runs` (Gaia2 uses 3), `--limit`, and `--model` (the label
 recorded in the trace — match it to `agent.yaml`'s `llm.model`).
+
+### `llm_calls.jsonl` — one row per model call
+
+Written for every sweep, scored or not, and costing no tokens: `call_id`, `arm`, `model`,
+`semantic_label`, `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`,
+`seconds`, `round_trips`, `finish_reason`, plus `scenario_id` / `run_number` so one file holds a
+whole capability. `round_trips > 1` is one decision that crossed the wire more than once (a
+parser-repair pass on the S-ORA side), with the token fields summed across them.
+
+The ReAct arm groups differently, because ARE calls the engine again on a malformed output and
+there is no logical-call id to reuse: each crossing is its own row, and `bracket_id` is what says
+they were one charged step. It has to be on the row — the extra keys the engine returns in its
+metadata dict are dropped by ARE's `LLMOutputThoughtActionLog`, so after the run the file is the
+only place a retried decision can still be told apart from two decisions.
+
+A `null` token field means the provider did not report it — never a measured zero. `usage_captured:
+false` says the tokens are not a complete account of the call: the usage block was unreachable, or
+only some of a repaired call's round-trips reported one (a retry that dies before reporting still
+counts as a crossing, since the timing record comes from a `finally`). Most providers ship no cache
+or reasoning detail block, so `null` there is the ordinary case and `cached_input_tokens: 0` is a
+real, measured miss. `cached_input_tokens` in particular exists only here: the human-readable trace
+drops it.
+
+A failed round-trip is recorded with an `error:` `finish_reason` and is *charged* — the agent
+emitted the call and waited for it to fail. "Failed" does not mean "unbilled": ARE validates the
+response after LiteLLM returned it, so a content-filtered answer raises with a full usage block
+already in hand, and the row reports what that crossing actually cost. Only a crossing that
+produced no response at all bills the charge model's fixed per-call term alone. The fit excludes
+these rows; the bill does not.
+
+Rows for a scenario are written when that scenario's recording ends, not as each call returns: a
+repaired call is two round-trips on one `call_id` and nothing in the stream marks the last of them,
+so the row can only be settled once the scenario's stream has. `batch.py` truncates the file once at
+the start of a capability sweep, alongside the `output.jsonl` it replaces — otherwise a re-run's
+rows would sit next to the previous sweep's under the same `scenario_id` and `run_number`, and the
+fit would count the stale ones a second time. `run_benchmark.py --llm-calls` appends, so several
+single-scenario runs can be pointed at one file deliberately.
+
+`examples.gaia2.react_engine.MeteredLiteLLMEngine` writes the same schema with `arm: "react"` for
+the ARE baseline, whose stock engine reports nothing at all — see that module for why ARE's own
+agent is charged zero for thinking.
 
 ### Submitting
 
