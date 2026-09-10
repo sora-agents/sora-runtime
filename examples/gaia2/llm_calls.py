@@ -33,6 +33,16 @@ from typing import Any, Literal
 Arm = Literal["sora", "react", "grid"]
 
 
+def read_finish_reason(response: Any) -> str | None:
+    """The first choice's ``finish_reason``, or None where the object carries no choices.
+
+    Separate from :func:`read_usage` because a streamed call splits the two: the usage block rides
+    a final chunk that carries no choices, and the finish reason rides a content chunk that carries
+    no usage."""
+    choices = getattr(response, "choices", None) or []
+    return getattr(choices[0], "finish_reason", None) if choices else None
+
+
 def read_usage(response: Any) -> tuple[int, int | None, int, int | None, str | None, bool]:
     """(input, cached_input, output, reasoning, finish_reason, captured) from a usage-carrying
     response.
@@ -51,10 +61,7 @@ def read_usage(response: Any) -> tuple[int, int | None, int, int | None, str | N
         return 0, None, 0, None, None, False
     prompt_details = getattr(usage, "prompt_tokens_details", None)
     completion_details = getattr(usage, "completion_tokens_details", None)
-    finish_reason: str | None = None
-    choices = getattr(response, "choices", None) or []
-    if choices:
-        finish_reason = getattr(choices[0], "finish_reason", None)
+    finish_reason = read_finish_reason(response)
     # `is not None`, not truthiness: a provider reporting `cached_tokens: 0` measured a cache miss,
     # which is a different fact from a provider that shipped no `prompt_tokens_details` block at all
     # (the ordinary case for most models). Collapsing the second into 0 would put a fabricated cache

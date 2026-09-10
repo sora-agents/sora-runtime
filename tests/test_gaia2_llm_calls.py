@@ -636,3 +636,273 @@ def test_a_failed_round_trip_is_charged_its_fixed_term(
         eng.chat_completion([{"role": "user", "content": "a"}])
 
     assert _rows(writer.path)[0]["charged_seconds"] == pytest.approx(3.0)
+
+
+# -- the ReAct arm, streamed ---------------------------------------------------------------------
+
+# Streaming is not a preference here. S-ORA's client streams by default — its stall timeout means
+# "the provider went quiet", which is only observable on a streamed call — so a non-streaming ReAct
+# arm differs from it in transport, on exactly the per-arm comparison the charge model exists to
+# make. ARE's own engine hardcodes a non-streaming `litellm.completion()` and ignores its
+# `**kwargs`, so both the streaming and the settings have to be applied at the interception seam.
+
+
+def _stream_chunks(text: str, *, usage: Any = None, finish_reason: str = "stop") -> list[Any]:
+    """Real LiteLLM stream chunks, not stand-ins.
+
+    ``stream_chunk_builder`` reaches into ``_hidden_params`` and indexes chunks as mappings, and
+    the response it returns has to satisfy ARE's ``type(response) is ModelResponse`` — a duck-typed
+    double would pass a test that the installed LiteLLM would fail."""
+    from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+
+    def chunk(**choice: Any) -> Any:
+        return ModelResponseStream(
+            id="chatcmpl-stream", model="test/model", choices=[StreamingChoices(index=0, **choice)]
+        )
+
+    # Sliced, not split: a split on whitespace would drop the separators and the test would then
+    # be asserting on text the provider never sent.
+    chunks = [
+        chunk(delta=Delta(role="assistant", content=text[i : i + 4]))
+        for i in range(0, len(text), 4)
+    ]
+    chunks.append(chunk(delta=Delta(content=None), finish_reason=finish_reason))
+    if usage is not None:
+        # The usage block rides a trailing chunk carrying no choices at all.
+        chunks.append(
+            ModelResponseStream(id="chatcmpl-stream", model="test/model", choices=[], usage=usage)
+        )
+    return chunks
+
+
+def _stream_usage(prompt: int, cached: int | None, completion: int) -> Any:
+    from litellm.types.utils import PromptTokensDetailsWrapper, Usage
+
+    details = PromptTokensDetailsWrapper(cached_tokens=cached) if cached is not None else None
+    return Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=prompt + completion,
+        prompt_tokens_details=details,
+    )
+
+
+@pytest.fixture
+def streaming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[Any, list[Any], list[dict[str, Any]], LLMCallWriter]]:
+    """A streaming metered engine, plus the queue it draws from and every kwarg dict the provider
+    call was made with."""
+    from are.simulation.agents.llm.litellm import litellm_engine as module
+    from are.simulation.agents.llm.litellm.litellm_engine import LiteLLMModelConfig
+    from examples.gaia2.react_engine import MeteredLiteLLMEngine
+
+    queue: list[Any] = []
+    seen: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        nxt = queue.pop(0)
+        return iter(nxt) if kwargs.get("stream") else nxt
+
+    monkeypatch.setattr(module, "completion", fake_completion)
+    writer = LLMCallWriter(tmp_path / "react.jsonl").open()
+    eng = MeteredLiteLLMEngine(
+        LiteLLMModelConfig(model_name="test/model", provider="local"),
+        writer=writer,
+        scenario_id="scen-s",
+        request_kwargs={"reasoning_effort": "high", "max_completion_tokens": 16384},
+        stream=True,
+    )
+    try:
+        yield eng, queue, seen, writer
+    finally:
+        writer.close()
+
+
+@requires_are
+def test_a_streamed_call_reaches_are_as_an_ordinary_response(
+    streaming: tuple[Any, list[Any], list[dict[str, Any]], LLMCallWriter],
+) -> None:
+    """ARE's body runs unchanged over the reassembled response — including the ``True``/``False``
+    lowercasing its own checkers depend on, which is the reason the chunks are rebuilt rather than
+    joined by hand here."""
+    eng, queue, seen, writer = streaming
+    queue.append(_stream_chunks("Thought: True", usage=_stream_usage(1200, None, 40)))
+
+    text, metadata = eng.chat_completion([{"role": "user", "content": "a"}])
+
+    assert text == "Thought: true"
+    assert seen[0]["stream"] is True
+    assert seen[0]["stream_options"] == {"include_usage": True}
+    assert metadata["prompt_tokens"] == 1200 and metadata["completion_tokens"] == 40
+    (row,) = _rows(writer.path)
+    assert row["input_tokens"] == 1200 and row["output_tokens"] == 40
+    assert row["finish_reason"] == "stop"
+    assert row["usage_captured"] is True
+
+
+@requires_are
+def test_a_streamed_cache_read_survives_the_rebuild(
+    streaming: tuple[Any, list[Any], list[dict[str, Any]], LLMCallWriter],
+) -> None:
+    """The cached count is what makes the ReAct arm's growing prefix affordable to charge, and it
+    rides the same trailing chunk as the totals."""
+    eng, queue, _seen, writer = streaming
+    queue.append(_stream_chunks("Thought: ok", usage=_stream_usage(9000, 8192, 30)))
+
+    eng.chat_completion([{"role": "user", "content": "a"}])
+
+    (row,) = _rows(writer.path)
+    assert row["input_tokens"] == 9000 and row["cached_input_tokens"] == 8192
+
+
+@requires_are
+def test_a_stream_without_usage_is_never_estimated(
+    streaming: tuple[Any, list[Any], list[dict[str, Any]], LLMCallWriter],
+) -> None:
+    """The trap this guard exists for.
+
+    ``stream_chunk_builder`` fills a *missing* usage block by re-tokenizing prompt and completion
+    locally, so a provider that ignores ``include_usage`` yields counts that are plausible, wrong,
+    and indistinguishable from reported ones once written to a row. The first assertion pins that
+    the estimate really is produced — without it this test would pass for the wrong reason if
+    LiteLLM ever started returning zeros instead."""
+    from litellm import stream_chunk_builder
+
+    eng, queue, _seen, writer = streaming
+    chunks = _stream_chunks("Thought: ok", usage=None)
+    rebuilt = stream_chunk_builder(list(chunks), messages=[{"role": "user", "content": "a " * 200}])
+    assert rebuilt is not None and rebuilt.usage.prompt_tokens > 0  # the estimate, not a report
+
+    queue.append(chunks)
+    eng.chat_completion([{"role": "user", "content": "a " * 200}])
+
+    (row,) = _rows(writer.path)
+    assert row["usage_captured"] is False
+    assert row["input_tokens"] is None and row["output_tokens"] is None
+    # Still a paid crossing, and still charged — undercounted loudly, never dropped.
+    assert row["seconds"] is not None
+
+
+@requires_are
+def test_a_stream_that_dies_midway_is_still_recorded(
+    streaming: tuple[Any, list[Any], list[dict[str, Any]], LLMCallWriter],
+) -> None:
+    """Tokens streamed before the failure were billed by the provider, but nothing reported them:
+    the usage chunk never arrived. The row says so rather than guessing."""
+
+    def dying() -> Iterator[Any]:
+        yield from _stream_chunks("Thought: ok", usage=None)[:1]
+        raise TimeoutError("stream stalled")
+
+    eng, queue, _seen, writer = streaming
+    queue.append(dying())
+
+    with pytest.raises(TimeoutError):
+        eng.chat_completion([{"role": "user", "content": "a"}])
+
+    (row,) = _rows(writer.path)
+    assert row["finish_reason"] == "error:TimeoutError"
+    assert row["usage_captured"] is False
+
+
+@requires_are
+def test_profile_settings_ride_the_call_are_would_send_bare(
+    streaming: tuple[Any, list[Any], list[dict[str, Any]], LLMCallWriter],
+) -> None:
+    """ARE hands ``litellm.completion`` five fixed arguments and drops its own ``**kwargs``, so
+    without this the baseline runs at the provider's defaults while the other arm runs at the
+    profile's."""
+    eng, queue, seen, _writer = streaming
+    queue.append(_stream_chunks("ok", usage=_stream_usage(10, None, 2)))
+
+    eng.chat_completion([{"role": "user", "content": "a"}])
+
+    assert seen[0]["reasoning_effort"] == "high"
+    assert seen[0]["max_completion_tokens"] == 16384
+    # ARE's own five are untouched.
+    assert seen[0]["model"] == "test/model" and "messages" in seen[0]
+
+
+@requires_are
+def test_a_non_streaming_engine_sends_no_stream_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile that does not stream must reach the provider as the request it always was — the
+    flag is added by the wrapper, so its absence has to be asserted, not assumed."""
+    from are.simulation.agents.llm.litellm import litellm_engine as module
+    from are.simulation.agents.llm.litellm.litellm_engine import LiteLLMModelConfig
+    from examples.gaia2.react_engine import MeteredLiteLLMEngine
+
+    seen: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return _fake_response(prompt=10, cached=None, completion=2, reasoning=None)
+
+    monkeypatch.setattr(module, "completion", fake_completion)
+    writer = LLMCallWriter(tmp_path / "react.jsonl").open()
+    eng = MeteredLiteLLMEngine(
+        LiteLLMModelConfig(model_name="test/model", provider="local"),
+        writer=writer,
+        request_kwargs={"temperature": 0.5},
+    )
+    try:
+        eng.chat_completion([{"role": "user", "content": "a"}])
+    finally:
+        writer.close()
+
+    assert "stream" not in seen[0] and "stream_options" not in seen[0]
+    assert seen[0]["temperature"] == 0.5
+
+
+@requires_are
+def test_settings_do_not_leak_to_an_unmetered_engine(
+    streaming: tuple[Any, list[Any], list[dict[str, Any]], LLMCallWriter],
+) -> None:
+    """The wrapper is a module global and the settings live on a thread-local. Left set, this
+    engine's operating point would silently reach whatever calls ``completion`` next on the same
+    thread — a stock ``LiteLLMEngine``, another harness — which is exactly the kind of
+    cross-contamination that makes two arms look like one."""
+    from are.simulation.agents.llm.litellm.litellm_engine import (
+        LiteLLMEngine,
+        LiteLLMModelConfig,
+    )
+
+    eng, queue, seen, _writer = streaming
+    queue.append(_stream_chunks("ok", usage=_stream_usage(10, None, 2)))
+    eng.chat_completion([{"role": "user", "content": "a"}])
+
+    queue.append(_fake_response(prompt=1, cached=None, completion=1, reasoning=None))
+    plain = LiteLLMEngine(LiteLLMModelConfig(model_name="other/model", provider="local"))
+    plain.chat_completion([{"role": "user", "content": "b"}])
+
+    assert "stream" not in seen[1] and "reasoning_effort" not in seen[1]
+
+
+@requires_are
+def test_from_profile_runs_the_arm_at_the_profiles_operating_point() -> None:
+    """The constructor a driver should reach for: the operating point comes from the same profile
+    the S-ORA arm is configured from, so the two cannot drift apart by omission."""
+    from examples.gaia2.evaluation.core import load_profiles
+    from examples.gaia2.react_engine import MeteredLiteLLMEngine
+
+    root = Path(__file__).parents[1] / "examples" / "gaia2" / "evaluation"
+    kimi = load_profiles(root / "profiles.json")["kimi-k2.5-prompt"]
+
+    eng = MeteredLiteLLMEngine.from_profile(kimi, scenario_id="scen-k")
+
+    assert eng.model_config.model_name == "moonshotai/kimi-k2.5"
+    assert eng.model_config.endpoint == "https://openrouter.ai/api/v1"
+    assert eng.stream is True
+    sent = dict(eng.settings.request_kwargs)
+    assert sent["temperature"] == 0.5
+    assert sent["max_completion_tokens"] == 16384
+    assert sent["extra_body"]["reasoning"] == {"enabled": True}
+    assert sent["extra_body"]["provider"]["allow_fallbacks"] is False
+    assert sent["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
+    # Transport, added here rather than by the profile's operating point.
+    assert sent["timeout"] == 300 and sent["num_retries"] == 0
+    # Omitted settings are absent, never present-and-null.
+    assert "reasoning_effort" not in sent and "top_p" not in sent

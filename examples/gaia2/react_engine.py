@@ -14,8 +14,8 @@ Feeding that dict is the whole integration: no patch to ARE is needed, a subclas
 same object later carries the frozen charge (pass ``charge=``), so instrumenting the arm and
 charging it through one code path shared with S-ORA are the same class rather than two.
 
-Three things that would otherwise bite
---------------------------------------
+Four things that would otherwise bite
+-------------------------------------
 1. **Retries live inside the pause bracket.** On a malformed output ``step()`` re-calls the engine
    and keeps only the *last* metadata, so a retried step silently loses the earlier round-trips'
    tokens. ``begin_bracket()`` (wire it with ``wrap_pause_env``) makes the returned metadata
@@ -37,22 +37,42 @@ Three things that would otherwise bite
    body — including its ``True``/``False`` lowercasing, which downstream checkers depend on — and
    the ``ModelResponse`` is captured from ``litellm.completion`` on the way past. Copying the body
    here to reach the response would fork it from the installed ARE and drift silently.
+4. **ARE sends no settings and never streams.** Its ``chat_completion`` ignores its own ``**kwargs``
+   and hands ``litellm.completion`` five fixed arguments, so an uninstrumented baseline runs at the
+   provider's defaults — a different operating point from S-ORA's, on the one comparison that
+   cannot be corrected after the fact. Both are fixed at the same seam the response is captured at:
+   the profile's request kwargs are merged into the call, and ``stream=True`` with
+   ``stream_options={"include_usage": True}`` is added when the profile streams, the chunks
+   reassembled by LiteLLM's own ``stream_chunk_builder`` into the ``ModelResponse`` ARE's
+   assertions expect. Streaming carries one trap of its own: ``stream_chunk_builder`` fills a
+   *missing* usage block by re-tokenizing prompt and completion locally, so a provider that ignores
+   ``include_usage`` yields plausible, wrong counts that no downstream reader can tell from
+   reported ones. The row's tokens therefore come from the provider's raw usage chunk, never from
+   the rebuilt response — see ``_usage_source``.
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 from are.simulation.agents.llm.litellm.litellm_engine import (
     LiteLLMEngine,
     LiteLLMModelConfig,
 )
+from litellm import stream_chunk_builder
 
-from examples.gaia2.llm_calls import LLMCallRecord, LLMCallWriter
+from examples.gaia2.evaluation.core import ModelProfile
+from examples.gaia2.llm_calls import (
+    LLMCallRecord,
+    LLMCallWriter,
+    read_finish_reason,
+    read_usage,
+)
 
 # Seconds to charge for one round-trip, given (input_tokens, cached_input_tokens, output_tokens).
 # The frozen charge model plugs in here; None bills measured wall clock instead.
@@ -60,10 +80,29 @@ ChargeModel = Callable[[int, int, int], float]
 
 _capture = threading.local()
 
+# What LiteLLM wants for a streamed call to report usage at all: without it the final chunk carries
+# no usage block and the rebuilt response falls back to a local estimate.
+_STREAM_OPTIONS = {"include_usage": True}
+
+
+@dataclass(frozen=True)
+class _CallSettings:
+    """What the wrapper applies to one crossing — set by the engine immediately before ARE's
+    ``chat_completion`` runs, and cleared immediately after, so an unmetered engine sharing the
+    thread is never touched."""
+
+    request_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    stream: bool = False
+
 
 def _install_response_capture() -> None:
-    """Wrap the ``completion`` name ARE's engine module calls, stashing each ``ModelResponse`` on a
-    thread-local.
+    """Wrap the ``completion`` name ARE's engine module calls: apply the caller's request settings,
+    stream when asked, and stash the resulting ``ModelResponse`` on a thread-local.
+
+    This is the only seam where both problems can be fixed at once. ARE's ``chat_completion``
+    neither forwards settings nor streams, and re-implementing its body here to change that would
+    fork it from the installed ARE — including the ``True``/``False`` lowercasing downstream
+    checkers depend on — and drift silently.
 
     Thread-local rather than an instance attribute because a batch may run scenarios in threads
     while sharing one patched module global, and the wrapper always runs on its caller's thread.
@@ -78,9 +117,25 @@ def _install_response_capture() -> None:
         return
 
     def capturing(*args: Any, **kwargs: Any) -> Any:
-        response = inner(*args, **kwargs)
-        _capture.response = response
-        return response
+        settings: _CallSettings = getattr(_capture, "settings", None) or _CallSettings()
+        kwargs.update(settings.request_kwargs)
+        if not settings.stream:
+            _capture.response = inner(*args, **kwargs)
+            return _capture.response
+        chunks = []
+        usage_chunk: Any = None
+        for chunk in inner(*args, **kwargs, stream=True, stream_options=dict(_STREAM_OPTIONS)):
+            chunks.append(chunk)
+            # Usage rides a trailing chunk of its own, carrying no choices — so it is collected
+            # separately from the content and kept as the row's only token authority.
+            if getattr(chunk, "usage", None) is not None:
+                usage_chunk = chunk
+        _capture.usage_chunk = usage_chunk
+        # `messages=` is what the builder needs to *estimate* a missing prompt count. It is passed
+        # because the rebuilt response goes to ARE, which asserts on its shape; the estimate it may
+        # contain never reaches a row.
+        _capture.response = stream_chunk_builder(chunks, messages=kwargs.get("messages"))
+        return _capture.response
 
     capturing._sora_capture = True  # type: ignore[attr-defined]
     module.completion = capturing
@@ -103,45 +158,15 @@ def _sum_known(values: Iterable[int | None]) -> int | None:
     return sum(known) if known else None
 
 
-def _read_usage(response: Any) -> tuple[int, int | None, int, int | None, str | None, bool]:
-    """(input, cached_input, output, reasoning, finish_reason, captured) from a ``ModelResponse``.
-
-    Every field is read defensively: providers differ in which detail blocks they populate, and a
-    provider that omits ``cached_tokens`` must not make the run look like a measured cache miss —
-    the caller writes ``usage_captured=False`` when the whole block was unreachable, which is the
-    signal that separates the two."""
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return 0, None, 0, None, None, False
-    prompt_details = getattr(usage, "prompt_tokens_details", None)
-    completion_details = getattr(usage, "completion_tokens_details", None)
-    finish_reason: str | None = None
-    choices = getattr(response, "choices", None) or []
-    if choices:
-        finish_reason = getattr(choices[0], "finish_reason", None)
-    # `is not None`, not truthiness: a provider reporting `cached_tokens: 0` measured a cache miss,
-    # which is a different fact from a provider that shipped no `prompt_tokens_details` block at all
-    # (the ordinary case for most models). Collapsing the second into 0 would put a fabricated cache
-    # miss into the cache-aware fit.
-    cached = getattr(prompt_details, "cached_tokens", None)
-    reasoning = getattr(completion_details, "reasoning_tokens", None)
-    return (
-        int(getattr(usage, "prompt_tokens", 0) or 0),
-        int(cached) if cached is not None else None,
-        int(getattr(usage, "completion_tokens", 0) or 0),
-        int(reasoning) if reasoning is not None else None,
-        finish_reason,
-        True,
-    )
-
-
 class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyped
     """``LiteLLMEngine`` that returns a populated metadata dict instead of ``None``.
 
     ``writer`` receives one ``LLMCallRecord`` per round-trip (``arm="react"``), tagged with the
     ``bracket_id`` of the step it belongs to; ``charge`` decides what ``completion_duration``
     bills. ``scenario_id``/``run_number`` are set per scenario by the driver so one file can hold
-    a whole capability's sweep."""
+    a whole capability's sweep. ``request_kwargs``/``stream`` carry the model profile's operating
+    point onto a call ARE would otherwise leave at the provider's defaults — prefer
+    :meth:`from_profile`, which derives both from the profile the other arm runs at."""
 
     def __init__(
         self,
@@ -151,6 +176,8 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         charge: ChargeModel | None = None,
         scenario_id: str | None = None,
         run_number: int | None = None,
+        request_kwargs: Mapping[str, Any] | None = None,
+        stream: bool = False,
     ) -> None:
         super().__init__(model_config)
         _install_response_capture()
@@ -158,10 +185,41 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         self.charge = charge
         self.scenario_id = scenario_id
         self.run_number = run_number
+        self.stream = stream
+        self.settings = _CallSettings(dict(request_kwargs or {}), stream)
         self._bracket: list[_RoundTrip] = []
         self._bracket_wired = False
         self.round_trips = 0
         self.brackets = 0
+
+    @classmethod
+    def from_profile(cls, profile: ModelProfile, **kwargs: Any) -> MeteredLiteLLMEngine:
+        """Build the engine from the same profile the S-ORA arm runs at.
+
+        The operating point comes from ``profile.request_kwargs()`` unchanged; ``stall_timeout``
+        and ``sdk_max_retries`` are added here rather than there because they are transport, and
+        LiteLLM takes transport per call (``timeout``/``num_retries``) where a client library takes
+        it at construction. Retries stay at the profile's number for the same reason the grid pins
+        them: a silently retried call is billed once and measured as the sum of both attempts.
+
+        Which routing string LiteLLM needs for a given provider is LiteLLM's own business and is
+        not second-guessed here — the profile's ``provider``/``model``/``endpoint`` are passed
+        through as they stand, and a live pilot is what confirms them."""
+        transport: dict[str, Any] = {"num_retries": profile.sdk_max_retries}
+        if profile.stall_timeout is not None:
+            transport["timeout"] = profile.stall_timeout
+        return cls(
+            LiteLLMModelConfig(
+                model_name=profile.model,
+                provider=profile.provider,
+                endpoint=profile.endpoint,
+                # Absent, LiteLLM falls back to its own environment lookup for the provider.
+                api_key=os.environ.get(profile.credential_env),
+            ),
+            request_kwargs={**profile.request_kwargs(), **transport},
+            stream=profile.stream,
+            **kwargs,
+        )
 
     # -- bracket -----------------------------------------------------------------------------
 
@@ -196,6 +254,8 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
     ) -> tuple[str, dict[str, Any] | None]:
         _install_response_capture()  # cheap; re-arms if anything replaced the module global
         _capture.response = None
+        _capture.usage_chunk = None
+        _capture.settings = self.settings
         if not self._bracket_wired:
             # Unwired, a bracket is one round-trip — all the engine can know without ARE's pause.
             self.brackets += 1
@@ -210,7 +270,7 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
             # captured response is read on this path for exactly that reason; only a failure that
             # produced no response at all falls through to a fixed-term row.
             trip, _reason, captured = self._trip(
-                self._take_response(), time.perf_counter() - started
+                *self._take_capture(), elapsed=time.perf_counter() - started
             )
             self._record(
                 trip,
@@ -219,27 +279,48 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
                 bracket_id=bracket_id,
             )
             raise
+        finally:
+            # Runs on the raising path too. Left set, it would apply this engine's operating point
+            # to whatever else calls `completion` on this thread next.
+            _capture.settings = None
         trip, finish_reason, captured = self._trip(
-            self._take_response(), time.perf_counter() - started
+            *self._take_capture(), elapsed=time.perf_counter() - started
         )
         self._record(trip, finish_reason=finish_reason, captured=captured, bracket_id=bracket_id)
         self._bracket.append(trip)
         return text, self._metadata(trip)
 
-    def _take_response(self) -> Any:
-        """The captured ``ModelResponse``, cleared as it is read so no later call can see it."""
-        response = getattr(_capture, "response", None)
+    def _take_capture(self) -> tuple[Any, Any]:
+        """The captured response and, on a streamed call, the provider's raw usage chunk — both
+        cleared as they are read so no later call can see them."""
+        captured = getattr(_capture, "response", None), getattr(_capture, "usage_chunk", None)
         _capture.response = None
-        return response
+        _capture.usage_chunk = None
+        return captured
 
-    def _trip(self, response: Any, elapsed: float) -> tuple[_RoundTrip, str | None, bool]:
+    def _usage_source(self, response: Any, usage_chunk: Any) -> Any:
+        """What the row's token counts are read from.
+
+        On a streamed call that is the provider's own usage chunk and *never* the rebuilt response:
+        ``stream_chunk_builder`` fills a missing usage block by re-tokenizing the prompt and the
+        completion locally, so a provider that ignores ``include_usage`` produces counts that are
+        plausible, wrong, and indistinguishable from reported ones once they are on a row. Falling
+        through to None instead is what writes ``usage_captured=False`` — a call charged at the
+        fixed per-call term alone, which undercounts visibly rather than mis-fitting silently."""
+        return usage_chunk if self.stream else response
+
+    def _trip(
+        self, response: Any, usage_chunk: Any, *, elapsed: float
+    ) -> tuple[_RoundTrip, str | None, bool]:
         """One round-trip's record, priced. ``response`` of None is the crossing that produced no
         answer at all: no tokens, and a charge model prices it at its fixed per-call term — zero
         would be the one reading the design rules out, since the agent did emit the call and did
         wait for it to fail."""
-        input_tokens, cached, output_tokens, reasoning, finish_reason, captured = _read_usage(
-            response
+        input_tokens, cached, output_tokens, reasoning, _, captured = read_usage(
+            self._usage_source(response, usage_chunk)
         )
+        # From the response either way: a streamed usage chunk carries no choices to read it off.
+        finish_reason = read_finish_reason(response)
         charged = self._charge_for(input_tokens, cached, output_tokens, elapsed)
         trip = _RoundTrip(input_tokens, cached, output_tokens, reasoning, elapsed, charged)
         return trip, finish_reason, captured

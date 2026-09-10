@@ -181,6 +181,26 @@ single-scenario runs can be pointed at one file deliberately.
 the ARE baseline, whose stock engine reports nothing at all — see that module for why ARE's own
 agent is charged zero for thinking.
 
+It also puts the baseline on the same request as the other arm. ARE's `LiteLLMEngine` ignores its
+own `**kwargs` and hands `litellm.completion` five fixed arguments, so an uninstrumented baseline
+runs at the provider's defaults — no reasoning setting, no output cap, no provider routing, and
+never streamed — while S-ORA runs at the profile's. Build it with
+`MeteredLiteLLMEngine.from_profile(profile)` and both arms send what
+`ModelProfile.request_kwargs()` says, streaming when the profile streams. Streaming matters beyond
+tidiness: S-ORA's client streams by default because its stall timeout means "the provider went
+quiet", which is only observable on a streamed call, so a non-streaming baseline differs from it in
+transport on precisely the per-arm comparison the charge model exists to make. Both changes are
+applied where the response is already intercepted; ARE's own `chat_completion` body still runs
+untouched, including the `True`/`False` lowercasing its checkers depend on.
+
+One streaming trap is worth knowing about, because nothing downstream could detect it: LiteLLM's
+`stream_chunk_builder` fills a *missing* usage block by re-tokenizing the prompt and completion
+locally, so a provider that ignores `include_usage` produces token counts that are plausible,
+wrong, and indistinguishable from reported ones. Rows therefore take their tokens from the
+provider's own trailing usage chunk and never from the rebuilt response — a stream that reported no
+usage is written `usage_captured: false` with null tokens and charged the fixed per-call term,
+which undercounts visibly instead of mis-fitting silently.
+
 ## `latency_grid.py` — the designed grid the charge model is fitted on
 
 **This one spends money.** Everything else in this directory is free to re-run; this is a token
