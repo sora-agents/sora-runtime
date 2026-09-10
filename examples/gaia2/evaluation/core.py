@@ -177,6 +177,48 @@ class ModelProfile:
                 values[key_map.get(name, name)] = setting.value
         return values
 
+    def request_kwargs(self) -> dict[str, Any]:
+        """The profile's operating point as chat-completions request kwargs.
+
+        One mapping, shared by every caller that speaks to a provider directly — the designed
+        latency grid and the ReAct arm's engine — because the two arms are comparable only if they
+        are the same request. ARE's ``LiteLLMEngine`` sends none of these: it ignores
+        ``chat_completion``'s ``**kwargs`` and hands ``litellm.completion`` a fixed five arguments,
+        so a caller that does not apply this dict runs the baseline at the provider's defaults
+        while S-ORA runs at the profile's. That difference lands on the *per-arm* comparison rather
+        than on either arm's own numbers, which is the one place it cannot be corrected afterwards.
+
+        Transport is deliberately absent — ``stall_timeout`` and ``sdk_max_retries`` belong to
+        whatever object opens the connection (a client's ``timeout``/``max_retries``, LiteLLM's
+        per-call ``timeout``/``num_retries``), not to the operating point. A setting the profile
+        marks ``intentionally_omitted`` is absent from the dict rather than present-and-null, so
+        the request carries no key for it at all."""
+        settings = self.client_settings()
+        kwargs: dict[str, Any] = {
+            name: settings[name]
+            for name in (
+                "reasoning_effort",
+                "temperature",
+                "top_p",
+                "seed",
+                "verbosity",
+                "service_tier",
+            )
+            if name in settings
+        }
+        if "max_tokens" in settings:
+            kwargs["max_completion_tokens"] = settings["max_tokens"]
+        extra_body = {
+            key: settings[name]
+            for key, name in (("reasoning", "reasoning"), ("provider", "provider_routing"))
+            if name in settings
+        }
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        if settings.get("router_metadata") is True:
+            kwargs["extra_headers"] = {"X-OpenRouter-Metadata": "enabled"}
+        return kwargs
+
     def reported_fields(self) -> dict[str, dict[str, Any]]:
         fields = {
             "provider": self.provider,

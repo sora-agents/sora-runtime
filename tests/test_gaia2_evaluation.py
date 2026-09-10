@@ -52,6 +52,29 @@ EVAL_ROOT = ROOT / "examples" / "gaia2" / "evaluation"
 PROMPT_ROOT = EVAL_ROOT / "campaigns" / "prompt"
 
 
+def test_a_profile_maps_onto_one_request_both_direct_callers_send() -> None:
+    """Everything that talks to a provider without a scaffold in between — the designed latency
+    grid, the ReAct arm's engine — builds its request from this one mapping. ARE sends none of it
+    on its own, so a second copy of the mapping is how the two arms end up at different operating
+    points without anything failing."""
+    profiles = load_profiles(EVAL_ROOT / "profiles.json")
+
+    high = profiles["gpt-5.4-high-paper"].request_kwargs()
+    assert high["reasoning_effort"] == "high"
+    assert high["max_completion_tokens"] == 16384
+    # The endpoint rejects a temperature alongside its reasoning controls; omitted means absent.
+    assert "temperature" not in high and "extra_body" not in high
+
+    kimi = profiles["kimi-k2.5-prompt"].request_kwargs()
+    assert kimi["temperature"] == 0.5
+    # OpenRouter takes both of these off the standard request shape, not on it.
+    assert kimi["extra_body"]["reasoning"] == {"enabled": True}
+    assert kimi["extra_body"]["provider"]["only"] == ["deepinfra"]
+    assert kimi["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
+    # Transport belongs to whatever opens the connection, never to the operating point.
+    assert "stall_timeout" not in kimi and "max_retries" not in kimi
+
+
 def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
     profiles = load_profiles(EVAL_ROOT / "profiles.json")
     assert set(profiles) == {

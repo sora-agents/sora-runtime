@@ -30,7 +30,45 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
 
-Arm = Literal["sora", "react"]
+Arm = Literal["sora", "react", "grid"]
+
+
+def read_usage(response: Any) -> tuple[int, int | None, int, int | None, str | None, bool]:
+    """(input, cached_input, output, reasoning, finish_reason, captured) from a usage-carrying
+    response.
+
+    Duck-typed on the OpenAI response shape, which is why it lives here rather than beside its
+    first caller: LiteLLM's ``ModelResponse``, the OpenAI SDK's completion object and a streamed
+    usage chunk all carry the same fields, and the latency grid reads them through a client that
+    is neither arm's.
+
+    Every field is read defensively: providers differ in which detail blocks they populate, and a
+    provider that omits ``cached_tokens`` must not make the run look like a measured cache miss —
+    the caller writes ``usage_captured=False`` when the whole block was unreachable, which is the
+    signal that separates the two."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0, None, 0, None, None, False
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    finish_reason: str | None = None
+    choices = getattr(response, "choices", None) or []
+    if choices:
+        finish_reason = getattr(choices[0], "finish_reason", None)
+    # `is not None`, not truthiness: a provider reporting `cached_tokens: 0` measured a cache miss,
+    # which is a different fact from a provider that shipped no `prompt_tokens_details` block at all
+    # (the ordinary case for most models). Collapsing the second into 0 would put a fabricated cache
+    # miss into the cache-aware fit.
+    cached = getattr(prompt_details, "cached_tokens", None)
+    reasoning = getattr(completion_details, "reasoning_tokens", None)
+    return (
+        int(getattr(usage, "prompt_tokens", 0) or 0),
+        int(cached) if cached is not None else None,
+        int(getattr(usage, "completion_tokens", 0) or 0),
+        int(reasoning) if reasoning is not None else None,
+        finish_reason,
+        True,
+    )
 
 
 @dataclass(frozen=True)

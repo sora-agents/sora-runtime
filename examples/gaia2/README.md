@@ -181,6 +181,68 @@ single-scenario runs can be pointed at one file deliberately.
 the ARE baseline, whose stock engine reports nothing at all — see that module for why ARE's own
 agent is charged zero for thinking.
 
+## `latency_grid.py` — the designed grid the charge model is fitted on
+
+**This one spends money.** Everything else in this directory is free to re-run; this is a token
+purchase of roughly $10 per model, so start with `--dry-run`, which prints the plan and the target
+volume and calls nothing.
+
+```
+# what it would do, and what it would cost in tokens
+python3 -m examples.gaia2.latency_grid --profile gpt-5.4-high-paper --dry-run
+
+# run it
+python3 -m examples.gaia2.latency_grid --profile gpt-5.4-high-paper \
+    --out grid/gpt-5.4-high.jsonl
+```
+
+The charge model is `a0 + uncached_in/R_in + cached_in/R_cache + out/R_out`, frozen before the
+sweep and applied identically to both arms. Its coefficients cannot be fitted from the agents'
+own calls: neither arm varies prompt length independently of answer length, so an ordinary
+least-squares fit on stored trajectories returns a **negative** input coefficient — a longer prompt
+served faster. The grid exists to move the two axes independently, which is the only thing that
+identifies `R_in`.
+
+Calls go through one plain `AsyncOpenAI` built from the named profile — deliberately neither arm's
+client. `a0` has to be the model's own per-call cost; measuring it through one arm's stack would
+fold that arm's SDK overhead into a coefficient later charged to both. The client is built once and
+reused, so `a0` is not inflated by handshakes a real run amortizes.
+
+Two files come out, joined on `call_id`: `llm_calls.jsonl` rows with `arm: "grid"`, and a
+`.manifest` sidecar carrying what makes a row an *experiment* rather than a call — the cell's
+targets, cache condition, block, warm-up flag, prompt and profile hashes, and `fit_eligible`. Read
+`fit_eligible` first: warm-ups, failures and cells that missed their target are all kept in the
+files, because every one of them was paid for, and all are excluded from the fit. A cached cell
+additionally needs the provider to have *reported* its cached token count — a usage block with no
+`prompt_tokens_details` leaves `uncached = input - cached` undefined on that arm, which is an
+unknown regressor rather than a small one. The uncached arm needs no such count: its prompts are
+unique per call, so an unreported cache is the zero it is. `cached_on_target` is reported
+separately and deliberately does *not* gate eligibility — a reported cache miss is still a valid
+observation of the input term, but an arm that missed everywhere means `R_cache` was never
+measured, and that has to be legible without recomputing it row by row.
+
+Because the two files join on `call_id`, and `call_id` is deterministic from the cell and the
+block, a second run into existing outputs would duplicate join keys. The CLI refuses that: pass
+`--overwrite` to truncate both files together, or `--resume` to continue. Resume skips at the
+granularity of a *unit*, not a cell — a cached group is a warm-up plus the measurements it warms,
+so a group left incomplete is re-run whole rather than re-entered against a prefix the provider
+evicted hours ago, and the repeated cells take suffixed call ids so nothing collides.
+
+The run opens with two cheap calibration calls that measure tokens per filler word and then
+**freeze** the ratio. This is not a warm-up nicety: word counts are derived from that ratio, so a
+ratio still refining itself during the grid would make a cell's prompt depend on which calls
+happened to run before it, break the claim that the stored seed regenerates the run's bytes, and —
+worst — shift a cached prefix's word count between a warm-up and the measurement it warms, quietly
+handing the provider a different head from the one it cached. The frozen ratio and both word counts
+land on every manifest row, so any prompt in the run can be rebuilt exactly and checked against its
+recorded `prompt_sha256`.
+
+Prompts are deterministic from the stored `--seed` and that frozen ratio, so a published
+coefficient can be traced back to the exact bytes that produced it. Everything except the two token axes comes from the profile —
+reasoning setting, temperature, provider routing, streaming — because latency does not transfer
+across them. `max_completion_tokens` is the single deliberate exception: it is the only way to
+force an output length, so it is the grid's independent variable rather than the profile's 16,384.
+
 ### Submitting
 
 The artifacts are exactly what ARE's uploader consumes — no container, no re-export.
