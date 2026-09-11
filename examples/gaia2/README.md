@@ -140,6 +140,66 @@ Flags mirror `run_benchmark.py`, plus: `--capability` (the dataset config to run
 `--hf-dataset`, `--output-dir`, `--num-runs` (Gaia2 uses 3), `--limit`, and `--model` (the label
 recorded in the trace — match it to `agent.yaml`'s `llm.model`).
 
+### `--arm` — which agent runs the sweep
+
+`--arm sora` (the default) runs S-ORA, configured by `--config`. `--arm react` runs ARE's own
+published ReAct agent as the baseline, configured by `--profile` — the same model, reasoning
+setting and output cap the S-ORA arm is pointed at. That last part is checked, not assumed: a react
+sweep compares the profile's operating point against `--config`'s `llm:` block and refuses before
+spending anything if they disagree, since two arms at different reasoning efforts produce two
+pass@1 columns that look comparable, carry the same model label, and are not. The comparison runs
+over the union of what the two sides declare, minus a named few that are not the operating point
+(`stall_timeout`, `max_retries`, `instrument`, `max_logical_calls`) — so routing counts too: the
+same model name at a different `base_url`, or behind a different `provider_routing`, is a different
+serving path, and a setting added to either side is compared from the day it exists.
+
+```bash
+# the pair: same capability, same scenarios, same judge, one root
+python -m examples.gaia2.batch --capability execution --limit 5 \
+    --judge-model claude-sonnet-5 --judge-provider anthropic --output-dir .sora/gaia2/pair
+python -m examples.gaia2.batch --capability execution --limit 5 --arm react \
+    --profile gpt-5.4-medium-prompt \
+    --judge-model claude-sonnet-5 --judge-provider anthropic --output-dir .sora/gaia2/pair
+
+python -m examples.gaia2.batch --report-only .sora/gaia2/pair              # S-ORA
+python -m examples.gaia2.batch --report-only .sora/gaia2/pair --arm react  # baseline
+```
+
+Everything except the agent is shared: the judge and its verdict parse, the oracle replay, the
+tool-call gate, the record shape, pass@1, and `llm_calls.jsonl`. The point of routing both arms
+through this one file is that a per-arm discrepancy in how a row is *scored* — rather than in how
+the agent performed — has nowhere to hide.
+
+`gpt-5.4-medium-prompt` is the profile matching the shipped `agent.yaml`; to run the pair at
+another operating point, move both sides.
+
+Four things that follow from that, each of which would otherwise tilt the comparison in a
+direction nothing in the artifacts would reveal:
+
+- **A react sweep lands under `{output-dir}/react/standard/{capability}/`.** Both arms write
+  `output.jsonl` and `llm_calls.jsonl` per capability, and re-running a capability truncates them
+  on purpose — so sharing a root would have the second arm destroy the first arm's results,
+  including the per-call rows the cost comparison is computed from. The default arm keeps the bare
+  root, and with it the layout ARE's upload script walks.
+- **An unjudged react run stays unscored.** `ScenarioRunner` always calls `scenario.validate()`,
+  and with no judge attached that falls through to ARE's base implementation, which returns
+  `env.state != FAILED` — True for any run that merely did not crash. The S-ORA arm already guards
+  on this; without the same guard, every unjudged baseline run would score a free pass.
+- **A crash is an `exception` row, not a failure.** ARE's `run()` collapses `success=None` plus an
+  exception into `success=False`. pass@1 *excludes* an exception and *counts* a failure, so left
+  collapsed an errored react run would be a genuine miss while the equivalent S-ORA run was dropped
+  from the denominator.
+
+- **Timeline expiry is latched when the agent stops, not when the row is written.** ARE pauses
+  nothing at shutdown — `Environment.stop()` leaves `TimeManager` running — and the first thing it
+  does after the agent returns is `scenario.validate()`, whose judge pass can take minutes. Read
+  off the clock afterwards, a run that finished inside its budget would report as expired and be
+  dropped from pass@1. The S-ORA arm latches at its own shutdown for the same reason.
+
+`--init-turns` means the same thing on both arms — without a judge it decides whether turns 2..n
+are delivered at all — so a paired sweep compares equal work. `--max-wall-seconds` applies to the
+S-ORA arm; the react arm is bounded by ARE's own event loop, which exits at `scenario.duration`.
+
 ### `llm_calls.jsonl` — one row per model call
 
 Written for every sweep, scored or not, and costing no tokens: `call_id`, `arm`, `model`,
@@ -226,12 +286,24 @@ anything, because a mis-wired experiment produces ordinary-looking rows against 
 The judge is attached here rather than by ARE, using the same `attach_judge` the S-ORA arm calls —
 `relax_judge_verdict_case` included, since ARE's engines lowercase `True`/`False` on the way out of
 every `chat_completion` and an unparsed verdict both mis-scores the event and withholds the
-remaining turns. Two arms scored by different judge wiring are a comparison of scorers. Note also
-that preprocessing is not optional: `ScenarioRunner` refuses an uninitialized scenario, so the
-unscored path preprocesses too (with ARE's dummy turn trigger, which always releases the next turn).
-Skipping it yields `success=None` and zero recorded calls, which reads exactly like a model that did
-nothing. `max_turns` is left unset on purpose — ARE's config defaults it to 1, but
-`run_scenario` overrides it from `scenario.nb_turns`, which every Gaia2 scenario carries.
+remaining turns. Two arms scored by different judge wiring are a comparison of scorers.
+`max_turns` is left unset on purpose — ARE's config defaults it to 1, but `run_scenario` overrides
+it from `scenario.nb_turns`, which every Gaia2 scenario carries.
+
+Initialization is not optional and not visible: `ScenarioRunner` refuses an uninitialized scenario,
+`load_scenario` does not initialize, and `attach_judge` / `populate_oracle_events` both do it as a
+side effect — so whether a caller has already satisfied it cannot be told from outside. A run that
+skipped it returns `success=None` with zero recorded calls, which reads exactly like a model that
+did nothing. `run_react_on_scenario` therefore initializes the scenario itself (idempotently); it is
+that function's precondition, not a rule for every caller to remember. Preprocessing proper is a
+separate matter, and is what decides whether turns 2..n are delivered.
+
+`run_react_on_scenario(scenario, profile, ...)` is the entry point `batch.py` uses for `--arm
+react`: it takes an already-loaded scenario and returns the *S-ORA arm's* `RunResult` type, so one
+record shape covers both arms. The S-ORA-only fields (`llm_report`, `replan_count`, `prop_reads`,
+...) are left at their defaults rather than filled with a plausible-looking ReAct analogue —
+`agent_llm_calls` counts *logical* calls on that arm and would silently become a round-trip count
+here. `llm_calls.jsonl` is the comparable per-call record.
 
 ## `latency_grid.py` — the designed grid the charge model is fitted on
 

@@ -21,12 +21,17 @@ from examples.gaia2._runner import (
     _terminal_cause,
 )
 from examples.gaia2.batch import (
+    _arm_root,
+    _check_operating_point,
     _jsonl_record,
+    _parse_args,
     _pass_at_1,
     _resolve_model_label,
+    _resolve_react_label,
     _score_status,
     _verdict_parse,
     aggregate,
+    main,
 )
 
 from sora.activity import ActivityState
@@ -711,3 +716,148 @@ def test_jsonl_record_omits_the_key_for_an_ordinary_run() -> None:
         awaiting_input=[],
     )
     assert "awaiting_input" not in rec["metadata"]
+
+
+# -- the two arms share a sweep root without sharing its files -------------------------------------
+
+
+def test_the_sora_arm_keeps_the_layout_the_uploader_walks() -> None:
+    """Not cosmetic: ARE's standalone upload script walks ``{root}/standard/{config}/output.jsonl``
+    and ``tests/test_gaia2_upload_compat.py`` locks that round-trip. Pushing the default arm down a
+    level to make the two symmetric would break every existing sweep tree and the submission path
+    with it."""
+    assert _arm_root("/out", "sora") == "/out"
+
+
+def test_the_react_arm_gets_its_own_subtree() -> None:
+    """Both arms write ``output.jsonl`` and ``llm_calls.jsonl`` per capability, and re-running a
+    capability truncates them on purpose. Into one root, the second arm would silently destroy the
+    first arm's results — including the per-call rows the cost comparison is computed from."""
+    assert _arm_root("/out", "react") == "/out/react"
+
+
+def test_a_react_label_defaults_to_the_profiles_model() -> None:
+    profile = SimpleNamespace(name="p", model="gpt-5.4", endpoint="https://e")
+    assert _resolve_react_label(None, profile) == "gpt-5.4"
+
+
+def test_a_react_label_naming_another_model_is_refused() -> None:
+    """The profile is the only thing that selects the model on this arm, so a label that disagrees
+    is a trace attributed to a model that never ran — and nothing downstream can detect it."""
+    profile = SimpleNamespace(name="p", model="gpt-5.4", endpoint="https://e")
+    with pytest.raises(SystemExit, match="gpt-5.4"):
+        _resolve_react_label("ReAct/kimi-k2.5", profile)
+
+
+def test_a_react_label_that_names_the_profiles_model_is_kept() -> None:
+    profile = SimpleNamespace(name="p", model="gpt-5.4", endpoint="https://e")
+    assert _resolve_react_label("ReAct/gpt-5.4", profile) == "ReAct/gpt-5.4"
+
+
+def test_the_arm_defaults_to_sora() -> None:
+    assert _parse_args(["--capability", "execution"]).arm == "sora"
+
+
+def test_the_react_arm_without_a_profile_is_refused() -> None:
+    """Nothing else selects the model on that arm, so this cannot be defaulted."""
+    with pytest.raises(SystemExit, match="--profile"):
+        main(["--capability", "execution", "--arm", "react"])
+
+
+def test_a_profile_on_the_sora_arm_is_refused_rather_than_ignored() -> None:
+    """A two-arm sweep script that passes --profile to both would otherwise run S-ORA at whatever
+    agent.yaml says while its command line claims the profile's model."""
+    with pytest.raises(SystemExit, match="--arm react"):
+        main(["--capability", "execution", "--arm", "sora", "--profile", "gpt-5.4-high-paper"])
+
+
+def test_report_only_reads_the_arm_it_is_asked_for(tmp_path: Path) -> None:
+    """The same --output-dir holds both arms; a report that ignored --arm would print the default
+    arm's numbers under the other arm's name."""
+    for arm_dir, score in ((tmp_path, 1.0), (tmp_path / "react", 0.0)):
+        d = arm_dir / "standard" / "execution"
+        d.mkdir(parents=True)
+        (d / "output.jsonl").write_text(
+            json.dumps({"task_id": "s1", "trace_id": "t", "score": score, "metadata": {}}) + "\n"
+        )
+    assert aggregate(_arm_root(str(tmp_path), "sora"))["overall"] == 1.0
+    assert aggregate(_arm_root(str(tmp_path), "react"))["overall"] == 0.0
+
+
+# -- the two arms have to be the same experiment ------------------------------------------------
+
+
+def _profile(name: str) -> Any:
+    from examples.gaia2.evaluation.core import load_profiles
+    from examples.gaia2.latency_grid import EVAL_ROOT
+
+    return load_profiles(EVAL_ROOT / "profiles.json")[name]
+
+
+def test_the_shipped_config_and_its_profile_describe_one_operating_point() -> None:
+    """The pair the docs tell people to run. This is the test that reddens if either side moves."""
+    _check_operating_point(_profile("gpt-5.4-medium-prompt"), "examples/gaia2/agent.yaml")
+
+
+def test_a_profile_at_another_reasoning_effort_is_refused() -> None:
+    """Same model, same cap, different thinking budget — two pass@1 columns that look comparable,
+    carry the same model label, and are not. Nothing downstream can tell them apart afterwards,
+    which is why this is refused up front rather than reported on the row."""
+    with pytest.raises(SystemExit, match="reasoning_effort"):
+        _check_operating_point(_profile("gpt-5.4-high-paper"), "examples/gaia2/agent.yaml")
+
+
+def test_a_profile_at_another_model_is_refused_by_the_same_check() -> None:
+    with pytest.raises(SystemExit, match="model"):
+        _check_operating_point(_profile("kimi-k2.5-prompt"), "examples/gaia2/agent.yaml")
+
+
+def test_a_profile_rerouted_to_another_endpoint_is_refused(tmp_path: Path) -> None:
+    """Same model, same effort, same cap — served by somewhere else. A model name is not a serving
+    path: a different ``base_url``, or the same one behind different ``provider_routing``, is a
+    different experiment wearing the shipped experiment's label. The check compares the union of
+    what the two sides declare rather than a list of interesting keys, so this is caught without
+    anyone having remembered to add routing to it."""
+    from dataclasses import replace
+
+    from examples.gaia2.evaluation.core import SettingValue
+
+    base = _profile("gpt-5.4-medium-prompt")
+    settings = dict(base.settings)
+    settings["provider_routing"] = SettingValue(status="sent", value={"only": ["elsewhere"]})
+    rerouted = replace(
+        base, name="rerouted", endpoint="https://example.invalid/v1", settings=settings
+    )
+    with pytest.raises(SystemExit) as refusal:
+        _check_operating_point(rerouted, "examples/gaia2/agent.yaml")
+    assert "base_url" in str(refusal.value)
+    assert "provider_routing" in str(refusal.value)
+
+
+def test_transport_and_bookkeeping_do_not_make_two_arms_incomparable() -> None:
+    """The other half of a union-based comparison: it must not refuse over keys that decide how a
+    call is carried or whether it is recorded. Left out, a widened check would redden the shipped
+    pair — ``max_logical_calls`` is in agent.yaml and in no profile at all."""
+    base = _profile("gpt-5.4-medium-prompt")
+    assert {"stall_timeout", "max_retries", "instrument"} <= set(base.client_settings())
+    _check_operating_point(base, "examples/gaia2/agent.yaml")
+
+
+def test_a_config_that_is_not_there_is_nothing_to_disagree_with(tmp_path: Path) -> None:
+    """A react-only run has no S-ORA side to be comparable with; refusing it would be refusing a
+    run that the check has nothing to say about."""
+    _check_operating_point(_profile("kimi-k2.5-prompt"), str(tmp_path / "absent.yaml"))
+
+
+def test_the_react_arm_checks_the_operating_point_before_spending() -> None:
+    with pytest.raises(SystemExit, match="operating point"):
+        main(
+            [
+                "--capability",
+                "execution",
+                "--arm",
+                "react",
+                "--profile",
+                "gpt-5.4-high-paper",
+            ]
+        )

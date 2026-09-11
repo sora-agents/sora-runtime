@@ -10,6 +10,7 @@ unwired bracket undercounts a retried step without erroring.
 from __future__ import annotations
 
 import json
+from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,11 +25,15 @@ from examples.gaia2.evaluation.core import load_profiles
 from examples.gaia2.latency_grid import EVAL_ROOT
 from examples.gaia2.llm_calls import LLMCallWriter
 from examples.gaia2.react_driver import (
+    CapturingScenarioRunner,
     MeteredAgentBuilder,
     MeteredEngineBuilder,
+    _timeline_expired,
     build_runner,
+    run_react_on_scenario,
     runner_config,
     wire_bracket,
+    wire_run_end,
 )
 from examples.gaia2.react_engine import MeteredLiteLLMEngine
 
@@ -213,7 +218,7 @@ def test_a_whole_scenario_run_lands_rows_carrying_its_identity(
             writer=writer,
             run_number=3,
             scenario_duration=20,
-            log=lambda _msg: None,
+            log_fn=lambda _msg: None,
         )
     finally:
         writer.close()
@@ -229,3 +234,404 @@ def test_a_whole_scenario_run_lands_rows_carrying_its_identity(
     # The bracket reached the engine through ARE's own pause callback, so a retried step's
     # round-trips would group rather than each being counted as its own step.
     assert all(row["bracket_id"] for row in rows)
+
+
+# -- reading ARE's result without biasing the comparison -------------------------------------------
+
+
+def _canned(runner_result: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``runner.run`` return a given ``ScenarioValidationResult`` without running anything.
+
+    Patched at ``ScenarioRunner``, the parent, so the method under test is the real inherited
+    one."""
+    from are.simulation.scenario_runner import ScenarioRunner
+
+    monkeypatch.setattr(ScenarioRunner, "run", lambda self, config, scenario: runner_result)
+
+
+def _validation(**kwargs: Any) -> Any:
+    from are.simulation.scenarios.scenario import ScenarioValidationResult
+
+    return ScenarioValidationResult(**kwargs)
+
+
+def test_an_unjudged_run_stays_unscored(profile: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ARE's runner always calls ``scenario.validate``, and with no judge attached that falls
+    through to the base implementation, which returns ``env.state != FAILED`` — True for any run
+    that merely did not crash. Recorded as a score, that is a free pass for every unjudged run on
+    this arm, and pass@1 would average it in against the other arm's honest None."""
+    _canned(_validation(success=True, rationale="did not crash"), monkeypatch)
+    result = run_react_on_scenario(
+        SimpleNamespace(scenario_id="s1", judge=None, initialize=lambda: None),
+        profile,
+        log_fn=lambda _m: None,
+    )
+    assert result.outcome.success is None
+
+
+def test_a_judged_runs_verdict_passes_through(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _canned(_validation(success=True, rationale="all events matched"), monkeypatch)
+    result = run_react_on_scenario(
+        SimpleNamespace(scenario_id="s1", judge=object(), initialize=lambda: None),
+        profile,
+        log_fn=lambda _m: None,
+    )
+    assert result.outcome.success is True
+    assert result.outcome.rationale == "all events matched"
+
+
+def test_a_crash_is_recorded_as_an_exception_not_a_failure(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ARE's ``run()`` collapses ``success=None`` plus an exception into ``success=False``. pass@1
+    *excludes* an exception row and *counts* a failure row, so left collapsed an errored ReAct run
+    would be scored as a genuine miss while the equivalent S-ORA run was dropped from the
+    denominator — a bias with no sign anywhere in the artifacts."""
+    boom = RuntimeError("engine died")
+    _canned(_validation(success=False, exception=boom), monkeypatch)
+    result = run_react_on_scenario(
+        SimpleNamespace(scenario_id="s1", judge=object(), initialize=lambda: None),
+        profile,
+        log_fn=lambda _m: None,
+    )
+    assert result.outcome.success is None
+    assert result.exception is boom
+
+
+def test_the_runner_keeps_the_environment_are_built(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_run`` builds the environment, uses it and drops it — but the two diagnostics that decide
+    how a row is *read* (timeline expiry, the tool-call gate) are computed from it."""
+    from are.simulation.scenario_runner import ScenarioRunner
+
+    env = object()
+    monkeypatch.setattr(
+        ScenarioRunner, "_run_with_agent", lambda self, *a, **kw: _validation(success=True)
+    )
+    runner, _ = build_runner(profile)
+    assert runner.environment is None
+    runner._run_with_agent("s1", SimpleNamespace(), env)
+    assert runner.environment is env
+
+
+def test_the_capturing_runner_is_ares_own() -> None:
+    from are.simulation.scenario_runner import ScenarioRunner
+
+    assert issubclass(CapturingScenarioRunner, ScenarioRunner)
+
+
+def test_timeline_expiry_mirrors_ares_own_exit_test() -> None:
+    """ARE's loop runs ``while time_passed() <= duration``, so expiry is strictly greater-than. The
+    row it marks is excluded from pass@1 — the world ended under the agent rather than the agent
+    choosing badly — and the slower arm is the one that hits it."""
+    assert _timeline_expired(
+        SimpleNamespace(duration=100, time_manager=SimpleNamespace(time_passed=lambda: 101))
+    )
+    assert not _timeline_expired(
+        SimpleNamespace(duration=100, time_manager=SimpleNamespace(time_passed=lambda: 100))
+    )
+    # ARE reads a None duration as "run indefinitely"; there is nothing to expire.
+    assert not _timeline_expired(SimpleNamespace(duration=None))
+    assert not _timeline_expired(None)
+
+
+def test_a_broken_expiry_probe_never_costs_the_run_its_result() -> None:
+    """It reinterprets every field beside it, so losing the whole result to it would be worse."""
+
+    def boom() -> float:
+        raise RuntimeError("no clock")
+
+    assert not _timeline_expired(
+        SimpleNamespace(duration=100, time_manager=SimpleNamespace(time_passed=boom))
+    )
+
+
+def test_expiry_is_latched_when_the_agent_stops_not_when_the_row_is_built(profile: Any) -> None:
+    """ARE pauses nothing at shutdown, and validation runs *after* the agent returns.
+
+    ``Environment.stop()`` sets the stop event and the state but leaves ``TimeManager`` on a wall
+    clock, so a verdict read while the row is being assembled drifts True on any run that finished
+    close to its budget — dropping a *successful* run out of pass@1. Latching at the moment the
+    agent stopped makes the answer independent of how long everything afterwards took."""
+    clock = iter([90.0, 5_000.0])
+    env = SimpleNamespace(
+        duration=100, time_manager=SimpleNamespace(time_passed=lambda: next(clock))
+    )
+    runner, _ = build_runner(profile)
+    runner.environment = env
+
+    runner.latch_expiry()  # the agent's loop has just returned: 90s of a 100s budget
+
+    # Everything after that — validate(), export, the write-count check — runs on a clock that is
+    # still moving, and must not be able to change the verdict.
+    assert runner.timeline_expired() is False
+    assert runner.timeline_expired() is False
+
+
+def test_the_row_carries_the_latched_verdict_not_a_late_reading(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row is assembled after the write-count check and the per-engine logging, and on a real
+    run after ARE's own validate() and export as well — all on a clock that never stopped."""
+    from are.simulation.scenario_runner import ScenarioRunner
+
+    clock = iter([80.0, 9_000.0])
+    env = SimpleNamespace(
+        duration=100, time_manager=SimpleNamespace(time_passed=lambda: next(clock))
+    )
+
+    def run(self: Any, config: Any, scenario: Any) -> Any:
+        self.environment = env
+        self.latch_expiry()  # where ARE's agent hands control back
+        return _validation(success=True)
+
+    monkeypatch.setattr(ScenarioRunner, "run", run)
+    result = run_react_on_scenario(
+        SimpleNamespace(scenario_id="s1", judge=object(), initialize=lambda: None),
+        profile,
+        log_fn=lambda _m: None,
+    )
+    assert result.timeline_expired is False
+
+
+def test_an_unlatched_runner_still_answers(profile: Any) -> None:
+    """A runner nothing ever latched (no agent built, an aborted run) falls back to a live probe
+    rather than silently reporting False."""
+    runner, _ = build_runner(profile)
+    runner.environment = SimpleNamespace(
+        duration=100, time_manager=SimpleNamespace(time_passed=lambda: 101)
+    )
+    assert runner.timeline_expired() is True
+
+
+def test_the_agents_own_run_is_what_latches_it() -> None:
+    """The latch has to sit on the agent, because that is the only object that knows when the loop
+    ended; ARE's runner reports it nowhere and validates before returning."""
+    latched: list[float] = []
+    passed = 10.0
+
+    def run_scenario(*_args: Any, **_kwargs: Any) -> str:
+        nonlocal passed
+        passed = 90.0  # the agent worked for a while, and finished inside the budget
+        return "output"
+
+    agent = SimpleNamespace(run_scenario=run_scenario)
+    wire_run_end(agent, lambda: latched.append(passed))
+    assert agent.run_scenario() == "output"
+    assert latched == [90.0]
+
+    # A crashed run still has a real answer, so the latch fires on the raising path too.
+    latched.clear()
+    boom = SimpleNamespace(run_scenario=_raise)
+    wire_run_end(boom, lambda: latched.append(passed))
+    with pytest.raises(RuntimeError):
+        boom.run_scenario()
+    assert latched == [90.0]
+
+
+def test_the_agent_are_builds_comes_back_latching(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole chain, since each half is useless alone: the builder is the only object that sees
+    the agent, the runner is the only one that holds the verdict, and one line joins them."""
+    monkeypatch.setattr(
+        AgentBuilder, "build", lambda self, **_kw: SimpleNamespace(run_scenario=lambda: "done")
+    )
+    runner, _ = build_runner(profile)
+    runner.environment = SimpleNamespace(
+        duration=100, time_manager=SimpleNamespace(time_passed=lambda: 42.0)
+    )
+    agent = runner.agent_builder.build(agent_config=None, env=None)
+
+    assert runner._expired is None  # nothing latched before the agent ran
+    assert agent.run_scenario() == "done"
+    assert runner._expired is False
+
+
+def test_an_agent_with_nothing_to_wrap_is_returned_untouched() -> None:
+    agent = SimpleNamespace()
+    assert wire_run_end(agent, lambda: None) is agent
+    wrapped = SimpleNamespace(run_scenario=lambda: None)
+    assert wire_run_end(wrapped, None) is wrapped
+
+
+def _raise(*_args: Any, **_kwargs: Any) -> None:
+    raise RuntimeError("agent died")
+
+
+# -- the batch harness's react branch, composed --------------------------------------------------
+
+
+def test_the_batch_harness_runs_the_react_arm_and_records_it(
+    profile: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One scenario all the way through ``batch._run_one_scenario`` on the react arm.
+
+    Every test above pins one seam, and the arm's first end-to-end run failed at none of them: an
+    unpreprocessed scenario made ARE's runner refuse, which surfaced as a result with no score and
+    no calls. The batch branch adds its own way to reach that state — ``--init-turns`` is optional
+    on the S-ORA arm — so the composition is worth a test of its own. Only the wire is faked.
+    """
+    import are.simulation.agents.llm.litellm.litellm_engine as litellm_engine
+    from examples.gaia2.batch import _run_one_scenario
+    from litellm.types.utils import Choices, Message, ModelResponse, Usage
+
+    from sora.adapters.are_sim import load_scenario
+
+    def fake_completion(**kwargs: Any) -> Any:
+        return ModelResponse(
+            choices=[
+                Choices(
+                    finish_reason="stop",
+                    index=0,
+                    message=Message(content=_REPLY, role="assistant"),
+                )
+            ],
+            usage=Usage(prompt_tokens=900, completion_tokens=20),
+        )
+
+    monkeypatch.setattr(litellm_engine, "completion", fake_completion)
+    scenario = load_scenario(str(_SCENARIO))
+    scenario.duration = 20
+    scenario.run_number = 2
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl")
+    args = Namespace(
+        arm="react",
+        model_profile=replace(profile, stream=False),
+        model="ReAct/gpt-5.4",
+        config="examples/gaia2/agent.yaml",
+        judge_model=None,
+        judge_provider=None,
+        judge_endpoint=None,
+        strict_verdict_case=False,
+        init_turns=False,  # not set, and the react branch must preprocess anyway
+        verbose=False,
+        max_wall_seconds=60.0,
+    )
+    try:
+        record = _run_one_scenario(scenario, 2, args, str(tmp_path), llm_calls=writer)
+    finally:
+        writer.close()
+
+    assert record["task_id"] == "scenario_universe_25_vetd7u"
+    # Unscored, not "failed": no judge was attached, so ARE's base validate() saying "the env did
+    # not fail" must not become a score.
+    assert record["score"] is None
+    assert record["metadata"]["status"] == "no_validation"
+    assert "exception_type" not in record["metadata"], record["metadata"].get("exception_message")
+    # The trace was exported under the arm that produced it, and the run actually made calls —
+    # zero rows is what the preprocessing failure looked like.
+    assert record["trace_id"] and Path(record["trace_id"]).exists()
+    rows = [json.loads(line) for line in writer.path.read_text().splitlines() if line.strip()]
+    assert rows and {row["arm"] for row in rows} == {"react"}
+    assert {row["run_number"] for row in rows} == {2}
+
+
+def test_the_driver_initializes_the_scenario_itself(
+    profile: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A freshly loaded scenario runs, without the caller having preprocessed it.
+
+    ARE's runner refuses an uninitialized scenario, and which call paths have already satisfied
+    that is invisible from outside: ``load_scenario`` does not initialize, while ``attach_judge``
+    and ``populate_oracle_events`` both do it as a side effect. A caller that guessed wrong got a
+    result with no score and no model calls — a model that appears to have sat idle."""
+    import are.simulation.agents.llm.litellm.litellm_engine as litellm_engine
+    from litellm.types.utils import Choices, Message, ModelResponse, Usage
+
+    from sora.adapters.are_sim import load_scenario
+
+    monkeypatch.setattr(
+        litellm_engine,
+        "completion",
+        lambda **kw: ModelResponse(
+            choices=[
+                Choices(
+                    finish_reason="stop", index=0, message=Message(content=_REPLY, role="assistant")
+                )
+            ],
+            usage=Usage(prompt_tokens=800, completion_tokens=10),
+        ),
+    )
+    scenario = load_scenario(str(_SCENARIO))
+    scenario.duration = 20
+    writer = LLMCallWriter(tmp_path / "calls.jsonl")
+    try:
+        result = run_react_on_scenario(
+            scenario, replace(profile, stream=False), writer=writer, log_fn=lambda _m: None
+        )
+    finally:
+        writer.close()
+
+    assert result.exception is None
+    assert writer.written, "the run made no model calls — ARE refused the scenario"
+
+
+def test_the_judges_answers_are_collected_on_this_arm_too(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one artifact a sweep cannot recover: ARE's graph judge keeps a bare boolean per judged
+    event, so a scored run swept without the raw answers can never be re-scored at any price. The
+    bracket has to span the whole run, not a later validate() — most events of a multi-turn
+    scenario are judged at the per-turn release gate, mid-run."""
+    from sora.adapters.are_judge import arm_judge_recording
+
+    arm_judge_recording()
+    _canned(_validation(success=True, rationale="ok"), monkeypatch)
+    result = run_react_on_scenario(
+        SimpleNamespace(scenario_id="s1", run_number=0, judge=object(), initialize=lambda: None),
+        profile,
+        record_judge=True,
+        verdict_parse="case-insensitive",
+        log_fn=lambda _m: None,
+    )
+    assert result.judge_recording is not None
+    assert result.judge_recording.scenario_id == "s1"
+    assert result.judge_recording.verdict_parse == "case-insensitive"
+
+
+def test_the_recording_is_filed_under_the_run_number_it_was_given(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch harness sets both the argument and the scenario attribute and they agree. A direct
+    caller passes only the argument — and a recording filed under a stale scenario attribute joins
+    to a different run's model-call rows, which is what re-scoring reads them side by side for."""
+    from sora.adapters.are_judge import arm_judge_recording
+
+    arm_judge_recording()
+    _canned(_validation(success=True, rationale="ok"), monkeypatch)
+    result = run_react_on_scenario(
+        SimpleNamespace(scenario_id="s1", run_number=0, judge=object(), initialize=lambda: None),
+        profile,
+        run_number=2,
+        record_judge=True,
+        log_fn=lambda _m: None,
+    )
+    assert result.judge_recording is not None
+    assert result.judge_recording.run_number == 2
+
+
+def test_a_recording_falls_back_to_the_scenarios_run_number() -> None:
+    """Both arms resolve it the same way, so a rescore reading them side by side sees one rule."""
+    from examples.gaia2._runner import _run_number_of
+
+    assert _run_number_of(SimpleNamespace(run_number=0), 2) == 2
+    assert _run_number_of(SimpleNamespace(run_number=1), None) == 1
+    assert _run_number_of(SimpleNamespace(), None) is None
+    assert _run_number_of(SimpleNamespace(run_number="1"), None) is None
+
+
+def test_no_recording_is_kept_when_it_was_not_asked_for(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _canned(_validation(success=True), monkeypatch)
+    result = run_react_on_scenario(
+        SimpleNamespace(scenario_id="s1", judge=object(), initialize=lambda: None),
+        profile,
+        log_fn=lambda _m: None,
+    )
+    assert result.judge_recording is None

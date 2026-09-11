@@ -139,6 +139,19 @@ def _awaiting_input(agent: Any) -> list[str]:
     ]
 
 
+def _run_number_of(scenario: Any, run_number: int | None) -> int | None:
+    """Which run a judge recording belongs to, preferring the number the caller asked for.
+
+    The batch harness sets both and they agree; a direct caller passes only the argument, and a
+    recording filed under a stale scenario attribute joins to the wrong run's model-call rows —
+    or to none at all. Both arms resolve it the same way, since rescoring reads them side by
+    side."""
+    if run_number is not None:
+        return run_number
+    value = getattr(scenario, "run_number", None)
+    return int(value) if isinstance(value, int) else None
+
+
 def _timeline_expired(simulation: Any) -> bool:
     """Whether ARE's own clock, not the agent, ended the run. Tolerates a simulation that predates
     the probe (a fake in a test) rather than requiring it on the ``Simulation`` Protocol."""
@@ -413,7 +426,7 @@ def run_scenario(
                 if collector is None
                 else collector.snapshot(
                     scenario_id=getattr(scenario, "scenario_id", None),
-                    run_number=getattr(scenario, "run_number", None),
+                    run_number=_run_number_of(scenario, run_number),
                     verdict_parse=verdict_parse,
                 )
             ),

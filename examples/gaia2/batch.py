@@ -1,7 +1,7 @@
 """Gaia2 batch harness — run a whole capability, emit leaderboard-grade artifacts, report pass@1.
 
-One invocation runs S-ORA over every scenario of *one* capability (dataset config) and writes, under
-``{output_dir}/standard/{capability}/``:
+One invocation runs *one* arm over every scenario of *one* capability (dataset config) and writes,
+under ``{output_dir}/standard/{capability}/``:
 
   * one HF-format trace file per (scenario, run), via ARE's ``JsonScenarioExporter`` — the exact
     artifact ``gaia2_upload_script.py`` consumes, so a run doubles as a leaderboard submission; and
@@ -47,6 +47,27 @@ at each row's ``trace_id`` for the trace payload — so all three must be presen
 path must resolve (hence the absolute ``--output-dir``). ``tests/test_gaia2_upload_compat.py`` locks
 this round-trip against the installed uploader.
 
+Arms. ``--arm sora`` (the default) runs S-ORA, configured by ``--config``; ``--arm react`` runs
+ARE's own published ReAct agent as the baseline, configured by ``--profile`` — the same model,
+reasoning setting and output cap the S-ORA arm is pointed at, which is what makes the two columns
+comparable, and which a react sweep checks against ``--config`` before spending anything rather
+than leaving to whoever wrote the command. Everything else — the judge and its verdict parse, the
+oracle replay, the tool-call gate, the record shape, pass@1 — is shared, so the two arms differ in
+the agent and nothing else.
+A react sweep lands under ``{output_dir}/react/standard/{capability}/`` so both can share one
+``--output-dir``; ``--report-only DIR --arm react`` reads it back. The default arm keeps the bare
+root, and with it the layout the upload script walks.
+
+    # the pair, same capability, same judge, one root:
+    python -m examples.gaia2.batch --capability execution --limit 5 \
+        --judge-model claude-sonnet-5 --judge-provider anthropic --output-dir .sora/gaia2/pair
+    python -m examples.gaia2.batch --capability execution --limit 5 --arm react \
+        --profile gpt-5.4-medium-prompt \
+        --judge-model claude-sonnet-5 --judge-provider anthropic --output-dir .sora/gaia2/pair
+
+The profile named there is the one whose operating point matches the shipped ``agent.yaml``; run
+the pair at a different one by moving *both* sides, not one.
+
 Per-scenario isolation is per fresh ``AreSimulation``; app/global-state bleed across scenarios in
 one process is a known risk (a subprocess-per-scenario runner is the fallback if it bites) — fine
 for the ``--limit`` smoke runs this is scoped to. The full 160/800 sweep is intentionally held until
@@ -59,12 +80,19 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from examples.gaia2.llm_calls import LLMCallWriter
 
 _DEFAULT_CONFIG = "examples/gaia2/agent.yaml"
 _DEFAULT_HF_DATASET = "meta-agents-research-environments/gaia2"
+_DEFAULT_PROFILES = "examples/gaia2/evaluation/profiles.json"
+
+# The two arms of the paired comparison: S-ORA's decision cycle, and ARE's own published ReAct
+# agent as the baseline. The arm names match the `arm` field on every per-call row in
+# llm_calls.jsonl, which is what joins a sweep's records to its cost.
+_ARMS = ("sora", "react")
 
 # The five capabilities Gaia2's headline (equal-weight) score averages over. A run may target any
 # dataset config (incl. `mini`); the report weights only these five when they're present.
@@ -87,6 +115,18 @@ def _score_status(
     if exception is not None:
         return None, "exception"
     return None, "no_validation"
+
+
+def _arm_root(output_dir: str, arm: str) -> str:
+    """Where one arm's artifacts live under a shared ``--output-dir``.
+
+    The S-ORA arm keeps the bare root, so its layout — and the standalone uploader's walk of
+    ``{root}/standard/{config}/output.jsonl``, which ``tests/test_gaia2_upload_compat.py`` locks —
+    is byte-for-byte what it was. Every other arm gets its own subtree. Without this, sweeping both
+    arms into one ``--output-dir`` would have the second silently truncate the first's
+    ``output.jsonl`` *and* ``llm_calls.jsonl``: same capability, same filenames, and the truncation
+    is deliberate (re-running a capability replaces its artifacts), so nothing would flag it."""
+    return output_dir if arm == "sora" else os.path.join(output_dir, arm)
 
 
 def _resolve_model_label(label: str | None, config_path: str) -> str | None:
@@ -112,6 +152,77 @@ def _resolve_model_label(label: str | None, config_path: str) -> str | None:
             f"config. Fix the label, or change llm.model in the config."
         )
     return label
+
+
+def _resolve_react_label(label: str | None, profile: Any) -> str:
+    """The same contract as :func:`_resolve_model_label`, for the arm whose model comes from a
+    profile instead of from agent.yaml. The profile is the only thing that selects the model on this
+    arm — ARE's runner config is built from it — so a label that does not name it is refused before
+    any tokens are spent rather than mislabeling the trace afterwards."""
+    if label is None:
+        return str(profile.model)
+    if str(profile.model) not in label:
+        raise SystemExit(
+            f"--model {label!r} does not name the model profile {profile.name!r} actually uses "
+            f"({profile.model!r}). The label is only recorded in the trace — it cannot override "
+            f"the profile. Fix the label, or pass a different --profile."
+        )
+    return label
+
+
+# Which keys are *not* part of the operating point. Everything else either side declares is, so a
+# setting added to a profile or to agent.yaml is compared from the day it exists rather than the day
+# someone remembers to widen a list — the failure of an allowlist here is silent and lands on a
+# comparison that cannot be redone. Transport decides how a call is carried, not what was asked for;
+# `instrument` decides whether the call is recorded, and its failure mode is a loudly empty
+# llm_calls.jsonl; `max_logical_calls` budgets S-ORA's own loop and has no per-request meaning at
+# all (ARE's loop cap is the react arm's analogue, and it is not a profile field).
+_NOT_THE_OPERATING_POINT = frozenset(
+    {"stall_timeout", "max_retries", "instrument", "max_logical_calls"}
+)
+
+
+def _check_operating_point(profile: Any, config_path: str) -> None:
+    """Refuse a react sweep whose profile does not run at the same operating point as the config.
+
+    The point of the baseline is that the two arms differ in the agent and nothing else, and the
+    operating point is the one difference nothing downstream can correct: a row records which
+    profile produced it, so a ReAct arm run at ``high`` against an S-ORA config at ``medium``
+    produces two pass@1 columns that look comparable, are labelled with the same model, and are
+    not. It is also the difference easiest to introduce by accident, since the two arms are two
+    separate commands reading two separate files. ``ModelProfile.client_settings`` already speaks
+    agent.yaml's ``llm:`` vocabulary, so the comparison is the same keys on both sides, and it is
+    taken over the union of what the two declare rather than a list of interesting ones — routing
+    is as much the experiment as reasoning effort is, since the same model name at a different
+    ``base_url`` or behind a different ``provider_routing`` is a different serving path, and
+    ``stream`` decides whether the token counts in the cost column were reported by the provider
+    or reconstructed locally. A missing config is not an error — a react-only run has nothing to
+    be compared against."""
+    if not os.path.exists(config_path):
+        return
+    from sora.bootstrap import load_yaml
+
+    configured = load_yaml(config_path).llm or {}
+    settings = profile.client_settings()
+    unset = "<unset>"
+    compared = (set(settings) | set(configured)) - _NOT_THE_OPERATING_POINT
+    diffs = [
+        (name, settings.get(name, unset), configured.get(name, unset))
+        for name in sorted(compared)
+        if settings.get(name, unset) != configured.get(name, unset)
+    ]
+    if not diffs:
+        return
+    detail = "\n".join(
+        f"  {name}: profile {here!r} vs config {there!r}" for name, here, there in diffs
+    )
+    raise SystemExit(
+        f"profile {profile.name!r} and {config_path} do not describe the same operating point:\n"
+        f"{detail}\n"
+        "The two arms are comparable only at the same one. Pick a profile that matches the "
+        "config, change the config's llm: block to match the profile, or point --config at the "
+        "config this profile pairs with."
+    )
 
 
 def _verdict_parse(args: argparse.Namespace) -> str | None:
@@ -328,8 +439,9 @@ def _print_report(summary: dict[str, Any]) -> None:
 def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
     from are.simulation.benchmark.scenario_loader import setup_scenarios_iterator
 
-    config_dir = os.path.join(args.output_dir, "standard", args.capability)
+    config_dir = os.path.join(_arm_root(args.output_dir, args.arm), "standard", args.capability)
     os.makedirs(config_dir, exist_ok=True)
+    print(f"arm: {args.arm}  ->  {config_dir}")
 
     if args.judge_model:
         # Said once at the top of the sweep as well as per record: an operator watching the run
@@ -443,20 +555,38 @@ def _run_one_scenario(
                 # sweep. The replay restores the scenario before it raises, so the run below still
                 # starts from a clean environment — just without a gate.
                 print(f"  {scenario.scenario_id}: oracle replay failed ({exc}) — no gate")
+            # Deliberately not forced on for the react arm, even though its runner has a harder
+            # initialization requirement (see `run_react_on_scenario`, which meets it itself):
+            # without a judge this flag decides whether turns 2..n are delivered at all, so an arm
+            # that set it while the other did not would be running a longer scenario, and the two
+            # pass@1 columns would not be measuring the same work.
             if args.init_turns:
                 initialize_turns(scenario)
-        result = run_scenario(
-            scenario,
-            config=args.config,
-            verbose=args.verbose,
-            max_wall_seconds=args.max_wall_seconds,
-            read_stdin=False,
-            record_judge=record_judge,
-            verdict_parse=_verdict_parse(args),
-            llm_calls=llm_calls,
-            scenario_id=scenario.scenario_id,
-            run_number=run_number,
-        )
+        if args.arm == "react":
+            from examples.gaia2.react_driver import run_react_on_scenario
+
+            result = run_react_on_scenario(
+                scenario,
+                args.model_profile,
+                writer=llm_calls,
+                run_number=run_number,
+                record_judge=record_judge,
+                verdict_parse=_verdict_parse(args),
+                log_fn=lambda msg: print(msg, flush=True),
+            )
+        else:
+            result = run_scenario(
+                scenario,
+                config=args.config,
+                verbose=args.verbose,
+                max_wall_seconds=args.max_wall_seconds,
+                read_stdin=False,
+                record_judge=record_judge,
+                verdict_parse=_verdict_parse(args),
+                llm_calls=llm_calls,
+                scenario_id=scenario.scenario_id,
+                run_number=run_number,
+            )
     except Exception as e:  # this scenario's judge/preprocess failed — record it, keep sweeping
         return _jsonl_record(
             scenario_id=scenario.scenario_id,
@@ -477,7 +607,7 @@ def _run_one_scenario(
             result.environment,
             scenario,
             model_id=args.model,
-            agent_id="sora",
+            agent_id=args.arm,
             validation_decision=decision,
             validation_rationale=result.outcome.rationale,
             run_duration=result.duration,
@@ -512,7 +642,7 @@ def _run_one_scenario(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="batch",
-        description="Run S-ORA over a Gaia2 capability, emit HF traces + output.jsonl, report.",
+        description="Run one arm over a Gaia2 capability, emit HF traces + output.jsonl, report.",
     )
     parser.add_argument(
         "--report-only",
@@ -534,10 +664,38 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"HuggingFace dataset repo (default: {_DEFAULT_HF_DATASET}).",
     )
     parser.add_argument(
+        "--arm",
+        default="sora",
+        choices=_ARMS,
+        help=(
+            "Which agent runs the sweep: S-ORA's decision cycle (default) or ARE's own published "
+            "ReAct agent as the baseline. `react` requires --profile and ignores --config; its "
+            "artifacts land under DIR/react/standard/<capability>/ so both arms can share one "
+            "--output-dir without overwriting each other."
+        ),
+    )
+    parser.add_argument(
         "--config",
         default=_DEFAULT_CONFIG,
         metavar="AGENT_YAML",
-        help=f"Agent config (default: {_DEFAULT_CONFIG}).",
+        help=f"Agent config for --arm sora (default: {_DEFAULT_CONFIG}).",
+    )
+    parser.add_argument(
+        "--profile",
+        metavar="NAME",
+        help=(
+            "Model profile for --arm react (from --profiles-path). It is the only thing that "
+            "selects the model, the reasoning setting and the output cap on that arm — the same "
+            "operating point the S-ORA arm is configured at, which is what makes the two "
+            "comparable."
+        ),
+    )
+    parser.add_argument(
+        "--profiles-path",
+        type=Path,
+        default=Path(_DEFAULT_PROFILES),
+        metavar="JSON",
+        help=f"Profile definitions (default: {_DEFAULT_PROFILES}).",
     )
     parser.add_argument(
         "--output-dir",
@@ -550,8 +708,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="LABEL",
         help=(
             "Agent-model label recorded in the trace, org-prefixed for a submission (e.g. "
-            "S-ORA/claude-opus-4-8). It must name agent.yaml's llm.model — which is the only thing "
-            "that selects the model — or the run is refused. Omit to label with llm.model itself."
+            "S-ORA/claude-opus-4-8). It must name the model the run actually uses — agent.yaml's "
+            "llm.model, or the profile's model on --arm react — or the run is refused. Omit to "
+            "label with that model id itself."
         ),
     )
     parser.add_argument("--num-runs", type=int, default=1, help="Runs per scenario (default: 1).")
@@ -589,7 +748,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Deliver every turn of a multi-turn scenario without a judge (runs stay unscored). "
             "Without it, an unscored multi-turn scenario stops after turn 1. Excludes "
-            "--judge-model."
+            "--judge-model. Means the same thing on both arms, so a paired sweep compares equal "
+            "work."
         ),
     )
     parser.add_argument(
@@ -597,7 +757,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1200.0,
         metavar="SECONDS",
-        help="Per-scenario wall-clock safety cap (default 1200).",
+        help=(
+            "Per-scenario wall-clock safety cap for --arm sora (default 1200). The react arm is "
+            "bounded by ARE's own event loop instead, which exits at scenario.duration."
+        ),
     )
     parser.add_argument("--verbose", action="store_true", help="Stream each scenario's trajectory.")
     return parser.parse_args(argv)
@@ -607,7 +770,7 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
     if args.report_only:
-        _print_report(aggregate(args.report_only))
+        _print_report(aggregate(_arm_root(args.report_only, args.arm)))
         return
 
     if not args.capability:
@@ -618,10 +781,34 @@ def main(argv: list[str] | None = None) -> None:
         # judge as the turn gate — the opposite of what --init-turns asks for. Refuse, don't ignore.
         raise SystemExit("--init-turns and --judge-model are mutually exclusive")
 
-    # Before a single token is spent: the trace label has to agree with the model the config selects
-    # (and absent a label, becomes it), so an exported trace can't attribute the run to a model that
-    # never ran it.
-    args.model = _resolve_model_label(args.model, args.config)
+    # Before a single token is spent: the trace label has to agree with the model the run actually
+    # selects, so an exported trace can't attribute the run to a model that never ran it. Which
+    # thing selects it differs by arm — agent.yaml's llm.model for S-ORA, the profile for ReAct —
+    # and nothing downstream can tell a mislabeled trace from a correct one.
+    args.model_profile = None
+    if args.arm == "react":
+        if not args.profile:
+            raise SystemExit("--arm react requires --profile (it selects the model for that arm)")
+        from examples.gaia2.evaluation.core import load_profiles
+
+        profiles = load_profiles(args.profiles_path)
+        if args.profile not in profiles:
+            raise SystemExit(f"unknown profile {args.profile!r}; have {sorted(profiles)}")
+        args.model_profile = profiles[args.profile]
+        args.model = _resolve_react_label(args.model, args.model_profile)
+        _check_operating_point(args.model_profile, args.config)
+        print(
+            f"profile {args.model_profile.name} -> {args.model_profile.model} "
+            f"at {args.model_profile.endpoint}"
+        )
+    else:
+        if args.profile:
+            # Silently ignoring it would let a two-arm sweep script run the S-ORA arm at a model
+            # nobody chose, while the command line says otherwise.
+            raise SystemExit(
+                "--profile applies to --arm react; --arm sora is configured by --config"
+            )
+        args.model = _resolve_model_label(args.model, args.config)
 
     # Absolutize the artifact root before anything writes under it: the HF trace path ARE returns
     # (and stores as each record's `trace_id`) is `os.path.join(output_dir, "hf", <file>)`, and the
@@ -643,7 +830,7 @@ def main(argv: list[str] | None = None) -> None:
     ensure_local_fallback_fs()
 
     _run_capability(args)
-    _print_report(aggregate(args.output_dir))
+    _print_report(aggregate(_arm_root(args.output_dir, args.arm)))
 
 
 if __name__ == "__main__":
