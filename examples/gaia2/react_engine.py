@@ -233,6 +233,13 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         self.brackets += 1
         self._bracket.clear()
 
+    @property
+    def bracketed(self) -> bool:
+        """Whether ARE's pause signal ever reached this engine. False means every round-trip was
+        counted as its own step, so a retried step's earlier tokens are missing from the metadata
+        ARE kept — an undercount, never a double charge, and worth reporting rather than hiding."""
+        return self._bracket_wired
+
     def wrap_pause_env(self, pause_env: Callable[[], None]) -> Callable[[], None]:
         """Wrap ARE's ``env.pause`` so brackets open in step with it. Pass the result as the agent's
         ``pause_env=`` at construction — ``ARESimulationAgent.initialize`` forwards it to the ReAct

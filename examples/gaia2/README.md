@@ -201,6 +201,38 @@ provider's own trailing usage chunk and never from the rebuilt response — a st
 usage is written `usage_captured: false` with null tokens and charged the fixed per-call term,
 which undercounts visibly instead of mis-fitting silently.
 
+## `react_driver.py` — one scenario on the ReAct arm
+
+The counterpart to `run_benchmark.py`: the same scenario, ARE's own published agent, one
+`LLMCallRecord` per model round-trip.
+
+```
+python -m examples.gaia2.react_driver \
+    --scenario examples/gaia2/scenarios/execution/acc-scenario_universe_23_1hu54e.json \
+    --profile gpt-5.4-high-paper \
+    --judge-model claude-sonnet-5 --judge-provider anthropic \
+    --llm-calls react_calls.jsonl --run-number 0
+```
+
+It deliberately does not re-implement ARE's run. `ScenarioRunner` still owns the environment, the
+oracle mode, the turn wiring and the trace export — a baseline is only a baseline if that stays
+ARE's code — and everything is injected through seams ARE already exposes. `LLMEngineBuilder.
+_create_concrete_engine`, documented upstream as overridable, returns a `MeteredLiteLLMEngine` built
+from the profile instead of a stock engine; `AgentBuilder.build` is subclassed only to wrap the
+agent's `pause_env` afterwards, which is the one signal an engine gets that a *step* rather than a
+round-trip has begun. A runner pointed at a model the profile does not name raises before it spends
+anything, because a mis-wired experiment produces ordinary-looking rows against the wrong model.
+
+The judge is attached here rather than by ARE, using the same `attach_judge` the S-ORA arm calls —
+`relax_judge_verdict_case` included, since ARE's engines lowercase `True`/`False` on the way out of
+every `chat_completion` and an unparsed verdict both mis-scores the event and withholds the
+remaining turns. Two arms scored by different judge wiring are a comparison of scorers. Note also
+that preprocessing is not optional: `ScenarioRunner` refuses an uninitialized scenario, so the
+unscored path preprocesses too (with ARE's dummy turn trigger, which always releases the next turn).
+Skipping it yields `success=None` and zero recorded calls, which reads exactly like a model that did
+nothing. `max_turns` is left unset on purpose — ARE's config defaults it to 1, but
+`run_scenario` overrides it from `scenario.nb_turns`, which every Gaia2 scenario carries.
+
 ## `latency_grid.py` — the designed grid the charge model is fitted on
 
 **This one spends money.** Everything else in this directory is free to re-run; this is a token
