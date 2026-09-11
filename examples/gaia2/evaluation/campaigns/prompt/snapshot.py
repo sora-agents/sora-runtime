@@ -243,7 +243,11 @@ def build_frozen_baseline(
             "intentionally omitted; the reasoning profiles support only the default value 1"
         ),
         "kimi_snapshot_status": "stable alias; no dated OpenRouter snapshot",
-        "kimi_provider": "DeepInfra endpoint pinned after Moonshot AI retired its route",
+        "kimi_provider": (
+            "Venice endpoint pinned after DeepInfra retired its route; chosen by measurement, "
+            "because the endpoint fixes the decode rate and the output-cap semantics that the "
+            "latency grid depends on, and neither is visible in what a provider declares"
+        ),
         "kimi_reasoning": "OpenRouter unified reasoning enabled with provider pinned",
     }
     return snapshot

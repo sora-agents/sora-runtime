@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "effective_date": "2026-09-12",
+  "currency": "USD",
+  "models": {
+    "gpt-5.4-2026-03-05": [
+      {"max_input_tokens": 272000, "input_per_million": 2.5, "cached_input_per_million": 0.25, "output_per_million": 15.0},
+      {"max_input_tokens": null, "input_per_million": 5.0, "cached_input_per_million": 0.5, "output_per_million": 22.5}
+    ],
+    "moonshotai/kimi-k2.5": [
+      {"max_input_tokens": null, "input_per_million": 0.532, "cached_input_per_million": 0.209, "output_per_million": 3.325}
+    ]
+  },
+  "notes": {
+    "moonshotai/kimi-k2.5": "OpenRouter Venice endpoint rates, read from the endpoints API on 2026-09-12; routing is pinned to venice and fallbacks are disabled. Rates are a property of the pinned endpoint, not of the model, so this row moves whenever the pin does: the preceding sheet priced deepinfra at 0.45/0.07/2.25 and would under-charge this pin by roughly half on output and threefold on cached input. Venice also serves a 256k context against the 262k the other endpoints offer, which is above anything either arm sends but is the endpoint's limit rather than the model's.",
+    "gpt-5.4-2026-03-05": "Carried forward unchanged from the 2026-09-02 sheet and not re-verified on this date; only the kimi row was re-read, because only its pin moved."
+  }
+}

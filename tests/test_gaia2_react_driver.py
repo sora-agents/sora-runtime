@@ -17,14 +17,19 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from are.simulation.agents.agent_builder import AgentBuilder
-from are.simulation.agents.are_simulation_agent_config import LLMEngineConfig
-from are.simulation.agents.default_agent.are_simulation_main import ARESimulationAgent
-from are.simulation.time_manager import TimeManager
-from examples.gaia2.evaluation.core import load_profiles
-from examples.gaia2.latency_grid import EVAL_ROOT
-from examples.gaia2.llm_calls import LLMCallWriter
-from examples.gaia2.react_driver import (
+
+# `examples.gaia2.react_driver` imports ARE transitively, so the guard has to cover this
+# module's own imports too: ARE is not a declared dependency and CI never installs it.
+pytest.importorskip("are.simulation.agents.agent_builder")
+
+from are.simulation.agents.agent_builder import AgentBuilder  # noqa: E402
+from are.simulation.agents.are_simulation_agent_config import LLMEngineConfig  # noqa: E402
+from are.simulation.agents.default_agent.are_simulation_main import ARESimulationAgent  # noqa: E402
+from are.simulation.time_manager import TimeManager  # noqa: E402
+from examples.gaia2.evaluation.core import load_profiles  # noqa: E402
+from examples.gaia2.latency_grid import EVAL_ROOT  # noqa: E402
+from examples.gaia2.llm_calls import LLMCallWriter  # noqa: E402
+from examples.gaia2.react_driver import (  # noqa: E402
     CapturingScenarioRunner,
     MeteredAgentBuilder,
     MeteredEngineBuilder,
@@ -35,7 +40,7 @@ from examples.gaia2.react_driver import (
     wire_bracket,
     wire_run_end,
 )
-from examples.gaia2.react_engine import MeteredLiteLLMEngine
+from examples.gaia2.react_engine import MeteredLiteLLMEngine  # noqa: E402
 
 
 @pytest.fixture
@@ -98,6 +103,24 @@ def test_the_agents_pause_signal_reaches_the_engines_bracket(profile: Any) -> No
     assert engine.bracketed is True
     # ARE's own callback still runs, and still runs after ours: the environment must actually pause.
     assert calls == ["are", "are"]
+
+
+def test_the_profiles_settings_are_declared_forwardable_not_droppable(profile: Any) -> None:
+    """LiteLLM validates a request against a per-model parameter list it ships, so a model newer
+    than the installed version has its ``reasoning_effort`` rejected before the wire — which a live
+    pilot found as every step of a run failing without a request ever being sent. The fix has to be
+    the one that *forwards*: ``drop_params`` would delete the setting silently and run the baseline
+    at the provider's default effort while S-ORA runs at the profile's, which is precisely the
+    operating-point drift the sweep refuses to start with."""
+    engine = MeteredLiteLLMEngine.from_profile(profile)
+    allowed = engine.settings.request_kwargs["allowed_openai_params"]
+    assert "reasoning_effort" in allowed
+    assert "max_completion_tokens" in allowed
+    # The envelopes LiteLLM passes through untouched have no business in a list of parameters it
+    # is being told to allow, and the setting itself still has to be on the request.
+    assert "extra_body" not in allowed
+    assert "extra_headers" not in allowed
+    assert engine.settings.request_kwargs["reasoning_effort"] == "high"
 
 
 def test_an_unmetered_agent_is_left_alone(profile: Any) -> None:

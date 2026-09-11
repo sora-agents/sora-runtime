@@ -7,6 +7,7 @@ path are all exercised without a key.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import Counter
 from pathlib import Path
@@ -18,6 +19,8 @@ from examples.gaia2.evaluation.core import load_profiles
 from examples.gaia2.latency_grid import (
     CALIBRATION_CALLS,
     EVAL_ROOT,
+    INPUT_LEVELS,
+    OUTPUT_LEVELS,
     GridCell,
     GridSpec,
     LatencyGrid,
@@ -25,6 +28,8 @@ from examples.gaia2.latency_grid import (
     _main,
     build_prompt,
     completed_call_ids,
+    format_range_check,
+    range_check,
 )
 from examples.gaia2.llm_calls import LLMCallWriter
 
@@ -276,7 +281,7 @@ async def test_provider_routing_rides_where_the_arm_puts_it(tmp_path: Path) -> N
         )
         await runner.run_cell(GridCell(input_tokens=1_000, output_tokens=64))
     (sent,) = client.calls
-    assert sent["extra_body"]["provider"]["only"] == ["deepinfra"]
+    assert sent["extra_body"]["provider"]["only"] == ["venice"]
     assert sent["extra_body"]["provider"]["allow_fallbacks"] is False
     assert sent["extra_body"]["reasoning"] == {"enabled": True}
     assert sent["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
@@ -553,3 +558,157 @@ async def test_the_cli_refuses_to_append_into_an_existing_grid(tmp_path: Path) -
     with pytest.raises(SystemExit) as caught:
         await _main(argv)
     assert "--resume" in str(caught.value) and "--overwrite" in str(caught.value)
+
+
+# -- the pilot: are the axes wide enough, and are the corners accepted? --------------------------
+
+
+def _call_row(**over: Any) -> dict[str, Any]:
+    row = {
+        "call_id": "c",
+        "arm": "react",
+        "input_tokens": 1_000,
+        "output_tokens": 100,
+        "usage_captured": True,
+        "finish_reason": "stop",
+    }
+    row.update(over)
+    return row
+
+
+def test_an_axis_the_pilot_stays_inside_is_left_as_designed() -> None:
+    ranges = {a.axis: a for a in range_check([_call_row() for _ in range(5)])}
+    assert ranges["input"].extend_to is None
+    assert ranges["output"].extend_to is None
+    assert ranges["input"].exceeded is False
+
+
+def test_an_axis_the_pilot_overruns_by_mass_is_extended() -> None:
+    """The ReAct arm re-feeds a growing prefix, so the case the grid's own axes were never fitted
+    against is a prompt past the top input level. One doubling, per the declared rule."""
+    rows = [_call_row(input_tokens=90_000)] + [_call_row(input_tokens=1_000) for _ in range(5)]
+    ranges = {a.axis: a for a in range_check(rows)}
+    assert ranges["input"].beyond_share > 0.05
+    assert ranges["input"].extend_to == 128_000
+
+
+def test_one_outlier_below_the_threshold_is_reported_and_not_acted_on() -> None:
+    """The half of the rule that is easy to drop: exceeding the top level is *not* the trigger.
+    A single long call cannot say whether extrapolating there is wrong, and the table the axes came
+    from granted a level to nothing smaller than 3.3% of the mass."""
+    rows = [_call_row(input_tokens=70_000)] + [_call_row(input_tokens=64_000) for _ in range(60)]
+    axis = {a.axis: a for a in range_check(rows)}["input"]
+    assert axis.exceeded is True
+    assert axis.beyond_share < 0.05
+    assert axis.extend_to is None
+    assert axis.maximum == 70_000
+
+
+def test_a_call_at_exactly_the_top_level_has_reached_it_not_overrun_it() -> None:
+    axis = {a.axis: a for a in range_check([_call_row(input_tokens=64_000)])}["input"]
+    assert axis.exceeded is False
+    assert axis.extend_to is None
+
+
+def test_rows_that_measured_nothing_are_not_read_as_small_calls() -> None:
+    """An uncaptured or failed row carries fields, and counting them would pull the mass down
+    exactly where the check is looking."""
+    rows = [
+        _call_row(input_tokens=90_000),
+        _call_row(input_tokens=10, usage_captured=False),
+        _call_row(input_tokens=10, finish_reason="error:APIError"),
+    ]
+    axis = {a.axis: a for a in range_check(rows)}["input"]
+    assert axis.calls == 1
+    assert axis.total_tokens == 90_000
+
+
+def test_the_range_check_reads_a_file_and_calls_nothing(tmp_path: Path) -> None:
+    """No --profile, deliberately: the check runs on whatever machine holds the rows, which need
+    not be one with a profile's credentials, and naming one to satisfy the parser would be a
+    dummy argument standing in for something the mode never reads."""
+    path = tmp_path / "llm_calls.jsonl"
+    path.write_text("\n".join(json.dumps(_call_row()) for _ in range(3)) + "\n")
+    assert asyncio.run(_main(["--range-check", str(path)])) == 0
+
+
+def test_an_axis_with_no_usable_sample_is_inconclusive_and_fails(tmp_path: Path) -> None:
+    """Absence of evidence is not a passed check. Every row here measured nothing, so the axis has
+    zero mass and a `beyond_share` of 0.0 — arithmetically identical to a pilot that stayed neatly
+    inside the design, and the one case where exiting zero would be a lie."""
+    rows = [
+        _call_row(usage_captured=False),
+        _call_row(finish_reason="error:APIError"),
+    ]
+    axis = {a.axis: a for a in range_check(rows)}["input"]
+    assert axis.calls == 0
+    assert axis.inconclusive is True
+    assert axis.extend_to is None
+    assert "INCONCLUSIVE" in format_range_check([axis])
+    path = tmp_path / "llm_calls.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    assert asyncio.run(_main(["--range-check", str(path)])) == 1
+
+
+def test_a_populated_axis_is_not_dragged_down_by_an_empty_one(tmp_path: Path) -> None:
+    """The two axes are counted independently, so a row reporting input but no output leaves the
+    output axis unchecked while the input axis still reads normally."""
+    rows = [_call_row(output_tokens=None) for _ in range(3)]
+    ranges = {a.axis: a for a in range_check(rows)}
+    assert ranges["input"].inconclusive is False
+    assert ranges["input"].extend_to is None
+    assert ranges["output"].inconclusive is True
+    path = tmp_path / "llm_calls.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    assert asyncio.run(_main(["--range-check", str(path)])) == 1
+
+
+def test_every_mode_that_reaches_the_network_still_demands_a_profile() -> None:
+    """Making --profile optional is scoped to the offline branch; dropping it anywhere else has to
+    stay an error rather than becoming a run against some default."""
+    with pytest.raises(SystemExit):
+        asyncio.run(_main(["--dry-run"]))
+
+
+def test_the_corners_are_both_ends_of_both_axes(grid: Any) -> None:
+    runner, _, _ = grid
+    corners = {(c.input_tokens, c.output_tokens) for c in runner.corner_cells()}
+    assert corners == {
+        (INPUT_LEVELS[0], OUTPUT_LEVELS[0]),
+        (INPUT_LEVELS[0], OUTPUT_LEVELS[-1]),
+        (INPUT_LEVELS[-1], OUTPUT_LEVELS[0]),
+        (INPUT_LEVELS[-1], OUTPUT_LEVELS[-1]),
+    }
+
+
+def test_a_preflight_call_is_paid_for_recorded_and_kept_out_of_the_fit(
+    grid: Any, tmp_path: Path
+) -> None:
+    """The small-end check's whole point: the bottom cell is sent for real, so a provider that
+    refuses that output cap is found before the grid is paid for — and the attempt is on disk
+    either way, without ever being eligible for the fit."""
+    runner, client, writer = grid
+    with writer:
+        outcomes = asyncio.run(runner.preflight(log=lambda *_: None))
+    assert len(outcomes) == 4
+    rows = _rows(tmp_path / "grid.manifest")
+    assert {row["phase"] for row in rows} == {"preflight"}
+    assert not any(row["fit_eligible"] for row in rows)
+    assert all(row["call_id"].startswith("preflight-") for row in rows)
+
+
+def test_a_refused_corner_is_recorded_and_exits_non_zero(
+    grid: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An endpoint can reject a `max_completion_tokens` too small for a reasoning model, and that
+    rejection reaches only the bottom cell — so it would otherwise surface partway through a paid
+    grid rather than in the call made to look for it."""
+    runner, client, writer = grid
+    client.responses = [RuntimeError("max_completion_tokens too small")] + [
+        _stream(prompt=10, completion=10) for _ in range(3)
+    ]
+    with writer:
+        outcomes = asyncio.run(runner.preflight(log=lambda *_: None))
+    refused = [o for o in outcomes if o.manifest["error"]]
+    assert [o.record.finish_reason for o in refused] == ["error:RuntimeError"]
+    assert _rows(tmp_path / "grid.jsonl")[0]["finish_reason"] == "error:RuntimeError"

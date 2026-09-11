@@ -204,10 +204,24 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
 
         Which routing string LiteLLM needs for a given provider is LiteLLM's own business and is
         not second-guessed here — the profile's ``provider``/``model``/``endpoint`` are passed
-        through as they stand, and a live pilot is what confirms them."""
+        through as they stand, and a live pilot is what confirms them.
+
+        The one thing that *is* second-guessed is LiteLLM's table of which parameters a model
+        accepts. It validates the request against a per-model list it ships, so a model newer than
+        the installed version is rejected before the wire — ``reasoning_effort`` on a reasoning
+        model it has never heard of — and the run dies at every step without a request ever being
+        sent. ``allowed_openai_params`` names the profile's own settings as forwardable, which is
+        the narrow fix: the alternative LiteLLM offers, ``drop_params``, would *silently* delete
+        them and run the baseline at the provider's defaults while S-ORA runs at the profile's,
+        which is exactly the operating-point drift the sweep refuses to start with. A provider that
+        genuinely rejects a setting still says so, on the wire, where the row records it."""
         transport: dict[str, Any] = {"num_retries": profile.sdk_max_retries}
         if profile.stall_timeout is not None:
             transport["timeout"] = profile.stall_timeout
+        request = profile.request_kwargs()
+        # `extra_body`/`extra_headers` are passthrough envelopes LiteLLM never validates; the rest
+        # are the request parameters it does.
+        allowed = sorted(set(request) - {"extra_body", "extra_headers"})
         return cls(
             LiteLLMModelConfig(
                 model_name=profile.model,
@@ -216,7 +230,11 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
                 # Absent, LiteLLM falls back to its own environment lookup for the provider.
                 api_key=os.environ.get(profile.credential_env),
             ),
-            request_kwargs={**profile.request_kwargs(), **transport},
+            request_kwargs={
+                **request,
+                **({"allowed_openai_params": allowed} if allowed else {}),
+                **transport,
+            },
             stream=profile.stream,
             **kwargs,
         )

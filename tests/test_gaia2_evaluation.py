@@ -70,8 +70,12 @@ def test_a_profile_maps_onto_one_request_both_direct_callers_send() -> None:
     assert kimi["temperature"] == 0.5
     # OpenRouter takes both of these off the standard request shape, not on it.
     assert kimi["extra_body"]["reasoning"] == {"enabled": True}
-    assert kimi["extra_body"]["provider"]["only"] == ["deepinfra"]
+    assert kimi["extra_body"]["provider"]["only"] == ["venice"]
     assert kimi["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
+    # `require_parameters` would reject every provider for this exact pair of fields — see the
+    # routing comment in the frozen-profile test below.
+    assert "require_parameters" not in kimi["extra_body"]["provider"]
+    assert kimi["max_completion_tokens"] == 16384
     # Transport belongs to whatever opens the connection, never to the operating point.
     assert "stall_timeout" not in kimi and "max_retries" not in kimi
 
@@ -136,11 +140,25 @@ def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
     assert kimi.campaigns == ("prompt",)
     assert kimi.settings["temperature"].value == 0.5
     assert kimi.settings["reasoning"].value == {"enabled": True}
+    # Every part of this pin was set by measurement, because none of it is visible in what the
+    # providers declare. deepinfra stopped serving the model and OpenRouter 404s the dead pin; among
+    # the replacements `max_completion_tokens` turns out to mean two different things. On some it
+    # bounds the whole completion, so reasoning spends the budget and small caps return empty
+    # content; on others it bounds the content alone and reasoning runs past the cap. Forcing an
+    # output length is how a decode rate gets measured, so a provider of the second kind reports
+    # counts that miss their target by enough to disqualify whole output levels — and one of them
+    # alternates between both meanings call to call, on identical requests. A third returns
+    # `reasoning_tokens: 0` and folds its thinking into `content`, which a JSON plan parser does not
+    # survive. Every one of them declares `reasoning` support. `require_parameters` is absent for a
+    # related mechanical reason: it filters providers to those declaring every parameter *by name*,
+    # the request carries OpenAI's modern `max_completion_tokens`, and every endpoint here declares
+    # only the older `max_tokens`, so the flag empties the candidate set on a spelling. It was never
+    # the guard it looked like either, for the same reason the choice could not be made from the
+    # declarations.
     assert kimi.settings["provider_routing"].value == {
-        "only": ["deepinfra"],
-        "order": ["deepinfra"],
+        "only": ["venice"],
+        "order": ["venice"],
         "allow_fallbacks": False,
-        "require_parameters": True,
     }
     assert kimi.settings["router_metadata"].value is True
     assert kimi.settings["max_output_tokens"].value == 16384

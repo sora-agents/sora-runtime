@@ -37,7 +37,7 @@ uv run python -m examples.gaia2.evaluation prompt run \
   --arm baseline \
   --gaia-repeats 3 \
   --output-dir /tmp/sora-gaia2-prompt \
-  --price-sheet examples/gaia2/evaluation/price_sheets/2026-09-02.json \
+  --price-sheet examples/gaia2/evaluation/price_sheets/2026-09-12.json \
   --confirm-budget 180 \
   --dry-run
 ```
@@ -62,7 +62,7 @@ Combine one or more checkpoint files into the canonical report:
 uv run python -m examples.gaia2.evaluation prompt report \
   --input /tmp/sora-gaia2-prompt/checkpoint.jsonl \
   --output /tmp/sora-gaia2-prompt/report.json \
-  --price-sheet examples/gaia2/evaluation/price_sheets/2026-09-02.json
+  --price-sheet examples/gaia2/evaluation/price_sheets/2026-09-12.json
 ```
 
 Normal reports redact locked acceptance prompts, oracles, and detailed trajectories. The harness

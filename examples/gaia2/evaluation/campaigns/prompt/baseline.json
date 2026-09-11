@@ -335,12 +335,11 @@
           "value": {
             "allow_fallbacks": false,
             "only": [
-              "deepinfra"
+              "venice"
             ],
             "order": [
-              "deepinfra"
-            ],
-            "require_parameters": true
+              "venice"
+            ]
           }
         },
         "reasoning": {
@@ -401,12 +400,11 @@
           "value": {
             "allow_fallbacks": false,
             "only": [
-              "deepinfra"
+              "venice"
             ],
             "order": [
-              "deepinfra"
-            ],
-            "require_parameters": true
+              "venice"
+            ]
           }
         },
         "reasoning": {
@@ -514,7 +512,7 @@
     "gaia_limit_unit": "logical_agent_llm_call",
     "gaia_logical_agent_llm_call_limit": 200,
     "gpt_5_4_temperature": "intentionally omitted; the reasoning profiles support only the default value 1",
-    "kimi_provider": "DeepInfra endpoint pinned after Moonshot AI retired its route",
+    "kimi_provider": "Venice endpoint pinned after DeepInfra retired its route; chosen by measurement, because the endpoint fixes the decode rate and the output-cap semantics that the latency grid depends on, and neither is visible in what a provider declares",
     "kimi_reasoning": "OpenRouter unified reasoning enabled with provider pinned",
     "kimi_snapshot_status": "stable alias; no dated OpenRouter snapshot",
     "paper_transfer_profile": "gpt-5.4-high-paper",
@@ -1957,8 +1955,8 @@
   ],
   "provenance": {
     "prompt_source_dirty_diff_sha256": null,
-    "source_dirty_diff_sha256": "38a1e146edf09df3331422a574097691d2068dd1ba8b627e86901921bcebb1cb",
-    "source_revision": "f6dfd9c7a6e1ef308af776ece7bb28eec4793498"
+    "source_dirty_diff_sha256": "9683687b0058e0bceac056084b87f12f86081a95f2da73055d873a5cde52a71f",
+    "source_revision": "6360a0902f580384257f18e3f6e49ae450969800"
   },
   "schema_version": 1
 }

@@ -315,10 +315,66 @@ volume and calls nothing.
 # what it would do, and what it would cost in tokens
 python3 -m examples.gaia2.latency_grid --profile gpt-5.4-high-paper --dry-run
 
+# send the four corner cells once, for real, and report what came back
+python3 -m examples.gaia2.latency_grid --profile gpt-5.4-high-paper --preflight \
+    --out grid/preflight-gpt-5.4-high.jsonl
+
 # run it
 python3 -m examples.gaia2.latency_grid --profile gpt-5.4-high-paper \
     --out grid/gpt-5.4-high.jsonl
 ```
+
+`--preflight` comes between the two, and its exit status is the point: a corner that was refused,
+or that came back with no output tokens, exits non-zero, so a script chaining preflight into the
+paid grid stops instead of proceeding. Both ends fail for reasons that appear nowhere in the middle
+of the design — a reasoning model may reject an output cap as small as the bottom level, and the
+top cell is the longest prompt the profile will ever send — and either refusal otherwise surfaces
+partway through a $10 run. It caught a live one: a profile pinned to an OpenRouter provider that
+had stopped serving its model refused all four corners with `NotFoundError`, which is a routing
+failure the grid itself would have reported as four dead cells. Repinning that profile then
+exposed a second refusal hiding behind the first, which is the better argument for the step: with
+`require_parameters: true` OpenRouter keeps only providers declaring support for every parameter
+sent, and *no* provider serving that model declares `max_completion_tokens` — they all declare the
+older `max_tokens` — so the modern field the OpenAI SDK emits emptied the candidate set on a name,
+not a capability. The flag was never the guard it looked like either. Asked which of the six
+providers serving that model honour `reasoning`, all six say they do; asked to answer a question,
+one returns `reasoning_tokens: 0` and folds its thinking into `content`, which for an agent whose
+planner parses JSON is a defect and not a preference. A serving condition is established by sending
+a request and reading the usage block back, which is what these four calls are — and they read more
+than the exit status. `max_completion_tokens` means two different things in the wild: on some
+endpoints it bounds the whole completion, so reasoning spends the budget and the smallest caps come
+back with empty content; on others it bounds the content alone and reasoning runs past the cap.
+Forcing an output length is how this grid measures a decode rate, so the second kind reports counts
+that miss their target, and at a 10% tolerance a couple of hundred reasoning tokens is enough to
+disqualify every cell at the three lowest output levels — taking `a0`, which only the lowest level
+pins, and half the cached arm with them. One endpoint was observed alternating between both meanings
+on identical requests, which is worse than either alone: what survives is then a self-selected
+subsample rather than an honestly missing row. The preflight exits zero on all of this, because an
+off-target count is not a refusal — it is something these four calls let you read before the grid
+runs, not something they gate. The corner calls are recorded like every other paid crossing, under
+`phase: "preflight"`, which `fit_eligible` already excludes.
+
+`--range-check FILE` is the other half and costs nothing: it reads a file, calls nothing, and so
+takes no `--profile` at all —
+
+```console
+python3 -m examples.gaia2.latency_grid --range-check runs/react-pilot/llm_calls.jsonl
+```
+
+It bands an arm's recorded `llm_calls.jsonl` against the axes and applies the extension rule fixed
+before the first pilot ran — **extend an axis by one level when the band beyond its top holds 5% or
+more of that axis's token mass** — because a threshold chosen after seeing the numbers is not a
+check. It extends only, never retracts: a level already in the design is what separates the
+coefficients from each other. An axis no usable row reported is called out as
+`INCONCLUSIVE` and exits non-zero rather than reading as in range: a pilot whose rows all failed
+produces the same 0% beyond-top share as one that stayed neatly inside the design, and only one of
+the two has actually been checked.
+
+The ReAct pilot has since run: 50 calls over two scenarios, max prompt 22.9k and max completion
+1.7k, nothing in the top input band, so neither axis moves. The number worth carrying out of it is
+that **91% of the ReAct arm's input tokens came back cached**, against an S-ORA arm whose prompts
+are unique per call — `R_cache` is nearly the whole of the baseline's input cost, not a refinement
+on it.
 
 The charge model is `a0 + uncached_in/R_in + cached_in/R_cache + out/R_out`, frozen before the
 sweep and applied identically to both arms. Its coefficients cannot be fitted from the agents'

@@ -46,10 +46,9 @@
         "provider_routing": {
           "status": "sent",
           "value": {
-            "only": ["deepinfra"],
-            "order": ["deepinfra"],
-            "allow_fallbacks": false,
-            "require_parameters": true
+            "only": ["venice"],
+            "order": ["venice"],
+            "allow_fallbacks": false
           }
         },
         "router_metadata": {"status": "sent", "value": true}
