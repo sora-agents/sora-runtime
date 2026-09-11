@@ -34,6 +34,7 @@ from sora.action import (
 from sora.activity import Activity, ActivityState
 from sora.memory import (
     PerceptSnapshot,
+    percept_snapshot,
 )
 from sora.perception import Percept
 from sora.references import (
@@ -271,15 +272,12 @@ def scoped_snapshot(wm: WorkingMemory, activity: Activity) -> PerceptSnapshot:
     # invisibly. This layer only sharpens a narrowing the agent already opted into: from the
     # agent-level union to the one activity the call is actually about.
     if not wm.attention_narrowed:
-        return PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+        return percept_snapshot(wm)
     joined = {tool.id for tool in wm.registry.all_tools()}
     referenced = referenced_tools(activity, joined)
     if referenced is None:  # unplanned -> the same breadth attention gives it
-        return PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
-    return PerceptSnapshot(
-        [percept for key, percept in wm.properties.items() if key[0] in referenced],
-        [percept for percept in wm.signals if percept.source in referenced],
-    )
+        return percept_snapshot(wm)
+    return percept_snapshot(wm, referenced)
 
 
 class DefaultObserveStrategy:

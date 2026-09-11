@@ -12,6 +12,7 @@ from examples.gaia2.evaluation.campaigns.prompt.contracts import run_contract_su
 from examples.gaia2.evaluation.campaigns.prompt.neutral import NEUTRAL_CASES, run_neutral_suite
 from examples.gaia2.evaluation.campaigns.prompt.reporting import build_report
 from examples.gaia2.evaluation.campaigns.prompt.snapshot import (
+    PROMPT_LABELS,
     build_prompt_snapshot,
     load_frozen_snapshot,
 )
@@ -73,6 +74,40 @@ def test_a_profile_maps_onto_one_request_both_direct_callers_send() -> None:
     assert kimi["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
     # Transport belongs to whatever opens the connection, never to the operating point.
     assert "stall_timeout" not in kimi and "max_retries" not in kimi
+
+
+# Keep this independent of the regeneratable baseline: these hashes preserve
+# comparison with campaigns run before adaptive prompt fitting.
+PRE_ADAPTIVE_RICH_PROMPT_HASHES = {
+    "plan": (
+        "5b7ee1722e0fc2e83717d9ae8cede2f354a871a3c31faa9d889c36f3372a5c35",
+        "ed21838824ce84fcaf6c45fec187cd00b5e5ed3284ff91b6568ba0f0f3a6c3f3",
+    ),
+    "ground": (
+        "c9ea7e42e57248d5e30e4ab21932b1d04c7e2c3b587e8178f3749ba125787096",
+        "9d8c2ab93e6b55c8e936439923b543490ad658698b6e02a168c37c644d9370ac",
+    ),
+    "select": (
+        "c7c6ab33af9c9528e69fd624f47b7b8e4da3cb9cac15a6fef5ea23a0574574be",
+        "df70b45cd8d4bbb21d4190255fc9b5147073ad8a0cf803b4c2fcc810b35098d2",
+    ),
+    "revalidate": (
+        "937ba9910d840300bdea6f921d21125aacb1c93d95dc54c8fae2597d784bf0c5",
+        "0604a54e23ef1e610ed2d189220e0e2757825a267d280490a42983832fb4650a",
+    ),
+    "condition": (
+        "ef6ff04830f41c1db22cd7f55f6734f4e7dbb3f89d44c48d6d2e9fe94e67c20e",
+        "3bdc0e453437d310919060ff0d1a35519f2e12b20ab4cec102c3ab6b18994905",
+    ),
+    "retirement": (
+        "6ceced55f7c15af1b950bc12989c358a6c3d9c39d0e6d3324ec7d9a8e32f692c",
+        "7c3fa0da05bfc4cd57f4a1643e3b6998fc42cc9a20fd209be36727b564ac753d",
+    ),
+    "relevance": (
+        "d2b9252ed908e97ef46d70f550faf3111975f70c8cf3c29c3201c736a9549663",
+        "7384623c984cb46666f1db690d664c931c742bdc16225726e14f293a447bd55e",
+    ),
+}
 
 
 def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
@@ -347,17 +382,11 @@ def test_contract_and_neutral_suites_are_deterministic_and_complete() -> None:
     assert neutral.passed == 16
 
 
-def test_frozen_snapshot_has_all_seven_exact_prompts_and_matches_runtime() -> None:
+def test_frozen_snapshot_has_all_tiered_prompt_variants_and_matches_runtime() -> None:
     frozen = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
     rendered = build_prompt_snapshot(source_revision=frozen["provenance"]["source_revision"])
-    assert {row["semantic_label"] for row in frozen["prompts"]} == {
-        "plan",
-        "ground",
-        "select",
-        "revalidate",
-        "condition",
-        "retirement",
-        "relevance",
+    assert {(row["perception_tier"], row["semantic_label"]) for row in frozen["prompts"]} == {
+        (tier, label) for tier in (1, 2, 3) for label in PROMPT_LABELS
     }
     assert rendered["prompts"] == frozen["prompts"]
     assert {profile["name"] for profile in frozen["evaluation_profiles"]} == {
@@ -370,6 +399,23 @@ def test_frozen_snapshot_has_all_seven_exact_prompts_and_matches_runtime() -> No
     for row in frozen["prompts"]:
         assert len(row["system_sha256"]) == len(row["user_sha256"]) == 64
         assert row["system"] and row["user"]
+        expected_channels = {
+            1: {"properties": False, "signals": False},
+            2: {"properties": False, "signals": True},
+            3: {"properties": True, "signals": True},
+        }
+        assert row["perception_channels"] == expected_channels[row["perception_tier"]]
+        assert row["sections"]
+        assert all(section["name"].startswith(("system.", "user.")) for section in row["sections"])
+        assert sum(section["characters"] for section in row["sections"]) == len(
+            row["system"]
+        ) + len(row["user"])
+    rich_rows = {
+        row["semantic_label"]: row for row in frozen["prompts"] if row["perception_tier"] == 3
+    }
+    assert {
+        label: (row["system_sha256"], row["user_sha256"]) for label, row in rich_rows.items()
+    } == PRE_ADAPTIVE_RICH_PROMPT_HASHES
     serialized = json.dumps(frozen).lower()
     assert "scenario_universe" not in serialized
     assert '"oracle":' not in serialized

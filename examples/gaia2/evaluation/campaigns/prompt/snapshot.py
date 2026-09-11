@@ -15,7 +15,12 @@ from examples.gaia2.evaluation.core import (
 )
 from sora.activity import Activity
 from sora.llm import CompletionRequest
-from sora.memory import FileMemoryBackend, PerceptSnapshot, ProceduralMemory
+from sora.memory import (
+    FileMemoryBackend,
+    PerceptionChannels,
+    PerceptSnapshot,
+    ProceduralMemory,
+)
 from sora.types import Change, PendingCondition, Plan, SignalWait, Step, Until
 
 PROMPT_LABELS = (
@@ -52,6 +57,11 @@ PROMPT_SOURCES = {
         "ProceduralMemory.judge_relevance",
     ),
 }
+PERCEPTION_TIERS = (
+    (1, PerceptionChannels(properties=False, signals=False)),
+    (2, PerceptionChannels(properties=False, signals=True)),
+    (3, PerceptionChannels(properties=True, signals=True)),
+)
 
 
 class _CaptureClient:
@@ -74,29 +84,32 @@ class _CaptureClient:
         return responses[request.semantic_label]
 
 
-async def _capture_requests() -> list[CompletionRequest]:
+async def _capture_requests(channels: PerceptionChannels) -> list[CompletionRequest]:
     client = _CaptureClient()
+    observed = PerceptSnapshot(channels=channels)
     with tempfile.TemporaryDirectory(prefix="sora-prompt-snapshot-") as tmp:
         memory = ProceduralMemory(FileMemoryBackend(Path(tmp)), llm=client)
         activity = Activity(id="snapshot-activity", goal="Find the requested record", context={})
-        await memory.infer(activity, {})
+        await memory.infer(activity, {}, observed=observed)
         await memory.ground(
             activity,
             "search",
             None,
             {"query": {"$bind": "requested_query"}},
+            observed=observed,
         )
         await memory.select(
             activity,
             [{"id": "item-1", "label": "blue"}, {"id": "item-2", "label": "red"}],
             "the item whose label is blue",
+            observed=observed,
         )
         activity.plan = Plan(
             id="snapshot-plan",
             goal=activity.goal,
             steps=[Step("send", {"to": "user", "content": {"text": "done"}})],
         )
-        await memory.revalidate(activity)
+        await memory.revalidate(activity, observed=observed)
         condition = PendingCondition(
             watch=SignalWait(
                 signal_name="state_changed",
@@ -112,9 +125,9 @@ async def _capture_requests() -> list[CompletionRequest]:
             activity,
             [condition],
             [("records", Change(path="items", updated=("item-1",)))],
-            PerceptSnapshot(),
+            observed,
         )
-        await memory.judge_retirement(activity, [condition], PerceptSnapshot())
+        await memory.judge_retirement(activity, [condition], observed)
         await memory.judge_relevance(
             [
                 {
@@ -125,39 +138,47 @@ async def _capture_requests() -> list[CompletionRequest]:
                 }
             ],
             [("records", Change(path="items", updated=("item-1",)))],
-            PerceptSnapshot(),
+            observed,
         )
     return client.requests
 
 
 def _prompt_rows() -> list[dict[str, Any]]:
-    requests = asyncio.run(_capture_requests())
-    if tuple(request.semantic_label for request in requests) != PROMPT_LABELS:
-        raise ValueError("runtime semantic prompt inventory no longer matches the frozen seven")
     rows: list[dict[str, Any]] = []
-    for request in requests:
-        source_file, system_symbol, renderer = PROMPT_SOURCES[request.semantic_label]
-        rows.append(
-            {
-                "semantic_label": request.semantic_label,
-                "prompt_version": request.prompt_version,
-                "source": {
-                    "file": source_file,
-                    "system_symbol": system_symbol,
-                    "renderer": renderer,
-                },
-                "system": request.system,
-                "user": request.user,
-                "system_sha256": sha256_text(request.system),
-                "user_sha256": sha256_text(request.user),
-                "request_hints": {
-                    "max_output_tokens": (
-                        request.profile.max_output_tokens if request.profile is not None else None
-                    ),
-                    "reasoning": request.profile.reasoning if request.profile is not None else None,
-                },
-            }
-        )
+    for perception_tier, channels in PERCEPTION_TIERS:
+        requests = asyncio.run(_capture_requests(channels))
+        if tuple(request.semantic_label for request in requests) != PROMPT_LABELS:
+            raise ValueError("runtime semantic prompt inventory no longer matches the frozen seven")
+        for request in requests:
+            source_file, system_symbol, renderer = PROMPT_SOURCES[request.semantic_label]
+            rows.append(
+                {
+                    "semantic_label": request.semantic_label,
+                    "prompt_version": request.prompt_version,
+                    "perception_tier": perception_tier,
+                    "perception_channels": asdict(channels),
+                    "source": {
+                        "file": source_file,
+                        "system_symbol": system_symbol,
+                        "renderer": renderer,
+                    },
+                    "system": request.system,
+                    "user": request.user,
+                    "system_sha256": sha256_text(request.system),
+                    "user_sha256": sha256_text(request.user),
+                    "sections": [asdict(section) for section in request.sections],
+                    "request_hints": {
+                        "max_output_tokens": (
+                            request.profile.max_output_tokens
+                            if request.profile is not None
+                            else None
+                        ),
+                        "reasoning": (
+                            request.profile.reasoning if request.profile is not None else None
+                        ),
+                    },
+                }
+            )
     return rows
 
 

@@ -138,9 +138,9 @@ class AgentConfig:
     mid-build. ``strategies``/``memory`` are dotted-path / URI maps resolved during ``build_agent``;
     ``workspaces`` is the raw list (each entry carries an ``origin`` plus adapter-specific keys like
     ``command``/``args``); ``llm`` is optional (absent -> no model, store/retrieve-only procedural
-    memory); ``procedural`` optionally names dotted-path ``plan_prompt``/``ground_prompt`` overrides
-    for ``ProceduralMemory`` (absent -> its own built-in ``default_plan_prompt``/
-    ``default_ground_prompt``)."""
+    memory); ``procedural`` optionally selects built-in prompt fitting and names dotted-path
+    ``plan_prompt``/``ground_prompt`` overrides for ``ProceduralMemory`` (absent -> adaptive fitting
+    with its own built-in ``default_plan_prompt``/``default_ground_prompt``)."""
 
     name: str
     strategies: dict[str, str]
@@ -378,13 +378,18 @@ def llm_for(config: AgentConfig) -> LLMClient | None:
 
 
 def procedural_prompts_for(config: AgentConfig) -> dict[str, Any]:
-    """Resolve the optional ``procedural.plan_prompt``/``procedural.ground_prompt`` dotted paths
-    into ``ProceduralMemory`` constructor kwargs — a custom callable fully replaces the built-in
-    default (``default_plan_prompt``/``default_ground_prompt``), it doesn't patch pieces of it.
-    Absent -> an empty dict, so ``ProceduralMemory``'s own defaults apply unchanged."""
+    """Resolve the optional ``procedural`` prompt settings into ``ProceduralMemory`` constructor
+    kwargs. A custom callable fully replaces its built-in prompt; ``prompt_fit`` only selects how
+    built-ins fit declared perception channels. Absent -> an empty dict, so the adaptive built-in
+    defaults apply unchanged."""
     if not config.procedural:
         return {}
     kwargs: dict[str, Any] = {}
+    if "prompt_fit" in config.procedural:
+        prompt_fit = config.procedural["prompt_fit"]
+        if prompt_fit not in {"adaptive", "fixed-rich"}:
+            raise ValueError("agent.yaml: procedural.prompt_fit must be 'adaptive' or 'fixed-rich'")
+        kwargs["prompt_fit"] = prompt_fit
     if "plan_prompt" in config.procedural:
         kwargs["prompt"] = import_object(config.procedural["plan_prompt"])
     if "ground_prompt" in config.procedural:

@@ -5,7 +5,13 @@
 `agent.yaml`'s `procedural:` block ([Your First Agent](../getting-started/first-agent.md#anatomy-of-agentyaml)) points at your own `PlanPrompt`/`GroundPrompt`
 callables — each fully *replaces* the corresponding built-in (`default_plan_prompt` /
 `default_ground_prompt`), it doesn't patch pieces of it; write one to change wording, tone, or the
-cost/quality tradeoff of planning and grounding. For example, the built-in prompt's default
+cost/quality tradeoff of planning and grounding. The default `prompt_fit: adaptive` setting only
+changes built-in prompts: it selects their modules from the perception channels declared by the
+relevant tool manuals and never rewrites a custom callable's output. If you customize only one
+prompt, the other built-in prompt remains adaptive. Use `prompt_fit: fixed-rich` only when you need
+a comparison control that always includes property and signal vocabulary.
+
+For example, the built-in prompt's default
 guidance for a `send` step reporting a not-yet-known result is a `$decide` reference — a natural
 sentence, but it costs one extra `ProceduralMemory.ground()` model call at run time (see
 `PlanPrompt` in the [Python API Reference](../reference/python-api.md#sora.memory)). A stricter prompt can trade that phrasing for a free, mechanical

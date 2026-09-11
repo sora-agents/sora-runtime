@@ -177,7 +177,7 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
       to invalidate — which is the ordering §3 describes, though note the claim there that the V3
       fixes cost no re-baseline was written about V3.1/V3.2 and does not hold for this one.
 
-- [ ] **V3.4** **Make the prompt modules tier-conditional.** The rendered prompts assume an
+- [x] **V3.4** **Make the prompt modules tier-conditional.** The rendered prompts assume an
       environment with observable properties: they teach `$prop` and property-backed conditions to
       every agent, including ones whose environment has no properties at all. Where the environment
       offers only operations and signals, `$prop` is dead vocabulary; where it offers only
@@ -191,6 +191,17 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
       rendered text is text-preserving by construction, so it is cheap to pull forward and is the
       enabler. Re-baselines the rows it touches, which is free before the prompt freeze and costly
       after it.
+
+      **Done:** prompt fit now follows the independent `properties` / `signals` affordances
+      declared by the manuals in each call's own tool scope. Operations-only calls omit observation,
+      focus, `$prop`, and pending-condition vocabulary; signal-only calls keep event/focus/wait
+      guidance without teaching properties; property-only calls keep property references and
+      derived-change watches without claiming a signal channel. The seven built-ins assemble from
+      named manifests and populate `CompletionRequest.sections`; custom plan/ground builders retain
+      their tuple contract and empty section metadata. `agent.procedural.prompt_fit` defaults to
+      `adaptive`, with `fixed-rich` available as the explicit sensitivity control. The prompt
+      snapshot now freezes all 21 semantic-call/tier combinations and the rich tier remains
+      byte-identical to its seven pre-change hashes.
 
 ### 2.5 Gate V4 — Release mechanics
 

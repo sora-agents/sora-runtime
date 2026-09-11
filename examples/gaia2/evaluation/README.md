@@ -15,11 +15,18 @@ acceptance payload:
 uv run python -m examples.gaia2.evaluation prompt check
 ```
 
-Render the current seven canonical prompt inputs without changing the tracked baseline:
+Render the current prompt matrix without changing the tracked baseline:
 
 ```console
 uv run python -m examples.gaia2.evaluation prompt snapshot
 ```
+
+The snapshot records each of the seven semantic calls at all three declared perception tiers:
+operations only (tier 1), operations plus signals (tier 2), and operations, signals, and observable
+properties (tier 3). Each row includes the rendered system and user text, hashes, declared channels,
+and per-module character counts from `CompletionRequest.sections`. Tier 3 stays byte-identical to
+the original rich prompt and is also the text used by the `fixed-rich` sensitivity control; the
+default `adaptive` fit removes instructions for channels that the environment does not declare.
 
 Inspect an exact three-repeat Gaia matrix and its cumulative reserve without running it:
 

@@ -28,6 +28,7 @@ from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.data_ops import _as_collection, _resolve_collection
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
+from sora.manual import Manual, ObservablePropertySpecification
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -1525,8 +1526,19 @@ async def test_the_decide_filter_data_op_plumbs_observed_state_through(tmp_path:
     # otherwise the two tests above are unreachable from a real plan.
     llm = FakeLLMClient('{"keep": []}')
     procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
-    tool = FakeTool("realestate")
-    cycle, working, _ = _cycle(tmp_path, procedural, tool)
+    tool = FakeTool(
+        "clock",
+        manual=Manual(
+            id="clock",
+            metadata={},
+            description="clock",
+            observable_properties=[ObservablePropertySpecification("state", "current date", {})],
+            signals=[],
+            operations=[],
+        ),
+    )
+    cycle, working, registry = _cycle(tmp_path, procedural, tool)
+    await registry.join(_ORIGIN)
     working.properties[("clock", "state")] = Percept(
         "clock", ObservableProperty("state", {"today": "2024-10-15"}), 0.0
     )

@@ -14,14 +14,16 @@ serialization round-trip the module owns.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from fakes import FakeLLMClient, fake_manual, plan_json
+from fakes import FakeLLMClient, FakeTool, fake_manual, plan_json
 from sora.action import invoke_step
 from sora.activity import Activity
 from sora.manual import (
     Manual,
+    MarkdownManualParser,
     ObservablePropertySpecification,
     OperationSpecification,
     SignalSpecification,
@@ -32,8 +34,10 @@ from sora.memory import (
     GROUND_SYSTEM_PROMPT,
     PLAN_SYSTEM_PROMPT,
     FileMemoryBackend,
+    PerceptionChannels,
     PerceptSnapshot,
     ProceduralMemory,
+    declared_perception_channels,
     default_ground_prompt,
     default_plan_prompt,
     remaining_steps,
@@ -350,17 +354,33 @@ async def test_infer_uses_injected_prompt(tmp_path: Path) -> None:
     ) -> tuple[str, str]:
         return "SYS: plan tersely", (
             f"CUSTOM goal={activity.goal} tools={sorted(tools)} "
-            f"properties={len(observed.properties)} signals={len(observed.signals)}"
+            f"properties={len(observed.properties)} signals={len(observed.signals)} "
+            f"channels={observed.channels}"
         )
 
     llm = FakeLLMClient(plan_json({"action": "wait"}))
-    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm, prompt=custom_prompt)
+    mem = ProceduralMemory(
+        FileMemoryBackend(tmp_path),
+        llm=llm,
+        prompt=custom_prompt,
+        prompt_fit="fixed-rich",
+    )
 
-    await mem.infer(_activity("g"), {"clock": fake_manual("clock", ["get_time"])})
+    channels = PerceptionChannels(properties=False, signals=True)
+    await mem.infer(
+        _activity("g"),
+        {"clock": fake_manual("clock", ["get_time"])},
+        PerceptSnapshot(channels=channels),
+    )
 
     assert llm.calls == [
-        ("SYS: plan tersely", "CUSTOM goal=g tools=['clock'] properties=0 signals=0")
+        (
+            "SYS: plan tersely",
+            "CUSTOM goal=g tools=['clock'] properties=0 signals=0 "
+            "channels=PerceptionChannels(properties=False, signals=True)",
+        )
     ]
+    assert llm.requests[0].sections == ()
 
 
 async def test_infer_default_prompt_is_used_when_none_injected(tmp_path: Path) -> None:
@@ -375,6 +395,25 @@ async def test_infer_default_prompt_is_used_when_none_injected(tmp_path: Path) -
     system, user = llm.calls[0]
     assert system == PLAN_SYSTEM_PROMPT
     assert "triage" in user and "EmailClientApp" in user and "list" in user
+    assert llm.requests[0].sections
+    section_chars = sum(section.characters for section in llm.requests[0].sections)
+    assert section_chars == len(system) + len(user)
+
+
+async def test_fixed_rich_prompt_fit_is_a_sensitivity_control(tmp_path: Path) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm, prompt_fit="fixed-rich")
+
+    await mem.infer(
+        _activity("triage"),
+        {},
+        observed=PerceptSnapshot(channels=PerceptionChannels(properties=False, signals=False)),
+    )
+
+    system, user = llm.calls[0]
+    assert system == PLAN_SYSTEM_PROMPT
+    assert "Currently observed properties" in user
+    assert "Recently observed signals" in user
 
 
 def test_default_plan_prompt_exposes_reusable_pieces() -> None:
@@ -397,6 +436,95 @@ def test_default_plan_prompt_includes_percept_rendering() -> None:
     assert system == PLAN_SYSTEM_PROMPT
     assert render_properties(properties) in user
     assert render_signals(signals) in user
+
+
+@pytest.mark.parametrize(
+    ("channels", "present", "absent"),
+    [
+        (
+            PerceptionChannels(properties=True, signals=True),
+            ("$prop", '"pending"', '"action": "focus"'),
+            (),
+        ),
+        (
+            PerceptionChannels(properties=False, signals=True),
+            ('"pending"', '"action": "focus"', "Recently observed signals"),
+            ("$prop", "Currently observed properties"),
+        ),
+        (
+            PerceptionChannels(properties=False, signals=False),
+            ("$from", '"action": "subgoal"'),
+            (
+                "$prop",
+                "maintenance",
+                '"pending"',
+                '"action": "focus"',
+                "Currently observed properties",
+                "Recently observed signals",
+            ),
+        ),
+        (
+            PerceptionChannels(properties=True, signals=False),
+            ("$prop", '"pending"', '"action": "focus"'),
+            ("recently observed signals", "Recently observed signals"),
+        ),
+    ],
+)
+def test_default_plan_prompt_follows_declared_perception_channels(
+    channels: PerceptionChannels,
+    present: tuple[str, ...],
+    absent: tuple[str, ...],
+) -> None:
+    system, user = default_plan_prompt(_activity("triage"), {}, PerceptSnapshot(channels=channels))
+    rendered = system + "\n" + user
+    for phrase in present:
+        assert phrase in rendered
+    for phrase in absent:
+        assert phrase not in rendered
+
+
+def test_reduced_plan_prompts_keep_channel_independent_guidance() -> None:
+    signals_system, _ = default_plan_prompt(
+        _activity("triage"),
+        {},
+        PerceptSnapshot(channels=PerceptionChannels(properties=False, signals=True)),
+    )
+    operations_system, _ = default_plan_prompt(
+        _activity("triage"),
+        {},
+        PerceptSnapshot(channels=PerceptionChannels(properties=False, signals=False)),
+    )
+
+    assert "Use the tool's OWN search or lookup operation" in signals_system
+    assert "SEVERAL near-matches" in signals_system
+    assert "For a plain top-N selection, `sort` + `take`" in operations_system
+    assert "Keep deliberative sub-goals RARE and SMALL" in operations_system
+
+
+def test_signals_only_plan_prompt_has_no_property_specific_guidance() -> None:
+    system, _ = default_plan_prompt(
+        _activity("triage"),
+        {},
+        PerceptSnapshot(channels=PerceptionChannels(properties=False, signals=True)),
+    )
+
+    assert "$prop" not in system
+    assert "property" not in system.lower()
+    assert "observable state" not in system
+    assert "property path" not in system
+    assert "turn EACH such clause into one entry" in system
+    assert '"path": "<dotted path>"' in system
+    assert '"kind": "added" | "removed" | "updated"' in system
+    assert "For a change-bearing signal" in system
+    assert "Never guess a `seconds`" in system
+
+
+def test_unspecified_channels_preserve_the_legacy_rich_prompt() -> None:
+    system, user = default_plan_prompt(_activity("triage"), {}, PerceptSnapshot())
+
+    assert system == PLAN_SYSTEM_PROMPT
+    assert "Currently observed properties" in user
+    assert "Recently observed signals" in user
 
 
 def test_render_messages_empty_and_populated() -> None:
@@ -741,6 +869,70 @@ def test_render_tools_falls_back_to_authored_markdown_sections() -> None:
     assert "temperature" in rendered and "target_reached" in rendered and "set_target" in rendered
     assert "focus to perceive" in rendered  # the prose section keeps the focus-framed label
 
+    rich = render_tools(
+        {"thermostat": manual},
+        PerceptionChannels(properties=True, signals=True),
+    )
+    assert "temperature" in rich and "target_reached" in rich and "set_target" in rich
+
+    properties_only = render_tools(
+        {"thermostat": manual},
+        PerceptionChannels(properties=True, signals=False),
+    )
+    assert "temperature" in properties_only and "target_reached" not in properties_only
+
+    signals_only = render_tools(
+        {"thermostat": manual},
+        PerceptionChannels(properties=False, signals=True),
+    )
+    assert "target_reached" in signals_only and "temperature" not in signals_only
+
+    fitted = render_tools(
+        {"thermostat": manual},
+        PerceptionChannels(properties=False, signals=False),
+    )
+    assert "set_target" in fitted
+    assert "temperature" not in fitted
+    assert "target_reached" not in fitted
+
+
+def test_authored_markdown_sections_declare_perception_channels() -> None:
+    manual = Manual(
+        id="thermostat",
+        metadata={},
+        description="",
+        observable_properties=[],
+        signals=[],
+        operations=[],
+        raw_text=(
+            "# Observable Properties\n- temperature: the current reading\n\n"
+            "# Signals\n- target_reached\n\n"
+            "# Operations\n- set_target: set the setpoint\n"
+        ),
+    )
+
+    assert declared_perception_channels([FakeTool("thermostat", manual=manual)]) == (
+        PerceptionChannels(properties=True, signals=True)
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("water-pump.md", PerceptionChannels(properties=True, signals=True)),
+        ("blinds.md", PerceptionChannels(properties=True, signals=False)),
+        ("video-stream.md", PerceptionChannels(properties=True, signals=False)),
+        ("clock.md", PerceptionChannels(properties=False, signals=False)),
+    ],
+)
+def test_authored_fixture_manuals_declare_perception_channels(
+    filename: str, expected: PerceptionChannels
+) -> None:
+    raw = (Path(__file__).parent / "fixtures" / "manuals" / filename).read_text()
+    manual = MarkdownManualParser().parse(raw)
+
+    assert declared_perception_channels([FakeTool(manual.id, manual=manual)]) == expected
+
 
 def test_render_tools_surfaces_usage_protocols_and_safety() -> None:
     # The constraints a plan must respect (part 6) reach the planner. Prose-only (authored
@@ -998,6 +1190,41 @@ async def test_ground_returns_concrete_params(tmp_path: Path) -> None:
 
     assert params == {"email_id": 42, "body": "hi Alice"}
     assert (llm.requests[0].semantic_label, llm.requests[0].prompt_version) == ("ground", "1")
+
+
+async def test_custom_ground_prompt_is_not_fitted_or_sectioned(tmp_path: Path) -> None:
+    seen_channels: list[PerceptionChannels | None] = []
+
+    def custom_ground_prompt(
+        activity: Activity,
+        operation_name: str,
+        manual: Manual | None,
+        partial_params: dict[str, Any],
+        observed: PerceptSnapshot,
+    ) -> tuple[str, str]:
+        seen_channels.append(observed.channels)
+        return "CUSTOM GROUND", f"{activity.goal}:{operation_name}:{sorted(partial_params)}"
+
+    llm = FakeLLMClient(_params_json(query="blue"))
+    memory = ProceduralMemory(
+        FileMemoryBackend(tmp_path),
+        llm=llm,
+        ground_prompt=custom_ground_prompt,
+        prompt_fit="fixed-rich",
+    )
+    channels = PerceptionChannels(properties=False, signals=True)
+
+    await memory.ground(
+        _activity("find"),
+        "search",
+        None,
+        {"query": "blue"},
+        PerceptSnapshot(channels=channels),
+    )
+
+    assert seen_channels == [channels]
+    assert llm.calls == [("CUSTOM GROUND", "find:search:['query']")]
+    assert llm.requests[0].sections == ()
 
 
 async def test_ground_prompt_carries_operation_schema_and_history(tmp_path: Path) -> None:

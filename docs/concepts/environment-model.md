@@ -8,6 +8,16 @@ A tool's _usage interface_ is defined by:
 - _signals_, which represent transient events that occur within the tool and carry information that may be relevant to agents
 - _operations_, which represent external actions provided by a tool
 
+Observable properties and signals are independent, explicitly declared channels. A manual may
+declare either one, both, or neither; an empty property snapshot or a quiet signal stream does not
+mean that the corresponding channel is unavailable. The runtime derives availability from both
+structured specifications and non-empty authored affordance sections in the relevant tools'
+manuals. It also treats a retained percept as evidence of its channel after the originating tool
+has departed and its manual is no longer live. The commonly used perception-tier names are
+shorthand for three profiles:
+tier 3 has properties and signals, tier 2 has signals but no properties, and tier 1 has neither.
+They do not rule out other combinations, such as a property-only tool catalog.
+
 The usage interface is inherently asynchronous: when an agent invokes a tool operation, the agent's decision cycle does not block until the operation completes.
 
 This distinction — an agent's action versus a tool's operation — mirrors the action/operation split in agent meta-models built on Agents & Artifacts, such as JaCaMo (Jason combined with the CArtAgO artifact-based environment). Concretely, invoking an operation produces two acknowledgments, not one: an immediate `ActionAck` confirming the action itself was dispatched — the same generic outcome every external action returns — and a separate `OperationAck` carrying the tool's own eventual result, made available later on the activity itself (see [Activities](activities-and-concurrency.md)) once the operation actually completes.
@@ -17,6 +27,19 @@ S-ORA does not define its own tool-authoring framework. Tools are expected to be
 Tools that share a connection or session — e.g., multiple operations exposed by one MCP server — are grouped into a workspace: a shared lifecycle boundary whose tools remain individually focusable, but whose underlying connection is established and torn down once, not per tool. A workspace's adapter fixes the tool-use protocol for everything inside it (e.g., all-MCP, all-WoT), but individual tools may still have their own connection address distinct from the workspace's — e.g., a hypermedia workspace for a lab could group virtual tools hosted on the workspace's own server alongside physical devices reachable at their own addresses in the same room.
 
 How finely a server's primitives map to tools is the adapter's call. A plain MCP adapter maps each MCP tool to one S-ORA tool with a single operation and no observable properties or signals (its resources being application-controlled, per the preceding paragraph); a _curating_ adapter can lift a richer abstraction on top — e.g., the ARE adapter groups a server's `<App>__<operation>` tools into one tool per app and surfaces that app's state resource as a curated observable/signal. The `<App>__` convention is that adapter's own curation, not canonical MCP.
+
+The declared channels also shape the built-in model prompts. With adaptive prompt fitting, each
+semantic call includes only the perception modules supported by the tools relevant to that call:
+property vocabulary such as `$prop` and property-backed conditions is absent when no property
+channel is declared, and signal-backed waiting is absent when no signal channel is declared. This
+is a capability decision, not a reaction to current data, so a declared-but-quiet channel keeps its
+instructions. Custom prompt callables continue to own their complete prompt text.
+
+The `fixed-rich` prompt-fit setting keeps the full property-and-signal vocabulary regardless of
+the declared channels. It exists as an experimental sensitivity control: comparing it with adaptive
+fitting holds prompt instructions constant while perception changes, at the deliberate cost of
+teaching lower-tier agents vocabulary their environment cannot satisfy. It should not be read as
+the normal or fairest lower-tier configuration.
 
 A tool's `address` is a _locator_ and may be absent — e.g., tools multiplexed over one MCP stdio connection have none — whereas its `id` is the stable _handle_ the agent uses to focus and invoke it, and is **globally unique**: because a tool is a shared object, two agents focusing the same tool, or messaging about it, must name it identically. The per-protocol adapter guarantees this by deriving the id from the tool's global identity — its URI where the protocol provides one, or a value synthesized from the workspace's global origin/address otherwise — deterministically, so a later `restore()` reproduces the same id. A single registry can only enforce the ids it sees (it rejects a collision within its own joined set rather than letting one workspace's tool shadow another's); global uniqueness itself rests on the adapter. See [ADR-0014](../architecture/adrs/0014-tool-identity-globally-unique.md).
 

@@ -26,9 +26,15 @@ from sora.action import (
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.manual import (
+    Manual,
+    ObservablePropertySpecification,
+    SignalSpecification,
+)
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptionChannels,
     ProceduralMemory,
     SemanticMemory,
     WorkingMemory,
@@ -79,6 +85,19 @@ def _planned(plan: Plan | None, **kwargs: Any) -> Activity:
 
 def _step(tool_id: str) -> Step:
     return invoke_step(tool_id, "op")
+
+
+def _channel_manual(manual_id: str, *, properties: bool = False, signals: bool = False) -> Manual:
+    return Manual(
+        id=manual_id,
+        metadata={},
+        description=f"fake {manual_id}",
+        observable_properties=(
+            [ObservablePropertySpecification("state", "", {})] if properties else []
+        ),
+        signals=[SignalSpecification("changed", "", {})] if signals else [],
+        operations=[],
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -543,7 +562,10 @@ async def test_rebaselining_leaves_an_unbaselined_activity_alone(tmp_path: Path)
 
 
 async def test_scoped_snapshot_keeps_only_the_activitys_own_tools() -> None:
-    wm, _ = await _joined_wm(FakeTool("mine"), FakeTool("theirs"))
+    wm, _ = await _joined_wm(
+        FakeTool("mine", manual=_channel_manual("mine", signals=True)),
+        FakeTool("theirs", manual=_channel_manual("theirs", properties=True)),
+    )
     wm.attention_narrowed = True  # what Observe records when the policy narrows
     wm.properties[("mine", "state")] = Percept("mine", ObservableProperty("state", 1), 0.0)
     wm.properties[("theirs", "state")] = Percept("theirs", ObservableProperty("state", 2), 0.0)
@@ -555,13 +577,17 @@ async def test_scoped_snapshot_keeps_only_the_activitys_own_tools() -> None:
 
     assert [p.source for p in view.properties] == ["mine"]
     assert [p.source for p in view.signals] == ["mine"]
+    assert view.channels == PerceptionChannels(properties=True, signals=True)
 
 
 async def test_scoped_snapshot_does_not_narrow_under_a_broad_focus_policy() -> None:
     """The two attention layers move together or the default's whole argument collapses: an agent
     on FocusAllJoined declined to narrow *because* a wrongly narrowed view fails silently, so
     narrowing its prompts anyway would reintroduce that risk one layer down and invisibly."""
-    wm, _ = await _joined_wm(FakeTool("mine"), FakeTool("theirs"))
+    wm, _ = await _joined_wm(
+        FakeTool("mine", manual=_channel_manual("mine", signals=True)),
+        FakeTool("theirs", manual=_channel_manual("theirs", properties=True)),
+    )
     assert wm.attention_narrowed is False  # the default, and what FocusAllJoined leaves it at
     wm.properties[("mine", "state")] = Percept("mine", ObservableProperty("state", 1), 0.0)
     wm.properties[("theirs", "state")] = Percept("theirs", ObservableProperty("state", 2), 0.0)
@@ -570,6 +596,44 @@ async def test_scoped_snapshot_does_not_narrow_under_a_broad_focus_policy() -> N
     view = scoped_snapshot(wm, activity)
 
     assert {p.source for p in view.properties} == {"mine", "theirs"}
+    assert view.channels == PerceptionChannels(properties=True, signals=True)
+
+
+async def test_broad_snapshot_retains_departed_percepts_and_their_implied_channels() -> None:
+    wm, _ = await _joined_wm(FakeTool("current"))
+    wm.properties[("departed", "state")] = Percept("departed", ObservableProperty("state", 1), 0.0)
+    wm.signals.append(Percept("departed", Signal("changed", {}), 0.0))
+    activity = _planned(None)
+
+    view = scoped_snapshot(wm, activity)
+
+    assert [percept.source for percept in view.properties] == ["departed"]
+    assert [percept.source for percept in view.signals] == ["departed"]
+    assert view.channels == PerceptionChannels(properties=True, signals=True)
+
+
+async def test_broad_snapshot_derives_channels_from_quiet_live_tools() -> None:
+    wm, _ = await _joined_wm(
+        FakeTool("properties", manual=_channel_manual("properties", properties=True)),
+        FakeTool("signals", manual=_channel_manual("signals", signals=True)),
+    )
+
+    view = scoped_snapshot(wm, _planned(None))
+
+    assert view.properties == [] and view.signals == []
+    assert view.channels == PerceptionChannels(properties=True, signals=True)
+
+
+async def test_broad_snapshot_unions_live_declarations_with_retained_percepts() -> None:
+    wm, _ = await _joined_wm(
+        FakeTool("current", manual=_channel_manual("current", properties=True))
+    )
+    wm.signals.append(Percept("departed", Signal("changed", {}), 0.0))
+
+    view = scoped_snapshot(wm, _planned(None))
+
+    assert [percept.source for percept in view.signals] == ["departed"]
+    assert view.channels == PerceptionChannels(properties=True, signals=True)
 
 
 async def test_scoped_snapshot_is_non_destructive() -> None:

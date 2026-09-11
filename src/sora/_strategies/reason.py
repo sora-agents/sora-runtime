@@ -64,7 +64,7 @@ from sora.data_ops import (
     _resolve_predicate_value,
 )
 from sora.memory import (
-    PerceptSnapshot,
+    percept_snapshot,
     render_plan,
     render_steps,
 )
@@ -204,7 +204,7 @@ class DefaultReasonStrategy:
                 # inference_sink (Observe attaches it and resets step_index); this Reason yields no
                 # step now. Situate won't reselect a RUNNING activity, so no re-fire meanwhile.
                 catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
-                observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+                observed = percept_snapshot(wm)
                 infer = cycle.actions.internal(InferAction.name)
                 await infer.execute(
                     cycle,
@@ -422,7 +422,7 @@ class DefaultReasonStrategy:
         # Agent-level on purpose, unlike ground/select: the gate above fires on ANY
         # perception change, so scoping this to the plan's own tools would hand the judge a world
         # in which the change that woke it is invisible — it would revalidate against nothing.
-        observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+        observed = percept_snapshot(wm)
         revalidate = cycle.actions.internal(RevalidateAction.name)
         await revalidate.execute(
             cycle,
@@ -563,7 +563,7 @@ class DefaultReasonStrategy:
             changes.extend(
                 (match.percept.source, change) for change in changes_of(match.percept.payload)
             )
-        observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+        observed = percept_snapshot(wm)
         evaluate = cycle.actions.internal(EvaluateConditionsAction.name)
         await evaluate.execute(
             cycle,
@@ -750,7 +750,7 @@ class DefaultReasonStrategy:
                 return _SUBGOAL_HALTED
             _lift_step_conditions(step, activity, wm, mode)
             catalog = {tool.id: tool.manual for tool in wm.registry.all_tools()}
-            observed = PerceptSnapshot(list(wm.properties.values()), list(wm.signals))
+            observed = percept_snapshot(wm)
             infer = cycle.actions.internal(InferAction.name)
             await infer.execute(
                 cycle,

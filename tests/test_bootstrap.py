@@ -259,11 +259,13 @@ def test_load_yaml_parses_procedural_block(tmp_path: Path) -> None:
             "    semantic: file://./s\n"
             "  workspaces: []\n"
             "  procedural:\n"
+            "    prompt_fit: fixed-rich\n"
             "    plan_prompt: test_bootstrap._fake_plan_prompt\n"
             "    ground_prompt: test_bootstrap._fake_ground_prompt\n",
         )
     )
     assert config.procedural == {
+        "prompt_fit": "fixed-rich",
         "plan_prompt": "test_bootstrap._fake_plan_prompt",
         "ground_prompt": "test_bootstrap._fake_ground_prompt",
     }
@@ -575,6 +577,21 @@ def _fake_ground_prompt(
 
 def test_procedural_prompts_for_absent_block_is_empty() -> None:
     assert procedural_prompts_for(_config(procedural=None)) == {}
+
+
+@pytest.mark.parametrize("prompt_fit", ["adaptive", "fixed-rich"])
+def test_procedural_prompts_for_resolves_prompt_fit(prompt_fit: str) -> None:
+    assert procedural_prompts_for(_config(procedural={"prompt_fit": prompt_fit})) == {
+        "prompt_fit": prompt_fit
+    }
+
+
+def test_procedural_prompts_for_rejects_unknown_prompt_fit() -> None:
+    with pytest.raises(
+        ValueError,
+        match="agent.yaml: procedural.prompt_fit must be 'adaptive' or 'fixed-rich'",
+    ):
+        procedural_prompts_for(_config(procedural={"prompt_fit": "compressed"}))
 
 
 def test_procedural_prompts_for_resolves_plan_prompt_only() -> None:

@@ -14,8 +14,19 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from urllib.parse import quote
+
+# ``PerceptionChannels`` is public from ``sora.memory`` alongside ``PerceptSnapshot`` so custom
+# prompt builders can inspect the same declaration as the built-ins.
+from sora._prompts import (
+    PerceptionChannels as PerceptionChannels,
+)
+from sora._prompts import (
+    PromptManifest,
+    PromptModule,
+    PromptRendering,
+)
 
 # Imported at runtime (not just for typing): SemanticMemory reconstructs these dataclasses from
 # the plain dicts the backend hands back. manual.py / environment.py only import their sora deps
@@ -65,6 +76,8 @@ if TYPE_CHECKING:
     from sora.perception import Message, Percept
 
 log = logging.getLogger("sora.memory")
+
+PromptFit = Literal["adaptive", "fixed-rich"]
 
 
 class MemoryBackend(Protocol):  # pluggable: file, DB, vector store
@@ -703,7 +716,177 @@ PLAN_SYSTEM_PROMPT = (
 )
 
 
-def render_tools(tools: dict[str, Manual]) -> str:
+_PLAN_MANIFEST = PromptManifest.split(
+    "plan",
+    PLAN_SYSTEM_PROMPT,
+    (
+        ("response-contract", "Respond with ONLY"),
+        ("focus-actions", '  {"action": "focus"'),
+        ("subgoal-action", '  {"action": "subgoal"'),
+        ("action-rules", 'A step with no "action"'),
+        ("focus-guidance", "You do not need `focus`"),
+        ("authorization-and-reporting", "Respect any usage"),
+        ("result-references", "When a parameter's value depends"),
+        ("property-references", "A value already in the CURRENTLY"),
+        ("name-matching", "That flips when the value"),
+        ("name-search", "Use the tool's OWN search"),
+        ("computed-references", "A value you must COMPUTE"),
+        ("narrowing", "Where the data is reachable only through operations"),
+        ("fanout", "When a step must be repeated"),
+        ("maintenance", "A `subgoal` step MAY"),
+        ("data-ops", "To NARROW or RESHAPE"),
+        ("current-state-predicates", "A `$decide` predicate is judged"),
+        ("predicate-composition", "Phrase the rule against"),
+        ("fired-changes", "When the goal you are planning was triggered"),
+        ("top-n-selection", "For a plain top-N selection"),
+        ("deliberative-subgoals", "Keep deliberative sub-goals"),
+        ("observed-context", "You are also given"),
+        ("pending-introduction", 'A plan MAY also carry {"pending"'),
+        ("pending-schema", '  {"watch": {"signal"'),
+        ("pending-watch", '"watch" is REQUIRED'),
+        ("pending-until", "`until` bounds the wait"),
+        ("pending-example", "Example — goal"),
+        ("pending-close", "Emit no `pending`"),
+    ),
+)
+
+
+_FOCUS_PROPERTIES = (
+    "You do not need `focus` steps for the tools your plan already names: the runtime attends to "
+    "every tool your steps invoke or reference, for as long as the plan is live. Emit `focus` only "
+    "for a tool whose properties you need but whose operations the plan never calls, and `unfocus` "
+    "only to stop watching one early. "
+)
+_FOCUS_SIGNALS = (
+    "You do not need `focus` steps for the tools your plan already names: the runtime attends to "
+    "every tool your steps invoke or reference, for as long as the plan is live. Emit `focus` only "
+    "for a tool whose signals you need but whose operations the plan never calls, and `unfocus` "
+    "only to stop watching one early. "
+)
+_NAME_MATCHING_WITHOUT_PROPERTIES = (
+    "When the value you match on is a NAME the USER phrased, `eq` matches only the stored string "
+    "in full, and people name things approximately — they shorten a title, drop a subtitle or an "
+    'edition, reorder words, punctuate it differently — so a goal saying "the Delft landscape" '
+    'may be stored as "View of Delft, oil on canvas (1661)". A mechanical `eq` on that phrase '
+    "matches NOTHING, and an empty result is indistinguishable from the record not existing: the "
+    "agent goes on to tell the user the thing cannot be found while it sits in the collection. So "
+    "do NOT resolve a user-phrased name with `eq`.\n"
+)
+_NAME_SEARCH_WITHOUT_PROPERTIES = (
+    "Use the tool's OWN search or lookup operation for that instead — whatever the catalog calls "
+    "it (a `search_*` / `find_*` / `lookup_*` operation, or one taking a `query`, `name` or "
+    "`keyword` parameter). Matching an approximate name against its own records is the job that "
+    "operation exists to do, and it is CHEAP: one call, no collection shipped to the model. Only "
+    "where the tool offers no such operation, call the broadest suitable read operation and "
+    'filter its returned collection with a {"$decide": ...} predicate that accepts the record '
+    "whose stored name CONTAINS or paraphrases the user's phrase — still never a mechanical "
+    "`eq`. What flips the rule is a FREE-FORM name, not who uttered the value: `eq` stays right "
+    "for anything the record stores verbatim out of a fixed vocabulary — ids and keys, enumerated "
+    "statuses and categories, numbers, dates, booleans, and anything copied from an earlier "
+    "result — and the user naming one of those (a city, a status) does not make it approximate.\n"
+    "Expect that search to come back with SEVERAL near-matches — for an approximate name that is "
+    "the normal outcome, not a failure. Narrow them afterwards on the fields the goal actually "
+    "constrains (a date, a medium, a gallery), or ask the user which one they meant. Do not "
+    "re-tighten to an `eq` on the name to cut the list down: that is the same mistake one step "
+    "later.\n"
+)
+_OPERATIONS_ONLY_NARROWING = (
+    "Where data is reachable through operations, narrow it before acting: use a specific search "
+    "or a date/range-bounded list operation so a $from reference points at an unambiguous result. "
+    "Prefer an operation that accepts the narrowing as parameters; otherwise apply a data-op to "
+    "the returned collection.\n"
+)
+_EXECUTION_CONTEXT_PREDICATE = (
+    "A `$decide` predicate is judged only against the execution context provided; it cannot "
+    "reconstruct state from before a change. "
+)
+_PROPERTIES_CONTEXT = (
+    "You are also given the agent's currently observed properties as already-known facts about "
+    "the current world. Use them to decide what to do and to fill stable values. Do not copy a "
+    "volatile identifier into a reusable plan; derive it from an operation result at execution "
+    "time.\n"
+)
+_SIGNALS_CONTEXT = (
+    "You are also given the agent's recently observed signals as already-known transient events. "
+    "Use them to decide what to do, while deriving operation parameters from declared operation "
+    "results rather than inventing values.\n"
+)
+_ACHIEVEMENT_SUBGOAL_ACTION = (
+    '  {"action": "subgoal", "goal": "<what to achieve>", "mode": "mechanical" | '
+    '"deliberative", ...}\n'
+)
+_PROPERTY_PENDING_WATCH = (
+    '"watch" is REQUIRED and is a cheap mechanical filter, not the judgement: use `signal` as a '
+    "stable label for the derived change, name its tool in `source`, and use `path` to point at "
+    "the part of the observed property that would move — it is what stops every unrelated change "
+    "from waking this goal. `kind` says WHICH WAY it has to move, and matters most when this goal "
+    "also WRITES to what it watches: an agent that watches a collection for additions and deletes "
+    "from that same collection will otherwise wake itself on every delete it makes. Set it "
+    "whenever "
+    "`when` names a direction, and omit it when any change is genuinely interesting. `when` is the "
+    "actual judgement, in plain language. `then` is a goal, phrased like the original goal — the "
+    "runtime plans it fresh when the moment comes, so do not write steps here.\n"
+)
+_SIGNAL_PENDING_WATCH = (
+    '"watch" is REQUIRED and is a cheap mechanical filter, not the judgement: name the signal and '
+    "the tool that would carry it. For a change-bearing signal, use `path` to point at the "
+    "affected "
+    "field or collection — it is what stops every unrelated change from waking this goal. `kind` "
+    "says WHICH WAY it has to move, and matters most when this goal also WRITES to what it "
+    "watches: "
+    "an agent that watches a collection for additions and deletes from that same collection will "
+    "otherwise wake itself on every delete it makes. Set it whenever `when` names a direction, and "
+    "omit it when any change is genuinely interesting. `when` is the actual judgement, in plain "
+    "language. `then` is a goal, phrased like the original goal — the runtime plans it fresh when "
+    "the moment comes, so do not write steps here.\n"
+)
+
+
+def _adapt_plan_module(module: PromptModule, channels: PerceptionChannels | None) -> str:
+    """Fit one planning module to the affordances declared in the call's tool scope."""
+    if channels is None or channels.rich:
+        return module.text
+    if module.name == "focus-actions" and not channels.any:
+        return ""
+    if module.name == "subgoal-action" and not channels.any:
+        return _ACHIEVEMENT_SUBGOAL_ACTION
+    if module.name == "focus-guidance":
+        if channels.properties:
+            return _FOCUS_PROPERTIES
+        if channels.signals:
+            return _FOCUS_SIGNALS
+        return ""
+    if module.name == "property-references" and not channels.properties:
+        return ""
+    if module.name == "name-matching" and not channels.properties:
+        return _NAME_MATCHING_WITHOUT_PROPERTIES
+    if module.name == "name-search" and not channels.properties:
+        return _NAME_SEARCH_WITHOUT_PROPERTIES
+    if module.name == "narrowing" and not channels.properties:
+        return _OPERATIONS_ONLY_NARROWING
+    if module.name == "maintenance" and not channels.any:
+        return ""
+    if module.name == "current-state-predicates" and not channels.properties:
+        return _EXECUTION_CONTEXT_PREDICATE
+    if module.name == "fired-changes" and not channels.any:
+        return ""
+    if module.name == "observed-context":
+        if not channels.any:
+            return ""
+        if channels.properties and not channels.signals:
+            return _PROPERTIES_CONTEXT
+        return _SIGNALS_CONTEXT
+    if module.name.startswith("pending-") and not channels.any:
+        return ""
+    if module.name == "pending-watch":
+        if channels.properties and not channels.signals:
+            return _PROPERTY_PENDING_WATCH
+        if channels.signals and not channels.properties:
+            return _SIGNAL_PENDING_WATCH
+    return module.text
+
+
+def render_tools(tools: dict[str, Manual], channels: PerceptionChannels | None = None) -> str:
     """Render the tools' three-part usage interface (A&A) for a planning prompt: operations to
     *invoke*, plus the observable properties and signals perceivable by *focusing* — surfacing the
     latter two is what motivates a focus/unfocus plan step (a tool with neither reads as
@@ -718,18 +901,20 @@ def render_tools(tools: dict[str, Manual]) -> str:
             header += f": {manual.description}"
         lines = [header]
         lines += _render_operations(manual)
-        lines += _render_affordances(
-            "observable properties (focus to perceive)",
-            "property",
-            [(p.name, p.description) for p in manual.observable_properties],
-            manual.section(ManualSection.OBSERVABLE_PROPERTIES),
-        )
-        lines += _render_affordances(
-            "signals (focus to receive)",
-            "signal",
-            [(s.name, s.description) for s in manual.signals],
-            manual.section(ManualSection.SIGNALS),
-        )
+        if channels is None or channels.properties:
+            lines += _render_affordances(
+                "observable properties (focus to perceive)",
+                "property",
+                [(p.name, p.description) for p in manual.observable_properties],
+                manual.section(ManualSection.OBSERVABLE_PROPERTIES),
+            )
+        if channels is None or channels.signals:
+            lines += _render_affordances(
+                "signals (focus to receive)",
+                "signal",
+                [(s.name, s.description) for s in manual.signals],
+                manual.section(ManualSection.SIGNALS),
+            )
         # Usage protocols & safety — the constraints the plan must respect. Prose-only (no
         # structured field: it lives only in an authored Markdown manual's raw_text — ADR-0015), so
         # it surfaces just for hand-authored manuals. The "suspend until signal Y" portion is
@@ -866,10 +1051,50 @@ class PerceptSnapshot:
     ``ObservableProperty``-payload percepts (replace-by-key, at most one per ``(source, name)``);
     ``signals`` holds ``Signal``-payload percepts (an append log — duplicates are distinct
     occurrences, never deduplicated). An empty snapshot (``PerceptSnapshot()``) means nothing
-    observed yet, not an omitted section."""
+    observed yet, not an omitted section. ``channels`` records what the manuals declare even when
+    those lists are quiet; ``None`` is the compatibility value for callers that predate channel-
+    fitted prompts and therefore keeps the legacy rich prompt."""
 
     properties: list[Percept] = field(default_factory=list)
     signals: list[Percept] = field(default_factory=list)
+    channels: PerceptionChannels | None = None
+
+
+def declared_perception_channels(tools: Sequence[Tool]) -> PerceptionChannels:
+    """The union of structured and prose-authored affordances in one model call's tool scope."""
+    return PerceptionChannels(
+        properties=any(
+            tool.manual.observable_properties
+            or _prose(tool.manual.section(ManualSection.OBSERVABLE_PROPERTIES)) is not None
+            for tool in tools
+        ),
+        signals=any(
+            tool.manual.signals or _prose(tool.manual.section(ManualSection.SIGNALS)) is not None
+            for tool in tools
+        ),
+    )
+
+
+def percept_snapshot(wm: WorkingMemory, tool_ids: set[str] | None = None) -> PerceptSnapshot:
+    """Snapshot percepts and every channel evidenced by the declarations or included content."""
+    tools = wm.registry.all_tools()
+    if tool_ids is not None:
+        tools = [tool for tool in tools if tool.id in tool_ids]
+        properties = [percept for key, percept in wm.properties.items() if key[0] in tool_ids]
+        signals = [percept for percept in wm.signals if percept.source in tool_ids]
+    else:
+        properties = list(wm.properties.values())
+        signals = list(wm.signals)
+    declared = declared_perception_channels(tools)
+    channels = PerceptionChannels(
+        properties=declared.properties or bool(properties),
+        signals=declared.signals or bool(signals),
+    )
+    return PerceptSnapshot(
+        properties,
+        signals,
+        channels=channels,
+    )
 
 
 def _render_json(value: Any) -> str:
@@ -1212,18 +1437,40 @@ def default_plan_prompt(
     ``PLAN_SYSTEM_PROMPT`` / ``render_tools`` / ``render_properties`` / ``render_signals`` /
     ``render_history`` / ``render_messages`` when writing a custom one."""
     observed = observed or PerceptSnapshot()
+    return _render_default_plan_prompt(activity, tools, observed, messages or []).pair()
+
+
+def _default_plan_user_prompt(
+    activity: Activity,
+    tools: dict[str, Manual],
+    observed: PerceptSnapshot,
+    messages: list[Message],
+) -> str:
+    channels = observed.channels
     user = (
         f"Goal: {activity.goal}\n"
         f"{_render_goal_provenance(activity)}\n"
         f"{_render_governing_step_conditions(activity)}"
-        f"Available tools and their operations:\n{render_tools(tools)}\n\n"
-        f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
-        f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
-        f"Ids reported by the change that triggered this goal:\n"
-        f"{render_seeded_bindings(activity.bindings)}\n\n"
-        f"Results of operations already executed:\n"
+        f"Available tools and their operations:\n{render_tools(tools, channels)}\n\n"
+        + (
+            f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
+            if channels is None or channels.properties
+            else ""
+        )
+        + (
+            f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
+            if channels is None or channels.signals
+            else ""
+        )
+        + (
+            "Ids reported by the change that triggered this goal:\n"
+            f"{render_seeded_bindings(activity.bindings)}\n\n"
+            if channels is None or channels.any
+            else ""
+        )
+        + f"Results of operations already executed:\n"
         f"{render_history(activity.history, _HISTORY_RENDER_PLAN)}\n\n"
-        f"Recent instructions from the user:\n{render_messages(messages or [])}"
+        f"Recent instructions from the user:\n{render_messages(messages)}"
     )
     if activity.superseded is not None:
         # Framing lives in the section itself, not PLAN_SYSTEM_PROMPT: a custom PlanPrompt that
@@ -1268,7 +1515,21 @@ def default_plan_prompt(
                 "over as-is.\n"
             )
         user += f"{framing}{render_superseded_plan(activity.superseded)}"
-    return PLAN_SYSTEM_PROMPT, user
+    return user
+
+
+def _render_default_plan_prompt(
+    activity: Activity,
+    tools: dict[str, Manual],
+    observed: PerceptSnapshot,
+    messages: list[Message],
+) -> PromptRendering:
+    user = _default_plan_user_prompt(activity, tools, observed, messages)
+    return _PLAN_MANIFEST.render(
+        (PromptModule("context", user, dynamic=True),),
+        observed.channels,
+        adapt=_adapt_plan_module,
+    )
 
 
 def step_from_raw(raw: dict[str, Any], *, record_malformed: bool = False) -> Step:
@@ -1683,6 +1944,47 @@ GROUND_SYSTEM_PROMPT = (
 )
 
 
+_GROUND_MANIFEST = PromptManifest.split(
+    "ground",
+    GROUND_SYSTEM_PROMPT,
+    (
+        ("response-contract", "Respond with ONLY"),
+        ("missing-data", "If a reference names data"),
+        ("list-integrity", "This applies element by element"),
+        ("resolvable-values", "That is only for missing DATA"),
+        ("execution-record", "Some parameters are natural-language TEXT"),
+    ),
+)
+
+
+def _ground_role_for(channels: PerceptionChannels) -> str:
+    if channels.properties:
+        observed = "the agent's currently observed properties, "
+        sources = "a prior result, a named binding, or an already-observed property"
+    elif channels.signals:
+        observed = "the agent's recently observed signals, "
+        sources = "a prior result, a named binding, or a recently observed signal"
+    else:
+        observed = ""
+        sources = "a prior result or a named binding"
+    return (
+        "You are grounding the parameters of a SINGLE tool operation about to be invoked. You are "
+        "given the goal, the operation and its parameter schema, a partial set of parameters (some "
+        f"values may still be references to earlier results), {observed}the named data-op bindings "
+        "(collections an earlier step computed), and the results of the operations already "
+        "executed. Produce the final, concrete parameters: fill every value that depends on "
+        f"{sources} from the ACTUAL data given, and keep already-concrete values as given.\n"
+    )
+
+
+def _adapt_ground_module(module: PromptModule, channels: PerceptionChannels | None) -> str:
+    if channels is None or channels.rich:
+        return module.text
+    if module.name == "role":
+        return _ground_role_for(channels)
+    return module.text
+
+
 class GroundPrompt(Protocol):
     """Builds the ``(system, user_prompt)`` pair ``ground()`` sends to the LLM — the grounding
     counterpart to ``PlanPrompt``, injected into ``ProceduralMemory`` so grounding *content* is
@@ -1962,6 +2264,19 @@ def default_ground_prompt(
     ``render_noop_subgoals`` / ``render_bindings`` / ``render_properties`` / ``render_signals`` in
     a custom one."""
     observed = observed or PerceptSnapshot()
+    return _render_default_ground_prompt(
+        activity, operation_name, manual, partial_params, observed
+    ).pair()
+
+
+def _default_ground_user_prompt(
+    activity: Activity,
+    operation_name: str,
+    manual: Manual | None,
+    partial_params: dict[str, Any],
+    observed: PerceptSnapshot,
+) -> str:
+    channels = observed.channels
     user = (
         # No goal-provenance notice here, unlike default_plan_prompt: it is advice about how to end
         # a *plan* ("do NOT invoke send_message_to_user"), which grounding one operation's params
@@ -1971,9 +2286,17 @@ def default_ground_prompt(
         f"Operation to invoke:\n{_render_operation_schema(manual, operation_name)}\n\n"
         f"Partial parameters (resolve any references, keep concrete values):\n"
         f"{json.dumps(partial_params, indent=2)}\n\n"
-        f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
-        f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
-        f"Named data-op bindings (a $bind reference or a $decide instruction may name one):\n"
+        + (
+            f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
+            if channels is None or channels.properties
+            else ""
+        )
+        + (
+            f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
+            if channels is None or channels.signals
+            else ""
+        )
+        + f"Named data-op bindings (a $bind reference or a $decide instruction may name one):\n"
         f"{render_bindings(activity.bindings)}\n\n"
         # Deliberately unwindowed: a $from/$decide reference may name any past result, and hiding
         # the entry that holds the referent fails the same way truncating it mid-record does.
@@ -1985,7 +2308,22 @@ def default_ground_prompt(
         f"because nothing was invoked for them):\n"
         f"{render_noop_subgoals(activity.noop_subgoals)}"
     )
-    return GROUND_SYSTEM_PROMPT, user
+    return user
+
+
+def _render_default_ground_prompt(
+    activity: Activity,
+    operation_name: str,
+    manual: Manual | None,
+    partial_params: dict[str, Any],
+    observed: PerceptSnapshot,
+) -> PromptRendering:
+    user = _default_ground_user_prompt(activity, operation_name, manual, partial_params, observed)
+    return _GROUND_MANIFEST.render(
+        (PromptModule("context", user, dynamic=True),),
+        observed.channels,
+        adapt=_adapt_ground_module,
+    )
 
 
 # The second legal answer of every escalation asked to RESOLVE a reference: the data that reference
@@ -2096,6 +2434,36 @@ CONDITION_SYSTEM_PROMPT = (
     "condition merely looks less likely now, and never to tidy up.\n"
     'Respond with ONLY a JSON object {"fired": [<indices>], "retired": [<indices>]} — 0-based '
     "indices into the numbered list, no prose, no fences. Use empty lists when nothing applies."
+)
+
+
+_CONDITION_SIGNAL_EVIDENCE = (
+    "You are given the original goal, and a numbered list of conditions. Each has a `when` (what "
+    "the agent is waiting for) and, optionally, an `until` (when it should stop waiting). You are "
+    "also given the observed change and the recently observed signals that accompanied it.\n"
+)
+_CONDITION_CHANGE_EVIDENCE = (
+    "You are given the original goal, and a numbered list of conditions. Each has a `when` (what "
+    "the agent is waiting for) and, optionally, an `until` (when it should stop waiting). You are "
+    "also given the observed change.\n"
+)
+_CONDITION_SIGNAL_VERDICTS = (
+    "For each condition decide, independently:\n"
+    "  - FIRED: the `when` has actually happened, judged from the observed change and recent "
+    "signals. Be strict — the change reaching the agent is only a prompt to look; most changes "
+    "are not the awaited event, and a wrong `fired` makes the agent redo work nobody asked for.\n"
+    "  - RETIRED: the `until` is now satisfied, so the agent should stop waiting on it. A "
+    "condition with no `until` is retired only if waiting has become pointless.\n"
+    "A condition can be neither (the usual answer: keep waiting), or both.\n"
+)
+_CONDITION_CHANGE_VERDICTS = (
+    "For each condition decide, independently:\n"
+    "  - FIRED: the `when` has actually happened, judged from the observed change. Be strict — "
+    "the change reaching the agent is only a prompt to look; most changes are not the awaited "
+    "event, and a wrong `fired` makes the agent redo work nobody asked for.\n"
+    "  - RETIRED: the `until` is now satisfied, so the agent should stop waiting on it. A "
+    "condition with no `until` is retired only if waiting has become pointless.\n"
+    "A condition can be neither (the usual answer: keep waiting), or both.\n"
 )
 
 
@@ -2256,6 +2624,102 @@ SELECT_SYSTEM_PROMPT = (
 )
 
 
+_SYSTEM_MANIFESTS = {
+    "select": PromptManifest.split(
+        "select",
+        SELECT_SYSTEM_PROMPT,
+        (
+            ("reference-resolution", "The predicate may NAME"),
+            ("response-contract", "Respond with ONLY"),
+            ("missing-context", "There is a second legal answer"),
+            ("resolvable-values", "That is only for missing CONTEXT"),
+        ),
+    ),
+    "revalidate": PromptManifest.split(
+        "revalidate",
+        REVALIDATE_SYSTEM_PROMPT,
+        (
+            ("validity", "The plan is INVALID"),
+            ("response-contract", "Respond with ONLY"),
+        ),
+    ),
+    "condition": PromptManifest.split(
+        "condition",
+        CONDITION_SYSTEM_PROMPT,
+        (
+            ("evidence", "You are given"),
+            ("verdicts", "For each condition decide"),
+            ("branch-retirement", "Judge FIRED for each"),
+            ("response-contract", "Respond with ONLY"),
+        ),
+    ),
+    "retirement": PromptManifest.split(
+        "retirement",
+        RETIREMENT_SYSTEM_PROMPT,
+        (
+            ("quiet-check", "The agent finished"),
+            ("evidence", "You are given"),
+            ("retirement-contract", "For each condition decide"),
+            ("no-firing", "Do NOT decide"),
+            ("conservative-default", "Default to keeping"),
+            ("response-contract", "Respond with ONLY"),
+        ),
+    ),
+    "relevance": PromptManifest.split(
+        "relevance",
+        RELEVANCE_SYSTEM_PROMPT,
+        (
+            ("evidence", "You are given"),
+            ("conservative-default", "Answer NO unless"),
+            ("response-contract", "Respond with ONLY"),
+        ),
+    ),
+}
+
+
+def _adapt_context_module(
+    semantic_label: str, module: PromptModule, channels: PerceptionChannels | None
+) -> str:
+    if channels is None or channels.rich:
+        return module.text
+    text = module.text
+    if semantic_label == "select":
+        if channels.properties:
+            world = "the currently observed properties"
+        elif channels.signals:
+            world = "the recently observed signals"
+        else:
+            world = "the available execution record"
+        text = text.replace("the observed world state", world)
+    elif semantic_label == "revalidate":
+        replacement = (
+            "the new observed properties and messages"
+            if channels.properties
+            else "the new signals and messages"
+            if channels.signals
+            else "the new messages"
+        )
+        text = text.replace("the new observed state and messages", replacement)
+    elif semantic_label == "condition" and not channels.properties:
+        if module.name == "evidence":
+            return _CONDITION_SIGNAL_EVIDENCE if channels.signals else _CONDITION_CHANGE_EVIDENCE
+        if module.name == "verdicts":
+            return _CONDITION_SIGNAL_VERDICTS if channels.signals else _CONDITION_CHANGE_VERDICTS
+    return text
+
+
+def _render_builtin_prompt(
+    semantic_label: str,
+    user_modules: Sequence[PromptModule],
+    channels: PerceptionChannels | None,
+) -> PromptRendering:
+    return _SYSTEM_MANIFESTS[semantic_label].render(
+        user_modules,
+        channels,
+        adapt=lambda module, fitted: _adapt_context_module(semantic_label, module, fitted),
+    )
+
+
 def _parse_keep(text: str, count: int) -> list[int]:
     """Parse the ``{"keep": [<indices>]}`` selection contract into the in-range indices to keep,
     preserving the model's order. Out-of-range or non-integer entries are dropped (defensive against
@@ -2329,6 +2793,7 @@ class ProceduralMemory:
         llm: LLMClient | None = None,
         prompt: PlanPrompt = default_plan_prompt,
         ground_prompt: GroundPrompt = default_ground_prompt,
+        prompt_fit: PromptFit = "adaptive",
     ) -> None:
         # `llm` is the model behind infer()/ground() — procedural memory "includes implicit
         # knowledge encoded in LLM weights", both *query* against it (CoALA). `None` keeps
@@ -2338,6 +2803,14 @@ class ProceduralMemory:
         self._llm = llm
         self._prompt = prompt
         self._ground_prompt = ground_prompt
+        if prompt_fit not in ("adaptive", "fixed-rich"):
+            raise ValueError("prompt_fit must be 'adaptive' or 'fixed-rich'")
+        self._prompt_fit = prompt_fit
+
+    def _fit_snapshot(self, snapshot: PerceptSnapshot) -> PerceptSnapshot:
+        if self._prompt_fit == "fixed-rich":
+            return replace(snapshot, channels=None)
+        return snapshot
 
     @property
     def model(self) -> str | None:
@@ -2391,7 +2864,14 @@ class ProceduralMemory:
                 "ProceduralMemory has no LLM configured; cannot infer a plan (store/retrieve "
                 "still work). Pass an LLMClient to enable inference."
             )
-        system, user = self._prompt(activity, tools, observed or PerceptSnapshot(), messages or [])
+        snapshot = observed or PerceptSnapshot()
+        if self._prompt is default_plan_prompt:
+            snapshot = self._fit_snapshot(snapshot)
+            rendering = _render_default_plan_prompt(activity, tools, snapshot, messages or [])
+        else:
+            system, user = self._prompt(activity, tools, snapshot, messages or [])
+            rendering = PromptRendering(system, user, ())
+        system, user = rendering.system, rendering.user
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         governing = _governing_step_conditions(activity)
 
@@ -2413,7 +2893,13 @@ class ProceduralMemory:
                 pending=pending,
             )
 
-        request = CompletionRequest(system, user, semantic_label="plan", prompt_version="1")
+        request = CompletionRequest(
+            system,
+            user,
+            semantic_label="plan",
+            prompt_version="1",
+            sections=rendering.sections,
+        )
         return await _complete_and_parse(self._llm, request, _to_plan, what="plan inference")
 
     async def ground(
@@ -2438,12 +2924,27 @@ class ProceduralMemory:
             raise RuntimeError(
                 "ProceduralMemory has no LLM configured; cannot ground parameters. Pass a client."
             )
-        system, user = self._ground_prompt(
-            activity, operation_name, manual, partial_params, observed or PerceptSnapshot()
-        )
+        snapshot = observed or PerceptSnapshot()
+        if self._ground_prompt is default_ground_prompt:
+            snapshot = self._fit_snapshot(snapshot)
+            rendering = _render_default_ground_prompt(
+                activity, operation_name, manual, partial_params, snapshot
+            )
+        else:
+            system, user = self._ground_prompt(
+                activity, operation_name, manual, partial_params, snapshot
+            )
+            rendering = PromptRendering(system, user, ())
+        system, user = rendering.system, rendering.user
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         text = await self._llm.complete(
-            CompletionRequest(system, user, semantic_label="ground", prompt_version="1")
+            CompletionRequest(
+                system,
+                user,
+                semantic_label="ground",
+                prompt_version="1",
+                sections=rendering.sections,
+            )
         )
         try:
             params = _parse_params(text)
@@ -2488,7 +2989,8 @@ class ProceduralMemory:
                 "ProceduralMemory has no LLM configured; cannot evaluate a $decide filter. Pass a "
                 "client."
             )
-        snapshot = observed or PerceptSnapshot()
+        snapshot = self._fit_snapshot(observed or PerceptSnapshot())
+        channels = snapshot.channels
         items = "\n".join(
             f"{index}: {json.dumps(item, default=str)}" for index, item in enumerate(collection)
         )
@@ -2498,19 +3000,32 @@ class ProceduralMemory:
             f"Results of operations already executed:\n{render_history(activity.history)}\n\n"
             f"Named data-op bindings (the predicate may name one):\n"
             f"{render_bindings(activity.bindings)}\n\n"
-            f"Currently observed properties:\n{render_properties(snapshot.properties)}\n\n"
-            f"Recently observed signals:\n{render_signals(snapshot.signals)}\n\n"
+            + (
+                f"Currently observed properties:\n{render_properties(snapshot.properties)}\n\n"
+                if channels is None or channels.properties
+                else ""
+            )
+            + (
+                f"Recently observed signals:\n{render_signals(snapshot.signals)}\n\n"
+                if channels is None or channels.signals
+                else ""
+            )
+            +
             # Items last: it is by far the largest section, and the context above is what the
             # predicate's references resolve against, so it should be read first.
             f"Items:\n{items}"
         )
-        log.debug("reason: system prompt\n%s\nUser prompt\n%s", SELECT_SYSTEM_PROMPT, user)
+        rendering = _render_builtin_prompt(
+            "select", (PromptModule("context", user, dynamic=True),), channels
+        )
+        log.debug("reason: system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         text = await self._llm.complete(
             CompletionRequest(
-                SELECT_SYSTEM_PROMPT,
+                rendering.system,
                 user,
                 semantic_label="select",
                 prompt_version="1",
+                sections=rendering.sections,
             )
         )
         try:
@@ -2547,7 +3062,8 @@ class ProceduralMemory:
             raise RuntimeError(
                 "ProceduralMemory has no LLM configured; cannot revalidate a plan. Pass a client."
             )
-        snapshot = observed or PerceptSnapshot()
+        snapshot = self._fit_snapshot(observed or PerceptSnapshot())
+        channels = snapshot.channels
         # The full remaining tail across the sub-goal stack, not just the active sub-plan (ADR-0022)
         # — checking only the sub-plan would call it "still valid" while a stale parent step waits.
         steps_text = render_steps(
@@ -2565,19 +3081,29 @@ class ProceduralMemory:
             f"{render_history(activity.history, _HISTORY_RENDER_REVALIDATE)}\n"
             f"Intermediate values already computed:\n{render_bindings(activity.bindings)}\n"
             f"Remaining plan steps:\n{steps_text}\n"
-            f"Observed properties:\n{render_properties(snapshot.properties)}\n"
-            f"Observed signals:\n{render_signals(snapshot.signals)}\n"
-            f"Recent messages:\n{render_messages(messages or [])}"
+            + (
+                f"Observed properties:\n{render_properties(snapshot.properties)}\n"
+                if channels is None or channels.properties
+                else ""
+            )
+            + (
+                f"Observed signals:\n{render_signals(snapshot.signals)}\n"
+                if channels is None or channels.signals
+                else ""
+            )
+            + f"Recent messages:\n{render_messages(messages or [])}"
         )
-        log.debug(
-            "reason: revalidate system prompt\n%s\nUser prompt\n%s", REVALIDATE_SYSTEM_PROMPT, user
+        rendering = _render_builtin_prompt(
+            "revalidate", (PromptModule("context", user, dynamic=True),), channels
         )
+        log.debug("reason: revalidate system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         text = await self._llm.complete(
             CompletionRequest(
-                REVALIDATE_SYSTEM_PROMPT,
+                rendering.system,
                 user,
                 semantic_label="revalidate",
                 prompt_version="1",
+                sections=rendering.sections,
             )
         )
         return _parse_verdict(text)
@@ -2611,7 +3137,8 @@ class ProceduralMemory:
             )
         if not conditions:
             return ConditionVerdict()
-        snapshot = observed or PerceptSnapshot()
+        snapshot = self._fit_snapshot(observed or PerceptSnapshot())
+        channels = snapshot.channels
         listed = "\n".join(
             f"{i}. when: {c.when}\n   until: {c.until.text if c.until else '(no explicit bound)'}"
             for i, c in enumerate(conditions)
@@ -2620,18 +3147,28 @@ class ProceduralMemory:
             f"Original goal: {activity.goal}\n"
             f"Conditions:\n{listed}\n"
             f"What changed:\n{render_changes(changes, snapshot.properties)}\n"
-            f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
-            f"Recently observed signals:\n{render_signals(snapshot.signals)}"
+            + (
+                f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
+                if channels is None or channels.properties
+                else ""
+            )
+            + (
+                f"Recently observed signals:\n{render_signals(snapshot.signals)}"
+                if channels is None or channels.signals
+                else ""
+            )
         )
-        log.debug(
-            "reason: condition system prompt\n%s\nUser prompt\n%s", CONDITION_SYSTEM_PROMPT, user
+        rendering = _render_builtin_prompt(
+            "condition", (PromptModule("context", user, dynamic=True),), channels
         )
+        log.debug("reason: condition system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         text = await self._llm.complete(
             CompletionRequest(
-                CONDITION_SYSTEM_PROMPT,
+                rendering.system,
                 user,
                 semantic_label="condition",
                 prompt_version="1",
+                sections=rendering.sections,
             )
         )
         return _parse_condition_verdict(text, len(conditions))
@@ -2666,7 +3203,8 @@ class ProceduralMemory:
             )
         if not conditions:
             return ()
-        snapshot = observed or PerceptSnapshot()
+        snapshot = self._fit_snapshot(observed or PerceptSnapshot())
+        channels = snapshot.channels
         listed = "\n".join(
             f"{i}. when: {c.when}\n   until: {c.until.text if c.until else '(no explicit bound)'}"
             for i, c in enumerate(conditions)
@@ -2674,19 +3212,29 @@ class ProceduralMemory:
         user = (
             f"Original goal: {activity.goal}\n"
             f"Conditions:\n{listed}\n"
-            f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
-            f"Recently observed signals:\n{render_signals(snapshot.signals)}"
+            + (
+                f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
+                if channels is None or channels.properties
+                else ""
+            )
+            + (
+                f"Recently observed signals:\n{render_signals(snapshot.signals)}"
+                if channels is None or channels.signals
+                else ""
+            )
         )
-        log.debug(
-            "observe: retirement system prompt\n%s\nUser prompt\n%s", RETIREMENT_SYSTEM_PROMPT, user
+        rendering = _render_builtin_prompt(
+            "retirement", (PromptModule("context", user, dynamic=True),), channels
         )
+        log.debug("observe: retirement system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         with llm_call_scope():
             text = await self._llm.complete(
                 CompletionRequest(
-                    RETIREMENT_SYSTEM_PROMPT,
+                    rendering.system,
                     user,
                     semantic_label="retirement",
                     prompt_version="1",
+                    sections=rendering.sections,
                 )
             )
             return _parse_condition_verdict(text, len(conditions), expect_fired=False).retired
@@ -2716,7 +3264,8 @@ class ProceduralMemory:
             )
         if not episodes:
             return None
-        snapshot = observed or PerceptSnapshot()
+        snapshot = self._fit_snapshot(observed or PerceptSnapshot())
+        channels = snapshot.channels
         listed = "\n".join(
             f"{i}. goal: {e.get('goal', '(unknown)')}\n"
             f"   outcome: {'succeeded' if e.get('succeeded') else 'failed'}\n"
@@ -2727,16 +3276,24 @@ class ProceduralMemory:
         user = (
             f"Recently finished tasks:\n{listed}\n"
             f"What just changed:\n{render_changes(changes, snapshot.properties)}\n"
-            f"Current observed properties:\n{render_properties(snapshot.properties)}"
+            + (
+                f"Current observed properties:\n{render_properties(snapshot.properties)}"
+                if channels is None or channels.properties
+                else ""
+            )
         )
-        log.debug("relevance: system prompt\n%s\nUser prompt\n%s", RELEVANCE_SYSTEM_PROMPT, user)
+        rendering = _render_builtin_prompt(
+            "relevance", (PromptModule("context", user, dynamic=True),), channels
+        )
+        log.debug("relevance: system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         with llm_call_scope():
             text = await self._llm.complete(
                 CompletionRequest(
-                    RELEVANCE_SYSTEM_PROMPT,
+                    rendering.system,
                     user,
                     semantic_label="relevance",
                     prompt_version="1",
+                    sections=rendering.sections,
                 )
             )
             return _parse_relevance(text, episodes)

@@ -38,8 +38,11 @@ def make_gaia2_adapter(origin: WorkspaceOrigin) -> FakeAdapter:
     return FakeAdapter("fake", workspace)
 
 
-def _write_config(tmp_path: Path, *, with_llm: bool) -> Path:
+def _write_config(tmp_path: Path, *, with_llm: bool, prompt_fit: str | None = None) -> Path:
     llm_block = "  llm:\n    client: fakes.FakeLLMClient\n" if with_llm else ""
+    procedural_block = (
+        f"  procedural:\n    prompt_fit: {prompt_fit}\n" if prompt_fit is not None else ""
+    )
     text = (
         "agent:\n"
         "  name: gaia2-test\n"
@@ -50,6 +53,7 @@ def _write_config(tmp_path: Path, *, with_llm: bool) -> Path:
         f"    procedural: file://{tmp_path}/procedural\n"
         f"    episodic: file://{tmp_path}/episodic\n"
         f"{llm_block}"
+        f"{procedural_block}"
         "  workspaces:\n"
         '    - origin: {adapter: fake, address: "fake://ws"}\n'
         "      factory: test_build_agent.make_gaia2_adapter\n"
@@ -136,3 +140,13 @@ def test_build_agent_without_procedural_block_uses_default_prompt(tmp_path: Path
 
     agent = build_agent(str(_write_config(tmp_path, with_llm=False)))
     assert agent.procedural._prompt is default_plan_prompt
+
+
+def test_build_agent_uses_adaptive_prompt_fit_by_default(tmp_path: Path) -> None:
+    agent = build_agent(str(_write_config(tmp_path, with_llm=False)))
+    assert agent.procedural._prompt_fit == "adaptive"
+
+
+def test_build_agent_wires_fixed_rich_prompt_fit(tmp_path: Path) -> None:
+    agent = build_agent(str(_write_config(tmp_path, with_llm=False, prompt_fit="fixed-rich")))
+    assert agent.procedural._prompt_fit == "fixed-rich"

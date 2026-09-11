@@ -26,10 +26,17 @@ from sora.action import default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
-from sora.manual import Manual, MarkdownManualParser, OperationSpecification
+from sora.manual import (
+    Manual,
+    MarkdownManualParser,
+    ObservablePropertySpecification,
+    OperationSpecification,
+    SignalSpecification,
+)
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptionChannels,
     PerceptSnapshot,
     ProceduralMemory,
     SemanticMemory,
@@ -440,7 +447,18 @@ async def test_reason_ground_escalation_receives_current_properties_and_signals(
 ) -> None:
     # The escalation shouldn't decide blind either — currently observed world state reaches
     # ground() alongside the operation schema/partial params/history.
-    tool = FakeTool("email", invoke_results={"reply_to_email": {"sent": True}})
+    tool = FakeTool(
+        "email",
+        manual=Manual(
+            id="email",
+            metadata={},
+            description="email",
+            observable_properties=[ObservablePropertySpecification("unread_count", "", {})],
+            signals=[SignalSpecification("new_email", "", {})],
+            operations=[OperationSpecification("reply_to_email", "", {})],
+        ),
+        invoke_results={"reply_to_email": {"sent": True}},
+    )
     spy = ScriptedProcedural(ground_result={"email_id": 99, "body": "hi"})
     cycle, working, registry = _cycle(tmp_path, spy, tool)
     await registry.join(_ORIGIN)
@@ -465,7 +483,11 @@ async def test_reason_ground_escalation_receives_current_properties_and_signals(
     await asyncio.sleep(0)  # let the background _ground_ task run so it records what it was asked
 
     assert len(spy.ground_percepts) == 1
-    assert spy.ground_percepts[0] == PerceptSnapshot([prop_percept], [signal_percept])
+    assert spy.ground_percepts[0] == PerceptSnapshot(
+        [prop_percept],
+        [signal_percept],
+        channels=PerceptionChannels(properties=True, signals=True),
+    )
 
 
 async def test_reason_reference_free_step_is_cheap_no_ground(tmp_path: Path) -> None:

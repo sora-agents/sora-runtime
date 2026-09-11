@@ -28,6 +28,15 @@ so what an agent can perceive varies by environment:
 | 2 | signals, operations | signals as triggers; state only by invoking a read and binding its output |
 | 1 | operations | only what an operation returned |
 
+These tier numbers are study shorthand, not a restriction on the environment model. Observable
+properties and signals are independent channels declared by structured specifications or non-empty
+authored affordance sections in each tool's manual: a catalog may expose both, either one, or
+neither. In particular, property-only is a valid combination even though it has no numbered tier
+in this study. Quiet channels remain available from their declarations; conversely, a retained
+percept is evidence of its channel when its originating tool has departed and its manual is no
+longer live. The prompt's channel profile is therefore the union of live declarations and the
+percept kinds actually included in that prompt.
+
 The in-process ARE adapter is tier 3, and it is where the runtime's instincts were formed. ARE
 gives it exactly one thing — `app.get_state()`, a whole-state read — and the adapter manufactures
 *both* halves from it: one `state` observable property, plus a `state_changed` signal synthesized
@@ -76,6 +85,30 @@ notification as *data*: they treat it as a cue, and then run a read command insi
 
 So the notification is sufficient as a trigger and insufficient as evidence, for them and for us.
 The tier-2 position is not a handicap relative to the baselines; it is the same position.
+
+## Prompt fitting is part of the honest tier configuration
+
+Perception channels constrain not only what reaches working memory but also which instructions are
+actionable. The built-in prompts therefore fit their modules to the channels declared by the tools
+relevant to each semantic call. The adaptive setting removes property-only vocabulary — including
+`$prop` references and property-backed conditions — when no property channel exists, and removes
+signal-backed waiting when no signal channel exists. It does not infer a tier from an empty value
+or a quiet cycle: a supported but currently empty channel retains its module. Other prompt material,
+including operation results, bindings, history, data operations, safety constraints, and subgoals,
+does not depend on the perception profile.
+
+This means the primary tier comparison intentionally changes two coupled things: the environment's
+available evidence and the instructions that teach the agent how to use that evidence. That is the
+honest deployable configuration. Keeping tier-3 instructions in a lower-tier environment would add
+tokens while encouraging plans that refer to capabilities the environment cannot satisfy.
+
+The `fixed-rich` setting is the sensitivity control for the narrower question. It renders the full
+property-and-signal prompt for every channel combination, so a comparison under that setting holds
+prompt instructions constant and varies perception alone. Its lower-tier result must be interpreted
+as a deliberately handicapped counterfactual, not as the expected performance of a correctly
+configured lower-tier agent. The gap between adaptive and fixed-rich at the same tier estimates the
+effect of fitting vocabulary to declared capabilities; it must not be attributed to perception
+quality itself.
 
 ## Why a judge-free replan follows
 

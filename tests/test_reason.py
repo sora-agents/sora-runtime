@@ -36,6 +36,7 @@ from sora.manual import Manual
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptionChannels,
     PerceptSnapshot,
     ProceduralMemory,
     SemanticMemory,
@@ -272,7 +273,9 @@ async def test_reason_infers_plan_on_cache_miss_with_joined_tool_catalog(tmp_pat
     # The planning catalog is the currently-joined tools, keyed by tool id -> its manual.
     assert called_tools == {tool.id: tool.manual}
     # No percepts observed yet in this test -> infer() still gets the (empty) current snapshot.
-    assert called_observed == PerceptSnapshot()
+    assert called_observed == PerceptSnapshot(
+        channels=PerceptionChannels(properties=False, signals=False)
+    )
 
     # The plan lands in a later Observe (step_index reset, activity READY); Reason then advances it.
     await DefaultObserveStrategy().observe(cycle)
@@ -305,7 +308,11 @@ async def test_reason_infer_receives_current_properties_and_signals(tmp_path: Pa
     await asyncio.sleep(0)  # let the background _infer_ task run so it records what it was asked
 
     _activity, _tools, called_observed = spy.infer_calls[0]
-    assert called_observed == PerceptSnapshot([prop_percept], [signal_percept])
+    assert called_observed == PerceptSnapshot(
+        [prop_percept],
+        [signal_percept],
+        channels=PerceptionChannels(properties=True, signals=True),
+    )
 
 
 async def test_reason_infer_receives_recent_user_messages(tmp_path: Path) -> None:

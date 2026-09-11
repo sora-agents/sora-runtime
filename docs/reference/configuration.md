@@ -123,15 +123,35 @@ instrumentation) — not a config option.
 
 ## `agent.procedural`
 
-`dict[str, str] | None`, optional. Overrides `ProceduralMemory`'s built-in prompts, each a dotted
-path to a callable satisfying the `PlanPrompt`/`GroundPrompt` Protocol:
+`dict[str, str] | None`, optional. Selects how the built-in prompts fit the environment and can
+override either prompt with a dotted path to a callable satisfying the `PlanPrompt`/`GroundPrompt`
+Protocol:
 
-| Key | Replaces |
-| --- | --- |
-| `plan_prompt` | `ProceduralMemory`'s built-in `default_plan_prompt` |
-| `ground_prompt` | `ProceduralMemory`'s built-in `default_ground_prompt` |
+| Key | Default | Effect |
+| --- | --- | --- |
+| `prompt_fit` | `adaptive` | `adaptive` selects prompt modules from the observable-property and signal channels declared by the relevant tool manuals. `fixed-rich` always includes both channels' vocabulary, as a sensitivity control. |
+| `plan_prompt` | `default_plan_prompt` | Replaces the built-in planning prompt. |
+| `ground_prompt` | `default_ground_prompt` | Replaces the built-in grounding prompt. |
 
-A named callable fully replaces the built-in default — it does not patch pieces of it.
+```yaml
+agent:
+  procedural:
+    prompt_fit: adaptive
+```
+
+With `adaptive`, an operations-only environment is not taught property references or signal waits;
+a signal-capable environment retains signal instructions, and a property-capable environment
+retains property instructions. Availability comes from each relevant manual's declarations —
+structured specifications when present, otherwise non-empty authored Observable Properties or
+Signals sections — rather than treating a quiet channel as absent. A retained percept from a
+departed tool also preserves its channel's vocabulary while that percept remains in the snapshot.
+`fixed-rich` preserves the full
+property-and-signal instruction set even when those channels are not declared; it is intended for
+controlled comparisons, not as the normal runtime setting.
+
+A named callable fully replaces the corresponding built-in default — it does not patch pieces of
+it, and `prompt_fit` does not rewrite custom prompt output. If only one callable is overridden,
+prompt fitting still applies to the other built-in prompt.
 
 ## `agent.max_subgoal_depth`
 

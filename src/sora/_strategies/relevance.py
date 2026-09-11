@@ -17,6 +17,7 @@ from sora.action import (
 from sora.activity import Activity
 from sora.memory import (
     PerceptSnapshot,
+    percept_snapshot,
 )
 from sora.perception import Percept
 from sora.types import (
@@ -101,9 +102,7 @@ class DefaultRelevanceJudge:
         changes: list[tuple[str, Change]] = []
         for percept in unclaimed:
             changes.extend((percept.source, change) for change in changes_of(percept.payload))
-        observed = PerceptSnapshot(
-            list(cycle.working.properties.values()), list(cycle.working.signals)
-        )
+        observed = percept_snapshot(cycle.working)
         self._in_flight = True
         _spawn_tracked(self._tasks, self._call(cycle, episodes, changes, observed))
 

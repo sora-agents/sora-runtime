@@ -17,6 +17,7 @@ from sora.activity import Activity, ActivityState
 from sora.memory import (
     PerceptSnapshot,
     pending_from_raw,
+    percept_snapshot,
 )
 from sora.perception import Percept
 from sora.types import (
@@ -552,9 +553,7 @@ class ConditionRetirement:
         # Agent-level, like both other judges and unlike a `_ground_`/`_select_` call: retirement
         # asks whether waiting is over, and the evidence for that ("the slot has taken place") is
         # routinely on a tool the waiting activity never touches.
-        observed = PerceptSnapshot(
-            list(cycle.working.properties.values()), list(cycle.working.signals)
-        )
+        observed = percept_snapshot(cycle.working)
         self._in_flight = True
         log.info(
             "observe: judging retirement of %d quiet condition(s) on %s",

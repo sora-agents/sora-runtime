@@ -29,10 +29,12 @@ from sora.action import default_action_registry
 from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, WorkspaceOrigin
+from sora.manual import Manual, ObservablePropertySpecification, SignalSpecification
 from sora.memory import (
     CONDITION_SYSTEM_PROMPT,
     EpisodicMemory,
     FileMemoryBackend,
+    PerceptionChannels,
     PerceptSnapshot,
     ProceduralMemory,
     SemanticMemory,
@@ -80,7 +82,17 @@ class _NullTransport:
 def _cycle(
     tmp_path: Path, procedural: ProceduralMemory, transport: MessageTransport | None = None
 ) -> tuple[DecisionCycle, WorkingMemory]:
-    tool = FakeTool("insim:are/Emails")
+    tool = FakeTool(
+        "insim:are/Emails",
+        manual=Manual(
+            id="Emails",
+            metadata={},
+            description="email",
+            observable_properties=[ObservablePropertySpecification("state", "", {})],
+            signals=[SignalSpecification("state_changed", "", {})],
+            operations=[],
+        ),
+    )
     registry = EnvironmentRegistry(
         adapters={_ORIGIN: FakeAdapter("fake", FakeWorkspace("ws", _ORIGIN, [tool]))}
     )
@@ -657,6 +669,7 @@ async def test_a_fired_condition_seeds_the_changed_ids_for_its_then_plan(tmp_pat
     activity.condition_batch = [state]
     activity.condition_verdict = _verdict(fired=(0,))
     working.activities[activity.id] = activity
+    await cycle.registry.join(_ORIGIN)
 
     await cycle.strategies.reason.reason(activity, working, cycle, _tick())
 
@@ -689,6 +702,7 @@ async def test_a_coarse_firing_does_not_seed_authoritative_empty_id_sets(
     activity.condition_batch = [state]
     activity.condition_verdict = _verdict(fired=(0,))
     working.activities[activity.id] = activity
+    await cycle.registry.join(_ORIGIN)
 
     await cycle.strategies.reason.reason(activity, working, cycle, _tick())
 
@@ -1529,6 +1543,32 @@ async def test_the_judgement_is_shown_the_record_the_change_points_at(tmp_path: 
     assert "Tuesday the 22nd" in prompt
 
 
+async def test_signals_only_condition_prompt_matches_the_evidence_it_receives(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLMClient(json.dumps({"fired": [], "retired": []}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    observed = PerceptSnapshot(
+        [],
+        [Percept("mail", Signal("changed", {"email_id": "e9"}), 0.0)],
+        channels=PerceptionChannels(properties=False, signals=True),
+    )
+
+    await procedural.evaluate_conditions(
+        _exhausted(),
+        [_condition()],
+        [("mail", Change(path="folders.INBOX.emails", added=("e9",)))],
+        observed,
+    )
+
+    system, user = llm.calls[0]
+    assert "current state" not in system.lower()
+    assert "observed state" not in system.lower()
+    assert "recently observed signals" in system.lower()
+    assert "Recently observed signals" in user
+    assert "Current observed properties" not in user
+
+
 async def test_only_the_changed_record_is_dereferenced_not_the_whole_property(
     tmp_path: Path,
 ) -> None:
@@ -1597,6 +1637,7 @@ async def test_the_gate_hands_the_judgement_the_source_of_each_change(tmp_path: 
     working.activities[activity.id] = activity
     working.properties[("insim:are/Emails", "state")] = _inbox(_REPLY)
     _signal(working, "folders.INBOX.emails")
+    await cycle.registry.join(_ORIGIN)
 
     await cycle.strategies.reason.reason(activity, working, cycle, _tick())
     await _settle()
@@ -1649,6 +1690,7 @@ async def test_the_relevance_judge_hands_the_judgement_the_source_of_each_change
     noise = [{"email_id": f"n{i}", "content": f"unrelated chatter {i}"} for i in range(200)]
     working.properties[("insim:are/Emails", "state")] = _inbox(*noise, _REPLY)
     _signal(working, "folders.INBOX.emails")
+    await cycle.registry.join(_ORIGIN)
 
     await judge.consider(cycle)
     await _settle()
