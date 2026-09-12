@@ -70,11 +70,33 @@ def _source_revision() -> str:
     return _git_output("rev-parse", "HEAD") or "unknown"
 
 
+def _exclude_pathspec(root_raw: str | None, excluded: set[Path]) -> list[str]:
+    """``--`` plus a ``:(exclude)`` pathspec per path, or nothing when there is none to exclude.
+
+    A pathspec list made only of exclusions means "everything else" to git, so no positive entry
+    is needed alongside them."""
+    if not root_raw or not excluded:
+        return []
+    root = Path(root_raw).resolve()
+    relatives: list[str] = []
+    for path in sorted(excluded):
+        try:
+            relatives.append(path.relative_to(root).as_posix())
+        except ValueError:  # outside the repo: nothing in the diff could name it anyway
+            continue
+    return ["--", *(f":(exclude){relative}" for relative in relatives)] if relatives else []
+
+
 def _dirty_diff_hash(*, excluded: set[Path] | None = None) -> str | None:
-    diff = _git_output("diff", "--binary", "HEAD")
     root_raw = _git_output("rev-parse", "--show-toplevel")
     untracked_raw = _git_output("ls-files", "--others", "--exclude-standard")
     excluded_resolved = {path.resolve() for path in excluded or set()}
+    # The exclusion has to reach `git diff`, not just the untracked scan below: the snapshot this
+    # hash is written into is itself a tracked file, so covering its own diff would mean the value
+    # is stale the moment it is stored, and two regenerations with no edit between them would
+    # disagree. It never converges while the snapshot is uncommitted — which, here, is its normal
+    # reviewable state.
+    diff = _git_output("diff", "--binary", "HEAD", *_exclude_pathspec(root_raw, excluded_resolved))
     additions: list[dict[str, str]] = []
     if root_raw and untracked_raw:
         root = Path(root_raw)

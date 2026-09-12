@@ -43,13 +43,19 @@ agent:
     # base_url: https://openrouter.ai/api/v1
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
-    stream: true
-    stall_timeout: 300.0
+    # Non-streamed to match the evaluation profile. The latency grid reads the same transport as
+    # both scaffold arms, and a per-call latency coefficient fitted on one transport does not
+    # transfer to another. That makes stall_timeout a total-duration cap rather than an inter-chunk
+    # silence bound, so it is sized as one: the largest completion ever observed here was ~3.9k
+    # tokens, which 600s clears at a sustained 6.4 tok/s. Outside a measured comparison, streaming
+    # is the better default — it is what lets the timeout tell "stalled" from "slow".
+    stream: false
+    stall_timeout: 600.0
     max_retries: 0
     reasoning_effort: medium
-    # A multi-step plan behind adaptive thinking overruns the 8192 default (thinking can take ~95%
-    # of the budget, truncating the plan JSON mid-serialization). The client streams the completion,
-    # so a large cap doesn't trip the SDK's non-streaming 10-minute guard.
+    # A multi-step plan behind reasoning overruns the 8192 default (thinking can take ~95% of the
+    # budget, truncating the plan JSON mid-serialization). The non-streaming ceiling that a large
+    # cap would trip belongs to the Anthropic SDK, not to the client selected above.
     max_tokens: 16384
     instrument: true
     max_logical_calls: 200

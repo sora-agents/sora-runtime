@@ -21,8 +21,8 @@
         "provider_routing": {"status": "intentionally_omitted", "value": null},
         "router_metadata": {"status": "intentionally_omitted", "value": null}
       },
-      "stream": true,
-      "stall_timeout": 300,
+      "stream": false,
+      "stall_timeout": 600,
       "sdk_max_retries": 0,
       "instrument": true
     },
@@ -53,8 +53,8 @@
         },
         "router_metadata": {"status": "sent", "value": true}
       },
-      "stream": true,
-      "stall_timeout": 300,
+      "stream": false,
+      "stall_timeout": 600,
       "sdk_max_retries": 0,
       "instrument": true
     },
@@ -78,8 +78,8 @@
         "provider_routing": {"status": "intentionally_omitted", "value": null},
         "router_metadata": {"status": "intentionally_omitted", "value": null}
       },
-      "stream": true,
-      "stall_timeout": 300,
+      "stream": false,
+      "stall_timeout": 600,
       "sdk_max_retries": 0,
       "instrument": true
     }

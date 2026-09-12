@@ -125,9 +125,12 @@ class OpenAICompatLLMClient:
         self._max_tokens = max_tokens
         self._instrument = instrument
         # Streaming is the default because it is what makes the timeout above a stall detector.
-        # `stream: false` is the escape hatch for an OpenAI-compatible endpoint whose streaming is
-        # broken or absent (some local runtimes); on that path the timeout reverts to a duration
-        # cap, so a target that needs it usually wants `stall_timeout: null` as well.
+        # `stream: false` turns that timeout back into a duration cap, so it wants a value chosen
+        # as one. Two targets ask for it: an OpenAI-compatible endpoint whose streaming is broken
+        # or absent (some local runtimes), and a measurement setup that has to pin one transport
+        # across several clients, since a per-call latency coefficient fitted on one transport does
+        # not transfer to another. `stall_timeout: null` is available too, but it inherits the SDK's
+        # own read timeout instead of recording a chosen bound — prefer an explicit generous cap.
         self._stream = stream
         # Evaluation-wide transport settings, distinct from CompletionProfile's per-semantic-call
         # hints. Only non-null values are retained and sent: omission is behavior for reasoning

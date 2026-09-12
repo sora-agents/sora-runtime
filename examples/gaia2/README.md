@@ -243,23 +243,29 @@ agent is charged zero for thinking.
 
 It also puts the baseline on the same request as the other arm. ARE's `LiteLLMEngine` ignores its
 own `**kwargs` and hands `litellm.completion` five fixed arguments, so an uninstrumented baseline
-runs at the provider's defaults — no reasoning setting, no output cap, no provider routing, and
-never streamed — while S-ORA runs at the profile's. Build it with
-`MeteredLiteLLMEngine.from_profile(profile)` and both arms send what
-`ModelProfile.request_kwargs()` says, streaming when the profile streams. Streaming matters beyond
-tidiness: S-ORA's client streams by default because its stall timeout means "the provider went
-quiet", which is only observable on a streamed call, so a non-streaming baseline differs from it in
-transport on precisely the per-arm comparison the charge model exists to make. Both changes are
-applied where the response is already intercepted; ARE's own `chat_completion` body still runs
-untouched, including the `True`/`False` lowercasing its checkers depend on.
+runs at the provider's defaults — no reasoning setting, no output cap, no provider routing — while
+S-ORA runs at the profile's. Build it with `MeteredLiteLLMEngine.from_profile(profile)` and both
+arms send what `ModelProfile.request_kwargs()` says. Both changes are applied where the response is
+already intercepted; ARE's own `chat_completion` body still runs untouched, including the
+`True`/`False` lowercasing its checkers depend on.
 
-One streaming trap is worth knowing about, because nothing downstream could detect it: LiteLLM's
+Transport follows the profile too, through a separate field. `stream` is read by the latency grid
+as well as by both arms, so all three always sit on one transport — a per-call latency coefficient
+fitted on one does not price an arm running on another. The shipped profiles are **non-streamed**,
+which is also ARE's native behaviour. The cost is that `stall_timeout` stops meaning "the provider
+went quiet" — observable only between chunks — and becomes a total-duration cap, so it is sized as
+one (600s). Outside a measured comparison, streaming is the better default: it is what lets that
+timeout tell a stalled connection from a slow one.
+
+A streaming trap is what forced the choice, and nothing downstream could detect it: LiteLLM's
 `stream_chunk_builder` fills a *missing* usage block by re-tokenizing the prompt and completion
 locally, so a provider that ignores `include_usage` produces token counts that are plausible,
 wrong, and indistinguishable from reported ones. Rows therefore take their tokens from the
-provider's own trailing usage chunk and never from the rebuilt response — a stream that reported no
-usage is written `usage_captured: false` with null tokens and charged the fixed per-call term,
-which undercounts visibly instead of mis-fitting silently.
+provider's own trailing usage chunk and never from the rebuilt response — necessary but not
+sufficient: on OpenRouter the usage chunk is *itself* assembled that way, measured there as
+content-only completion tokens with no cache detail at all. A stream that reported no usage is
+written `usage_captured: false` with null tokens and charged the fixed per-call term, which
+undercounts visibly instead of mis-fitting silently.
 
 ## `react_driver.py` — one scenario on the ReAct arm
 

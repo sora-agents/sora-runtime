@@ -78,11 +78,11 @@
         },
         "stall_timeout": {
           "status": "sent",
-          "value": 300.0
+          "value": 600.0
         },
         "stream": {
           "status": "sent",
-          "value": true
+          "value": false
         },
         "temperature": {
           "status": "intentionally_omitted",
@@ -140,8 +140,8 @@
           "value": null
         }
       },
-      "stall_timeout": 300.0,
-      "stream": true
+      "stall_timeout": 600.0,
+      "stream": false
     },
     {
       "campaigns": [
@@ -219,11 +219,11 @@
         },
         "stall_timeout": {
           "status": "sent",
-          "value": 300.0
+          "value": 600.0
         },
         "stream": {
           "status": "sent",
-          "value": true
+          "value": false
         },
         "temperature": {
           "status": "intentionally_omitted",
@@ -281,8 +281,8 @@
           "value": null
         }
       },
-      "stall_timeout": 300.0,
-      "stream": true
+      "stall_timeout": 600.0,
+      "stream": false
     },
     {
       "campaigns": [
@@ -370,11 +370,11 @@
         },
         "stall_timeout": {
           "status": "sent",
-          "value": 300.0
+          "value": 600.0
         },
         "stream": {
           "status": "sent",
-          "value": true
+          "value": false
         },
         "temperature": {
           "status": "sent",
@@ -442,8 +442,8 @@
           "value": null
         }
       },
-      "stall_timeout": 300.0,
-      "stream": true
+      "stall_timeout": 600.0,
+      "stream": false
     }
   ],
   "judge_profile": {
@@ -526,7 +526,8 @@
       "prop_reads",
       "distinct_prop_reads"
     ],
-    "statistical_bootstrap_seed": 20260831
+    "statistical_bootstrap_seed": 20260831,
+    "transport": "non-streamed on every profile, so stall_timeout is a total-duration cap rather than an inter-chunk silence bound. The latency grid reads the same profile field as both scaffold arms, and latency does not transfer across transports: a streamed grid fitting a0 and R_out for a non-streamed arm would charge that arm coefficients measured on a transport it never used. What forced the choice is that LiteLLM rebuilds a streamed usage block locally on OpenRouter, reporting content-only completion tokens and no cache detail; non-streamed usage was verified against the provider on both endpoints and both clients"
   },
   "pre_task_gaia_agent_settings": {
     "client": "sora.adapters.anthropic_llm.AnthropicLLMClient",
@@ -1955,8 +1956,8 @@
   ],
   "provenance": {
     "prompt_source_dirty_diff_sha256": null,
-    "source_dirty_diff_sha256": "9683687b0058e0bceac056084b87f12f86081a95f2da73055d873a5cde52a71f",
-    "source_revision": "6360a0902f580384257f18e3f6e49ae450969800"
+    "source_dirty_diff_sha256": "a75488e3b4bcc9df02530ee675e0735abd6ab559ed0cb899c2b8617fefe3bcb1",
+    "source_revision": "3b1476f5469ca5753e289727054549264cea6241"
   },
   "schema_version": 1
 }

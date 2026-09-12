@@ -1,7 +1,7 @@
 """The designed latency grid: shape, prompt determinism, and what reaches the two files.
 
 Nothing here touches a network. The client is faked at the ``chat.completions.create`` seam, which
-is the whole surface ``LatencyGrid`` uses, so the streaming path, the usage join and the failure
+is the whole surface ``LatencyGrid`` uses, so both transports, the usage join and the failure
 path are all exercised without a key.
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -67,10 +68,52 @@ class _FakeClient:
 
     async def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
-        nxt = self.responses.pop(0) if self.responses else _stream(prompt=10, completion=10)
+        nxt = self.responses.pop(0) if self.responses else _response(prompt=10, completion=10)
         if isinstance(nxt, Exception):
             raise nxt
         return nxt
+
+
+def _usage(
+    *,
+    prompt: int,
+    completion: int,
+    cached: int | None,
+    reasoning: int | None,
+) -> Any:
+    return SimpleNamespace(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        prompt_tokens_details=(
+            SimpleNamespace(cached_tokens=cached) if cached is not None else None
+        ),
+        completion_tokens_details=(
+            SimpleNamespace(reasoning_tokens=reasoning) if reasoning is not None else None
+        ),
+    )
+
+
+def _response(
+    *,
+    prompt: int,
+    completion: int,
+    cached: int | None = None,
+    reasoning: int | None = None,
+    finish_reason: str = "length",
+    model: str = "gpt-5.4-2026-03-05",
+) -> Any:
+    """The non-streamed reply: usage and finish_reason on one object. This is what the shipped
+    profiles select, so it is the default shape the doubles return."""
+    return SimpleNamespace(
+        model=model,
+        usage=_usage(prompt=prompt, completion=completion, cached=cached, reasoning=reasoning),
+        choices=[
+            SimpleNamespace(
+                finish_reason=finish_reason,
+                message=SimpleNamespace(content="1\n2\n3\n"),
+            )
+        ],
+    )
 
 
 def _stream(
@@ -82,6 +125,9 @@ def _stream(
     finish_reason: str = "length",
     model: str = "gpt-5.4-2026-03-05",
 ) -> _FakeStream:
+    """The streamed reply, kept because the branch is still reachable from a profile that asks for
+    it: usage rides a trailing chunk with no choices, the finish reason a content chunk with no
+    usage, so the two have to be collected separately."""
     content = SimpleNamespace(
         model=model,
         usage=None,
@@ -91,16 +137,7 @@ def _stream(
     )
     usage = SimpleNamespace(
         model=model,
-        usage=SimpleNamespace(
-            prompt_tokens=prompt,
-            completion_tokens=completion,
-            prompt_tokens_details=(
-                SimpleNamespace(cached_tokens=cached) if cached is not None else None
-            ),
-            completion_tokens_details=(
-                SimpleNamespace(reasoning_tokens=reasoning) if reasoning is not None else None
-            ),
-        ),
+        usage=_usage(prompt=prompt, completion=completion, cached=cached, reasoning=reasoning),
         choices=[],
     )
     return _FakeStream([content, usage])
@@ -247,22 +284,34 @@ def test_calibration_moves_toward_what_the_provider_counted() -> None:
 # -- the request -----------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("streamed", [False, True])
 @pytest.mark.asyncio
 async def test_only_the_output_cap_deviates_from_the_profile(
-    grid: tuple[LatencyGrid, _FakeClient, LLMCallWriter],
+    tmp_path: Path, profile: Any, streamed: bool
 ) -> None:
-    """The grid has to sit at the sweep's operating point — latency does not transfer across
-    reasoning settings — except for the cap, which is the only way to force an output length."""
-    runner, client, _ = grid
-    client.responses = [_stream(prompt=4_000, completion=256)]
-    await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=256))
+    """The grid has to sit at the sweep's operating point — latency transfers across neither the
+    reasoning settings nor the transport — except for the cap, which is the only way to force an
+    output length. Both transports are checked because both arms read the same profile field the
+    grid does, and coefficients fitted on one do not price the other."""
+    reply = _stream if streamed else _response
+    client = _FakeClient([reply(prompt=4_000, completion=256)])
+    with LLMCallWriter(tmp_path / "grid.jsonl") as writer:
+        runner = LatencyGrid(
+            replace(profile, stream=streamed),
+            spec=GridSpec(blocks=1),
+            writer=writer,
+            manifest_path=tmp_path / "grid.manifest",
+            client=client,
+        )
+        runner.calibration.freeze()
+        await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=256))
     (sent,) = client.calls
     assert sent["model"] == "gpt-5.4-2026-03-05"
     assert sent["reasoning_effort"] == "high"
     assert sent["max_completion_tokens"] == 256  # not the profile's 16384
     assert "temperature" not in sent  # intentionally_omitted in the profile
-    assert sent["stream"] is True
-    assert sent["stream_options"] == {"include_usage": True}
+    assert sent.get("stream", False) is streamed
+    assert ("stream_options" in sent) is streamed
 
 
 @pytest.mark.asyncio
@@ -270,7 +319,7 @@ async def test_provider_routing_rides_where_the_arm_puts_it(tmp_path: Path) -> N
     """Kimi's pinned single-provider route is part of the operating point: fitted on one route and
     swept on another, every coefficient is wrong and nothing says so."""
     kimi = load_profiles(EVAL_ROOT / "profiles.json")["kimi-k2.5-prompt"]
-    client = _FakeClient([_stream(prompt=1_000, completion=64, model="moonshotai/kimi-k2.5")])
+    client = _FakeClient([_response(prompt=1_000, completion=64, model="moonshotai/kimi-k2.5")])
     with LLMCallWriter(tmp_path / "grid.jsonl") as writer:
         runner = LatencyGrid(
             kimi,
@@ -296,7 +345,7 @@ async def test_a_measured_call_lands_in_both_files_joined_by_call_id(
     grid: tuple[LatencyGrid, _FakeClient, LLMCallWriter], tmp_path: Path
 ) -> None:
     runner, client, writer = grid
-    client.responses = [_stream(prompt=4_100, completion=256, cached=0, reasoning=200)]
+    client.responses = [_response(prompt=4_100, completion=256, cached=0, reasoning=200)]
     written = await runner.run(limit=1, log=lambda _msg: None)
     assert written == 1
     (row,) = _rows(writer.path)
@@ -320,7 +369,7 @@ async def test_a_warmup_is_paid_for_recorded_and_kept_out_of_the_fit(
     """It populates the cache rather than measuring a hit. Dropping it would hide a real cost;
     fitting it would price a cold prefill as a cached one."""
     runner, client, writer = grid
-    client.responses = [_stream(prompt=17_000, completion=256, cached=0)]
+    client.responses = [_response(prompt=17_000, completion=256, cached=0)]
     await runner.run_cell(
         GridCell(input_tokens=17_000, output_tokens=256, cached_prefix_tokens=16_000, warmup=True)
     )
@@ -358,7 +407,7 @@ async def test_a_cell_that_missed_its_target_is_kept_but_not_fitted(
     """The provider stopped early — a refusal, a stop sequence, a shorter cap than asked for. The
     row is real and billed; it is just not an observation of the cell it was aimed at."""
     runner, client, _ = grid
-    client.responses = [_stream(prompt=4_000, completion=12, finish_reason="stop")]
+    client.responses = [_response(prompt=4_000, completion=12, finish_reason="stop")]
     outcome = await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=4_096))
     assert outcome.manifest["output_on_target"] is False
     assert outcome.manifest["fit_eligible"] is False
@@ -371,7 +420,7 @@ async def test_calls_are_issued_one_at_a_time(
 ) -> None:
     """Concurrency here would measure our own queueing and call it the provider's latency."""
     runner, client, _ = grid
-    client.responses = [_stream(prompt=1_000, completion=64) for _ in range(4)]
+    client.responses = [_response(prompt=1_000, completion=64) for _ in range(4)]
     await runner.run(limit=4, log=lambda _msg: None)
     assert len(client.calls) == 4
 
@@ -418,8 +467,8 @@ def test_a_moving_ratio_would_shift_a_cached_head() -> None:
 async def test_calibration_runs_first_is_recorded_and_is_never_fitted(
     tmp_path: Path, profile: Any
 ) -> None:
-    client = _FakeClient([_stream(prompt=2_000, completion=16) for _ in range(CALIBRATION_CALLS)])
-    client.responses.append(_stream(prompt=1_000, completion=64))
+    client = _FakeClient([_response(prompt=2_000, completion=16) for _ in range(CALIBRATION_CALLS)])
+    client.responses.append(_response(prompt=1_000, completion=64))
     writer = LLMCallWriter(tmp_path / "grid.jsonl")
     runner = LatencyGrid(
         profile,
@@ -451,7 +500,7 @@ async def test_a_cached_cell_without_a_reported_cache_count_is_not_fitted(
     undefined, and a fit that trusts ``fit_eligible`` would take an unknown regressor for a known
     one — the one failure mode here that produces a plausible number rather than a missing one."""
     runner, client, _ = grid
-    client.responses = [_stream(prompt=17_000, completion=256, cached=None)]
+    client.responses = [_response(prompt=17_000, completion=256, cached=None)]
     outcome = await runner.run_cell(
         GridCell(input_tokens=17_000, output_tokens=256, cached_prefix_tokens=16_000)
     )
@@ -468,7 +517,7 @@ async def test_an_uncached_cell_needs_no_cache_count(
     """Its prompt is unique per call, so an unreported cached count is the zero it is. Requiring
     one here would throw away the whole grid on every provider that reports no cache detail."""
     runner, client, _ = grid
-    client.responses = [_stream(prompt=4_000, completion=256, cached=None)]
+    client.responses = [_response(prompt=4_000, completion=256, cached=None)]
     outcome = await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=256))
     assert outcome.manifest["fit_eligible"] is True
     assert outcome.manifest["cached_on_target"] is None
@@ -482,7 +531,7 @@ async def test_a_cached_cell_that_missed_its_prefix_is_visible_but_still_fitted(
     zero cached tokens. It still has to be visible, because a cached arm that missed everywhere
     means ``R_cache`` was never measured at all."""
     runner, client, _ = grid
-    client.responses = [_stream(prompt=17_000, completion=256, cached=0)]
+    client.responses = [_response(prompt=17_000, completion=256, cached=0)]
     outcome = await runner.run_cell(
         GridCell(input_tokens=17_000, output_tokens=256, cached_prefix_tokens=16_000)
     )
@@ -528,7 +577,7 @@ async def test_a_repeated_cell_never_reuses_a_call_id(tmp_path: Path, profile: A
         spec=GridSpec(blocks=1),
         writer=writer,
         manifest_path=tmp_path / "grid.manifest",
-        client=_FakeClient([_stream(prompt=1_000, completion=64) for _ in range(2)]),
+        client=_FakeClient([_response(prompt=1_000, completion=64) for _ in range(2)]),
         completed=[cell.call_id()],
     )
     runner.calibration.freeze()
@@ -705,7 +754,7 @@ def test_a_refused_corner_is_recorded_and_exits_non_zero(
     grid rather than in the call made to look for it."""
     runner, client, writer = grid
     client.responses = [RuntimeError("max_completion_tokens too small")] + [
-        _stream(prompt=10, completion=10) for _ in range(3)
+        _response(prompt=10, completion=10) for _ in range(3)
     ]
     with writer:
         outcomes = asyncio.run(runner.preflight(log=lambda *_: None))

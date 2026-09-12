@@ -400,6 +400,24 @@ def test_contract_and_neutral_suites_are_deterministic_and_complete() -> None:
     assert neutral.passed == 16
 
 
+def test_the_frozen_snapshot_is_not_hashed_over_its_own_diff(tmp_path: Path) -> None:
+    """``source_dirty_diff_sha256`` records the uncommitted state a baseline was frozen against.
+    The baseline is itself a tracked file, so leaving it inside ``git diff`` made the value stale
+    the instant it was stored: two regenerations with nothing edited between them disagreed, and
+    the field never converged while the snapshot sat uncommitted — its normal reviewable state."""
+    from examples.gaia2.evaluation.cli import _exclude_pathspec
+
+    root = (tmp_path / "repo").resolve()
+    (root / "nested").mkdir(parents=True)
+    target = root / "nested" / "baseline.json"
+    assert _exclude_pathspec(str(root), {target}) == ["--", ":(exclude)nested/baseline.json"]
+    # Nothing to exclude means no pathspec at all: a bare `git diff HEAD` has to stay bare, or it
+    # would start reporting "everything except nothing" differently from the whole tree.
+    assert _exclude_pathspec(str(root), set()) == []
+    # A path outside the repo can never appear in the diff, and must not yield a bogus pathspec.
+    assert _exclude_pathspec(str(root), {(tmp_path / "elsewhere.json").resolve()}) == []
+
+
 def test_frozen_snapshot_has_all_tiered_prompt_variants_and_matches_runtime() -> None:
     frozen = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
     rendered = build_prompt_snapshot(source_revision=frozen["provenance"]["source_revision"])
@@ -412,6 +430,13 @@ def test_frozen_snapshot_has_all_tiered_prompt_variants_and_matches_runtime() ->
         "gpt-5.4-high-paper",
         "kimi-k2.5-prompt",
     }
+    # Contents, not just names: the baseline reports the transport and settings a campaign ran
+    # under, so an edit to profiles.json that never reaches the baseline makes it misdescribe the
+    # run rather than fail. Same depth as the judge_profile comparison below.
+    evaluation_profiles = load_profiles(EVAL_ROOT / "profiles.json")
+    assert frozen["evaluation_profiles"] == [
+        evaluation_profiles[name].to_dict() for name in sorted(evaluation_profiles)
+    ]
     assert frozen["notes"]["campaigns"] == ["prompt", "aamas2027"]
     assert frozen["judge_profile"] == load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
     for row in frozen["prompts"]:

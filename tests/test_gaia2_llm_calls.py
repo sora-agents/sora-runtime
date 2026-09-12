@@ -20,6 +20,7 @@ import importlib.util
 import json
 import logging
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -895,14 +896,21 @@ def test_from_profile_runs_the_arm_at_the_profiles_operating_point() -> None:
 
     assert eng.model_config.model_name == "moonshotai/kimi-k2.5"
     assert eng.model_config.endpoint == "https://openrouter.ai/api/v1"
-    assert eng.stream is True
+    # Transport follows the profile, which the latency grid reads too — coefficients fitted on one
+    # transport do not price an arm running on another.
+    assert eng.stream is False
+    assert (
+        MeteredLiteLLMEngine.from_profile(replace(kimi, stream=True), scenario_id="scen-k").stream
+        is True
+    )
     sent = dict(eng.settings.request_kwargs)
     assert sent["temperature"] == 0.5
     assert sent["max_completion_tokens"] == 16384
     assert sent["extra_body"]["reasoning"] == {"enabled": True}
     assert sent["extra_body"]["provider"]["allow_fallbacks"] is False
     assert sent["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
-    # Transport, added here rather than by the profile's operating point.
-    assert sent["timeout"] == 300 and sent["num_retries"] == 0
+    # Transport, added here rather than by the profile's operating point. Non-streamed, the
+    # timeout is a total-duration cap rather than an inter-chunk silence bound.
+    assert sent["timeout"] == 600 and sent["num_retries"] == 0
     # Omitted settings are absent, never present-and-null.
     assert "reasoning_effort" not in sent and "top_p" not in sent

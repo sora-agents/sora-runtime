@@ -40,15 +40,20 @@ Four things that would otherwise bite
 4. **ARE sends no settings and never streams.** Its ``chat_completion`` ignores its own ``**kwargs``
    and hands ``litellm.completion`` five fixed arguments, so an uninstrumented baseline runs at the
    provider's defaults — a different operating point from S-ORA's, on the one comparison that
-   cannot be corrected after the fact. Both are fixed at the same seam the response is captured at:
-   the profile's request kwargs are merged into the call, and ``stream=True`` with
-   ``stream_options={"include_usage": True}`` is added when the profile streams, the chunks
-   reassembled by LiteLLM's own ``stream_chunk_builder`` into the ``ModelResponse`` ARE's
-   assertions expect. Streaming carries one trap of its own: ``stream_chunk_builder`` fills a
-   *missing* usage block by re-tokenizing prompt and completion locally, so a provider that ignores
-   ``include_usage`` yields plausible, wrong counts that no downstream reader can tell from
-   reported ones. The row's tokens therefore come from the provider's raw usage chunk, never from
-   the rebuilt response — see ``_usage_source``.
+   cannot be corrected after the fact. The profile's request kwargs are therefore merged in at the
+   same seam the response is captured at. Streaming is *not* part of that operating point: it
+   changes how tokens arrive, not what is sampled. The profile field selecting it is read by the
+   latency grid too, which is what keeps the fitted coefficients and the arms they are charged to
+   on one transport. The shipped profiles are non-streamed — also ARE's native behaviour — and the
+   streamed branch stays for a profile that asks for it, adding ``stream=True`` with
+   ``stream_options={"include_usage": True}``, the chunks reassembled by LiteLLM's own
+   ``stream_chunk_builder`` into the ``ModelResponse`` ARE's assertions expect. That branch carries
+   a trap worth keeping on record: ``stream_chunk_builder`` fills a *missing* usage block by
+   re-tokenizing prompt and completion locally, so a provider that ignores ``include_usage`` yields
+   plausible, wrong counts no downstream reader can tell from reported ones. Taking the row's
+   tokens from the raw usage chunk rather than the rebuilt response (see ``_usage_source``) is
+   necessary but not sufficient — on OpenRouter the usage *chunk itself* is built that way, and
+   measured as content-only completion tokens with no cache detail at all.
 """
 
 from __future__ import annotations
@@ -331,7 +336,13 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         completion locally, so a provider that ignores ``include_usage`` produces counts that are
         plausible, wrong, and indistinguishable from reported ones once they are on a row. Falling
         through to None instead is what writes ``usage_captured=False`` — a call charged at the
-        fixed per-call term alone, which undercounts visibly rather than mis-fitting silently."""
+        fixed per-call term alone, which undercounts visibly rather than mis-fitting silently.
+
+        Necessary but not sufficient, and the reason the shipped profiles are non-streamed: on
+        OpenRouter the usage chunk is *itself* assembled by ``stream_chunk_builder``, so both sides
+        of this choice are the same locally counted object — measured there as content-only
+        completion tokens and a permanently absent cache count. Verify a provider's streamed block
+        against the SDK's before trusting an arm's rows on it."""
         return usage_chunk if self.stream else response
 
     def _trip(

@@ -249,6 +249,16 @@ def build_frozen_baseline(
             "latency grid depends on, and neither is visible in what a provider declares"
         ),
         "kimi_reasoning": "OpenRouter unified reasoning enabled with provider pinned",
+        "transport": (
+            "non-streamed on every profile, so stall_timeout is a total-duration cap rather than "
+            "an inter-chunk silence bound. The latency grid reads the same profile field as both "
+            "scaffold arms, and latency does not transfer across transports: a streamed grid "
+            "fitting a0 and R_out for a non-streamed arm would charge that arm coefficients "
+            "measured on a transport it never used. What forced the choice is that LiteLLM "
+            "rebuilds a streamed usage block locally on OpenRouter, reporting content-only "
+            "completion tokens and no cache detail; non-streamed usage was verified against the "
+            "provider on both endpoints and both clients"
+        ),
     }
     return snapshot
 
