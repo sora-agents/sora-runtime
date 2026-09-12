@@ -4,6 +4,8 @@ import json
 import subprocess
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import fields
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -13,6 +15,7 @@ from examples.gaia2.evaluation.campaigns.prompt.contracts import run_contract_su
 from examples.gaia2.evaluation.campaigns.prompt.neutral import NEUTRAL_CASES, run_neutral_suite
 from examples.gaia2.evaluation.campaigns.prompt.reporting import build_report
 from examples.gaia2.evaluation.campaigns.prompt.snapshot import (
+    PERCEPTION_PROFILES,
     PROMPT_LABELS,
     build_prompt_snapshot,
     load_frozen_snapshot,
@@ -48,6 +51,9 @@ from examples.gaia2.evaluation.core import (
     record_from_dict,
     resolve_scenario,
 )
+
+from sora._prompts import SUPPORTED_PERCEPTION_CHANNELS
+from sora.memory import PerceptionChannels
 
 ROOT = Path(__file__).parents[1]
 EVAL_ROOT = ROOT / "examples" / "gaia2" / "evaluation"
@@ -498,11 +504,17 @@ def test_the_exclusion_pathspec_is_repo_relative_and_only_built_when_needed(tmp_
     assert _exclude_pathspec(str(root), {(tmp_path / "elsewhere.json").resolve()}) == []
 
 
-def test_frozen_snapshot_has_all_tiered_prompt_variants_and_matches_runtime() -> None:
+def test_frozen_snapshot_has_all_perception_profiles_and_matches_runtime() -> None:
     frozen = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
     rendered = build_prompt_snapshot(source_revision=frozen["provenance"]["source_revision"])
-    assert {(row["perception_tier"], row["semantic_label"]) for row in frozen["prompts"]} == {
-        (tier, label) for tier in (1, 2, 3) for label in PROMPT_LABELS
+    profile_names = (
+        "operations-only",
+        "signals-only",
+        "properties-and-signals",
+        "properties-only",
+    )
+    assert {(row["perception_profile"], row["semantic_label"]) for row in frozen["prompts"]} == {
+        (profile, label) for profile in profile_names for label in PROMPT_LABELS
     }
     assert rendered["prompts"] == frozen["prompts"]
     assert {profile["name"] for profile in frozen["evaluation_profiles"]} == {
@@ -523,18 +535,21 @@ def test_frozen_snapshot_has_all_tiered_prompt_variants_and_matches_runtime() ->
         assert len(row["system_sha256"]) == len(row["user_sha256"]) == 64
         assert row["system"] and row["user"]
         expected_channels = {
-            1: {"properties": False, "signals": False},
-            2: {"properties": False, "signals": True},
-            3: {"properties": True, "signals": True},
+            "operations-only": {"properties": False, "signals": False},
+            "signals-only": {"properties": False, "signals": True},
+            "properties-and-signals": {"properties": True, "signals": True},
+            "properties-only": {"properties": True, "signals": False},
         }
-        assert row["perception_channels"] == expected_channels[row["perception_tier"]]
+        assert row["perception_channels"] == expected_channels[row["perception_profile"]]
         assert row["sections"]
         assert all(section["name"].startswith(("system.", "user.")) for section in row["sections"])
         assert sum(section["characters"] for section in row["sections"]) == len(
             row["system"]
         ) + len(row["user"])
     rich_rows = {
-        row["semantic_label"]: row for row in frozen["prompts"] if row["perception_tier"] == 3
+        row["semantic_label"]: row
+        for row in frozen["prompts"]
+        if row["perception_profile"] == "properties-and-signals"
     }
     assert {
         label: (row["system_sha256"], row["user_sha256"]) for label, row in rich_rows.items()
@@ -543,6 +558,16 @@ def test_frozen_snapshot_has_all_tiered_prompt_variants_and_matches_runtime() ->
     assert "scenario_universe" not in serialized
     assert '"oracle":' not in serialized
     assert "sk-" not in serialized
+
+
+def test_prompt_profiles_exhaust_perception_channel_boolean_space() -> None:
+    channel_fields = tuple(field.name for field in fields(PerceptionChannels))
+    all_channels = {
+        PerceptionChannels(**dict(zip(channel_fields, values, strict=True)))
+        for values in product((False, True), repeat=len(channel_fields))
+    }
+    assert SUPPORTED_PERCEPTION_CHANNELS == all_channels
+    assert {channels for _, channels in PERCEPTION_PROFILES} == all_channels
 
 
 def test_report_redacts_acceptance_details_and_marks_new_safety_violation_hard() -> None:

@@ -17,15 +17,42 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from urllib.parse import quote
 
-# ``PerceptionChannels`` is public from ``sora.memory`` alongside ``PerceptSnapshot`` so custom
-# prompt builders can inspect the same declaration as the built-ins.
+# These compatibility names remain public from ``sora.memory`` even though their definitions now
+# live with the built-in prompt manifests.
 from sora._prompts import (
-    PerceptionChannels as PerceptionChannels,
+    CONDITION_PROMPT,
+    GROUND_PROMPT,
+    PLAN_PROMPT,
+    RELEVANCE_PROMPT,
+    RETIREMENT_PROMPT,
+    REVALIDATE_PROMPT,
+    SELECT_PROMPT,
+    PromptRendering,
+    fitted_channels,
 )
 from sora._prompts import (
-    PromptManifest,
-    PromptModule,
-    PromptRendering,
+    CONDITION_SYSTEM_PROMPT as CONDITION_SYSTEM_PROMPT,
+)
+from sora._prompts import (
+    GROUND_SYSTEM_PROMPT as GROUND_SYSTEM_PROMPT,
+)
+from sora._prompts import (
+    PLAN_SYSTEM_PROMPT as PLAN_SYSTEM_PROMPT,
+)
+from sora._prompts import (
+    RELEVANCE_SYSTEM_PROMPT as RELEVANCE_SYSTEM_PROMPT,
+)
+from sora._prompts import (
+    RETIREMENT_SYSTEM_PROMPT as RETIREMENT_SYSTEM_PROMPT,
+)
+from sora._prompts import (
+    REVALIDATE_SYSTEM_PROMPT as REVALIDATE_SYSTEM_PROMPT,
+)
+from sora._prompts import (
+    SELECT_SYSTEM_PROMPT as SELECT_SYSTEM_PROMPT,
+)
+from sora._prompts import (
+    PerceptionChannels as PerceptionChannels,
 )
 
 # Imported at runtime (not just for typing): SemanticMemory reconstructs these dataclasses from
@@ -341,550 +368,6 @@ def _tool_record_from_dict(d: dict[str, Any]) -> ToolRecord:
 # planning into a ReasonStrategy); the *response contract* stays fixed — a custom prompt must still
 # yield the {"steps": [...]} JSON that `_parse_plan_steps` reads.
 
-# Worked examples in this prompt are deliberately drawn from a domain nothing evaluates this
-# runtime on (a museum collection catalogue). They used to be drawn from the ARE/Gaia2 apartment
-# search that most runs exercise — which quietly turned a benchmark score into a partial measure of
-# how well the prompt pre-solved that benchmark's own task family. The structural rules are what
-# these examples exist to teach and they are domain-free; keeping the nouns off any evaluated domain
-# costs nothing and keeps the number honest. When adding an example, do NOT reach for the scenario
-# you happen to be debugging.
-PLAN_SYSTEM_PROMPT = (
-    "You are the planning component of an autonomous agent runtime. Given a goal and the tools "
-    "available to the agent, produce a short, ordered plan of concrete steps that achieves the "
-    "goal using only the listed tools and operations.\n"
-    'Respond with ONLY a JSON object of the form {"steps": [ ... ]} and nothing else — no prose, '
-    "no markdown fences. Each step is one of:\n"
-    '  {"action": "invoke", "tool_id": "<id>", "operation_name": "<op>", "params": { ... }}\n'
-    '  {"action": "focus", "tool_id": "<id>"}\n'
-    '  {"action": "unfocus", "tool_id": "<id>"}\n'
-    '  {"action": "subgoal", "goal": "<what to achieve>", "mode": "mechanical" | "deliberative", '
-    '"goal_kind": "achievement" | "maintenance", ...}\n'
-    'A step with no "action" is treated as "invoke". Use only tool ids and operation names that '
-    "appear in the provided tool list. You do not need `focus` steps for the tools your plan "
-    "already names: the runtime attends to every tool your steps invoke or reference, for as long "
-    "as the plan is live. Emit `focus` only for a tool whose properties or signals you need but "
-    "whose operations the plan never calls, and `unfocus` only to stop watching one early. "
-    "Respect any usage protocols & safety constraints listed for a tool "
-    "when choosing and ordering steps. If the goal came from the user, end the plan by invoking "
-    "the user-reply tool's `send_message_to_user` operation to report the outcome — a plan that "
-    "never reports back leaves the user without an answer. Put that report in its `text` param as "
-    "a short, outcome-specific natural-language sentence. State what was done or answer the "
-    "user's question; a bare completion acknowledgement such as 'Done' or 'Everything is done' "
-    "does not report an outcome. If truthful wording depends on results not yet available, use "
-    "`$decide` to phrase the report from those results at execution time rather than guessing "
-    "during planning.\n"
-    "`send_message_to_user` is the agent's OWN reply channel — the recipient is always the user, "
-    "so it is NEVER how you message anyone else. When the goal asks to email/message/notify some "
-    "OTHER person, that is a domain tool's own operation (e.g. an email client's `send_email`), "
-    "filling recipient / subject / body from earlier results; when it must reach EACH of several "
-    "recipients (e.g. notify each curator), fan that invoke out with a mechanical sub-goal.\n"
-    "Never add outward communication the goal did not ask for. A step that sends something to "
-    "anyone other than the user — a message, a reply, an invitation, a confirmation — belongs in "
-    "the plan ONLY where the goal explicitly asks for it. Doing the requested work AND one extra "
-    "courtesy note is not thoroughness: it speaks in the user's name on a matter they did not "
-    "raise. (`send_message_to_user` is not an exception to route around this — it reports back to "
-    "the user, who asked.)\n"
-    "Some verbs only LOOK like speech. To accept, confirm, agree to, acknowledge, approve, decline "
-    "or turn down an offer or proposal names a DECISION and the state change that records it — not "
-    "an instruction to compose a message saying so. Plan those as the operations that change state "
-    "(make the booking, cancel what it supersedes, update the record), and tell the other party "
-    "only where the goal separately says to.\n"
-    "When a parameter's value depends on the RESULT of an earlier step (e.g. an id or address you "
-    "only learn by first listing/searching), you do NOT know it yet — never invent a literal. "
-    "Instead reference the earlier result:\n"
-    '  {"$from": "<operation_name>", "path": "<dotted path into that operation\'s result>"}, or\n'
-    '  {"$decide": "<what value is needed>"} when picking the value needs judgement.\n'
-    "A value already in the CURRENTLY OBSERVED PROPERTIES above needs no operation at all — "
-    "reference it directly:\n"
-    '  {"$prop": "<tool_id>.<property_name>", "path": "<dotted path into the property value>"}\n'
-    "One rule: qualify the property name with its tool id. A `$prop` that names its tool is what "
-    "tells the runtime to keep observing that tool while the plan runs, and it is also what keeps "
-    "the reference unambiguous when several tools expose a property by that name (many publish a "
-    "`state`). A bare name is accepted only when it is unambiguous among the tools already being "
-    "observed — so it can go missing later even though it resolves now. Qualify it.\n"
-    "Prefer $prop over paginated scanning: where a property already holds the whole collection "
-    "(e.g. an app's `state`), filter THAT with a data-op in one step rather than calling a "
-    "list/search operation repeatedly to page through the same data.\n"
-    "To spot that case, read the shape each property is listed with above: it names the fields and "
-    'gives the count, e.g. `Contacts.state = {contacts: {<key>: {..., job: "..."}} x 125}`. A '
-    "count that large is the COMPLETE collection, and a list operation that returns ten at a time "
-    "is a window onto this same data — so filter the property on the field you need and skip the "
-    "operation entirely. For a field whose value is EXACT — an id, a status, a category, a "
-    "number, a date, a flag — a search operation is a guess that can return [] even when the "
-    "record is there, while filtering the property cannot.\n"
-    "That flips when the value you match on is a NAME the USER phrased. `eq` matches only the "
-    "stored string in full, and people name things approximately — they shorten a title, drop a "
-    'subtitle or an edition, reorder words, punctuate it differently — so a goal saying "the '
-    'Delft landscape" is stored as "View of Delft, oil on canvas (1661)". A mechanical `eq` on '
-    "that phrase matches NOTHING, and an empty result is indistinguishable from the record not "
-    "existing: the agent goes on to tell the user the thing cannot be found while it sits in the "
-    "collection. So do NOT resolve a user-phrased name with `eq`.\n"
-    "Use the tool's OWN search or lookup operation for that instead — whatever the catalog calls "
-    "it (a `search_*` / `find_*` / `lookup_*` operation, or one taking a `query`, `name` or "
-    "`keyword` parameter). Matching an approximate name against its own records is the job that "
-    "operation exists to do, and it is CHEAP: one call, no collection shipped to the model. Only "
-    'where the tool offers no such operation, filter the property with a {"$decide": ...} '
-    "predicate that accepts the record whose stored name CONTAINS or paraphrases the user's "
-    "phrase — still never a mechanical `eq`. What flips the rule is a FREE-FORM name, not who "
-    "uttered the value: `eq` stays right for anything the record stores verbatim out of a fixed "
-    "vocabulary — ids and keys, enumerated statuses and categories, numbers, dates, booleans, and "
-    "anything copied from an earlier result or from observed state — and the user naming one of "
-    "those (a city, a status) does not make it approximate.\n"
-    "Expect that search to come back with SEVERAL near-matches — for an approximate name that is "
-    "the normal outcome, not a failure. Narrow them afterwards on the fields the goal actually "
-    "constrains (a date, a medium, a gallery), or ask the user which one they meant. Do not "
-    "re-tighten to an `eq` on the name to cut the list down: that is the same mistake one step "
-    "later.\n"
-    "A value you must COMPUTE from an earlier result is in the same boat, and a DATE is the case "
-    'that most often goes wrong. "This coming Saturday", "tomorrow", "an hour after the '
-    "meeting\" all depend on a clock reading you have not taken yet: you do not know today's date "
-    "at planning time, so a literal date baked into a step is a guess, and a plan that reads the "
-    "clock in step 0 and then hardcodes a date in step 2 has thrown that reading away. Take the "
-    "reading in an earlier step and express every value derived from it as a $decide naming the "
-    "calculation, e.g. "
-    '{"start_datetime": {"$decide": "the first Saturday on or after the get_current_time result, '
-    'at 08:00:00, formatted YYYY-MM-DD HH:MM:SS"}}'
-    " — it is then computed at run time against the real clock.\n"
-    "For a $from path, read the referenced operation's declared `returns:` shape in the tool "
-    "catalog and index into THAT: a numeric segment indexes a list position, a name indexes a "
-    "field. So if an operation returns an array of records, the id of the first record is "
-    '{"$from": "<op>", "path": "0.<id_field>"}; if it returns a single record, just "<id_field>"; '
-    'if it returns a bare value, the empty path "". A path that does not match the declared shape '
-    "will not resolve against the real result, so match the field names and nesting shown under "
-    "`returns:` exactly (do not assume a wrapper key or a field name that isn't listed there).\n"
-    "A reference must be the WHOLE value of its key, never embedded inside a larger string — "
-    '{"text": "It is {"$from": ...}."} is invalid and will be sent to the user unresolved, '
-    "literal braces and all. It MAY, though, stand as a whole ELEMENT of a list when the "
-    'parameter is a list — {"attendees": [{"$decide": "the manager\'s full name"}]} is '
-    "valid and resolves element by element; that is the only way to express a list whose members "
-    "are not known until run time. "
-    "To report a not-yet-known result in prose, make the field itself a "
-    '$decide reference describing the sentence to produce, e.g. {"text": {"$decide": "one '
-    'sentence reporting the get_time result"}} — it is phrased from the real result at run time, '
-    "not at plan time.\n"
-    "Where the data is reachable only through operations, prefer a narrowing step first (e.g. "
-    "search for the specific item, or a date/range-bounded list operation) so a $from reference "
-    "points at an unambiguous result. Check the observed properties before reaching for that: if "
-    "one already holds the collection and the narrowing is MECHANICAL (a field compared against an "
-    "EXACT value — a name the user phrased is not one, per the rule above), $prop plus that "
-    "filter beats a search — it sees every record rather than the first "
-    "page, and it costs no operation at all. When the narrowing would instead need a $decide "
-    "filter, prefer an operation that takes it as PARAMETERS (a from/to range, a query, a status): "
-    "a $decide filter ships EVERY item in the collection to the model, so it costs more the bigger "
-    "the collection, where the operation does the same selection in one declared call. Reach for "
-    "$prop plus a $decide filter only when no operation expresses that narrowing.\n"
-    "When a step must be repeated once PER ITEM of a collection you only learn at run time "
-    "(catalogue each of the found artifacts, notify each curator), do NOT hard-code one step per "
-    "item and do "
-    "NOT collapse it to a single step — you do not know how many items there will be. Emit ONE "
-    '`subgoal` step instead. For a uniform repeat over a collection, use "mode": "mechanical" '
-    "with:\n"
-    '  "in": {"$from": "<operation_name>", "path": "<path to the array in that result>"}  the '
-    "collection to iterate,\n"
-    '  "as": "<name>"  a name for the current element, and\n'
-    '  "template": { <a single step> }  the step to run once per element, referencing the current '
-    'element as {"$bind": "<name>", "path": "<path into the element>"} wherever the element\'s '
-    "value is needed. The runtime fans this out to exactly one concrete step per element (the "
-    "count comes from the data, not from you), so narrow the collection first (search/filter) to "
-    "exactly the items that should be acted on. For repeated work that needs fresh per-item "
-    'judgement rather than a uniform template, use "mode": "deliberative" with just the "goal" — '
-    "the runtime plans "
-    "that sub-goal separately when it is reached.\n"
-    "A deliberative sub-goal must be strictly NARROWER than the goal it appears in: one PART of "
-    "the remaining work, never that same goal restated with extra qualifiers. Restating reduces "
-    "nothing, and the runtime treats a sub-goal that largely repeats the goal it was planned "
-    "under as runaway recursion — it refuses to plan it and stops to ask the user how to "
-    "proceed, so the plan makes no further progress at all. Two shapes in particular are not "
-    "sub-goals. Do NOT defer 'now find / identify / pick the one that matches' to one: that is a "
-    "`filter` over results you already have, and the filtered collection IS the answer. And do "
-    "NOT write 'keep calling the operation until the match turns up' — there is no loop-until-"
-    "found step, and phrasing one as a sub-goal is the commonest way to trip the recursion check. "
-    "To scan a paginated collection, fan the list operation out over a LITERAL list of offsets "
-    'with a MECHANICAL sub-goal ("in": [0, 20, 40, ...] — a literal list is a valid "in" — "as": '
-    '"offset", and a template that passes {"$bind": "offset"} to the operation), then `collect` '
-    "those runs, `flatten` the pages into records, and `filter` those records. Pick the offsets "
-    "from the page size the operation documents, and sweep PAST where you expect the data to end "
-    "rather than stopping short: an offset beyond the last record returns an empty page and costs "
-    "one call, whereas stopping short drops records silently and the filter then reports that "
-    "nothing matched.\n"
-    'A `subgoal` step MAY also carry "goal_kind": "achievement" | "maintenance" (default '
-    '"achievement"). It answers a different question from "mode": "mode" says how the sub-plan is '
-    'produced, "goal_kind" says WHEN the sub-goal is finished, so either kind can be planned '
-    "either way. An ACHIEVEMENT sub-goal names something to get DONE, and it is finished once its "
-    'steps have run — that is nearly every sub-goal. Use "maintenance" when the goal instead names '
-    'a WINDOW to keep watching over ("for the next hour, whenever a loan request arrives, check it '
-    'against the exhibition calendar"): there the steps are only the FIRST pass, and read as an '
-    "achievement goal the runtime would take that first pass for the whole job and run straight on "
-    "to whatever follows the sub-goal — the report telling the user it is all done — while the "
-    "window is still open. Keep the window itself in the sub-goal's `goal` text, and put a "
-    '`pending` condition ON THE SUBGOAL STEP itself — the same {"pending": [ ... ]} block '
-    'described below, as a key of the step alongside "goal" and "mode" — whose `until` says when '
-    "the window closes: that `until` is the only thing that ends a maintenance sub-goal, and one "
-    "that declares no such condition ends as soon as its steps do. When the window is a stretch "
-    'of time ("for the next hour"), say so with `until`\'s object form described below — the '
-    "runtime can then end the sub-goal off the environment's own clock rather than by repeated "
-    "judgement. Declare it HERE even though the sub-goal will have a plan of its own: this step "
-    'is the last moment at which the window has not started yet, so it is the last moment "for '
-    'the next hour" is literally true and a `seconds` can be stated honestly. Writing it later — '
-    "in the sub-plan, or in a re-plan part-way through — means the window is already open, its "
-    "remaining length is not something you were told, and you would have to guess a `seconds` "
-    "(do not).\n"
-    "To NARROW or RESHAPE a collection before you act on it — keep only the qualifying items, "
-    "dedupe, sort, take the top few, gather per-item results, or reduce to a single number — emit "
-    "one data-op step per transform (they compose in order, one per step; do NOT do it all at "
-    'once). Each reads an `in` collection ({"$from": ...}, a prior {"$bind": "<name>"}, or a '
-    "literal list) and writes a named result under `out`, which later steps read as "
-    '{"$bind": "<name>", "path": "..."} (the same $bind you use for a sub-goal element). The '
-    "data-ops:\n"
-    '  {"action": "filter", "in": ..., "out": "<name>", "where": ...}  keep matching items; '
-    '`where` is either {"path": "<field>", "op": "<eq|ne|lt|le|gt|ge|between|in|not_in>", '
-    '"value": <v>} (a mechanical comparison; `between` takes [lo, hi], '
-    "`in`/`not_in` take a list) or "
-    '{"$decide": "<predicate in words>"} when keeping an item needs judgement — costly, since '
-    "every item goes to the model, so narrow with an operation or a mechanical comparison "
-    "wherever you can. A `$decide` predicate is judged against the world as it is NOW: a $prop "
-    "snapshot is current state, never a history, so a predicate that asks how things were BEFORE "
-    "something happened cannot be answered and will silently get the wrong items. Phrase the rule "
-    "against what is currently true plus the identities the change itself reported — 'overlaps one "
-    "of the newly added events and is not itself one of them', never 'overlapped the calendar as "
-    "it existed immediately before that addition'. For `in`/`not_in`, "
-    "`value` may itself be a reference to ANOTHER collection to test membership against — "
-    '{"path": "<field>", "op": "not_in", "value": {"$from": "<op>"} | {"$bind": "<name>"}, '
-    '"value_path": "<field to read from each item of that collection>"}: '
-    "this keeps (in) / excludes "
-    "(not_in) items whose `path` value is among that other collection's `value_path` values — e.g. "
-    "keep artifacts NOT already catalogued. Omit `value_path` when the referenced "
-    "collection is already "
-    "a list of the bare keys. For the OTHER ops, `value` may likewise be a reference — to the "
-    "value being compared against, not to a collection — so a threshold computed by an earlier "
-    'step is usable directly: {"path": "score", "op": "gt", "value": {"$bind": "<mean>"}} keeps '
-    "what beats a `reduce` mean, and `between` accepts either a reference resolving to [lo, hi] or "
-    'the pair with a reference at each end: {"op": "between", "value": [{"$bind": "<lo>"}, '
-    '{"$bind": "<hi>"}]}, for two bounds that come from two different steps. No '
-    "`value_path` there: the referenced value IS the operand. Whichever way you write it, the "
-    "operand has to end up being something the op can compare against — a single value for "
-    "lt/le/gt/ge, a two-element pair for `between`. A reference to a whole record, or to nothing, "
-    "does not compare and is rejected as a plan defect rather than silently matching no item. "
-    "A `where` may also COMBINE clauses instead of being one: "
-    '{"all": [<clause>, ...]} (every clause must hold) or {"any": [<clause>, ...]} (at least one '
-    "must), nesting freely. Most real rules have two or three parts, and one awkward part is NOT a "
-    "reason to make the WHOLE predicate a $decide — compose the mechanical clauses instead. An "
-    "empty clause list is rejected as a defect rather than quietly keeping everything. There is "
-    "one further op, for ranges rather than points: "
-    '{"op": "overlaps", "start_path": "<field>", "end_path": "<field>", "against": '
-    '{"$bind": "<name>"} | {"$from": "<op>"}, "against_start_path": "<field>", '
-    '"against_end_path": "<field>"} keeps items whose own [start, end] range overlaps that of AT '
-    "LEAST ONE item in the referenced collection. It is half-open: ranges that merely touch at a "
-    'boundary do NOT overlap — add "boundaries": "inclusive" if a shared endpoint should count. '
-    "Any ordered values work (ISO-8601 timestamps compare correctly as text), so a clash rule "
-    "between two sets of ranges never needs a $decide,\n"
-    '  {"action": "distinct", "in": ..., "out": "<name>", "by": "<field>"}  drop duplicates (omit '
-    "`by` to dedupe whole items),\n"
-    '  {"action": "sort", "in": ..., "out": "<name>", "by": "<field>", "desc": true|false},\n'
-    '  {"action": "take", "in": ..., "out": "<name>", "n": <count>}  the first n items,\n'
-    '  {"action": "collect", "from": "<operation_name>", "out": "<name>"}  gather the results of '
-    "every run of that operation THIS plan performs — use it after a mechanical sub-goal that "
-    "invoked one operation per item, to turn the scattered per-item results into one list. It "
-    "reaches only this plan's own runs: results listed under 'Results of operations already "
-    "executed' that a PREVIOUS, replaced plan produced are NOT collectible, and collecting them "
-    "yields an empty list — if this plan needs those values, run the operation again. Each "
-    "collected item also "
-    "carries that call's INPUT arguments, so you can filter/join on them even when the result "
-    "doesn't echo them back — e.g. after get_condition_score per gallery, `collect` yields items "
-    "with both the returned score AND the gallery_id it was called for, so a mechanical `between` "
-    "then an `in`/`not_in` membership join on gallery_id needs no $decide,\n"
-    '  {"action": "flatten", "in": ..., "out": "<name>", "path": "<payload field>"}  concatenate a '
-    "collection OF collections into one flat collection. This is what turns a paginated sweep into "
-    "records: `collect` yields one item per CALL — one per PAGE — so a `filter` placed straight "
-    "after it tests the pages, matches none of them, and keeps nothing. Omit `path` when each "
-    "element is already a list or a recognisable page envelope; give `path` to name the payload "
-    "field when you know it. Flattening an already-flat collection changes nothing, so it is safe "
-    "to include whenever the elements might be pages,\n"
-    '  {"action": "reduce", "in": ..., "out": "<name>", "op": "<sum|min|max|count|mean>", '
-    '"by": "<field>"}  aggregate to a single value.\n'
-    "So the 'catalogue each QUALIFYING artifact' shape is: search -> `filter` the results into a "
-    '`qualifying` binding -> a mechanical sub-goal whose "in" is {"$bind": "qualifying"}. To act '
-    "on values a tool produced per item (e.g. a condition score per gallery), map with a "
-    "mechanical sub-goal, then `collect` its results before filtering or reducing them.\n"
-    "When the goal you are planning was triggered by a `pending` condition FIRING and its change "
-    "reported item ids, the runtime has ALREADY extracted them into three bindings shown in this "
-    "prompt under 'Ids reported by the change that triggered this goal': `fired_added_ids`, "
-    "`fired_removed_ids`, `fired_updated_ids`. Reference them directly. Do NOT write a $decide to "
-    "work out what just changed — the answer is already in hand, and re-deriving it sends the "
-    "whole collection to a model to do set membership. If that section instead says ids are "
-    "unavailable, the adapter reported only that something changed: do not interpret that as an "
-    "empty change set, reference the absent bindings, or invent the missing ids. Plan from the "
-    "currently observed state only when it is sufficient to act safely. Never use those three "
-    "names for your own `out`. An `op: not_in` against an EMPTY available binding excludes "
-    "nothing, so pair an exclusion clause with a positive clause under `all` rather than leaning "
-    "on it alone.\n"
-    "So 'whenever a booking is added, cancel the existing bookings that clash with it' is fully "
-    "mechanical — no $decide and no model call: `filter` the collection down to the added items "
-    'with {"path": "<id field>", "op": "in", "value": {"$bind": "fired_added_ids"}} -> `filter` it '
-    'again with {"all": [{"path": "<id field>", "op": "not_in", "value": '
-    '{"$bind": "fired_added_ids"}}, {"op": "overlaps", "start_path": "<start field>", "end_path": '
-    '"<end field>", "against": {"$bind": "<the added ones>"}, "against_start_path": '
-    '"<start field>", "against_end_path": "<end field>"}]} -> a mechanical sub-goal over THAT '
-    "result. Reach for the same shape whenever a rule joins a collection against the items that "
-    "just changed.\n"
-    "For a plain top-N selection, `sort` + `take` is the right tool — and it stays right even when "
-    "ties on the sort key are possible, AS LONG AS the goal does not dictate how to break them "
-    "(any of the tied items is an acceptable pick). Do NOT reach for a $decide just because a tie "
-    "could happen. ONLY when the goal SPECIFIES a tie-break or priority rule that the sort order "
-    "cannot encode — one that applies among items tied on the primary key, or that depends on how "
-    "many items qualify (e.g. 'the two oldest; if their dates tie, prefer the ones with a "
-    "conservation report, ordered alphabetically; if fewer than two have a report, take the ones "
-    "with the most provenance records') — is `sort` + `take` wrong: taking first collapses the "
-    "tie by the sort's "
-    "incidental order and DISCARDS the other tied candidates before the specified rule can weigh "
-    "them. For that case bring the candidates together with `sort` on the primary key, then apply "
-    "the WHOLE rule in ONE `$decide` filter over that sorted collection — "
-    '{"action": "filter", "in": {"$bind": "<sorted>"}, "out": "<name>", "where": {"$decide": '
-    '"<the entire selection rule: how many to keep and every tie-break clause>"}} — so the '
-    "judgement sees every tied candidate and returns exactly the chosen subset (do not `take` "
-    "before it).\n"
-    "Keep deliberative sub-goals RARE and SMALL. A deliberative sub-goal re-plans with the model "
-    "when it is reached, so its goal must REDUCE the problem to a concrete, hard-to-template slice "
-    "— it must NOT restate the task, or a large part of it, as another sub-goal. If you are about "
-    'to write a deliberative "goal" that echoes the parent goal, STOP and decompose the work HERE '
-    "instead — into concrete invoke steps, data-ops, and mechanical sub-goals. Repeating one tool "
-    "call over a collection is a MECHANICAL sub-goal; keeping / deduping / sorting / limiting / "
-    "gathering / aggregating a collection is DATA-OP steps; a value that needs judgement is "
-    "$decide. Reserve a deliberative sub-goal for a small, genuinely heterogeneous continuation "
-    "whose SHAPE — not merely its values — is unknown until you see run-time state (e.g. triage an "
-    "ambiguous result set where the right next step depends on what was found). Prefer a single "
-    "flat plan that "
-    "reduces to concrete steps: the runtime REFUSES a deliberative sub-goal that merely re-states "
-    "an ancestor, so a plan that leans on them instead of reducing will stall and do nothing.\n"
-    "You are also given the agent's currently observed properties (persistent state, e.g. a "
-    "thermostat reading) and recently observed signals (transient events, e.g. a notification) as "
-    "already-known facts about the current world. Use them to decide WHAT to do — which branch to "
-    "take, whether a step is still needed — and to fill parameters whose value is stable and "
-    "meaningful (a temperature, a status, a name). But do NOT copy a volatile IDENTIFIER you "
-    "happen to see there — an email id, event id, message or thread id, an address — into a step "
-    "as a literal: such an id is specific to this run's data, so a plan that hardcodes it is not "
-    "reusable and breaks the next time the same goal runs against different data. For an id, still "
-    "emit a $from reference to the operation that yields it (adding the narrowing search/list step "
-    "if the plan lacks one), exactly as you would if it were not currently visible.\n"
-    # Pending conditions. This is the one part of the contract the planner most reliably gets wrong
-    # by OMISSION rather than by malformation: a run that stated three conditional clauses in its
-    # own prose encoded none of them as structure, terminated on a confirmation, and had nothing
-    # alive when the awaited reply arrived. Hence the explicit instruction to re-read the goal for
-    # conditional language, and the worked example showing prose -> structure for that shape.
-    'A plan MAY also carry {"pending": [ ... ]} alongside "steps". A pending condition says what '
-    "would make this goal relevant AGAIN after the steps are done — so the activity waits instead "
-    "of finishing. Re-read the goal for conditional language ('if', 'in case', 'should X happen', "
-    "'let me know when', 'once they reply') and turn EACH such clause into one entry. Do not leave "
-    "a condition in prose: a clause you mention but do not encode here is silently lost the moment "
-    "the last step completes. Each entry is:\n"
-    '  {"watch": {"signal": "<signal name>", "source": "<tool id>", "path": "<dotted path>", '
-    '"kind": "added" | "removed" | "updated"}, '
-    '"when": "<what must have happened>", "then": "<what to do about it>", '
-    '"until": "<when to stop waiting>" | {"text": "<when to stop waiting>", '
-    '"seconds": <how long the window lasts>}}\n'
-    '"watch" is REQUIRED and is a cheap mechanical filter, not the judgement: name the signal and '
-    "the tool that would carry the news, and use `path` to point at the part of that tool's "
-    "observable state that would move — it is what stops every unrelated event from waking this "
-    "goal. `kind` says WHICH WAY it has to move, and matters most when this goal also WRITES to "
-    "what it watches: an agent that watches a collection for additions and deletes from that same "
-    "collection will otherwise wake itself on every delete it makes. Set it whenever `when` names "
-    "a direction, and omit it when any change is genuinely interesting. `when` is the actual "
-    "judgement, in plain language. `then` is a goal, phrased like the original goal — the runtime "
-    "plans it fresh when the moment comes, so do not write steps here.\n"
-    "`until` bounds the wait, and has two forms. Write a plain string when what ends the wait is "
-    'an EVENT — something that has to happen in the world ("the restoration slot has taken '
-    'place"). Write the object form when what ends it is a STRETCH OF TIME, and put that stretch '
-    "in `seconds`: the runtime then closes the window by looking at the environment's own clock, "
-    "with no further judgement. `seconds` is counted from the moment the agent STARTS waiting, so "
-    'use it only when the window begins then — "for the next 30 minutes" is '
-    '{"text": "30 minutes have passed", "seconds": 1800}, but "two weeks after the exhibition '
-    'opens" is not a stretch that starts now, so write it as a plain string and let it be judged '
-    "as an event. Never guess a `seconds` you were not given; a wrong one stops the agent watching "
-    "while the thing it is watching for can still happen.\n"
-    'Example — goal: "Book the Rembrandt restoration slot for the 14th and tell the conservator; '
-    "if she can't make it, rebook for whatever day she suggests.\" The second clause is a pending "
-    "condition, not a step:\n"
-    '  {"steps": [ ... book the slot, message the conservator, report to the user ... ],\n'
-    '   "pending": [{"watch": {"signal": "state_changed", "source": "<messaging tool id>", '
-    '"path": "folders.INBOX.messages", "kind": "added"},\n'
-    '     "when": "the conservator replies that the 14th does not work, or proposes another day",\n'
-    '     "then": "Rebook the Rembrandt restoration slot for the day she proposes, clearing '
-    'whatever is already booked then",\n'
-    '     "until": "the restoration slot has taken place"}]}\n'
-    "Emit no `pending` at all when the goal is unconditional — most goals are. A condition you "
-    "cannot name a watch for does not belong here."
-)
-
-
-_PLAN_MANIFEST = PromptManifest.split(
-    "plan",
-    PLAN_SYSTEM_PROMPT,
-    (
-        ("response-contract", "Respond with ONLY"),
-        ("focus-actions", '  {"action": "focus"'),
-        ("subgoal-action", '  {"action": "subgoal"'),
-        ("action-rules", 'A step with no "action"'),
-        ("focus-guidance", "You do not need `focus`"),
-        ("authorization-and-reporting", "Respect any usage"),
-        ("result-references", "When a parameter's value depends"),
-        ("property-references", "A value already in the CURRENTLY"),
-        ("name-matching", "That flips when the value"),
-        ("name-search", "Use the tool's OWN search"),
-        ("computed-references", "A value you must COMPUTE"),
-        ("narrowing", "Where the data is reachable only through operations"),
-        ("fanout", "When a step must be repeated"),
-        ("maintenance", "A `subgoal` step MAY"),
-        ("data-ops", "To NARROW or RESHAPE"),
-        ("current-state-predicates", "A `$decide` predicate is judged"),
-        ("predicate-composition", "Phrase the rule against"),
-        ("fired-changes", "When the goal you are planning was triggered"),
-        ("top-n-selection", "For a plain top-N selection"),
-        ("deliberative-subgoals", "Keep deliberative sub-goals"),
-        ("observed-context", "You are also given"),
-        ("pending-introduction", 'A plan MAY also carry {"pending"'),
-        ("pending-schema", '  {"watch": {"signal"'),
-        ("pending-watch", '"watch" is REQUIRED'),
-        ("pending-until", "`until` bounds the wait"),
-        ("pending-example", "Example — goal"),
-        ("pending-close", "Emit no `pending`"),
-    ),
-)
-
-
-_FOCUS_PROPERTIES = (
-    "You do not need `focus` steps for the tools your plan already names: the runtime attends to "
-    "every tool your steps invoke or reference, for as long as the plan is live. Emit `focus` only "
-    "for a tool whose properties you need but whose operations the plan never calls, and `unfocus` "
-    "only to stop watching one early. "
-)
-_FOCUS_SIGNALS = (
-    "You do not need `focus` steps for the tools your plan already names: the runtime attends to "
-    "every tool your steps invoke or reference, for as long as the plan is live. Emit `focus` only "
-    "for a tool whose signals you need but whose operations the plan never calls, and `unfocus` "
-    "only to stop watching one early. "
-)
-_NAME_MATCHING_WITHOUT_PROPERTIES = (
-    "When the value you match on is a NAME the USER phrased, `eq` matches only the stored string "
-    "in full, and people name things approximately — they shorten a title, drop a subtitle or an "
-    'edition, reorder words, punctuate it differently — so a goal saying "the Delft landscape" '
-    'may be stored as "View of Delft, oil on canvas (1661)". A mechanical `eq` on that phrase '
-    "matches NOTHING, and an empty result is indistinguishable from the record not existing: the "
-    "agent goes on to tell the user the thing cannot be found while it sits in the collection. So "
-    "do NOT resolve a user-phrased name with `eq`.\n"
-)
-_NAME_SEARCH_WITHOUT_PROPERTIES = (
-    "Use the tool's OWN search or lookup operation for that instead — whatever the catalog calls "
-    "it (a `search_*` / `find_*` / `lookup_*` operation, or one taking a `query`, `name` or "
-    "`keyword` parameter). Matching an approximate name against its own records is the job that "
-    "operation exists to do, and it is CHEAP: one call, no collection shipped to the model. Only "
-    "where the tool offers no such operation, call the broadest suitable read operation and "
-    'filter its returned collection with a {"$decide": ...} predicate that accepts the record '
-    "whose stored name CONTAINS or paraphrases the user's phrase — still never a mechanical "
-    "`eq`. What flips the rule is a FREE-FORM name, not who uttered the value: `eq` stays right "
-    "for anything the record stores verbatim out of a fixed vocabulary — ids and keys, enumerated "
-    "statuses and categories, numbers, dates, booleans, and anything copied from an earlier "
-    "result — and the user naming one of those (a city, a status) does not make it approximate.\n"
-    "Expect that search to come back with SEVERAL near-matches — for an approximate name that is "
-    "the normal outcome, not a failure. Narrow them afterwards on the fields the goal actually "
-    "constrains (a date, a medium, a gallery), or ask the user which one they meant. Do not "
-    "re-tighten to an `eq` on the name to cut the list down: that is the same mistake one step "
-    "later.\n"
-)
-_OPERATIONS_ONLY_NARROWING = (
-    "Where data is reachable through operations, narrow it before acting: use a specific search "
-    "or a date/range-bounded list operation so a $from reference points at an unambiguous result. "
-    "Prefer an operation that accepts the narrowing as parameters; otherwise apply a data-op to "
-    "the returned collection.\n"
-)
-_EXECUTION_CONTEXT_PREDICATE = (
-    "A `$decide` predicate is judged only against the execution context provided; it cannot "
-    "reconstruct state from before a change. "
-)
-_PROPERTIES_CONTEXT = (
-    "You are also given the agent's currently observed properties as already-known facts about "
-    "the current world. Use them to decide what to do and to fill stable values. Do not copy a "
-    "volatile identifier into a reusable plan; derive it from an operation result at execution "
-    "time.\n"
-)
-_SIGNALS_CONTEXT = (
-    "You are also given the agent's recently observed signals as already-known transient events. "
-    "Use them to decide what to do, while deriving operation parameters from declared operation "
-    "results rather than inventing values.\n"
-)
-_ACHIEVEMENT_SUBGOAL_ACTION = (
-    '  {"action": "subgoal", "goal": "<what to achieve>", "mode": "mechanical" | '
-    '"deliberative", ...}\n'
-)
-_PROPERTY_PENDING_WATCH = (
-    '"watch" is REQUIRED and is a cheap mechanical filter, not the judgement: use `signal` as a '
-    "stable label for the derived change, name its tool in `source`, and use `path` to point at "
-    "the part of the observed property that would move — it is what stops every unrelated change "
-    "from waking this goal. `kind` says WHICH WAY it has to move, and matters most when this goal "
-    "also WRITES to what it watches: an agent that watches a collection for additions and deletes "
-    "from that same collection will otherwise wake itself on every delete it makes. Set it "
-    "whenever "
-    "`when` names a direction, and omit it when any change is genuinely interesting. `when` is the "
-    "actual judgement, in plain language. `then` is a goal, phrased like the original goal — the "
-    "runtime plans it fresh when the moment comes, so do not write steps here.\n"
-)
-_SIGNAL_PENDING_WATCH = (
-    '"watch" is REQUIRED and is a cheap mechanical filter, not the judgement: name the signal and '
-    "the tool that would carry it. For a change-bearing signal, use `path` to point at the "
-    "affected "
-    "field or collection — it is what stops every unrelated change from waking this goal. `kind` "
-    "says WHICH WAY it has to move, and matters most when this goal also WRITES to what it "
-    "watches: "
-    "an agent that watches a collection for additions and deletes from that same collection will "
-    "otherwise wake itself on every delete it makes. Set it whenever `when` names a direction, and "
-    "omit it when any change is genuinely interesting. `when` is the actual judgement, in plain "
-    "language. `then` is a goal, phrased like the original goal — the runtime plans it fresh when "
-    "the moment comes, so do not write steps here.\n"
-)
-
-
-def _adapt_plan_module(module: PromptModule, channels: PerceptionChannels | None) -> str:
-    """Fit one planning module to the affordances declared in the call's tool scope."""
-    if channels is None or channels.rich:
-        return module.text
-    if module.name == "focus-actions" and not channels.any:
-        return ""
-    if module.name == "subgoal-action" and not channels.any:
-        return _ACHIEVEMENT_SUBGOAL_ACTION
-    if module.name == "focus-guidance":
-        if channels.properties:
-            return _FOCUS_PROPERTIES
-        if channels.signals:
-            return _FOCUS_SIGNALS
-        return ""
-    if module.name == "property-references" and not channels.properties:
-        return ""
-    if module.name == "name-matching" and not channels.properties:
-        return _NAME_MATCHING_WITHOUT_PROPERTIES
-    if module.name == "name-search" and not channels.properties:
-        return _NAME_SEARCH_WITHOUT_PROPERTIES
-    if module.name == "narrowing" and not channels.properties:
-        return _OPERATIONS_ONLY_NARROWING
-    if module.name == "maintenance" and not channels.any:
-        return ""
-    if module.name == "current-state-predicates" and not channels.properties:
-        return _EXECUTION_CONTEXT_PREDICATE
-    if module.name == "fired-changes" and not channels.any:
-        return ""
-    if module.name == "observed-context":
-        if not channels.any:
-            return ""
-        if channels.properties and not channels.signals:
-            return _PROPERTIES_CONTEXT
-        return _SIGNALS_CONTEXT
-    if module.name.startswith("pending-") and not channels.any:
-        return ""
-    if module.name == "pending-watch":
-        if channels.properties and not channels.signals:
-            return _PROPERTY_PENDING_WATCH
-        if channels.signals and not channels.properties:
-            return _SIGNAL_PENDING_WATCH
-    return module.text
-
 
 def render_tools(tools: dict[str, Manual], channels: PerceptionChannels | None = None) -> str:
     """Render the tools' three-part usage interface (A&A) for a planning prompt: operations to
@@ -894,6 +377,7 @@ def render_tools(tools: dict[str, Manual], channels: PerceptionChannels | None =
     must respect. Public so a custom ``PlanPrompt`` can reuse it."""
     if not tools:
         return "(no tools available)"
+    fitted = fitted_channels(channels)
     blocks: list[str] = []
     for tool_id, manual in tools.items():
         header = f"- tool `{tool_id}`"
@@ -901,14 +385,14 @@ def render_tools(tools: dict[str, Manual], channels: PerceptionChannels | None =
             header += f": {manual.description}"
         lines = [header]
         lines += _render_operations(manual)
-        if channels is None or channels.properties:
+        if fitted.properties:
             lines += _render_affordances(
                 "observable properties (focus to perceive)",
                 "property",
                 [(p.name, p.description) for p in manual.observable_properties],
                 manual.section(ManualSection.OBSERVABLE_PROPERTIES),
             )
-        if channels is None or channels.signals:
+        if fitted.signals:
             lines += _render_affordances(
                 "signals (focus to receive)",
                 "signal",
@@ -1446,7 +930,7 @@ def _default_plan_user_prompt(
     observed: PerceptSnapshot,
     messages: list[Message],
 ) -> str:
-    channels = observed.channels
+    channels = fitted_channels(observed.channels)
     user = (
         f"Goal: {activity.goal}\n"
         f"{_render_goal_provenance(activity)}\n"
@@ -1454,18 +938,18 @@ def _default_plan_user_prompt(
         f"Available tools and their operations:\n{render_tools(tools, channels)}\n\n"
         + (
             f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
-            if channels is None or channels.properties
+            if channels.properties
             else ""
         )
         + (
             f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
-            if channels is None or channels.signals
+            if channels.signals
             else ""
         )
         + (
             "Ids reported by the change that triggered this goal:\n"
             f"{render_seeded_bindings(activity.bindings)}\n\n"
-            if channels is None or channels.any
+            if channels.any
             else ""
         )
         + f"Results of operations already executed:\n"
@@ -1525,11 +1009,7 @@ def _render_default_plan_prompt(
     messages: list[Message],
 ) -> PromptRendering:
     user = _default_plan_user_prompt(activity, tools, observed, messages)
-    return _PLAN_MANIFEST.render(
-        (PromptModule("context", user, dynamic=True),),
-        observed.channels,
-        adapt=_adapt_plan_module,
-    )
+    return PLAN_PROMPT.render(user, observed.channels)
 
 
 def step_from_raw(raw: dict[str, Any], *, record_malformed: bool = False) -> Step:
@@ -1904,86 +1384,6 @@ def _load_json_object(text: str, *, record_repair: bool = True) -> Any:
 
 # --- parameter grounding (the Reason-phase escalation, packaged here like infer) ------------------
 
-GROUND_SYSTEM_PROMPT = (
-    "You are grounding the parameters of a SINGLE tool operation about to be invoked. You are "
-    "given the goal, the operation and its parameter schema, a partial set of parameters (some "
-    "values may still be references to earlier results), the agent's currently observed properties "
-    "and recently observed signals, the named data-op bindings (collections an earlier step "
-    "computed), and the results of the operations already executed. Produce the final, concrete "
-    "parameters: fill every value that depends on a prior result, a named binding, or an already-"
-    "observed property/signal from the ACTUAL data given, and keep already-concrete values as "
-    "given.\n"
-    'Respond with ONLY a JSON object of the form {"params": { ... }} and nothing else — no prose, '
-    "no markdown fences. Use only parameter names from the schema.\n"
-    "If a reference names data that is NOT in what you were given — the operation it names "
-    "returned an empty list, the field is absent, the binding is empty — then that value does not "
-    "exist yet and you must NOT invent one. Do NOT substitute a nearby value that merely looks "
-    "plausible: the user's own name or address, some other contact, a guessed date. The agent "
-    "ACTS on what you "
-    "return and many operations are irreversible, so a wrong-but-plausible recipient is far worse "
-    "than an admitted gap — a gap can be recovered from, a sent email cannot. In that case respond "
-    'with ONLY {"unresolvable": "<which parameter, and what was missing from the data>"} instead, '
-    "and the runtime re-plans from it.\n"
-    "This applies element by element inside a LIST parameter too: if an element's reference names "
-    "data that is not there, report the gap for that parameter — do NOT quietly drop the element "
-    "and return a shorter list. A list that comes back shorter than it went in is silently doing "
-    "less than the step asked for, which reads as success and is not; the runtime rejects it.\n"
-    "That is only for missing DATA. A value you can compute or phrase from what you WERE given is "
-    "resolvable, so produce it: a $decide asking for a sentence about a result that is present, or "
-    "a date derived from a clock reading in the history, are ordinary work, not gaps.\n"
-    "Some parameters are natural-language TEXT you are asked to phrase — a report back to the "
-    "user, an email body. Phrase those from the EXECUTION RECORD: the results of operations "
-    "already executed, plus the note of planned steps that performed no operation. The goal tells "
-    "you what was INTENDED, never what happened. Do NOT state that an action was performed unless "
-    "the record shows the operation that performed it — a planned step can legitimately expand to "
-    "nothing when the collection it iterates turns out empty, and then the thing it would have "
-    "done was not done by anyone. Where the record shows such a step, say so plainly and say which "
-    "work it was, rather than omitting it or reporting the intent as achieved. The user has no "
-    "other view of what the agent did, so a report that overstates it is not something they can "
-    "catch or recover from."
-)
-
-
-_GROUND_MANIFEST = PromptManifest.split(
-    "ground",
-    GROUND_SYSTEM_PROMPT,
-    (
-        ("response-contract", "Respond with ONLY"),
-        ("missing-data", "If a reference names data"),
-        ("list-integrity", "This applies element by element"),
-        ("resolvable-values", "That is only for missing DATA"),
-        ("execution-record", "Some parameters are natural-language TEXT"),
-    ),
-)
-
-
-def _ground_role_for(channels: PerceptionChannels) -> str:
-    if channels.properties:
-        observed = "the agent's currently observed properties, "
-        sources = "a prior result, a named binding, or an already-observed property"
-    elif channels.signals:
-        observed = "the agent's recently observed signals, "
-        sources = "a prior result, a named binding, or a recently observed signal"
-    else:
-        observed = ""
-        sources = "a prior result or a named binding"
-    return (
-        "You are grounding the parameters of a SINGLE tool operation about to be invoked. You are "
-        "given the goal, the operation and its parameter schema, a partial set of parameters (some "
-        f"values may still be references to earlier results), {observed}the named data-op bindings "
-        "(collections an earlier step computed), and the results of the operations already "
-        "executed. Produce the final, concrete parameters: fill every value that depends on "
-        f"{sources} from the ACTUAL data given, and keep already-concrete values as given.\n"
-    )
-
-
-def _adapt_ground_module(module: PromptModule, channels: PerceptionChannels | None) -> str:
-    if channels is None or channels.rich:
-        return module.text
-    if module.name == "role":
-        return _ground_role_for(channels)
-    return module.text
-
 
 class GroundPrompt(Protocol):
     """Builds the ``(system, user_prompt)`` pair ``ground()`` sends to the LLM — the grounding
@@ -2276,7 +1676,7 @@ def _default_ground_user_prompt(
     partial_params: dict[str, Any],
     observed: PerceptSnapshot,
 ) -> str:
-    channels = observed.channels
+    channels = fitted_channels(observed.channels)
     user = (
         # No goal-provenance notice here, unlike default_plan_prompt: it is advice about how to end
         # a *plan* ("do NOT invoke send_message_to_user"), which grounding one operation's params
@@ -2288,12 +1688,12 @@ def _default_ground_user_prompt(
         f"{json.dumps(partial_params, indent=2)}\n\n"
         + (
             f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
-            if channels is None or channels.properties
+            if channels.properties
             else ""
         )
         + (
             f"Recently observed signals:\n{render_signals(observed.signals)}\n\n"
-            if channels is None or channels.signals
+            if channels.signals
             else ""
         )
         + f"Named data-op bindings (a $bind reference or a $decide instruction may name one):\n"
@@ -2319,11 +1719,7 @@ def _render_default_ground_prompt(
     observed: PerceptSnapshot,
 ) -> PromptRendering:
     user = _default_ground_user_prompt(activity, operation_name, manual, partial_params, observed)
-    return _GROUND_MANIFEST.render(
-        (PromptModule("context", user, dynamic=True),),
-        observed.channels,
-        adapt=_adapt_ground_module,
-    )
+    return GROUND_PROMPT.render(user, observed.channels)
 
 
 # The second legal answer of every escalation asked to RESOLVE a reference: the data that reference
@@ -2378,21 +1774,6 @@ def _check_no_dropped_elements(partial_params: dict[str, Any], params: dict[str,
 
 # --- revalidate: the context-adaptation plan-validity re-check — ADR-0024 ------------------------
 
-REVALIDATE_SYSTEM_PROMPT = (
-    "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. "
-    "You are given the goal, what the agent has ALREADY DONE (the operations executed so far with "
-    "their results, and the intermediate values its earlier steps computed and named), the plan's "
-    "REMAINING steps, and the new observed state and messages. "
-    "The plan is INVALID if the new information changes what the remaining steps should do — a "
-    "follow-up that changes a detail the plan acted on, or a precondition that no longer holds. "
-    "It is VALID if the work already executed plus the remaining steps still achieve the goal; "
-    "the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps "
-    "only: work an executed operation already accomplished, or a value already computed and named, "
-    "does not have to reappear in them — a remaining step that reads such a value is satisfied by "
-    "it, not evidence of a gap.\n"
-    'Respond with ONLY a JSON object {"valid": true} or {"valid": false} — no prose, no fences.'
-)
-
 
 def _parse_verdict(text: str) -> bool:
     """Parse the revalidation's ``{"valid": bool}`` answer. A malformed/unparseable answer degrades
@@ -2409,62 +1790,7 @@ def _parse_verdict(text: str) -> bool:
     return bool(valid)
 
 
-# --- pending conditions: the batched "did any of these fire?" judgement — ADR-0022 --------------
-
-CONDITION_SYSTEM_PROMPT = (
-    "You are deciding whether an agent's declared FOLLOW-UP CONDITIONS have come true. The agent "
-    "finished a task and is waiting in case something specific happens. Something changed in its "
-    "environment; you decide whether that change is what it was waiting for.\n"
-    "You are given the original goal, and a numbered list of conditions. Each has a `when` (what "
-    "the agent is waiting for) and, optionally, an `until` (when it should stop waiting). You are "
-    "also given the observed change and the current state it landed in.\n"
-    "For each condition decide, independently:\n"
-    "  - FIRED: the `when` has actually happened, judged from the observed state. Be strict — the "
-    "change reaching the agent is only a prompt to look; most changes are not the awaited event, "
-    "and a wrong `fired` makes the agent redo work nobody asked for.\n"
-    "  - RETIRED: the `until` is now satisfied, so the agent should stop waiting on it. A "
-    "condition with no `until` is retired only if waiting has become pointless.\n"
-    "A condition can be neither (the usual answer: keep waiting), or both.\n"
-    "Judge FIRED for each condition on its own, but retirement is not always independent. "
-    "Conditions listed together usually come from ONE clause of the goal, and often describe "
-    'MUTUALLY EXCLUSIVE branches of it ("if they propose an alternative" / "if they propose '
-    'none"). Firing one branch settles the others: also retire any condition whose `when` can no '
-    "longer happen given what you just judged to be true — a branch that has been overtaken is not "
-    "still waiting, it is decided. Retire on that logical incompatibility only, never because a "
-    "condition merely looks less likely now, and never to tidy up.\n"
-    'Respond with ONLY a JSON object {"fired": [<indices>], "retired": [<indices>]} — 0-based '
-    "indices into the numbered list, no prose, no fences. Use empty lists when nothing applies."
-)
-
-
-_CONDITION_SIGNAL_EVIDENCE = (
-    "You are given the original goal, and a numbered list of conditions. Each has a `when` (what "
-    "the agent is waiting for) and, optionally, an `until` (when it should stop waiting). You are "
-    "also given the observed change and the recently observed signals that accompanied it.\n"
-)
-_CONDITION_CHANGE_EVIDENCE = (
-    "You are given the original goal, and a numbered list of conditions. Each has a `when` (what "
-    "the agent is waiting for) and, optionally, an `until` (when it should stop waiting). You are "
-    "also given the observed change.\n"
-)
-_CONDITION_SIGNAL_VERDICTS = (
-    "For each condition decide, independently:\n"
-    "  - FIRED: the `when` has actually happened, judged from the observed change and recent "
-    "signals. Be strict — the change reaching the agent is only a prompt to look; most changes "
-    "are not the awaited event, and a wrong `fired` makes the agent redo work nobody asked for.\n"
-    "  - RETIRED: the `until` is now satisfied, so the agent should stop waiting on it. A "
-    "condition with no `until` is retired only if waiting has become pointless.\n"
-    "A condition can be neither (the usual answer: keep waiting), or both.\n"
-)
-_CONDITION_CHANGE_VERDICTS = (
-    "For each condition decide, independently:\n"
-    "  - FIRED: the `when` has actually happened, judged from the observed change. Be strict — "
-    "the change reaching the agent is only a prompt to look; most changes are not the awaited "
-    "event, and a wrong `fired` makes the agent redo work nobody asked for.\n"
-    "  - RETIRED: the `until` is now satisfied, so the agent should stop waiting on it. A "
-    "condition with no `until` is retired only if waiting has become pointless.\n"
-    "A condition can be neither (the usual answer: keep waiting), or both.\n"
-)
+# --- pending-condition parsers: firing (ADR-0022) and retirement (ADR-0027) ---------------------
 
 
 def _parse_condition_verdict(
@@ -2508,47 +1834,7 @@ def _parse_condition_verdict(
     )
 
 
-# --- pending conditions: the retire-only sweep over a watch that has gone quiet — ADR-0027 -------
-
-RETIREMENT_SYSTEM_PROMPT = (
-    "You are deciding whether an agent should STOP waiting on conditions it declared.\n"
-    "The agent finished a piece of work and is watching in case something specific happens. "
-    "Nothing has moved on any of these watches for a while, and this is a periodic check that they "
-    "are still worth waiting on. It is NOT a report that something occurred.\n"
-    "You are given the original goal, a numbered list of conditions, and the agent's current view "
-    "of its environment. Each condition has a `when` (what the agent is waiting for) and, "
-    "optionally, an `until` (when it should stop waiting).\n"
-    "For each condition decide only whether it is RETIRED: its `until` is now satisfied, so the "
-    "waiting is over. A condition with no `until` is retired only if waiting has become "
-    "pointless — what it waits for can no longer happen at all.\n"
-    "Do NOT decide whether any `when` has come true. That is judged elsewhere, from the change "
-    "itself, and nothing you are given here is evidence that an awaited event happened.\n"
-    "Default to keeping a condition. Retiring one the agent is still owed drops a commitment "
-    "silently and unrecoverably; keeping one too long costs only another check.\n"
-    'Respond with ONLY a JSON object {"retired": [<indices>]} — 0-based indices into the numbered '
-    "list, no prose, no fences. Use an empty list when every condition is still worth waiting on."
-)
-
-
-# --- undeclared relevance: does a change bear on work that already finished? — ADR-0026 ----------
-
-RELEVANCE_SYSTEM_PROMPT = (
-    "You are deciding whether something that just changed in an agent's environment means a task "
-    "it ALREADY FINISHED needs following up.\n"
-    "You are given a numbered list of recently finished tasks (what each was trying to do, how it "
-    "went) and a description of what just changed. Decide whether the change is a genuine "
-    "follow-up to exactly one of those tasks — a reply to a message it sent, a cancellation of "
-    "something it arranged, a rejection of something it submitted.\n"
-    "Answer NO unless the connection is specific and concrete. Most changes are unrelated "
-    "background activity, and the agent's own past actions often cause changes that follow from "
-    "work it already completed correctly — those are not follow-ups. A wrong YES interrupts a "
-    "person with a question about work that was already done properly.\n"
-    'Respond with ONLY a JSON object. If nothing follows up: {"relevant": false}. Otherwise:\n'
-    '  {"relevant": true, "task": <index>, "goal": "<what the agent should now do about it>", '
-    '"question": "<a one-sentence question asking the user whether to do it>"}\n'
-    "`goal` is phrased like a task instruction. `question` is addressed to the user, states what "
-    "changed and what you propose, and must be answerable with yes or no. No prose, no fences."
-)
+# --- undeclared relevance: does a change bear on work that already finished? — ADR-0026 ---------
 
 
 def _parse_relevance(text: str, episodes: Sequence[Any]) -> RelevanceCandidate | None:
@@ -2595,129 +1881,7 @@ def _parse_relevance(text: str, episodes: Sequence[Any]) -> RelevanceCandidate |
     return RelevanceCandidate(episode_id=episode_id, goal=goal.strip(), question=question.strip())
 
 
-# --- select: the model-escalated data-op filter predicate ($decide) — ADR-0023 -------------------
-
-SELECT_SYSTEM_PROMPT = (
-    "You are filtering a list down to the subset that satisfies a natural-language predicate. You "
-    "are given the goal, the predicate, the agent's execution context (the results of operations "
-    "already executed, the named data-op bindings, and the observed world state), and finally the "
-    "list items, each on its own line prefixed by its 0-based index.\n"
-    "The predicate may NAME a value from that context instead of spelling it out — 'the Saturday "
-    "after the get_current_time result', 'whoever is in the shortlist binding'. Resolve every such "
-    "reference against the context FIRST, down to a concrete value, and only then test the items "
-    "against it. Whether an individual item is kept is still judged on ITS OWN data; the context "
-    "supplies the values the predicate compares against, never a reason to keep an item.\n"
-    'Respond with ONLY a JSON object of the form {"keep": [<indices>]} — the 0-based indices of '
-    "the items to KEEP — and nothing else, no prose, no markdown fences. Keep an item only if it "
-    'clearly satisfies the predicate; if none do, respond {"keep": []}.\n'
-    "There is a second legal answer, for one specific case: the predicate names something the "
-    "context does NOT contain — a result from an operation that never ran or came back empty, a "
-    "binding that is not there — so you cannot work out what to compare the items against. Do NOT "
-    "guess the missing value, and do NOT fall back on an empty keep-list: an empty answer means "
-    "'no item qualified', the agent acts on it as a real result, and a whole clause of the task "
-    "then goes silently undone. Respond with ONLY "
-    '{"unresolvable": "<what the predicate names, and what was missing from the context>"} '
-    "instead, and the runtime re-plans from it.\n"
-    "That is only for missing CONTEXT. A predicate you CAN evaluate from what you were given is "
-    "ordinary work, however much judgement it takes — including one whose honest answer is that no "
-    'item qualifies. Answer {"keep": []} for that, not "unresolvable".'
-)
-
-
-_SYSTEM_MANIFESTS = {
-    "select": PromptManifest.split(
-        "select",
-        SELECT_SYSTEM_PROMPT,
-        (
-            ("reference-resolution", "The predicate may NAME"),
-            ("response-contract", "Respond with ONLY"),
-            ("missing-context", "There is a second legal answer"),
-            ("resolvable-values", "That is only for missing CONTEXT"),
-        ),
-    ),
-    "revalidate": PromptManifest.split(
-        "revalidate",
-        REVALIDATE_SYSTEM_PROMPT,
-        (
-            ("validity", "The plan is INVALID"),
-            ("response-contract", "Respond with ONLY"),
-        ),
-    ),
-    "condition": PromptManifest.split(
-        "condition",
-        CONDITION_SYSTEM_PROMPT,
-        (
-            ("evidence", "You are given"),
-            ("verdicts", "For each condition decide"),
-            ("branch-retirement", "Judge FIRED for each"),
-            ("response-contract", "Respond with ONLY"),
-        ),
-    ),
-    "retirement": PromptManifest.split(
-        "retirement",
-        RETIREMENT_SYSTEM_PROMPT,
-        (
-            ("quiet-check", "The agent finished"),
-            ("evidence", "You are given"),
-            ("retirement-contract", "For each condition decide"),
-            ("no-firing", "Do NOT decide"),
-            ("conservative-default", "Default to keeping"),
-            ("response-contract", "Respond with ONLY"),
-        ),
-    ),
-    "relevance": PromptManifest.split(
-        "relevance",
-        RELEVANCE_SYSTEM_PROMPT,
-        (
-            ("evidence", "You are given"),
-            ("conservative-default", "Answer NO unless"),
-            ("response-contract", "Respond with ONLY"),
-        ),
-    ),
-}
-
-
-def _adapt_context_module(
-    semantic_label: str, module: PromptModule, channels: PerceptionChannels | None
-) -> str:
-    if channels is None or channels.rich:
-        return module.text
-    text = module.text
-    if semantic_label == "select":
-        if channels.properties:
-            world = "the currently observed properties"
-        elif channels.signals:
-            world = "the recently observed signals"
-        else:
-            world = "the available execution record"
-        text = text.replace("the observed world state", world)
-    elif semantic_label == "revalidate":
-        replacement = (
-            "the new observed properties and messages"
-            if channels.properties
-            else "the new signals and messages"
-            if channels.signals
-            else "the new messages"
-        )
-        text = text.replace("the new observed state and messages", replacement)
-    elif semantic_label == "condition" and not channels.properties:
-        if module.name == "evidence":
-            return _CONDITION_SIGNAL_EVIDENCE if channels.signals else _CONDITION_CHANGE_EVIDENCE
-        if module.name == "verdicts":
-            return _CONDITION_SIGNAL_VERDICTS if channels.signals else _CONDITION_CHANGE_VERDICTS
-    return text
-
-
-def _render_builtin_prompt(
-    semantic_label: str,
-    user_modules: Sequence[PromptModule],
-    channels: PerceptionChannels | None,
-) -> PromptRendering:
-    return _SYSTEM_MANIFESTS[semantic_label].render(
-        user_modules,
-        channels,
-        adapt=lambda module, fitted: _adapt_context_module(semantic_label, module, fitted),
-    )
+# --- select: the model-escalated data-op filter predicate ($decide) — ADR-0023 ------------------
 
 
 def _parse_keep(text: str, count: int) -> list[int]:
@@ -2808,9 +1972,8 @@ class ProceduralMemory:
         self._prompt_fit = prompt_fit
 
     def _fit_snapshot(self, snapshot: PerceptSnapshot) -> PerceptSnapshot:
-        if self._prompt_fit == "fixed-rich":
-            return replace(snapshot, channels=None)
-        return snapshot
+        channels = None if self._prompt_fit == "fixed-rich" else snapshot.channels
+        return replace(snapshot, channels=fitted_channels(channels))
 
     @property
     def model(self) -> str | None:
@@ -2870,7 +2033,7 @@ class ProceduralMemory:
             rendering = _render_default_plan_prompt(activity, tools, snapshot, messages or [])
         else:
             system, user = self._prompt(activity, tools, snapshot, messages or [])
-            rendering = PromptRendering(system, user, ())
+            rendering = PLAN_PROMPT.render_custom(system, user)
         system, user = rendering.system, rendering.user
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         governing = _governing_step_conditions(activity)
@@ -2896,8 +2059,8 @@ class ProceduralMemory:
         request = CompletionRequest(
             system,
             user,
-            semantic_label="plan",
-            prompt_version="1",
+            semantic_label=rendering.semantic_label,
+            prompt_version=rendering.prompt_version,
             sections=rendering.sections,
         )
         return await _complete_and_parse(self._llm, request, _to_plan, what="plan inference")
@@ -2934,15 +2097,15 @@ class ProceduralMemory:
             system, user = self._ground_prompt(
                 activity, operation_name, manual, partial_params, snapshot
             )
-            rendering = PromptRendering(system, user, ())
+            rendering = GROUND_PROMPT.render_custom(system, user)
         system, user = rendering.system, rendering.user
         log.debug("reason: system prompt\n%s\nUser prompt\n%s", system, user)
         text = await self._llm.complete(
             CompletionRequest(
                 system,
                 user,
-                semantic_label="ground",
-                prompt_version="1",
+                semantic_label=rendering.semantic_label,
+                prompt_version=rendering.prompt_version,
                 sections=rendering.sections,
             )
         )
@@ -2990,7 +2153,7 @@ class ProceduralMemory:
                 "client."
             )
         snapshot = self._fit_snapshot(observed or PerceptSnapshot())
-        channels = snapshot.channels
+        channels = fitted_channels(snapshot.channels)
         items = "\n".join(
             f"{index}: {json.dumps(item, default=str)}" for index, item in enumerate(collection)
         )
@@ -3002,12 +2165,12 @@ class ProceduralMemory:
             f"{render_bindings(activity.bindings)}\n\n"
             + (
                 f"Currently observed properties:\n{render_properties(snapshot.properties)}\n\n"
-                if channels is None or channels.properties
+                if channels.properties
                 else ""
             )
             + (
                 f"Recently observed signals:\n{render_signals(snapshot.signals)}\n\n"
-                if channels is None or channels.signals
+                if channels.signals
                 else ""
             )
             +
@@ -3015,16 +2178,14 @@ class ProceduralMemory:
             # predicate's references resolve against, so it should be read first.
             f"Items:\n{items}"
         )
-        rendering = _render_builtin_prompt(
-            "select", (PromptModule("context", user, dynamic=True),), channels
-        )
-        log.debug("reason: system prompt\n%s\nUser prompt\n%s", rendering.system, user)
+        rendering = SELECT_PROMPT.render(user, channels)
+        log.debug("reason: system prompt\n%s\nUser prompt\n%s", rendering.system, rendering.user)
         text = await self._llm.complete(
             CompletionRequest(
                 rendering.system,
-                user,
-                semantic_label="select",
-                prompt_version="1",
+                rendering.user,
+                semantic_label=rendering.semantic_label,
+                prompt_version=rendering.prompt_version,
                 sections=rendering.sections,
             )
         )
@@ -3063,7 +2224,7 @@ class ProceduralMemory:
                 "ProceduralMemory has no LLM configured; cannot revalidate a plan. Pass a client."
             )
         snapshot = self._fit_snapshot(observed or PerceptSnapshot())
-        channels = snapshot.channels
+        channels = fitted_channels(snapshot.channels)
         # The full remaining tail across the sub-goal stack, not just the active sub-plan (ADR-0022)
         # — checking only the sub-plan would call it "still valid" while a stale parent step waits.
         steps_text = render_steps(
@@ -3083,26 +2244,28 @@ class ProceduralMemory:
             f"Remaining plan steps:\n{steps_text}\n"
             + (
                 f"Observed properties:\n{render_properties(snapshot.properties)}\n"
-                if channels is None or channels.properties
+                if channels.properties
                 else ""
             )
             + (
                 f"Observed signals:\n{render_signals(snapshot.signals)}\n"
-                if channels is None or channels.signals
+                if channels.signals
                 else ""
             )
             + f"Recent messages:\n{render_messages(messages or [])}"
         )
-        rendering = _render_builtin_prompt(
-            "revalidate", (PromptModule("context", user, dynamic=True),), channels
+        rendering = REVALIDATE_PROMPT.render(user, channels)
+        log.debug(
+            "reason: revalidate system prompt\n%s\nUser prompt\n%s",
+            rendering.system,
+            rendering.user,
         )
-        log.debug("reason: revalidate system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         text = await self._llm.complete(
             CompletionRequest(
                 rendering.system,
-                user,
-                semantic_label="revalidate",
-                prompt_version="1",
+                rendering.user,
+                semantic_label=rendering.semantic_label,
+                prompt_version=rendering.prompt_version,
                 sections=rendering.sections,
             )
         )
@@ -3138,7 +2301,7 @@ class ProceduralMemory:
         if not conditions:
             return ConditionVerdict()
         snapshot = self._fit_snapshot(observed or PerceptSnapshot())
-        channels = snapshot.channels
+        channels = fitted_channels(snapshot.channels)
         listed = "\n".join(
             f"{i}. when: {c.when}\n   until: {c.until.text if c.until else '(no explicit bound)'}"
             for i, c in enumerate(conditions)
@@ -3149,25 +2312,27 @@ class ProceduralMemory:
             f"What changed:\n{render_changes(changes, snapshot.properties)}\n"
             + (
                 f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
-                if channels is None or channels.properties
+                if channels.properties
                 else ""
             )
             + (
                 f"Recently observed signals:\n{render_signals(snapshot.signals)}"
-                if channels is None or channels.signals
+                if channels.signals
                 else ""
             )
         )
-        rendering = _render_builtin_prompt(
-            "condition", (PromptModule("context", user, dynamic=True),), channels
+        rendering = CONDITION_PROMPT.render(user, channels)
+        log.debug(
+            "reason: condition system prompt\n%s\nUser prompt\n%s",
+            rendering.system,
+            rendering.user,
         )
-        log.debug("reason: condition system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         text = await self._llm.complete(
             CompletionRequest(
                 rendering.system,
-                user,
-                semantic_label="condition",
-                prompt_version="1",
+                rendering.user,
+                semantic_label=rendering.semantic_label,
+                prompt_version=rendering.prompt_version,
                 sections=rendering.sections,
             )
         )
@@ -3204,7 +2369,7 @@ class ProceduralMemory:
         if not conditions:
             return ()
         snapshot = self._fit_snapshot(observed or PerceptSnapshot())
-        channels = snapshot.channels
+        channels = fitted_channels(snapshot.channels)
         listed = "\n".join(
             f"{i}. when: {c.when}\n   until: {c.until.text if c.until else '(no explicit bound)'}"
             for i, c in enumerate(conditions)
@@ -3214,26 +2379,28 @@ class ProceduralMemory:
             f"Conditions:\n{listed}\n"
             + (
                 f"Current observed properties:\n{render_properties(snapshot.properties)}\n"
-                if channels is None or channels.properties
+                if channels.properties
                 else ""
             )
             + (
                 f"Recently observed signals:\n{render_signals(snapshot.signals)}"
-                if channels is None or channels.signals
+                if channels.signals
                 else ""
             )
         )
-        rendering = _render_builtin_prompt(
-            "retirement", (PromptModule("context", user, dynamic=True),), channels
+        rendering = RETIREMENT_PROMPT.render(user, channels)
+        log.debug(
+            "observe: retirement system prompt\n%s\nUser prompt\n%s",
+            rendering.system,
+            rendering.user,
         )
-        log.debug("observe: retirement system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         with llm_call_scope():
             text = await self._llm.complete(
                 CompletionRequest(
                     rendering.system,
-                    user,
-                    semantic_label="retirement",
-                    prompt_version="1",
+                    rendering.user,
+                    semantic_label=rendering.semantic_label,
+                    prompt_version=rendering.prompt_version,
                     sections=rendering.sections,
                 )
             )
@@ -3265,7 +2432,7 @@ class ProceduralMemory:
         if not episodes:
             return None
         snapshot = self._fit_snapshot(observed or PerceptSnapshot())
-        channels = snapshot.channels
+        channels = fitted_channels(snapshot.channels)
         listed = "\n".join(
             f"{i}. goal: {e.get('goal', '(unknown)')}\n"
             f"   outcome: {'succeeded' if e.get('succeeded') else 'failed'}\n"
@@ -3278,21 +2445,23 @@ class ProceduralMemory:
             f"What just changed:\n{render_changes(changes, snapshot.properties)}\n"
             + (
                 f"Current observed properties:\n{render_properties(snapshot.properties)}"
-                if channels is None or channels.properties
+                if channels.properties
                 else ""
             )
         )
-        rendering = _render_builtin_prompt(
-            "relevance", (PromptModule("context", user, dynamic=True),), channels
+        rendering = RELEVANCE_PROMPT.render(user, channels)
+        log.debug(
+            "relevance: system prompt\n%s\nUser prompt\n%s",
+            rendering.system,
+            rendering.user,
         )
-        log.debug("relevance: system prompt\n%s\nUser prompt\n%s", rendering.system, user)
         with llm_call_scope():
             text = await self._llm.complete(
                 CompletionRequest(
                     rendering.system,
-                    user,
-                    semantic_label="relevance",
-                    prompt_version="1",
+                    rendering.user,
+                    semantic_label=rendering.semantic_label,
+                    prompt_version=rendering.prompt_version,
                     sections=rendering.sections,
                 )
             )

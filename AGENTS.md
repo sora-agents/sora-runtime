@@ -46,6 +46,7 @@ Module-to-concept map (from the API Sketch's own file markers — this is where 
 | `sora/activity.py` | `Activity`, `ActivityState` |
 | `sora/action.py` | `InternalAction`, `ExternalAction`, `ActionRegistry`, the predefined external actions (invoke/focus/unfocus/join/leave/send) and internal actions (create_activity/load/unload/filter/suspend/resume/infer/ground), `default_action_registry()` |
 | `sora/memory.py` | `MemoryBackend`, `WorkingMemory`, `SemanticMemory`, `ProceduralMemory`, `EpisodicMemory` |
+| `sora/_prompts/` | Named built-in system-prompt modules, channel variants, and prompt assembly metadata |
 | `sora/strategies.py` | Stable public strategy-extension façade: `TickResult`, `Strategies`, phase Protocols, policies, and default re-exports |
 | `sora/_strategies/` | Default implementations organized by phase (`observe`, `reflect`, `situate`, `reason`, `act`) plus their private condition, inference, interaction, parameter, reconsideration, and subgoal mechanics |
 | `sora/references.py` | Reference grammar, deterministic resolution, and diagnostics shared by grounding and planning |
@@ -73,7 +74,7 @@ None of these is discoverable by reading the code.
 1. **The symptom names the wrong component.** ARE's event judge checks timing *first* and reports a late-but-correct call under the same `TOOL_JUDGE_REJECT` label as a wrong-argument one; a replan defect surfaces at the step that read an empty binding, not the data-op that wrote it. Confirm which component actually failed — from the run's own trace — before changing code.
 2. **A reverted experiment leaves no trace in git.** Batching a condition's queued changes (`_pursue_fired_condition` in `src/sora/_strategies/reason.py`) looks like free throughput; it dilutes the `fired_*_ids` in `SEEDED_BINDINGS` that the `then` sub-plan depends on, caused a replan storm, and was reverted off `main`. An absent optimization here may be a rejected one.
 3. **A stale base disarms the guards silently.** `examples/gaia2/evaluation/campaigns/prompt/baseline.json` pins the seven semantic prompts by sha256 and `tests/test_gaia2_evaluation.py` reddens on any edit — but a worktree branched from `origin/main` while the main checkout holds uncommitted work (routine, since agents don't commit here) hashes the wrong prompts, and the tripwire goes quiet instead of red.
-4. **Some breakage is silent and delayed.** A behavioral edit to `PLAN_SYSTEM_PROMPT` (`src/sora/memory.py`) invalidates comparison against every benchmark number recorded before it. The sha256 gate says a prompt moved, not that results became incomparable: a fix scoped to one call site should move exactly one row. Re-freezing to reach green without saying so is the failure.
+4. **Some breakage is silent and delayed.** A behavioral edit to `PLAN_SYSTEM_PROMPT` (`src/sora/_prompts/plan.py`) invalidates comparison against every benchmark number recorded before it. The sha256 gate says a prompt moved, not that results became incomparable: a fix scoped to one call site should move exactly one row. Re-freezing to reach green without saying so is the failure.
 
 ## Architectural habits to default to
 

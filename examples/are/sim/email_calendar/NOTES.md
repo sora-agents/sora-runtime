@@ -88,7 +88,7 @@ correct:
   behavior was unsound). `ProceduralMemory.store`/`retrieve` remain as latent capability for a future
   experience-distillation step.
 - **Identifiers stay references.** The core planner prompt (`PLAN_SYSTEM_PROMPT` in
-  `src/sora/memory.py`) tells the model to keep a volatile identifier (an email/event id) as a
+  `src/sora/_prompts/plan.py`) tells the model to keep a volatile identifier (an email/event id) as a
   `$from` reference even when it is visible in observations, instead of hard-coding it — robust
   binding on its own merit (and it was what made a cached plan run-coupled, before caching was
   disabled).

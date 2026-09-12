@@ -13,6 +13,7 @@ from examples.gaia2.evaluation.core import (
     load_profiles,
     sha256_text,
 )
+from sora._prompts import SUPPORTED_PERCEPTION_CHANNELS
 from sora.activity import Activity
 from sora.llm import CompletionRequest
 from sora.memory import (
@@ -33,34 +34,43 @@ PROMPT_LABELS = (
     "relevance",
 )
 PROMPT_SOURCES = {
-    "plan": ("src/sora/memory.py", "PLAN_SYSTEM_PROMPT", "default_plan_prompt"),
-    "ground": ("src/sora/memory.py", "GROUND_SYSTEM_PROMPT", "default_ground_prompt"),
-    "select": ("src/sora/memory.py", "SELECT_SYSTEM_PROMPT", "ProceduralMemory.select"),
+    "plan": ("src/sora/_prompts/plan.py", "PLAN_SYSTEM_PROMPT", "default_plan_prompt"),
+    "ground": (
+        "src/sora/_prompts/ground.py",
+        "GROUND_SYSTEM_PROMPT",
+        "default_ground_prompt",
+    ),
+    "select": (
+        "src/sora/_prompts/judgments.py",
+        "SELECT_SYSTEM_PROMPT",
+        "ProceduralMemory.select",
+    ),
     "revalidate": (
-        "src/sora/memory.py",
+        "src/sora/_prompts/judgments.py",
         "REVALIDATE_SYSTEM_PROMPT",
         "ProceduralMemory.revalidate",
     ),
     "condition": (
-        "src/sora/memory.py",
+        "src/sora/_prompts/judgments.py",
         "CONDITION_SYSTEM_PROMPT",
         "ProceduralMemory.evaluate_conditions",
     ),
     "retirement": (
-        "src/sora/memory.py",
+        "src/sora/_prompts/judgments.py",
         "RETIREMENT_SYSTEM_PROMPT",
         "ProceduralMemory.judge_retirement",
     ),
     "relevance": (
-        "src/sora/memory.py",
+        "src/sora/_prompts/judgments.py",
         "RELEVANCE_SYSTEM_PROMPT",
         "ProceduralMemory.judge_relevance",
     ),
 }
-PERCEPTION_TIERS = (
-    (1, PerceptionChannels(properties=False, signals=False)),
-    (2, PerceptionChannels(properties=False, signals=True)),
-    (3, PerceptionChannels(properties=True, signals=True)),
+PERCEPTION_PROFILES = (
+    ("operations-only", PerceptionChannels(properties=False, signals=False)),
+    ("signals-only", PerceptionChannels(properties=False, signals=True)),
+    ("properties-and-signals", PerceptionChannels(properties=True, signals=True)),
+    ("properties-only", PerceptionChannels(properties=True, signals=False)),
 )
 
 
@@ -144,8 +154,10 @@ async def _capture_requests(channels: PerceptionChannels) -> list[CompletionRequ
 
 
 def _prompt_rows() -> list[dict[str, Any]]:
+    if {channels for _, channels in PERCEPTION_PROFILES} != SUPPORTED_PERCEPTION_CHANNELS:
+        raise ValueError("prompt snapshots must cover every supported perception profile")
     rows: list[dict[str, Any]] = []
-    for perception_tier, channels in PERCEPTION_TIERS:
+    for perception_profile, channels in PERCEPTION_PROFILES:
         requests = asyncio.run(_capture_requests(channels))
         if tuple(request.semantic_label for request in requests) != PROMPT_LABELS:
             raise ValueError("runtime semantic prompt inventory no longer matches the frozen seven")
@@ -155,7 +167,7 @@ def _prompt_rows() -> list[dict[str, Any]]:
                 {
                     "semantic_label": request.semantic_label,
                     "prompt_version": request.prompt_version,
-                    "perception_tier": perception_tier,
+                    "perception_profile": perception_profile,
                     "perception_channels": asdict(channels),
                     "source": {
                         "file": source_file,
