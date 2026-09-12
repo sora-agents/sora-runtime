@@ -34,13 +34,19 @@ from examples.gaia2.react_driver import (  # noqa: E402
     MeteredAgentBuilder,
     MeteredEngineBuilder,
     _timeline_expired,
+    build_parser,
     build_runner,
+    main,
+    preflight,
     run_react_on_scenario,
     runner_config,
     wire_bracket,
     wire_run_end,
 )
-from examples.gaia2.react_engine import MeteredLiteLLMEngine  # noqa: E402
+from examples.gaia2.react_engine import (  # noqa: E402
+    MeteredLiteLLMEngine,
+    _CallSettings,
+)
 
 
 @pytest.fixture
@@ -658,3 +664,114 @@ def test_no_recording_is_kept_when_it_was_not_asked_for(
         log_fn=lambda _m: None,
     )
     assert result.judge_recording is None
+
+
+# -- preflight -------------------------------------------------------------------------------
+
+PREFLIGHT_PROFILE = "kimi-k2.5-prompt"  # sends both probed settings' siblings plus a provider pin
+
+
+class _FakeEngine:
+    """Enough of the engine for the preflight: settings it can override, and a call it can make."""
+
+    def __init__(self, profile: Any, writer: Any = None, *, answer: Any = "ok", row: Any = None):
+        self.settings = _CallSettings({"reasoning_effort": "medium"}, False)
+        self.writer = writer
+        self._answer = answer
+        self._row = row or SimpleNamespace(
+            input_tokens=13, output_tokens=21, reasoning_tokens=11, usage_captured=True
+        )
+
+    def chat_completion(self, messages: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(self._answer, Exception):
+            raise self._answer
+        if self.writer is not None:
+            self.writer.write(self._row)
+        return self._answer, None
+
+
+def _factory(**kwargs: Any) -> Any:
+    """A factory whose *probe* calls (no writer) behave differently from the route call."""
+    probe_answer = kwargs.pop("probe_answer")
+
+    def build(profile: Any, writer: Any = None) -> Any:
+        if writer is None:
+            return _FakeEngine(profile, None, answer=probe_answer)
+        return _FakeEngine(profile, writer, **kwargs)
+
+    return build
+
+
+def _run_preflight(**kwargs: Any) -> tuple[int, str]:
+    profile = load_profiles(EVAL_ROOT / "profiles.json")[PREFLIGHT_PROFILE]
+    lines: list[str] = []
+    code = preflight(profile, factory=_factory(**kwargs), log=lines.append)
+    return code, "\n".join(lines)
+
+
+def test_preflight_passes_when_every_probed_setting_is_refused_by_the_provider() -> None:
+    from litellm.exceptions import BadRequestError
+
+    refusal = BadRequestError(
+        message="OpenrouterException - no allowed providers", model="m", llm_provider="openrouter"
+    )
+    code, out = _run_preflight(probe_answer=refusal)
+    assert code == 0, out
+    assert "wire OK extra_body" in out
+    assert "passed" in out
+
+
+def test_preflight_fails_when_a_probed_setting_is_answered_instead_of_refused() -> None:
+    """The failure this whole step exists for. LiteLLM drops an unsupported parameter rather than
+    raising, so the arm runs at the provider's default while S-ORA runs at the profile's — and the
+    call still returns a plausible answer, which is why a green route proves nothing on its own."""
+    code, out = _run_preflight(probe_answer="ok")
+    assert code == 1
+    assert "DROPPED extra_body" in out
+    assert "provider's default" in out
+
+
+def test_preflight_tells_a_client_side_refusal_from_a_crossing() -> None:
+    """``UnsupportedParamsError`` is a refusal that proves the opposite of the others: LiteLLM's
+    own table rejected the call before sending it, which is the failure ``allowed_openai_params``
+    exists to prevent. Counting it as a crossing would report a dead arm as healthy."""
+    from litellm.exceptions import UnsupportedParamsError
+
+    code, out = _run_preflight(
+        probe_answer=UnsupportedParamsError(status_code=400, message="not supported")
+    )
+    assert code == 1
+    assert "DROPPED extra_body" in out
+    assert "allowed_openai_params" in out
+
+
+def test_preflight_stops_at_a_route_that_never_resolved() -> None:
+    code, out = _run_preflight(
+        answer=RuntimeError("NotFoundError: no such model"), probe_answer="ok"
+    )
+    assert code == 1
+    assert "REFUSED route" in out
+    # Nothing after the route can be read if the route itself failed, so no probe is reported.
+    assert "extra_body" not in out
+
+
+def test_preflight_fails_a_route_that_answered_without_reporting_usage() -> None:
+    """Every row of the arm would bill the charge model's fixed per-call term alone — an
+    undercount that looks like a cheap arm rather than a broken one."""
+    from litellm.exceptions import BadRequestError
+
+    code, out = _run_preflight(
+        row=SimpleNamespace(
+            input_tokens=None, output_tokens=None, reasoning_tokens=None, usage_captured=False
+        ),
+        probe_answer=BadRequestError(message="x", model="m", llm_provider="openrouter"),
+    )
+    assert code == 1
+    assert "no usage reported" in out
+
+
+def test_preflight_needs_no_scenario_and_a_run_still_does() -> None:
+    parsed = build_parser().parse_args(["--profile", PREFLIGHT_PROFILE, "--preflight"])
+    assert parsed.scenario is None and parsed.preflight is True
+    with pytest.raises(SystemExit):
+        main(["--profile", PREFLIGHT_PROFILE])

@@ -249,6 +249,38 @@ arms send what `ModelProfile.request_kwargs()` says. Both changes are applied wh
 already intercepted; ARE's own `chat_completion` body still runs untouched, including the
 `True`/`False` lowercasing its checkers depend on.
 
+That path reaches the provider through LiteLLM rather than through an SDK client, so it resolves
+`provider`/`model`/`endpoint` by its own rules — rules no test that fakes the wire exercises, and
+that a repin can invalidate silently. `react_driver.py --preflight` is the guard, the same contract
+the grid's has for the other arm's client:
+
+```bash
+python3 -m examples.gaia2.react_driver --profile kimi-k2.5-prompt --preflight
+```
+
+It needs no scenario, sends one cheap call, and exits non-zero so a script chaining it into a sweep
+stops rather than discovering the problem partway through a paid run. All three profiles passed on
+2026-09-12 — resolved and billed, non-streamed, both usage detail blocks present, the
+`kimi-k2.5-prompt` pin served by Venice.
+
+A returning call is not by itself evidence that the arm runs at the profile's operating point,
+which is why the route check is only half of it. LiteLLM's failure mode here is to *drop* a
+parameter rather than raise — `drop_params` is what it recommends — and a dropped `reasoning_effort`
+still comes back with a plausible answer at the provider's default, which is precisely the arm-to-arm
+drift the sweep's own guard refuses to start with. So each probe sends a value only the far end can
+refuse, and being refused is the pass: `reasoning_effort: supreme` returns OpenAI's own enumeration
+of accepted values, and a nonexistent name in the provider pin returns OpenRouter's list of who
+really serves the model. Neither reply is producible by a request that never left the process.
+`UnsupportedParamsError` is the one refusal that means the opposite — LiteLLM's own table rejected
+the call before sending it, the failure `allowed_openai_params` exists to prevent — so it is
+reported as a drop, not a crossing.
+
+Only probes whose refusal has actually been observed are shipped, because a provider that clamps an
+out-of-range value instead of refusing it would be reported as having dropped the setting — a false
+alarm on the one check whose job is to be trusted. Everything else the profile sends is printed as
+unprobed rather than passed over, so the coverage gap is visible: today that is
+`max_completion_tokens`, `temperature` and `extra_headers`.
+
 Transport follows the profile too, through a separate field. `stream` is read by the latency grid
 as well as by both arms, so all three always sit on one transport — a per-call latency coefficient
 fitted on one does not price an arm running on another. The shipped profiles are **non-streamed**,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -400,17 +401,64 @@ def test_contract_and_neutral_suites_are_deterministic_and_complete() -> None:
     assert neutral.passed == 16
 
 
-def test_the_frozen_snapshot_is_not_hashed_over_its_own_diff(tmp_path: Path) -> None:
+def _committed_repo(root: Path) -> None:
+    """A one-commit repo with a nested tracked file, ready to be dirtied."""
+    (root / "nested").mkdir(parents=True)
+    (root / "nested" / "baseline.json").write_text("{}\n")
+    (root / "other.txt").write_text("one\n")
+    for args in (
+        ("init", "-q", "."),
+        ("config", "user.email", "frozen@example.invalid"),
+        ("config", "user.name", "frozen"),
+        ("add", "-A"),
+        ("-c", "commit.gpgsign=false", "commit", "-qm", "init"),
+    ):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+
+def test_the_frozen_snapshot_is_not_hashed_over_its_own_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``source_dirty_diff_sha256`` records the uncommitted state a baseline was frozen against.
     The baseline is itself a tracked file, so leaving it inside ``git diff`` made the value stale
     the instant it was stored: two regenerations with nothing edited between them disagreed, and
     the field never converged while the snapshot sat uncommitted — its normal reviewable state."""
+    from examples.gaia2.evaluation.cli import _dirty_diff_hash
+
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    _committed_repo(root)
+    target = root / "nested" / "baseline.json"
+    (root / "other.txt").write_text("two\n")  # a real uncommitted edit, which must stay covered
+    (root / "untracked.txt").write_text("scanned\n")
+    monkeypatch.chdir(root)
+
+    target.write_text('{"frozen": 1}\n')
+    first = _dirty_diff_hash(excluded={target})
+    assert first is not None
+    target.write_text('{"frozen": 2}\n')
+    assert _dirty_diff_hash(excluded={target}) == first  # converges: its own bytes are not in it
+
+    # Still a hash *of* the dirty tree, though, not a constant that happens to converge.
+    (root / "other.txt").write_text("three\n")
+    assert _dirty_diff_hash(excluded={target}) != first
+
+    # Both git calls are anchored at the repo root rather than the process CWD. Run from a
+    # subdirectory, a `:(exclude)` pathspec without `top` matches nothing — and, being
+    # exclusion-only, still means "everything else", so the baseline returns to the diff instead of
+    # erroring — while `ls-files --others` reports only the subtree it was invoked in.
+    (root / "other.txt").write_text("two\n")
+    monkeypatch.chdir(root / "nested")
+    assert _dirty_diff_hash(excluded={target}) == first
+
+
+def test_the_exclusion_pathspec_is_repo_relative_and_only_built_when_needed(tmp_path: Path) -> None:
     from examples.gaia2.evaluation.cli import _exclude_pathspec
 
     root = (tmp_path / "repo").resolve()
     (root / "nested").mkdir(parents=True)
     target = root / "nested" / "baseline.json"
-    assert _exclude_pathspec(str(root), {target}) == ["--", ":(exclude)nested/baseline.json"]
+    assert _exclude_pathspec(str(root), {target}) == ["--", ":(exclude,top)nested/baseline.json"]
     # Nothing to exclude means no pathspec at all: a bare `git diff HEAD` has to stay bare, or it
     # would start reporting "everything except nothing" differently from the whole tree.
     assert _exclude_pathspec(str(root), set()) == []

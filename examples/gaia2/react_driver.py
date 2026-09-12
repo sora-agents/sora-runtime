@@ -58,6 +58,7 @@ import argparse
 import contextlib
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -453,9 +454,150 @@ def run_react_on_scenario(
     )
 
 
+PREFLIGHT_MESSAGES = [{"role": "user", "content": "Reply with the single word: ok"}]
+
+# Keyed by the request kwarg each probe replaces, so coverage is measured against what
+# `request_kwargs()` actually sends rather than against the profile's settings — those also carry
+# identity and transport, which no request parameter corresponds to. Only values whose refusal has
+# been *observed* belong here: a provider that silently clamps an out-of-range value instead of
+# refusing it would be reported as having dropped the setting, which is a false alarm on the one
+# check whose whole job is to be trusted. Everything sent without a probe is named as unprobed
+# rather than passed over in silence.
+WIRE_PROBES: dict[str, dict[str, Any]] = {
+    # OpenAI answers with its own enumeration of the values it accepts.
+    "reasoning_effort": {"reasoning_effort": "supreme"},
+    # OpenRouter answers with the providers that really serve the model — which is also the
+    # cheapest way to find the alternatives when a pin dies. One probe covers the whole envelope:
+    # `reasoning` rides in the same dict, and LiteLLM either forwards `extra_body` or it does not.
+    "extra_body": {
+        "extra_body": {
+            "provider": {"only": ["sora-preflight-no-such-provider"], "allow_fallbacks": False}
+        }
+    },
+}
+
+
+def _provider_refused(exc: BaseException) -> tuple[bool, str]:
+    """Whether the far end refused, walking the ``__cause__`` chain ARE's wrapper adds.
+
+    ``UnsupportedParamsError`` is the one refusal that is *not* proof: LiteLLM raises it from its
+    own per-model table without sending anything, which is the failure ``allowed_openai_params``
+    exists to prevent. Reported apart from a clean crossing for that reason."""
+    from litellm.exceptions import UnsupportedParamsError
+
+    seen: list[str] = []
+    current: BaseException | None = exc
+    while current is not None:
+        seen.append(f"{type(current).__name__}: {current}")
+        if isinstance(current, UnsupportedParamsError):
+            return False, (
+                "refused by LiteLLM before the wire (allowed_openai_params no longer covers it)"
+            )
+        current = current.__cause__
+    return True, seen[-1].split("\n")[0][:200]
+
+
+class _Collected:
+    """Stands in for :class:`LLMCallWriter`; the engine only ever calls ``write``."""
+
+    def __init__(self) -> None:
+        self.rows: list[Any] = []
+
+    def write(self, record: Any) -> None:
+        self.rows.append(record)
+
+
+def preflight(
+    profile: ModelProfile,
+    *,
+    factory: Any = None,
+    log: Any = print,
+) -> int:
+    """Send one live call on this profile's route, then prove its settings crossed the wire.
+
+    The ReAct arm reaches the provider through LiteLLM rather than through an SDK client, so it
+    resolves ``provider``/``model``/``endpoint`` by its own rules — rules no test that fakes the
+    wire exercises, and that a repin can invalidate silently. The grid has the same guard for the
+    other arm's client; this is that guard for this one, with the same contract: a non-zero exit,
+    so a script chaining preflight into a sweep stops here rather than discovering it partway
+    through a paid run.
+
+    A returning call is *not* on its own evidence that the arm runs at the profile's operating
+    point. The failure mode here drops a parameter rather than raising — ``drop_params`` is
+    literally what LiteLLM recommends — and a dropped ``reasoning_effort`` still comes back with a
+    plausible answer at the provider's default, which is exactly the arm-to-arm drift the sweep's
+    own guard refuses to start with. So each probe sends a value only the far end can refuse: being
+    refused is the pass, and answering is the failure."""
+    factory = factory or MeteredLiteLLMEngine.from_profile
+    failures: list[str] = []
+    log(f"preflight {profile.name} -> {profile.provider}/{profile.model} at {profile.endpoint}")
+
+    collected = _Collected()
+    engine = factory(profile, writer=collected)
+    started = time.perf_counter()
+    try:
+        text, _ = engine.chat_completion(list(PREFLIGHT_MESSAGES))
+    except Exception as exc:  # noqa: BLE001 — every refusal is reported, none is fatal here
+        log(f"  REFUSED route: {type(exc).__name__}: {str(exc)[:200]}")
+        # Nothing below can be interpreted without a route, so this is the whole answer.
+        return 1
+    row = collected.rows[-1] if collected.rows else None
+    seconds = time.perf_counter() - started
+    log(
+        f"  route OK in {seconds:.1f}s: text={text[:40]!r} "
+        f"in={getattr(row, 'input_tokens', None)} out={getattr(row, 'output_tokens', None)} "
+        f"reasoning={getattr(row, 'reasoning_tokens', None)} "
+        f"usage_captured={getattr(row, 'usage_captured', None)}"
+    )
+    if not (text or "").strip():
+        failures.append("route: answered with no text")
+    if row is None or not row.usage_captured:
+        failures.append(
+            "route: no usage reported, so every row of this arm would bill the fixed term alone"
+        )
+    elif not (row.output_tokens or 0):
+        failures.append("route: accepted, no output tokens reported")
+
+    request = profile.request_kwargs()
+    for setting, override in WIRE_PROBES.items():
+        if setting not in request:
+            continue
+        probe = factory(profile)
+        probe.settings = replace(
+            probe.settings, request_kwargs={**probe.settings.request_kwargs, **override}
+        )
+        try:
+            probe.chat_completion(list(PREFLIGHT_MESSAGES))
+        except Exception as exc:  # noqa: BLE001 — the refusal is the result being measured
+            crossed, detail = _provider_refused(exc)
+            log(f"  {'wire OK ' if crossed else 'DROPPED '}{setting}: {detail}")
+            if not crossed:
+                failures.append(f"{setting}: {detail}")
+        else:
+            log(f"  DROPPED {setting}: a value the provider must refuse was answered instead")
+            failures.append(
+                f"{setting}: dropped before the wire — the arm runs at the provider's default"
+            )
+    unprobed = sorted(set(request) - set(WIRE_PROBES))
+    if unprobed:
+        log(
+            "  unprobed settings (sent, no observed refusal to test them with): "
+            + ", ".join(unprobed)
+        )
+
+    for failure in failures:
+        log(f"  FAIL {failure}")
+    log(f"preflight {'FAILED' if failures else 'passed'} for {profile.name}")
+    return 1 if failures else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--scenario", required=True, help="path to a Gaia2 scenario JSON")
+    parser.add_argument(
+        "--scenario",
+        default=None,
+        help="path to a Gaia2 scenario JSON; not needed with --preflight",
+    )
     parser.add_argument("--profile", required=True, help="profile name from profiles.json")
     parser.add_argument("--profiles-path", type=Path, default=EVAL_ROOT / "profiles.json")
     parser.add_argument("--llm-calls", type=Path, default=None, help="JSONL to append call rows to")
@@ -466,6 +608,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario-duration", type=float, default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--export", action="store_true", help="write ARE's HF trace")
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="confirm the profile's route resolves and its settings reach the provider, then exit",
+    )
     return parser
 
 
@@ -475,6 +622,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.profile not in profiles:
         raise SystemExit(f"unknown profile {args.profile!r}; have {sorted(profiles)}")
     profile = profiles[args.profile]
+    if args.preflight:
+        return preflight(profile)
+    if not args.scenario:
+        raise SystemExit("--scenario is required unless --preflight is given")
     print(f"profile {profile.name} -> {profile.model} at {profile.endpoint}  (arm: react)")
     writer = LLMCallWriter(args.llm_calls) if args.llm_calls else None
     try:

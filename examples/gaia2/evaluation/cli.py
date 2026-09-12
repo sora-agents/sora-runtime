@@ -74,7 +74,11 @@ def _exclude_pathspec(root_raw: str | None, excluded: set[Path]) -> list[str]:
     """``--`` plus a ``:(exclude)`` pathspec per path, or nothing when there is none to exclude.
 
     A pathspec list made only of exclusions means "everything else" to git, so no positive entry
-    is needed alongside them."""
+    is needed alongside them. ``top`` anchors each path at the repo root: without it git resolves
+    against the process CWD, and a pathspec that matches nothing still means "everything else", so
+    the file comes back into the diff rather than the command failing. The only caller already
+    invokes git at the root, which would make it redundant — it is kept so the helper's output is
+    correct on its own terms, not conditionally on where the caller happens to run git."""
     if not root_raw or not excluded:
         return []
     root = Path(root_raw).resolve()
@@ -84,19 +88,25 @@ def _exclude_pathspec(root_raw: str | None, excluded: set[Path]) -> list[str]:
             relatives.append(path.relative_to(root).as_posix())
         except ValueError:  # outside the repo: nothing in the diff could name it anyway
             continue
-    return ["--", *(f":(exclude){relative}" for relative in relatives)] if relatives else []
+    return ["--", *(f":(exclude,top){relative}" for relative in relatives)] if relatives else []
 
 
 def _dirty_diff_hash(*, excluded: set[Path] | None = None) -> str | None:
     root_raw = _git_output("rev-parse", "--show-toplevel")
-    untracked_raw = _git_output("ls-files", "--others", "--exclude-standard")
+    # Both content commands are anchored at the toplevel rather than run in the process CWD: `git
+    # ls-files --others` reports only the subtree it is run from, and names it relative to that, so
+    # invoked from anywhere but the root this hash would silently cover a slice of the tree.
+    at_root = ("-C", root_raw) if root_raw else ()
+    untracked_raw = _git_output(*at_root, "ls-files", "--others", "--exclude-standard")
     excluded_resolved = {path.resolve() for path in excluded or set()}
     # The exclusion has to reach `git diff`, not just the untracked scan below: the snapshot this
     # hash is written into is itself a tracked file, so covering its own diff would mean the value
     # is stale the moment it is stored, and two regenerations with no edit between them would
     # disagree. It never converges while the snapshot is uncommitted — which, here, is its normal
     # reviewable state.
-    diff = _git_output("diff", "--binary", "HEAD", *_exclude_pathspec(root_raw, excluded_resolved))
+    diff = _git_output(
+        *at_root, "diff", "--binary", "HEAD", *_exclude_pathspec(root_raw, excluded_resolved)
+    )
     additions: list[dict[str, str]] = []
     if root_raw and untracked_raw:
         root = Path(root_raw)

@@ -209,7 +209,15 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
 
         Which routing string LiteLLM needs for a given provider is LiteLLM's own business and is
         not second-guessed here — the profile's ``provider``/``model``/``endpoint`` are passed
-        through as they stand, and a live pilot is what confirms them.
+        through as they stand, and a live pilot is what confirms them. All three shipped profiles
+        resolved and billed on 2026-09-12, non-streamed, with both usage detail blocks present.
+
+        A call that merely *returns* confirms nothing about the settings, though: LiteLLM's failure
+        mode here is to drop a parameter, not to raise, and a dropped one leaves a plausible answer
+        behind. What confirms it is sending a value only the far end can refuse — ``supreme`` for
+        ``reasoning_effort`` came back as OpenAI's own enumeration of the values it accepts, and a
+        nonexistent name in the provider pin came back as OpenRouter's list of who really serves the
+        model. Both are proof of crossing; neither can be produced by a request that never left.
 
         The one thing that *is* second-guessed is LiteLLM's table of which parameters a model
         accepts. It validates the request against a per-model list it ships, so a model newer than
