@@ -73,8 +73,8 @@
           "value": null
         },
         "service_tier": {
-          "status": "intentionally_omitted",
-          "value": null
+          "status": "sent",
+          "value": "default"
         },
         "stall_timeout": {
           "status": "sent",
@@ -124,8 +124,8 @@
           "value": null
         },
         "service_tier": {
-          "status": "intentionally_omitted",
-          "value": null
+          "status": "sent",
+          "value": "default"
         },
         "temperature": {
           "status": "intentionally_omitted",
@@ -214,8 +214,8 @@
           "value": null
         },
         "service_tier": {
-          "status": "intentionally_omitted",
-          "value": null
+          "status": "sent",
+          "value": "default"
         },
         "stall_timeout": {
           "status": "sent",
@@ -265,8 +265,8 @@
           "value": null
         },
         "service_tier": {
-          "status": "intentionally_omitted",
-          "value": null
+          "status": "sent",
+          "value": "default"
         },
         "temperature": {
           "status": "intentionally_omitted",
@@ -1956,8 +1956,8 @@
   ],
   "provenance": {
     "prompt_source_dirty_diff_sha256": null,
-    "source_dirty_diff_sha256": "a75488e3b4bcc9df02530ee675e0735abd6ab559ed0cb899c2b8617fefe3bcb1",
-    "source_revision": "3b1476f5469ca5753e289727054549264cea6241"
+    "source_dirty_diff_sha256": "00de5c534c1d69a0d4bcf583f3d608d9f7d96097d66655f4b2a58f0606b6cbdd",
+    "source_revision": "9979d2f413233fad430d5814069e176e5b559951"
   },
   "schema_version": 1
 }

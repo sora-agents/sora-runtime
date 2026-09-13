@@ -703,7 +703,8 @@ def _factory(**kwargs: Any) -> Any:
 
 
 def _run_preflight(**kwargs: Any) -> tuple[int, str]:
-    profile = load_profiles(EVAL_ROOT / "profiles.json")[PREFLIGHT_PROFILE]
+    name = kwargs.pop("profile_name", PREFLIGHT_PROFILE)
+    profile = load_profiles(EVAL_ROOT / "profiles.json")[name]
     lines: list[str] = []
     code = preflight(profile, factory=_factory(**kwargs), log=lines.append)
     return code, "\n".join(lines)
@@ -729,6 +730,24 @@ def test_preflight_fails_when_a_probed_setting_is_answered_instead_of_refused() 
     assert code == 1
     assert "DROPPED extra_body" in out
     assert "provider's default" in out
+
+
+def _refusal() -> Any:
+    from litellm.exceptions import BadRequestError
+
+    return BadRequestError(
+        message="OpenrouterException - no allowed providers", model="m", llm_provider="openrouter"
+    )
+
+
+def test_the_serving_tier_is_probed_on_the_profiles_that_send_it() -> None:
+    """`service_tier` decides how fast the provider serves the call, so an arm that silently lost
+    it is an arm whose latencies were measured somewhere else. The kimi profile the other preflight
+    tests run does not send it, so without this the probe could be deleted and stay green."""
+    code, out = _run_preflight(probe_answer=_refusal(), profile_name="gpt-5.4-high-paper")
+    assert code == 0, out
+    assert "wire OK service_tier" in out
+    assert "service_tier" not in out.split("unprobed settings")[-1]
 
 
 def test_preflight_tells_a_client_side_refusal_from_a_crossing() -> None:

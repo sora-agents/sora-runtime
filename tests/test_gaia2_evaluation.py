@@ -193,6 +193,38 @@ def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
     }
 
 
+# Tiers observed to resolve to themselves. OpenAI validates `service_tier` — an invented value is
+# refused with the accepted enumeration — but validating is not honoring: measured 2026-09-13 on
+# this account, `fast` is accepted and served as `priority`, echoing `priority` back. So a probe
+# that proves the parameter crossed the wire does *not* prove the arm ran at the tier the profile
+# names, and only a value seen to come back unchanged may be pinned. Widening this set means
+# re-measuring, not editing it.
+VERIFIED_SERVICE_TIERS = {"default"}
+
+
+def test_the_serving_tier_is_pinned_only_where_it_is_both_honored_and_verified() -> None:
+    """Left unset, OpenAI resolves `service_tier` to `auto`, which picks a tier from whatever
+    credits the account holds at the time — so the serving condition, and with it the latency the
+    charge coefficients are fitted from, would be defined outside this repo and free to move
+    between two runs that the profile digest calls identical."""
+    profiles = load_profiles(EVAL_ROOT / "profiles.json")
+    openai_profiles = [p for p in profiles.values() if p.provider == "openai"]
+    assert openai_profiles
+    for profile in openai_profiles:
+        tier = profile.settings["service_tier"]
+        assert tier.status == "sent", profile.name
+        assert tier.value in VERIFIED_SERVICE_TIERS, profile.name
+        assert profile.request_kwargs()["service_tier"] == tier.value
+
+    # OpenRouter has no such parameter: it answers 200 and echoes `service_tier: null` rather than
+    # refusing, so marking it `sent` there would record a serving condition that was never in
+    # force — the same silent fiction, one layer up from the wire.
+    for profile in profiles.values():
+        if profile.provider == "openrouter":
+            assert profile.settings["service_tier"].status == "intentionally_omitted", profile.name
+            assert "service_tier" not in profile.request_kwargs()
+
+
 def test_prompt_judge_profile_pins_gpt_5_1_snapshot_and_are_policy() -> None:
     judge = load_judge_profile(PROMPT_ROOT / "judge.json")
 

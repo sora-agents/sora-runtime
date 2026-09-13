@@ -46,9 +46,13 @@ agent:
     # Non-streamed to match the evaluation profile. The latency grid reads the same transport as
     # both scaffold arms, and a per-call latency coefficient fitted on one transport does not
     # transfer to another. That makes stall_timeout a total-duration cap rather than an inter-chunk
-    # silence bound, so it is sized as one: the largest completion ever observed here was ~3.9k
-    # tokens, which 600s clears at a sustained 6.4 tok/s. Outside a measured comparison, streaming
-    # is the better default — it is what lets the timeout tell "stalled" from "slow".
+    # silence bound, so it is deliberately sized as one: a call still running at 600s is aborted
+    # rather than waited out. That is a choice, not headroom. One ~3.9k-token completion is on
+    # record here taking ~14 minutes (see `sora/adapters/openai_llm.py`) and would now be killed;
+    # it was a rare incident, and a scenario's whole real-time budget is ~1000s, so a call that
+    # slow has already lost the scenario whether or not it is allowed to finish. Outside a measured
+    # comparison, streaming is the better default — it is what lets the timeout tell "stalled"
+    # from "slow".
     stream: false
     stall_timeout: 600.0
     max_retries: 0
@@ -57,6 +61,14 @@ agent:
     # budget, truncating the plan JSON mid-serialization). The non-streaming ceiling that a large
     # cap would trip belongs to the Anthropic SDK, not to the client selected above.
     max_tokens: 16384
+    # Pinned rather than left to resolve: unset, OpenAI reads this as `auto` and picks a tier from
+    # whatever credits the account holds at the time, which would put the serving condition — and
+    # so the latency the charge coefficients are fitted from — outside this repo. `default` is the
+    # one value observed to resolve to itself; `fast` is accepted and served as `priority`. The
+    # evaluation profile carries the same pin, and a disagreement between the two fails the batch
+    # guard rather than running the arms at two operating points. OpenRouter ignores the parameter,
+    # so the commented-out route above would send it to no effect.
+    service_tier: default
     instrument: true
     max_logical_calls: 200
   transport:

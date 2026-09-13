@@ -260,7 +260,7 @@ python3 -m examples.gaia2.react_driver --profile kimi-k2.5-prompt --preflight
 
 It needs no scenario, sends one cheap call, and exits non-zero so a script chaining it into a sweep
 stops rather than discovering the problem partway through a paid run. All three profiles passed on
-2026-09-12 — resolved and billed, non-streamed, both usage detail blocks present, the
+2026-09-13 — resolved and billed, non-streamed, both usage detail blocks present, the
 `kimi-k2.5-prompt` pin served by Venice.
 
 A returning call is not by itself evidence that the arm runs at the profile's operating point,
@@ -268,9 +268,9 @@ which is why the route check is only half of it. LiteLLM's failure mode here is 
 parameter rather than raise — `drop_params` is what it recommends — and a dropped `reasoning_effort`
 still comes back with a plausible answer at the provider's default, which is precisely the arm-to-arm
 drift the sweep's own guard refuses to start with. So each probe sends a value only the far end can
-refuse, and being refused is the pass: `reasoning_effort: supreme` returns OpenAI's own enumeration
-of accepted values, and a nonexistent name in the provider pin returns OpenRouter's list of who
-really serves the model. Neither reply is producible by a request that never left the process.
+refuse, and being refused is the pass: `reasoning_effort: supreme` and `service_tier: supreme` each
+return OpenAI's own enumeration of accepted values, and a nonexistent name in the provider pin
+returns OpenRouter's list of who really serves the model. Neither reply is producible by a request that never left the process.
 `UnsupportedParamsError` is the one refusal that means the opposite — LiteLLM's own table rejected
 the call before sending it, the failure `allowed_openai_params` exists to prevent — so it is
 reported as a drop, not a crossing.
@@ -280,6 +280,29 @@ out-of-range value instead of refusing it would be reported as having dropped th
 alarm on the one check whose job is to be trusted. Everything else the profile sends is printed as
 unprobed rather than passed over, so the coverage gap is visible: today that is
 `max_completion_tokens`, `temperature` and `extra_headers`.
+
+### What the profiles pin about *how* the call is served
+
+A latency number is only reproducible if the conditions it was measured under are recorded, and one
+of those lives outside the request the profile describes.
+
+`service_tier` is the first. Left unset OpenAI resolves it to `auto`, which picks a tier from
+whatever credits the account happens to hold — so the serving condition would be defined outside
+this repo and free to move between two runs the profile digest calls identical. Both OpenAI
+profiles now pin it to `default`. Measured on 2026-09-13, that is a *recording rather than a
+re-baseline*: unset, `auto` and `default` all resolved to `default` on this account, so nothing
+about the operating point moved and numbers recorded before the pin stay comparable with numbers
+recorded after it.
+
+**`default` is pinned rather than any other tier because it is the only one observed to resolve to
+itself.** OpenAI validates this parameter — an invented value is refused with the enumeration — but
+validating is not honoring: `fast` is *accepted* and served as `priority`, which the response
+reports back. So the wire probe proves the parameter crossed and still cannot prove the arm ran at
+the named tier, and a profile pinning `fast` would record a serving condition that was never in
+force. `tests/test_gaia2_evaluation.py` holds the set of tiers whose resolution has actually been
+observed and reddens on a pin outside it; widening that set means re-measuring, not editing it.
+OpenRouter has no such parameter at all — it answers 200 and echoes `service_tier: null` — so
+`kimi-k2.5-prompt` leaves it omitted rather than claiming a pin that does nothing.
 
 Transport follows the profile too, through a separate field. `stream` is read by the latency grid
 as well as by both arms, so all three always sit on one transport — a per-call latency coefficient

@@ -17,7 +17,7 @@
         "seed": {"status": "intentionally_omitted", "value": null},
         "verbosity": {"status": "intentionally_omitted", "value": null},
         "max_output_tokens": {"status": "sent", "value": 16384},
-        "service_tier": {"status": "intentionally_omitted", "value": null},
+        "service_tier": {"status": "sent", "value": "default"},
         "provider_routing": {"status": "intentionally_omitted", "value": null},
         "router_metadata": {"status": "intentionally_omitted", "value": null}
       },
@@ -74,7 +74,7 @@
         "seed": {"status": "intentionally_omitted", "value": null},
         "verbosity": {"status": "intentionally_omitted", "value": null},
         "max_output_tokens": {"status": "sent", "value": 16384},
-        "service_tier": {"status": "intentionally_omitted", "value": null},
+        "service_tier": {"status": "sent", "value": "default"},
         "provider_routing": {"status": "intentionally_omitted", "value": null},
         "router_metadata": {"status": "intentionally_omitted", "value": null}
       },

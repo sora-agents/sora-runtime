@@ -474,6 +474,9 @@ WIRE_PROBES: dict[str, dict[str, Any]] = {
             "provider": {"only": ["sora-preflight-no-such-provider"], "allow_fallbacks": False}
         }
     },
+    # OpenAI enumerates its tiers the same way. Only OpenAI validates this one: OpenRouter answers
+    # 200 and echoes `service_tier: null`, which is why no profile of its sends it.
+    "service_tier": {"service_tier": "supreme"},
 }
 
 
