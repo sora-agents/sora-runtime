@@ -26,7 +26,7 @@ from are.simulation.agents.agent_builder import AgentBuilder  # noqa: E402
 from are.simulation.agents.are_simulation_agent_config import LLMEngineConfig  # noqa: E402
 from are.simulation.agents.default_agent.are_simulation_main import ARESimulationAgent  # noqa: E402
 from are.simulation.time_manager import TimeManager  # noqa: E402
-from examples.gaia2.evaluation.core import load_profiles  # noqa: E402
+from examples.gaia2.evaluation.core import MODEL_SNAPSHOTS, load_profiles  # noqa: E402
 from examples.gaia2.latency_grid import EVAL_ROOT  # noqa: E402
 from examples.gaia2.llm_calls import LLMCallWriter  # noqa: E402
 from examples.gaia2.react_driver import (  # noqa: E402
@@ -703,10 +703,15 @@ def _factory(**kwargs: Any) -> Any:
 
 
 def _run_preflight(**kwargs: Any) -> tuple[int, str]:
+    # `served_snapshot` is always injected: the real one pulls OpenRouter's catalogue over the
+    # network, and the profile these tests run is the one that has a snapshot recorded for it.
+    snapshot = kwargs.pop("served_snapshot", lambda profile: MODEL_SNAPSHOTS.get(profile.model))
     name = kwargs.pop("profile_name", PREFLIGHT_PROFILE)
     profile = load_profiles(EVAL_ROOT / "profiles.json")[name]
     lines: list[str] = []
-    code = preflight(profile, factory=_factory(**kwargs), log=lines.append)
+    code = preflight(
+        profile, factory=_factory(**kwargs), log=lines.append, served_snapshot=snapshot
+    )
     return code, "\n".join(lines)
 
 
@@ -778,6 +783,28 @@ def test_the_serving_tier_is_probed_on_the_profiles_that_send_it() -> None:
     assert code == 0, out
     assert "wire OK service_tier" in out
     assert "service_tier" not in out.split("unprobed settings")[-1]
+
+
+def test_preflight_fails_when_the_model_alias_has_been_repointed() -> None:
+    """An OpenRouter model id names a family, not a snapshot. Every probe above can pass while the
+    alias quietly serves a different model than the one the recorded latencies were measured on —
+    and since the dated form is not addressable, noticing the move is the only guard available."""
+    code, out = _run_preflight(
+        probe_answer=_refusal(),
+        served_snapshot=lambda profile: "moonshotai/kimi-k2.5-0601",
+    )
+    assert code == 1
+    assert "MOVED" in out
+    assert "moonshotai/kimi-k2.5-0601" in out
+
+
+def test_an_unreadable_catalogue_leaves_the_snapshot_unverified_rather_than_failing() -> None:
+    """A listing that did not load says nothing either way. Failing on it would redden the gate on
+    a network blip, which is the one thing a check whose job is to be trusted cannot afford; the
+    run is named as unverified instead, the way an unprobed setting is."""
+    code, out = _run_preflight(probe_answer=_refusal(), served_snapshot=lambda profile: None)
+    assert code == 0, out
+    assert "UNVERIFIED" in out
 
 
 def test_preflight_tells_a_client_side_refusal_from_a_crossing() -> None:

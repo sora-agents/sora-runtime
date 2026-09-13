@@ -31,14 +31,19 @@ import json
 import os
 import random
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI, Timeout
 
-from examples.gaia2.evaluation.core import ModelProfile, load_profiles
+from examples.gaia2.evaluation.core import (
+    MODEL_SNAPSHOTS,
+    ModelProfile,
+    load_profiles,
+    served_snapshot,
+)
 from examples.gaia2.llm_calls import LLMCallRecord, LLMCallWriter, read_usage
 
 EVAL_ROOT = Path(__file__).resolve().parent / "evaluation"
@@ -310,6 +315,8 @@ class LatencyGrid:
         api_key: str | None = None,
         client: Any = None,
         completed: Iterable[str] = (),
+        seen: Iterable[str] = (),
+        snapshot: str | None = None,
     ) -> None:
         self.profile = profile
         self.spec = spec or GridSpec()
@@ -317,12 +324,16 @@ class LatencyGrid:
         self.manifest_path = manifest_path
         self.calibration = _Calibration()
         self._profile_sha256 = profile_digest(profile)
+        self.served_snapshot = snapshot
         self._client = client if client is not None else self._build_client(profile, api_key)
         self._manifest: Any = None
-        # Call ids already on disk from an interrupted run. They decide what is skipped, and they
-        # seed the uniqueness check so a re-run cell cannot land on an id the file already holds.
+        # Call ids already on disk from an interrupted run. `completed` decides what is skipped
+        # and comes from the manifest, since a cell without an experiment record is not done. The
+        # uniqueness check is seeded more widely — with every id in *either* file, because an
+        # interrupt between the two writes leaves an id on the calls side and nowhere else, and a
+        # re-run that reuses it duplicates a join key.
         self._completed = set(completed)
-        self._seen = set(self._completed)
+        self._seen = self._completed | set(seen)
 
     @staticmethod
     def _build_client(profile: ModelProfile, api_key: str | None) -> AsyncOpenAI:
@@ -432,6 +443,9 @@ class LatencyGrid:
             "phase": phase,
             "profile": self.profile.name,
             "profile_sha256": self._profile_sha256,
+            # Not derivable from the digest above: the profile names an alias, so this is the only
+            # place a row says which model the seconds next to it were actually measured on.
+            "served_snapshot": self.served_snapshot,
             "seed": self.spec.seed,
             # The third input to `build_prompt`, and the one that is not a constant of the design:
             # without it the seed alone does not regenerate the run's bytes.
@@ -604,24 +618,85 @@ class LatencyGrid:
         return outcomes
 
 
-def completed_call_ids(manifest_path: Path) -> set[str]:
-    """Call ids already recorded, for resuming. A line that will not parse is skipped rather than
-    fatal: a run killed mid-write leaves a partial last line, and that is exactly the case resume
-    exists for. The cell it belonged to is then re-run, which is the safe direction."""
-    if not manifest_path.exists():
-        return set()
-    ids: set[str] = set()
-    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+def _jsonl_rows(path: Path) -> Iterator[dict[str, Any] | None]:
+    """Parsed JSONL rows, with ``None`` for a line that will not parse.
+
+    A run killed mid-write leaves a partial last line, and that is exactly the case resume exists
+    for — so a bad line is never fatal here. But it is not nothing either, and the two readers want
+    opposite things from it: the completed-id reader wants it gone, because a cell whose row is
+    unreadable has to be re-run, which is the safe direction; the provenance readers want it
+    *present* as an unknown, because a row that cannot be parsed cannot be shown to match the
+    profile now being run, and silently dropping it would let a manifest of nothing but bad lines
+    pass a check it was never actually subjected to."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
+            yield None
             continue
-        call_id = row.get("call_id")
-        if isinstance(call_id, str):
-            ids.add(call_id)
-    return ids
+        yield row if isinstance(row, dict) else None
+
+
+def completed_call_ids(manifest_path: Path) -> set[str]:
+    """Call ids already recorded, for resuming."""
+    return {
+        row["call_id"]
+        for row in _jsonl_rows(manifest_path)
+        if row is not None and isinstance(row.get("call_id"), str)
+    }
+
+
+def recorded_calls(calls_path: Path) -> set[str]:
+    """Call ids already in the calls file, which is not the same set as the manifest's.
+
+    A cell is written in two places and the calls file goes first, so an interrupt between the two
+    writes leaves a call row with no manifest row behind it. That row is invisible to every check
+    here — the manifest is where a row's profile and snapshot live — and invisible to
+    `completed_call_ids`, which is right, because a measurement with no experiment record next to
+    it is not a completed cell and its unit has to be re-run. What it must not do is let the re-run
+    take the id the orphan already holds: the two files join on `call_id`, and a duplicate key on
+    the calls side turns that join into a silent one-to-many."""
+    return {
+        row["call_id"]
+        for row in _jsonl_rows(calls_path)
+        if row is not None and isinstance(row.get("call_id"), str)
+    }
+
+
+def recorded_profile_digests(manifest_path: Path) -> set[str | None]:
+    """Which profiles the recorded calls were made under — ``None`` for a row that does not say.
+
+    Seconds are the measured quantity here, and every one of them belongs to the operating point
+    it was measured at: a repin, a changed thinking budget or a transport flip all move latency
+    without moving `call_id`, which is derived from the cell and the block alone. So a resumed grid
+    will happily fill the remaining cells at a new operating point and hand the fit one dataset
+    that is really two. Nothing downstream can detect that, which is why it is caught here."""
+    return {
+        row.get("profile_sha256")
+        if row is not None and isinstance(row.get("profile_sha256"), str)
+        else None
+        for row in _jsonl_rows(manifest_path)
+    }
+
+
+def recorded_snapshots(manifest_path: Path) -> set[str | None]:
+    """Which model snapshot the recorded calls were served from — ``None`` where unknown.
+
+    The profile digest cannot carry this. A profile names `moonshotai/kimi-k2.5`, and that is an
+    alias: when the provider repoints it the profile is byte-identical, so the digest matches and a
+    resumed grid appends timings from a different model to the ones it already holds. Recorded per
+    row and compared here for that reason. Unknown on either side is reported, never fatal —
+    the catalogue is a network read, and a blip must not block resuming a run that cost $10."""
+    return {
+        row.get("served_snapshot")
+        if row is not None and isinstance(row.get("served_snapshot"), str)
+        else None
+        for row in _jsonl_rows(manifest_path)
+    }
 
 
 def _on_target(reported: int | None, target: int) -> bool | None:
@@ -845,6 +920,26 @@ async def _main(argv: list[str] | None = None) -> int:
     )
     if args.dry_run:
         return 0
+    # Before any paid call, and deliberately after `--dry-run` has already returned, since this
+    # reads the network and dry-run promises to call nothing. A repointed alias is the one change
+    # that invalidates a grid without touching anything the profile digest covers: the seconds
+    # would be measured on a model the run does not name. Refused rather than warned about —
+    # everything after this line costs about $10.
+    expected_snapshot = MODEL_SNAPSHOTS.get(profile.model)
+    snapshot: str | None = None
+    if expected_snapshot is not None:
+        snapshot = served_snapshot(profile)
+        if snapshot is None:
+            print(f"  model snapshot UNVERIFIED: {profile.model} (catalogue unreadable)")
+        elif snapshot != expected_snapshot:
+            raise SystemExit(
+                f"{profile.model} is an alias and now resolves to {snapshot}, not "
+                f"{expected_snapshot}. Every latency number measured under it was measured on a "
+                f"different model; re-measure rather than extending the old grid."
+            )
+        else:
+            print(f"  model snapshot OK: {profile.model} -> {snapshot}")
+
     manifest_path = args.manifest or args.out.with_suffix(args.out.suffix + ".manifest")
     # The two files join on `call_id`, which is deterministic from the cell and the block — so
     # appending into an existing pair silently duplicates join keys, and a reader has no way to
@@ -852,14 +947,51 @@ async def _main(argv: list[str] | None = None) -> int:
     # one costs about $10 to re-run, so neither happens without being asked for.
     existing = [path for path in (args.out, manifest_path) if path.exists()]
     completed: set[str] = set()
+    seen: set[str] = set()
     if existing and not (args.resume or args.overwrite):
         listed = ", ".join(str(path) for path in existing)
         raise SystemExit(
             f"{listed} already exists; pass --resume to continue it or --overwrite to replace it"
         )
     if args.resume:
+        digest = profile_digest(profile)
+        foreign = recorded_profile_digests(manifest_path) - {digest}
+        if foreign:
+            listed = ", ".join(sorted(d[:12] if d else "(unrecorded)" for d in foreign))
+            raise SystemExit(
+                f"{manifest_path} holds calls made under a different profile: {listed}, "
+                f"against {digest[:12]} now. Resuming would fit one set of coefficients to two "
+                f"operating points. Re-run the grid with --overwrite, or resume it with the "
+                f"profile it was started under."
+            )
+        # The digest above cannot see a repoint, because the profile holds the alias and is
+        # byte-identical on either side of one. Compared only where both sides are known: an
+        # unreadable catalogue now, or a manifest written before this field existed, leaves the
+        # question open, and an open question must not block resuming a run that was paid for.
+        recorded = recorded_snapshots(manifest_path)
+        mismatched = {slug for slug in recorded if slug is not None and slug != snapshot}
+        if snapshot is not None and mismatched:
+            listed = ", ".join(sorted(mismatched))
+            raise SystemExit(
+                f"{manifest_path} holds calls served from {listed}, against {snapshot} now. "
+                f"The profile is unchanged because it names an alias, but the model is not. "
+                f"Re-run the grid with --overwrite rather than fitting across the seam."
+            )
+        if recorded - {snapshot}:
+            print("  resuming: model snapshot UNVERIFIED for some recorded calls")
         completed = completed_call_ids(manifest_path)
-        print(f"  resuming: {len(completed)} calls already recorded")
+        # Repaired rather than refused: an orphaned call row *is* the interrupted run that
+        # `--resume` exists for, and refusing it would leave re-measuring the whole grid as the
+        # only way forward. Its cell still re-runs — nothing records what that call was an
+        # experiment in — and the repeat takes a suffixed id so the join stays one-to-one.
+        seen = recorded_calls(args.out)
+        orphans = seen - completed
+        if orphans:
+            print(
+                f"  resuming: {len(orphans)} call rows have no manifest row; their cells will be "
+                f"re-measured under suffixed ids"
+            )
+        print(f"  resuming: {len(completed)} calls already recorded under {digest[:12]}")
     with LLMCallWriter(args.out, reset=args.overwrite) as writer:
         if args.overwrite:
             # Truncated together with the calls file: one file reset and the other appended is the
@@ -871,7 +1003,9 @@ async def _main(argv: list[str] | None = None) -> int:
             spec=spec,
             writer=writer,
             manifest_path=manifest_path,
+            snapshot=snapshot,
             completed=completed,
+            seen=seen,
         )
         if args.preflight:
             outcomes = await grid.preflight()

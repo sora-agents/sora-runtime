@@ -291,8 +291,8 @@ unprobed rather than passed over, so the coverage gap is visible: today that is
 
 ### What the profiles pin about *how* the call is served
 
-A latency number is only reproducible if the conditions it was measured under are recorded, and one
-of those lives outside the request the profile describes.
+A latency number is only reproducible if the conditions it was measured under are recorded, and two
+of those live outside the request the profile describes.
 
 `service_tier` is the first. Left unset OpenAI resolves it to `auto`, which picks a tier from
 whatever credits the account happens to hold — so the serving condition would be defined outside
@@ -311,6 +311,25 @@ force. `tests/test_gaia2_evaluation.py` holds the set of tiers whose resolution 
 observed and reddens on a pin outside it; widening that set means re-measuring, not editing it.
 OpenRouter has no such parameter at all — it answers 200 and echoes `service_tier: null` — so
 `kimi-k2.5-prompt` leaves it omitted rather than claiming a pin that does nothing.
+
+The model id is the second, and it cannot be pinned. OpenRouter ids name a *family*:
+`moonshotai/kimi-k2.5` is served today from the snapshot `moonshotai/kimi-k2.5-0127`, and the dated
+form is not an addressable alternative — the API accepts it, routes it identically, and normalizes
+it straight back to the alias in the response, so there is no request a profile can send that names
+a snapshot. What is available is noticing the swap: the models listing reports each id's
+`canonical_slug`, and a repointed alias reports a different one. Both the ReAct preflight and the
+latency grid read it (a free GET, no tokens) and refuse on a mismatch, because every latency
+recorded under the old slug was measured on a different model. The grid checks it in its own right
+rather than inheriting the preflight's: the preflight guards one arm's *routing*, while the grid is
+where the seconds the charge model is fitted from are actually bought, and nothing obliges an
+operator to run the one before the other. A listing that will not load is reported as unverified
+rather than failed — it says nothing either way, and reddening the gate on a network blip is what a
+check whose job is to be trusted cannot afford.
+
+Because the id names a family, the profile digest cannot see a repoint at all: the profile is
+byte-identical on either side of one. So the resolved slug is recorded on every manifest row, and
+resume compares it alongside the digest — the digest catches a repin, a changed thinking budget or
+a transport flip, and only the slug catches the model moving underneath an unchanged profile.
 
 Transport follows the profile too, through a separate field. `stream` is read by the latency grid
 as well as by both arms, so all three always sit on one transport — a per-call latency coefficient
@@ -476,6 +495,26 @@ block, a second run into existing outputs would duplicate join keys. The CLI ref
 granularity of a *unit*, not a cell — a cached group is a warm-up plus the measurements it warms,
 so a group left incomplete is re-run whole rather than re-entered against a prefix the provider
 evicted hours ago, and the repeated cells take suffixed call ids so nothing collides.
+
+Resume also refuses a manifest whose recorded `profile_sha256` is not the profile now being run.
+`call_id` is derived from the cell and the block alone, so it is unchanged by a repin, a different
+thinking budget or a transport flip — each of which moves the seconds this grid exists to measure.
+Without the check a resumed run fills the remaining cells at a new operating point and hands the
+fit one dataset that is really two, with nothing in the seconds marking where the seam is. A row
+that records no digest at all counts as foreign for the same reason: it cannot be shown to match —
+and so does a row that will not parse, which is the half-written last line an interrupted run
+leaves behind. That line is read twice, to opposite ends: it is *not* a completed call, so its cell
+is re-run, but it *is* an unknown for provenance, because dropping it would let a manifest of
+nothing but bad lines pass a check it was never subjected to.
+
+The same interrupt can also land one write earlier. A cell is written to the calls file first and
+the manifest second, so a run killed between them leaves a call row with no manifest row at all —
+invisible to every check above, since provenance lives on the manifest side. Its cell re-runs, which
+is correct: a measurement with no experiment record next to it is not a completed cell. But the
+uniqueness of `call_id` spans both files, so the ids the repeat must avoid are read from both, and
+the repeat takes a suffixed id rather than the orphan's. Resume reports how many such rows it found
+and continues — an orphan is the interrupted run `--resume` exists for, and refusing it would leave
+re-measuring the whole grid as the only way out.
 
 The run opens with two cheap calibration calls that measure tokens per filler word and then
 **freeze** the ratio. This is not a warm-up nicety: word counts are derived from that ratio, so a

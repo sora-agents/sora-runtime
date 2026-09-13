@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -253,6 +254,43 @@ class ModelProfile:
             "instrument": self.instrument,
             "reported_fields": self.reported_fields(),
         }
+
+
+# What an OpenRouter model id denotes. `moonshotai/kimi-k2.5` is a family alias served today from
+# the snapshot `moonshotai/kimi-k2.5-0127`, and the dated form is **not** an addressable pin: the
+# API accepts it, routes it identically, and normalizes it back to the alias in the response, so a
+# profile has no way to name a snapshot. What is left is noticing the swap, which the models
+# listing does report — a repointed alias carries a different `canonical_slug`. Recorded here
+# rather than as a profile setting because it is an observation about the provider, not something
+# the request carries, and it lives next to `ModelProfile` rather than in either driver because
+# both the ReAct preflight and the latency grid have to be able to ask.
+MODEL_SNAPSHOTS: dict[str, str] = {"moonshotai/kimi-k2.5": "moonshotai/kimi-k2.5-0127"}
+
+
+def served_snapshot(profile: ModelProfile) -> str | None:
+    """The snapshot the provider currently serves ``profile.model`` from, or None if unreadable.
+
+    Read from the models listing, which is free and carries no tokens; there is no single-model
+    lookup, so this pulls the whole catalogue once. Unreadable is deliberately not a failure — the
+    check is provenance, and a listing that did not load says nothing either way, where a slug that
+    loaded and differs says the alias moved under us."""
+    import urllib.request
+
+    key = os.environ.get(profile.credential_env)
+    request = urllib.request.Request(
+        f"{profile.endpoint.rstrip('/')}/models",
+        headers={"Authorization": f"Bearer {key}"} if key else {},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 — profile URL
+            catalogue = json.load(response)
+    except Exception:  # noqa: BLE001 — an unreadable listing is reported, never fatal
+        return None
+    for entry in catalogue.get("data", []):
+        if entry.get("id") == profile.model:
+            slug = entry.get("canonical_slug")
+            return str(slug) if slug else None
+    return None
 
 
 def load_profiles(path: Path) -> dict[str, ModelProfile]:

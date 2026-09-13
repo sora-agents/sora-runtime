@@ -70,7 +70,14 @@ from are.simulation.scenario_runner import ScenarioRunner
 from are.simulation.scenarios.config import ScenarioRunnerConfig
 
 from examples.gaia2._runner import RunResult, _run_number_of
-from examples.gaia2.evaluation.core import ModelProfile, load_profiles
+from examples.gaia2.evaluation.core import (
+    MODEL_SNAPSHOTS,
+    ModelProfile,
+    load_profiles,
+)
+from examples.gaia2.evaluation.core import (
+    served_snapshot as _served_snapshot,
+)
 from examples.gaia2.llm_calls import LLMCallWriter
 from examples.gaia2.react_engine import ChargeModel, MeteredLiteLLMEngine
 
@@ -527,6 +534,7 @@ def preflight(
     *,
     factory: Any = None,
     log: Any = print,
+    served_snapshot: Any = None,
 ) -> int:
     """Send one live call on this profile's route, then prove its settings crossed the wire.
 
@@ -544,6 +552,7 @@ def preflight(
     own guard refuses to start with. So each probe sends a value only the far end can refuse: being
     refused is the pass, and answering is the failure."""
     factory = factory or MeteredLiteLLMEngine.from_profile
+    served_snapshot = served_snapshot or _served_snapshot
     failures: list[str] = []
     log(f"preflight {profile.name} -> {profile.provider}/{profile.model} at {profile.endpoint}")
 
@@ -604,6 +613,21 @@ def preflight(
             failures.append(
                 f"{setting}: dropped before the wire — the arm runs at the provider's default"
             )
+    expected_snapshot = MODEL_SNAPSHOTS.get(profile.model)
+    if expected_snapshot is not None:
+        served = served_snapshot(profile)
+        if served is None:
+            log(f"  model snapshot UNVERIFIED: {profile.model} (catalogue unreadable)")
+        elif served != expected_snapshot:
+            log(f"  model snapshot MOVED: {profile.model} now serves {served}")
+            failures.append(
+                f"model: {profile.model} is an alias and now resolves to {served}, not "
+                f"{expected_snapshot} — every latency number measured under it was measured on a "
+                f"different model"
+            )
+        else:
+            log(f"  model snapshot OK: {profile.model} -> {served}")
+
     unprobed = sorted(set(request) - set(WIRE_PROBES))
     if unprobed:
         log(

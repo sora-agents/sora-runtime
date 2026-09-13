@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from examples.gaia2 import latency_grid
 from examples.gaia2.evaluation.core import load_profiles
 from examples.gaia2.latency_grid import (
     CALIBRATION_CALLS,
@@ -30,7 +31,10 @@ from examples.gaia2.latency_grid import (
     build_prompt,
     completed_call_ids,
     format_range_check,
+    profile_digest,
     range_check,
+    recorded_profile_digests,
+    recorded_snapshots,
 )
 from examples.gaia2.llm_calls import LLMCallWriter
 
@@ -146,6 +150,22 @@ def _stream(
 @pytest.fixture
 def profile() -> Any:
     return load_profiles(EVAL_ROOT / "profiles.json")["gpt-5.4-high-paper"]
+
+
+@pytest.fixture(autouse=True)
+def no_real_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test in this module may reach a provider, whatever else it gets wrong.
+
+    `tests/conftest.py` loads the repo-root `.env` before collection, so a real key is present
+    while the suite runs. Every `_main` test here is a test of something that *refuses* — and each
+    one is therefore one failed refusal away from starting the very grid it is asserting gets
+    stopped, which costs about $10 and is exactly what happens when one of these guards is removed
+    to check that its test still fails. Stubbing the client factory makes that failure mode a
+    failed assertion rather than a purchase. Tests that pass an explicit client are untouched:
+    `_build_client` is only consulted when none was given."""
+    monkeypatch.setattr(
+        LatencyGrid, "_build_client", staticmethod(lambda profile, key: _FakeClient([]))
+    )
 
 
 @pytest.fixture
@@ -597,6 +617,25 @@ def test_completed_ids_survive_a_half_written_last_line(tmp_path: Path) -> None:
     assert completed_call_ids(tmp_path / "missing.manifest") == set()
 
 
+def test_a_resume_can_tell_which_profile_the_recorded_calls_were_made_under(
+    tmp_path: Path,
+) -> None:
+    """`call_id` is derived from the cell and the block alone, so it is identical across a repin,
+    a changed thinking budget or a transport flip — each of which moves the seconds being
+    measured. Resuming across one fits a single set of coefficients to two operating points, and
+    nothing downstream can see that it happened."""
+    manifest = tmp_path / "grid.manifest"
+    manifest.write_text(
+        '{"call_id": "a", "profile_sha256": "aa"}\n'
+        '{"call_id": "b", "profile_sha256": "bb"}\n'
+        '{"call_id": "c"}\n'
+    )
+    assert recorded_profile_digests(manifest) == {"aa", "bb", None}
+    # A row that never recorded one cannot be shown to match, so it counts as foreign too.
+    assert recorded_profile_digests(manifest) - {"aa"} == {"bb", None}
+    assert recorded_profile_digests(tmp_path / "missing.manifest") == set()
+
+
 @pytest.mark.asyncio
 async def test_the_cli_refuses_to_append_into_an_existing_grid(tmp_path: Path) -> None:
     """Appending duplicates deterministic call ids; truncating throws away a paid-for grid. The
@@ -607,6 +646,31 @@ async def test_the_cli_refuses_to_append_into_an_existing_grid(tmp_path: Path) -
     with pytest.raises(SystemExit) as caught:
         await _main(argv)
     assert "--resume" in str(caught.value) and "--overwrite" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_the_cli_refuses_to_resume_a_grid_started_under_another_profile(
+    tmp_path: Path,
+) -> None:
+    """The manifest records the profile each call was made under; resume has to read it. A grid
+    half-measured at one operating point and half at another is not a fit of either, and the
+    seconds carry no mark saying which half they came from."""
+    out = tmp_path / "grid.jsonl"
+    manifest = tmp_path / "grid.manifest"
+    out.write_text("")
+    manifest.write_text('{"call_id": "uncached-in1000-out64-b0", "profile_sha256": "deadbeef"}\n')
+    argv = [
+        "--profile",
+        "gpt-5.4-high-paper",
+        "--out",
+        str(out),
+        "--manifest",
+        str(manifest),
+        "--resume",
+    ]
+    with pytest.raises(SystemExit) as caught:
+        await _main(argv)
+    assert "deadbeef" in str(caught.value) and "--overwrite" in str(caught.value)
 
 
 # -- the pilot: are the axes wide enough, and are the corners accepted? --------------------------
@@ -761,3 +825,155 @@ def test_a_refused_corner_is_recorded_and_exits_non_zero(
     refused = [o for o in outcomes if o.manifest["error"]]
     assert [o.record.finish_reason for o in refused] == ["error:RuntimeError"]
     assert _rows(tmp_path / "grid.jsonl")[0]["finish_reason"] == "error:RuntimeError"
+
+
+# -- the model under the alias -------------------------------------------------------------------
+
+
+def test_an_unreadable_row_counts_as_an_unknown_rather_than_as_nothing(tmp_path: Path) -> None:
+    """The two readers want opposite things from a half-written line. A cell whose row cannot be
+    parsed has to be re-run, so it must not count as completed — but it also cannot be *shown* to
+    have been recorded under the profile now being run, and dropping it entirely would let a
+    manifest of nothing but bad lines pass a provenance check it was never subjected to."""
+    manifest = tmp_path / "grid.manifest"
+    manifest.write_text('{"call_id": "a", "profile_sha256": "aa"}\n{"call_id": "uncach')
+    assert completed_call_ids(manifest) == {"a"}
+    assert recorded_profile_digests(manifest) == {"aa", None}
+
+    # The case that matters: every line unreadable. Nothing is completed, so a resume re-runs the
+    # lot — but the rows it is appending to are still of unknown provenance, and saying so is the
+    # difference between an empty set that passes and an unknown that does not.
+    only_bad = tmp_path / "only-bad.manifest"
+    only_bad.write_text("{not json at all\n")
+    assert completed_call_ids(only_bad) == set()
+    assert recorded_profile_digests(only_bad) == {None}
+    assert recorded_snapshots(only_bad) == {None}
+
+
+@pytest.mark.asyncio
+async def test_the_manifest_records_which_snapshot_served_each_call(
+    tmp_path: Path, profile: Any
+) -> None:
+    """The profile digest cannot carry this: a profile names an alias, and is byte-identical
+    before and after the provider repoints it. Without the row, a resumed grid has no way to tell
+    that the model underneath its own recorded calls moved."""
+    client = _FakeClient([_response(prompt=2_000, completion=16) for _ in range(CALIBRATION_CALLS)])
+    client.responses.append(_response(prompt=1_000, completion=64))
+    writer = LLMCallWriter(tmp_path / "grid.jsonl")
+    runner = LatencyGrid(
+        profile,
+        spec=GridSpec(blocks=1),
+        writer=writer,
+        manifest_path=tmp_path / "grid.manifest",
+        client=client,
+        snapshot="moonshotai/kimi-k2.5-0127",
+    )
+    await runner.run(limit=1, log=lambda _msg: None)
+    writer.close()
+    rows = _rows(tmp_path / "grid.manifest")
+    assert rows
+    # Every row, calibration included: all of them were paid for on that model.
+    assert {row["served_snapshot"] for row in rows} == {"moonshotai/kimi-k2.5-0127"}
+
+
+@pytest.mark.asyncio
+async def test_the_cli_refuses_to_spend_on_a_grid_whose_alias_has_been_repointed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard has to sit on the path that spends the money. A repoint is the one change that
+    invalidates a grid while leaving everything the profile digest covers untouched, and the grid
+    — not either scaffold arm — is where the seconds the charge model is fitted from come from."""
+    monkeypatch.setattr(
+        latency_grid, "served_snapshot", lambda profile: "moonshotai/kimi-k2.5-0601"
+    )
+    argv = ["--profile", "kimi-k2.5-prompt", "--out", str(tmp_path / "grid.jsonl")]
+    with pytest.raises(SystemExit) as caught:
+        await _main(argv)
+    assert "moonshotai/kimi-k2.5-0601" in str(caught.value)
+    assert "moonshotai/kimi-k2.5-0127" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_catalogue_does_not_block_a_grid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provenance, not permission: a listing that did not load says nothing either way, and a
+    network blip must not stand between an operator and a run they have already paid for. Shown
+    by letting it through to the *next* refusal rather than by running the grid."""
+    monkeypatch.setattr(latency_grid, "served_snapshot", lambda profile: None)
+    out = tmp_path / "grid.jsonl"
+    out.write_text("")
+    with pytest.raises(SystemExit) as caught:
+        await _main(["--profile", "kimi-k2.5-prompt", "--out", str(out)])
+    assert "--resume" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_the_cli_refuses_to_resume_across_a_repointed_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The profile digest passes here — it is the *same* profile, byte for byte. Only the recorded
+    snapshot shows that the model underneath it moved, and without that the resumed run appends
+    timings from a different model to the ones it already holds."""
+    # The alias resolves to exactly what is expected of it *now*, so the pre-spend check passes
+    # and this is the resume guard alone: the recorded calls are the stale half, from before the
+    # repoint that the expectation was since updated for.
+    monkeypatch.setattr(
+        latency_grid, "served_snapshot", lambda profile: "moonshotai/kimi-k2.5-0127"
+    )
+    profile = load_profiles(EVAL_ROOT / "profiles.json")["kimi-k2.5-prompt"]
+    out = tmp_path / "grid.jsonl"
+    manifest = tmp_path / "grid.manifest"
+    out.write_text("")
+    manifest.write_text(
+        json.dumps(
+            {
+                "call_id": "uncached-in1000-out64-b0",
+                "profile_sha256": profile_digest(profile),
+                "served_snapshot": "moonshotai/kimi-k2.5-0925",
+            }
+        )
+        + "\n"
+    )
+    argv = [
+        "--profile",
+        "kimi-k2.5-prompt",
+        "--out",
+        str(out),
+        "--manifest",
+        str(manifest),
+        "--resume",
+    ]
+    with pytest.raises(SystemExit) as caught:
+        await _main(argv)
+    # The digest half passed — same profile, byte for byte — so only the snapshot can have
+    # raised this, and the message has to name the half that is stale.
+    assert "moonshotai/kimi-k2.5-0925" in str(caught.value)
+    assert "--overwrite" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_a_call_row_whose_manifest_row_was_never_written_keeps_its_id(
+    tmp_path: Path,
+) -> None:
+    """The two files are written one after the other, calls first, so an interrupt can land
+    between them. The manifest is then missing a row the calls file has, and resume is right to
+    re-run that cell — nothing records what the measurement was an experiment in. What it must not
+    do is let the repeat take the orphan's id: the files join on `call_id`, and a duplicate on the
+    calls side makes that join one-to-many with no way to tell the rows apart."""
+    out = tmp_path / "grid.jsonl"
+    manifest = tmp_path / "grid.manifest"
+    argv = ["--profile", "gpt-5.4-medium-prompt", "--out", str(out), "--manifest", str(manifest)]
+    await _main([*argv, "--overwrite", "--limit", "1"])
+
+    # The interrupt: the last call's row is on disk, its manifest row never made it.
+    orphan = _rows(out)[-1]["call_id"]
+    kept = [row for row in _rows(manifest) if row["call_id"] != orphan]
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in kept), encoding="utf-8")
+
+    await _main([*argv, "--resume", "--limit", "1"])
+
+    ids = [row["call_id"] for row in _rows(out)]
+    assert len(ids) == len(set(ids)), "a call id is on the calls side twice"
+    assert ids.count(orphan) == 1
+    assert f"{orphan}-r2" in ids
