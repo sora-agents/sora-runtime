@@ -732,6 +732,36 @@ def test_preflight_fails_when_a_probed_setting_is_answered_instead_of_refused() 
     assert "provider's default" in out
 
 
+def test_preflight_fails_when_reasoning_was_requested_but_none_was_done() -> None:
+    """Every shipped profile asks the model to think. A probe can show a setting reached the
+    provider; only the reported reasoning tokens show the provider acted on it — which is the only
+    honoring question OpenRouter's level-free ``reasoning: {enabled: true}`` block can be asked."""
+    from litellm.exceptions import BadRequestError
+
+    refusal = BadRequestError(
+        message="OpenrouterException - no allowed providers", model="m", llm_provider="openrouter"
+    )
+    code, out = _run_preflight(
+        probe_answer=refusal,
+        row=SimpleNamespace(
+            input_tokens=13, output_tokens=21, reasoning_tokens=0, usage_captured=True
+        ),
+    )
+    assert code == 1
+    assert "zero reasoning tokens" in out
+
+
+def test_the_reasoning_check_covers_both_ways_a_profile_can_ask_for_it() -> None:
+    from examples.gaia2.react_driver import _asks_for_reasoning
+
+    assert _asks_for_reasoning({"reasoning_effort": "medium"})  # a validated OpenAI parameter
+    assert _asks_for_reasoning({"extra_body": {"reasoning": {"enabled": True}}})  # OpenRouter's
+    # An envelope carrying only a provider pin asks for no thinking, and must not be read as if it
+    # did: the check would then redden on any non-reasoning profile that happens to pin a provider.
+    assert not _asks_for_reasoning({"extra_body": {"provider": {"only": ["venice"]}}})
+    assert not _asks_for_reasoning({"max_completion_tokens": 16384})
+
+
 def _refusal() -> Any:
     from litellm.exceptions import BadRequestError
 

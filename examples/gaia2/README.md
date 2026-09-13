@@ -275,6 +275,14 @@ returns OpenRouter's list of who really serves the model. Neither reply is produ
 the call before sending it, the failure `allowed_openai_params` exists to prevent — so it is
 reported as a drop, not a crossing.
 
+Crossing is not honoring, though, and one setting can be checked for both. Every shipped profile
+asks the model to think — two by `reasoning_effort`, `kimi-k2.5-prompt` by OpenRouter's `reasoning`
+block inside `extra_body` — so the route check also fails a call that reports zero reasoning tokens
+against a profile that asked for some. That block declares no level, so this is the only honoring
+question it can be asked. A zero has two readings and the next step differs between them: the
+endpoint ignored the request, or a repin landed on one that does not itemize reasoning separately.
+Both shipped endpoints itemize it today.
+
 Only probes whose refusal has actually been observed are shipped, because a provider that clamps an
 out-of-range value instead of refusing it would be reported as having dropped the setting — a false
 alarm on the one check whose job is to be trusted. Everything else the profile sends is printed as

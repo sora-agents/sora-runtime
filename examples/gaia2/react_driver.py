@@ -58,6 +58,7 @@ import argparse
 import contextlib
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -510,6 +511,17 @@ class _Collected:
         self.rows.append(record)
 
 
+def _asks_for_reasoning(request: Mapping[str, Any]) -> bool:
+    """Whether this profile asked the model to think, by either of the two routes in use.
+
+    ``reasoning_effort`` is a validated OpenAI parameter; OpenRouter's ``reasoning`` block rides
+    ``extra_body`` instead, so a profile can request reasoning without naming a level at all."""
+    if request.get("reasoning_effort"):
+        return True
+    extra = request.get("extra_body")
+    return bool(isinstance(extra, dict) and extra.get("reasoning"))
+
+
 def preflight(
     profile: ModelProfile,
     *,
@@ -552,6 +564,7 @@ def preflight(
         f"reasoning={getattr(row, 'reasoning_tokens', None)} "
         f"usage_captured={getattr(row, 'usage_captured', None)}"
     )
+    request = profile.request_kwargs()
     if not (text or "").strip():
         failures.append("route: answered with no text")
     if row is None or not row.usage_captured:
@@ -560,8 +573,18 @@ def preflight(
         )
     elif not (row.output_tokens or 0):
         failures.append("route: accepted, no output tokens reported")
+    elif _asks_for_reasoning(request) and not (row.reasoning_tokens or 0):
+        # The probes below can show that a setting reached the provider; only this shows the
+        # provider acted on it. It is the one honoring question a `reasoning: {enabled: true}`
+        # block can be asked, since that form declares no level to compare against. Both shipped
+        # endpoints itemize reasoning tokens today, so a zero here means one of two things and the
+        # next step differs: the endpoint stopped reasoning, or a repin landed somewhere that does
+        # not report it separately. Check the raw usage block before believing either.
+        failures.append(
+            "route: reasoning requested, zero reasoning tokens reported — "
+            "either the endpoint ignored it or it does not itemize it"
+        )
 
-    request = profile.request_kwargs()
     for setting, override in WIRE_PROBES.items():
         if setting not in request:
             continue
