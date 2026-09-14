@@ -1,4 +1,43 @@
 {
+  "charge_model": {
+    "digest": "c91e3535312eaafa75e46cb27f15e57eb05ebf76e05efe848703a4213e0c067b",
+    "effective_date": "2026-09-14",
+    "measured_date": "2026-09-13",
+    "models": {
+      "gpt-5.4-2026-03-05": {
+        "a0_seconds": 0.7983868960830829,
+        "decode_includes_reasoning": true,
+        "provider": "openai",
+        "provider_routing": null,
+        "r_cache_tokens_per_second": 455887.4177461271,
+        "r_in_tokens_per_second": 121033.04695262844,
+        "r_out_tokens_per_second": 247.05632201574088,
+        "seconds_per_cached_input_token": 2.1935240172758537e-06,
+        "seconds_per_output_token": 0.0040476600308827,
+        "seconds_per_uncached_input_token": 8.262206274881219e-06
+      },
+      "moonshotai/kimi-k2.5": {
+        "a0_seconds": 0.6992090542621108,
+        "decode_includes_reasoning": true,
+        "provider": "openrouter",
+        "provider_routing": {
+          "allow_fallbacks": false,
+          "only": [
+            "venice"
+          ],
+          "order": [
+            "venice"
+          ]
+        },
+        "r_cache_tokens_per_second": 26288.440259609346,
+        "r_in_tokens_per_second": 17325.64589425193,
+        "r_out_tokens_per_second": 272.4834503872458,
+        "seconds_per_cached_input_token": 3.803953335095508e-05,
+        "seconds_per_output_token": 0.0036699476558258058,
+        "seconds_per_uncached_input_token": 5.771790593571848e-05
+      }
+    }
+  },
   "evaluation_profiles": [
     {
       "campaigns": [
@@ -503,6 +542,7 @@
       "prompt",
       "aamas2027"
     ],
+    "charge_model": "frozen latency coefficients, charged identically to both scaffold arms so that the comparison measures architecture rather than provider speed. They are constants and will drift from live provider latency over the sweep without the charge moving, which is the provider-independence the freeze buys, not a defect",
     "contains_credentials": false,
     "contains_gaia_payloads": false,
     "contains_live_model_output": false,
@@ -2449,8 +2489,8 @@
   ],
   "provenance": {
     "prompt_source_dirty_diff_sha256": null,
-    "source_dirty_diff_sha256": "323e3eeaa8d2bfee45fa589946deff4b8517dc01c6afeeed521c117fdced350a",
-    "source_revision": "02613dbf69c774ffa183ab8c0aacbf0d3d6c3c7e"
+    "source_dirty_diff_sha256": "f1a668a7a1af719b32f317aff9e4d63c596b52dcda90fd128fb709979ea92c16",
+    "source_revision": "45e573623fd5b3148fa02d44bf3a1c978ba442cc"
   },
   "schema_version": 1
 }

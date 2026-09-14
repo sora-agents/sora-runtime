@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -95,6 +96,50 @@ class SettingValue:
 
 
 @dataclass(frozen=True)
+class EndpointIdentity:
+    """The declared serving path that endpoint-specific measurements are bound to.
+
+    This catches a profile repin, not a provider silently moving weights or service behind an
+    unchanged routing pin; validating frozen measurements against real calls remains separate.
+    """
+
+    provider: str
+    model: str
+    provider_routing_json: str | None
+
+    @classmethod
+    def create(
+        cls, provider: str, model: str, provider_routing: Mapping[str, Any] | None
+    ) -> EndpointIdentity:
+        routing_json = (
+            json.dumps(provider_routing, sort_keys=True, separators=(",", ":"))
+            if provider_routing is not None
+            else None
+        )
+        return cls(provider=provider, model=model, provider_routing_json=routing_json)
+
+    @classmethod
+    def from_artifact(cls, model: str, row: Mapping[str, Any]) -> EndpointIdentity:
+        if "provider_routing" not in row:
+            raise ValueError(f"endpoint measurement for {model} requires provider_routing")
+        routing = row["provider_routing"]
+        if routing is not None and not isinstance(routing, dict):
+            raise ValueError(f"provider_routing for {model} must be an object or null")
+        return cls.create(str(row["provider"]), model, routing)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "provider_routing": (
+                json.loads(self.provider_routing_json)
+                if self.provider_routing_json is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class ModelProfile:
     name: str
     provider: str
@@ -177,6 +222,13 @@ class ModelProfile:
             if setting.status == "sent":
                 values[key_map.get(name, name)] = setting.value
         return values
+
+    def endpoint_identity(self) -> EndpointIdentity:
+        routing = self.settings["provider_routing"]
+        value = routing.value if routing.status == "sent" else None
+        if value is not None and not isinstance(value, dict):
+            raise ValueError("a sent provider_routing setting must be an object")
+        return EndpointIdentity.create(self.provider, self.model, value)
 
     def request_kwargs(self) -> dict[str, Any]:
         """The profile's operating point as chat-completions request kwargs.
@@ -299,9 +351,9 @@ def served_snapshot(profile: ModelProfile) -> str | None:
 # their *sum*, and reading ``completion_tokens`` as the decode work would then silently under-count
 # it — in the latency grid, by pushing the difference into ``a0``.
 #
-# Keyed by ``(provider, model)`` rather than by model alone because this is a property of the
-# endpoint, not of the weights: the same model served from two providers can report either way, so
-# a repin owes this table a new entry exactly as it owes a new price sheet.
+# Keyed by the same declared endpoint identity as prices and latency coefficients because this is
+# a property of the endpoint, not of the weights: the same model served from two providers can
+# report either way, so a repin owes this table a new entry exactly as it owes a new price sheet.
 #
 # **Establish the value from an *uncapped* generation, never from grid rows.** The tempting test is
 # arithmetic and one-sided — reasoning cannot exceed completion if it is contained in it, and 31 of
@@ -318,9 +370,13 @@ def served_snapshot(profile: ModelProfile) -> str | None:
 # content "391" (~2 tokens) with 113 reasoning tokens reported ``completion_tokens=115``; a 120-word
 # answer (794 characters, ~167 tokens) with 3,099 reasoning tokens reported 3,266. Both are
 # content + reasoning to within a token or two, so reasoning is contained, exactly as on OpenAI.
-DECODE_INCLUDES_REASONING: dict[tuple[str, str], bool] = {
-    ("openai", "gpt-5.4-2026-03-05"): True,
-    ("openrouter", "moonshotai/kimi-k2.5"): True,
+DECODE_INCLUDES_REASONING: dict[EndpointIdentity, bool] = {
+    EndpointIdentity.create("openai", "gpt-5.4-2026-03-05", None): True,
+    EndpointIdentity.create(
+        "openrouter",
+        "moonshotai/kimi-k2.5",
+        {"only": ["venice"], "order": ["venice"], "allow_fallbacks": False},
+    ): True,
 }
 
 
@@ -331,7 +387,7 @@ def decode_includes_reasoning(profile: ModelProfile) -> bool | None:
     an *undefined* decode count, and a caller that guesses either way is fabricating a regressor or
     a charge. Callers must treat None as "cannot be used", the same way the grid already treats a
     cached cell whose provider reported no cache count."""
-    return DECODE_INCLUDES_REASONING.get((profile.provider, profile.model))
+    return DECODE_INCLUDES_REASONING.get(profile.endpoint_identity())
 
 
 def decode_tokens(
@@ -660,7 +716,7 @@ class PriceTier:
 class PriceSheet:
     effective_date: str
     currency: str
-    models: dict[str, tuple[PriceTier, ...]]
+    endpoints: dict[EndpointIdentity, tuple[PriceTier, ...]]
     digest: str
 
     @classmethod
@@ -673,8 +729,12 @@ class PriceSheet:
         models_raw = raw.get("models")
         if not isinstance(models_raw, dict) or not models_raw:
             raise ValueError("price sheet requires model rates")
-        models: dict[str, tuple[PriceTier, ...]] = {}
-        for model, tiers_raw in models_raw.items():
+        endpoints: dict[EndpointIdentity, tuple[PriceTier, ...]] = {}
+        for model, entry_raw in models_raw.items():
+            if not isinstance(entry_raw, dict):
+                raise ValueError(f"invalid price sheet entry for {model}")
+            endpoint = EndpointIdentity.from_artifact(str(model), entry_raw)
+            tiers_raw = entry_raw.get("tiers")
             if not isinstance(tiers_raw, list) or not tiers_raw:
                 raise ValueError(f"price sheet model {model} needs at least one tier")
             tiers: list[PriceTier] = []
@@ -695,13 +755,217 @@ class PriceSheet:
                 )
             if tiers[-1].max_input_tokens is not None:
                 raise ValueError(f"last price tier for {model} must be unbounded")
-            models[str(model)] = tuple(tiers)
+            endpoints[endpoint] = tuple(tiers)
         return cls(
             effective_date=str(raw["effective_date"]),
             currency=str(raw.get("currency", "USD")),
-            models=models,
+            endpoints=endpoints,
             digest=sha256_text(canonical_json(raw)),
         )
+
+    def for_profile(self, profile: ModelProfile) -> tuple[PriceTier, ...]:
+        endpoint = profile.endpoint_identity()
+        prices = self.endpoints.get(endpoint)
+        if prices is None:
+            same_model = [key.to_dict() for key in self.endpoints if key.model == profile.model]
+            if same_model:
+                raise ValueError(
+                    f"price sheet endpoint mismatch for profile {profile.name}: "
+                    f"artifact={same_model}, profile={endpoint.to_dict()}"
+                )
+            raise ValueError(f"price sheet has no rate for model {profile.model}")
+        return prices
+
+
+@dataclass(frozen=True)
+class ChargeCoefficients:
+    """One endpoint's frozen latency model: seconds charged for a call of a given token shape.
+
+    Stored as seconds *per token* rather than as the tokens-per-second rates the paper reports,
+    because the per-token coefficients are what the fit produces and what the charge multiplies;
+    keeping both in the file would let a rounded rate and its reciprocal disagree. The rates are
+    derived here instead."""
+
+    model: str
+    provider: str
+    provider_routing_json: str | None
+    a0_seconds: float
+    seconds_per_uncached_input_token: float
+    seconds_per_cached_input_token: float
+    seconds_per_output_token: float
+    decode_includes_reasoning: bool
+    fit: Mapping[str, Any]
+    note: str
+
+    def charged_seconds(self, uncached_input: int, cached_input: int, output: int) -> float:
+        return (
+            self.a0_seconds
+            + uncached_input * self.seconds_per_uncached_input_token
+            + cached_input * self.seconds_per_cached_input_token
+            + output * self.seconds_per_output_token
+        )
+
+    @property
+    def r_in_tokens_per_second(self) -> float:
+        return 1.0 / self.seconds_per_uncached_input_token
+
+    @property
+    def r_cache_tokens_per_second(self) -> float:
+        return 1.0 / self.seconds_per_cached_input_token
+
+    @property
+    def r_out_tokens_per_second(self) -> float:
+        return 1.0 / self.seconds_per_output_token
+
+
+@dataclass
+class TotalInputCharge:
+    """Adapt total prompt usage to the disjoint regressors the frozen fit was trained on."""
+
+    coefficients: ChargeCoefficients
+    cached_input_clamps: int = 0
+
+    def __call__(self, total_input: int, cached_input: int, output: int) -> float:
+        uncached_input = total_input - cached_input
+        if uncached_input < 0:
+            # Usage telemetry is not reliable enough to abort a paid sweep. Preserve the reported
+            # cached work, clamp only the impossible residual, and leave an inspectable count.
+            self.cached_input_clamps += 1
+            uncached_input = 0
+        return self.coefficients.charged_seconds(uncached_input, cached_input, output)
+
+
+@dataclass(frozen=True)
+class ChargeModelSheet:
+    """The frozen charge model, keyed by declared endpoint identity.
+
+    Coefficients live here rather than as constants in code for the same reason the prices do: they
+    are a measurement with a date and a provenance, and a run has to be able to say which ones it
+    charged. Editing this file silently invalidates comparison against every number recorded before
+    the edit, which is why it is pinned by sha256 in the campaign baseline alongside the prompts —
+    one gate, not a second mechanism."""
+
+    effective_date: str
+    measured_date: str
+    endpoints: Mapping[EndpointIdentity, ChargeCoefficients]
+    notes: Mapping[str, str]
+    digest: str
+
+    @classmethod
+    def load(cls, path: Path) -> ChargeModelSheet:
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError(f"unsupported charge model schema in {path}")
+        for field_name in ("effective_date", "measured_date"):
+            if not raw.get(field_name):
+                raise ValueError(f"charge model requires a {field_name}")
+        models_raw = raw.get("models")
+        if not isinstance(models_raw, dict) or not models_raw:
+            raise ValueError("charge model requires per-model coefficients")
+        endpoints: dict[EndpointIdentity, ChargeCoefficients] = {}
+        for model, row in models_raw.items():
+            if not isinstance(row, dict):
+                raise ValueError(f"invalid charge model entry for {model}")
+            provider = str(row["provider"])
+            declared = bool(row["decode_includes_reasoning"])
+            # The convention is copied from ``DECODE_INCLUDES_REASONING``, never authored here, and
+            # this is where that stays true. It has to be repeated in the file because it decides
+            # which regressor the coefficients beside it were fitted against — a frozen ``a0`` whose
+            # convention is not frozen with it is underdetermined, and reproducing the fit under the
+            # other reading moves kimi's by a factor of two. Repeating a value is how copies drift,
+            # so disagreement is an error rather than a precedence question: whichever of the two is
+            # wrong, the coefficients no longer describe the endpoint they are charged to.
+            endpoint = EndpointIdentity.from_artifact(str(model), row)
+            home = DECODE_INCLUDES_REASONING.get(endpoint)
+            if home is None:
+                raise ValueError(
+                    f"charge model covers {endpoint.to_dict()}, which declares no decode convention"
+                )
+            if home != declared:
+                raise ValueError(
+                    f"charge model for {provider}/{model} says decode_includes_reasoning="
+                    f"{declared}, but core declares {home}"
+                )
+            for key in (
+                "a0_seconds",
+                "seconds_per_uncached_input_token",
+                "seconds_per_cached_input_token",
+                "seconds_per_output_token",
+            ):
+                if float(row[key]) <= 0:
+                    # A non-positive coefficient prices tokens as free or as time refunded, and the
+                    # fit can produce one where an axis is unidentified. It is not chargeable.
+                    raise ValueError(f"charge model coefficient {key} for {model} must be positive")
+            endpoints[endpoint] = ChargeCoefficients(
+                model=str(model),
+                provider=provider,
+                provider_routing_json=endpoint.provider_routing_json,
+                a0_seconds=float(row["a0_seconds"]),
+                seconds_per_uncached_input_token=float(row["seconds_per_uncached_input_token"]),
+                seconds_per_cached_input_token=float(row["seconds_per_cached_input_token"]),
+                seconds_per_output_token=float(row["seconds_per_output_token"]),
+                decode_includes_reasoning=declared,
+                fit=dict(row.get("fit", {})),
+                note=str(row.get("note", "")),
+            )
+        return cls(
+            effective_date=str(raw["effective_date"]),
+            measured_date=str(raw["measured_date"]),
+            endpoints=endpoints,
+            notes=dict(raw.get("notes", {})),
+            digest=sha256_text(canonical_json(raw)),
+        )
+
+    def for_profile(self, profile: ModelProfile) -> ChargeCoefficients:
+        endpoint = profile.endpoint_identity()
+        coefficients = self.endpoints.get(endpoint)
+        if coefficients is None:
+            same_model = [key.to_dict() for key in self.endpoints if key.model == profile.model]
+            if same_model:
+                raise ValueError(
+                    f"charge model endpoint mismatch for profile {profile.name}: "
+                    f"artifact={same_model}, profile={endpoint.to_dict()}"
+                )
+            raise ValueError(f"charge model has no coefficients for {profile.model}")
+        return coefficients
+
+    @property
+    def models(self) -> Mapping[str, ChargeCoefficients]:
+        return {endpoint.model: row for endpoint, row in self.endpoints.items()}
+
+    def charge_for(self, profile: ModelProfile) -> TotalInputCharge:
+        """The per-call charge both arms are metered through, bound to one model.
+
+        Matches ``react_engine.ChargeModel`` so the ReAct baseline and S-ORA are charged by the same
+        frozen numbers through the same signature; an arm that computed its own would be measuring
+        its provider rather than its architecture."""
+        return TotalInputCharge(self.for_profile(profile))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "digest": self.digest,
+            "effective_date": self.effective_date,
+            "measured_date": self.measured_date,
+            "models": {
+                model: {
+                    "a0_seconds": row.a0_seconds,
+                    "decode_includes_reasoning": row.decode_includes_reasoning,
+                    "provider": row.provider,
+                    "provider_routing": (
+                        json.loads(row.provider_routing_json)
+                        if row.provider_routing_json is not None
+                        else None
+                    ),
+                    "r_cache_tokens_per_second": row.r_cache_tokens_per_second,
+                    "r_in_tokens_per_second": row.r_in_tokens_per_second,
+                    "r_out_tokens_per_second": row.r_out_tokens_per_second,
+                    "seconds_per_cached_input_token": row.seconds_per_cached_input_token,
+                    "seconds_per_output_token": row.seconds_per_output_token,
+                    "seconds_per_uncached_input_token": row.seconds_per_uncached_input_token,
+                }
+                for model, row in sorted(self.models.items())
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -722,10 +986,8 @@ class CostResult:
     tier_max_input_tokens: int | None
 
 
-def calculate_call_cost(sheet: PriceSheet, model: str, usage: CallUsage) -> CostResult:
-    tiers = sheet.models.get(model)
-    if tiers is None:
-        raise ValueError(f"price sheet has no rate for model {model}")
+def calculate_call_cost(sheet: PriceSheet, profile: ModelProfile, usage: CallUsage) -> CostResult:
+    tiers = sheet.for_profile(profile)
     tier = next(
         row
         for row in tiers

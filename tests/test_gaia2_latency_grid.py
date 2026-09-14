@@ -481,7 +481,7 @@ async def test_an_endpoint_declared_to_report_reasoning_separately_decodes_the_s
     about a live endpoint that the endpoint does not actually follow."""
     disjoint = replace(profile, model="some/disjoint-model")
     monkeypatched = dict(core.DECODE_INCLUDES_REASONING)
-    monkeypatched[(disjoint.provider, disjoint.model)] = False
+    monkeypatched[disjoint.endpoint_identity()] = False
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(core, "DECODE_INCLUDES_REASONING", monkeypatched)
         runner, client = _grid_for(disjoint, tmp_path)

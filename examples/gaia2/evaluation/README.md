@@ -52,6 +52,13 @@ the guard explicitly with `--max-agent-llm-calls`. External actions and S-ORA de
 reported separately as architectural diagnostics and do not define Gaia2 steps. The actual limit
 is stored with every live Gaia case and summarized in report provenance.
 
+Price rows, frozen latency coefficients, and decode-count conventions are bound to the profile's
+declared `(provider, model, provider_routing)` endpoint identity. A profile repin therefore fails
+the offline check and live-run preflight instead of silently reusing measurements from another
+backend. This key cannot detect a provider moving weights or service behind an unchanged routing
+pin; validating the frozen coefficients against real calls from both arms remains a separate
+end-of-sweep drift check.
+
 Remove `--dry-run` only after reviewing the matrix, configuring the profile's credential variable,
 and confirming that the scenario root contains the ignored Gaia2 payloads. Acceptance runs also
 require `--ack-locked-acceptance` before any locked payload is opened. Contract and offline-neutral

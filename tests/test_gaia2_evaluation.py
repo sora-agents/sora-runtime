@@ -4,13 +4,14 @@ import json
 import subprocess
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import fields
+from dataclasses import fields, replace
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from examples.gaia2.evaluation import core
 from examples.gaia2.evaluation.campaigns.prompt.contracts import run_contract_suite
 from examples.gaia2.evaluation.campaigns.prompt.neutral import NEUTRAL_CASES, run_neutral_suite
 from examples.gaia2.evaluation.campaigns.prompt.reporting import build_report
@@ -37,6 +38,7 @@ from examples.gaia2.evaluation.cli import (
 from examples.gaia2.evaluation.core import (
     BudgetPolicy,
     CallUsage,
+    ChargeModelSheet,
     EvaluationRecord,
     ManifestLockedError,
     ModelProfile,
@@ -382,27 +384,83 @@ def test_budget_matrix_enforces_cumulative_checkpoint_run_and_spend_ceilings() -
 
 
 def test_cost_calculation_separates_cache_and_applies_long_context_tiers() -> None:
-    sheet = PriceSheet.load(EVAL_ROOT / "price_sheets" / "2026-09-02.json")
+    profiles = load_profiles(EVAL_ROOT / "profiles.json")
+    gpt = profiles["gpt-5.4-medium-prompt"]
+    kimi = profiles["kimi-k2.5-prompt"]
+    sheet = PriceSheet.load(EVAL_ROOT / "price_sheets" / "2026-09-12.json")
     short = calculate_call_cost(
         sheet,
-        "gpt-5.4-2026-03-05",
+        gpt,
         CallUsage(input_tokens=100_000, cached_input_tokens=40_000, output_tokens=10_000),
     )
     assert short.agent_cost == pytest.approx(0.31)
     assert short.upper_bound is False
     long = calculate_call_cost(
         sheet,
-        "gpt-5.4-2026-03-05",
+        gpt,
         CallUsage(input_tokens=300_000, cached_input_tokens=0, output_tokens=20_000),
     )
     assert long.agent_cost == pytest.approx(1.95)
     unknown_cache = calculate_call_cost(
         sheet,
-        "moonshotai/kimi-k2.5",
+        kimi,
         CallUsage(input_tokens=100_000, cached_input_tokens=None, output_tokens=10_000),
     )
     assert unknown_cache.upper_bound is True
-    assert unknown_cache.agent_cost == pytest.approx(0.0675)
+    assert unknown_cache.agent_cost == pytest.approx(0.08645)
+
+
+def test_reasoning_tokens_are_reported_but_never_charged() -> None:
+    """`reasoning_tokens` is descriptive, because `completion_tokens` already contains it.
+
+    True on both measured endpoints, and checked on the pinned Venice one against OpenRouter's own
+    `usage.cost` on 2026-09-14: a call reporting (22 prompt, 115 completion, 113 reasoning) was
+    charged 3.94079e-04 = 22*0.532/M + 115*3.325/M, so the reasoning is paid for inside the 115.
+    Adding it on top would very nearly double this arm's output cost.
+    """
+    sheet = PriceSheet.load(EVAL_ROOT / "price_sheets" / "2026-09-12.json")
+    profile = load_profiles(EVAL_ROOT / "profiles.json")["kimi-k2.5-prompt"]
+    usage = CallUsage(input_tokens=1_000_000, cached_input_tokens=0, output_tokens=100_000)
+    without = calculate_call_cost(sheet, profile, usage)
+    with_reasoning = calculate_call_cost(sheet, profile, replace(usage, reasoning_tokens=100_000))
+    assert with_reasoning.output_cost == without.output_cost
+    assert with_reasoning.agent_cost == without.agent_cost
+
+    # The observed call above, priced the way the endpoint priced it.
+    probe = calculate_call_cost(
+        sheet,
+        profile,
+        CallUsage(input_tokens=22, cached_input_tokens=0, output_tokens=115, reasoning_tokens=113),
+    )
+    assert probe.agent_cost == pytest.approx(0.000394079)
+
+
+def test_endpoint_measurements_reject_a_profile_repin() -> None:
+    profiles = load_profiles(EVAL_ROOT / "profiles.json")
+    profile = profiles["kimi-k2.5-prompt"]
+    routing = profile.settings["provider_routing"]
+    repinned = replace(
+        profile,
+        settings=profile.settings
+        | {
+            "provider_routing": replace(
+                routing,
+                value={
+                    "only": ["deepinfra"],
+                    "order": ["deepinfra"],
+                    "allow_fallbacks": False,
+                },
+            )
+        },
+    )
+    price_sheet = PriceSheet.load(EVAL_ROOT / "price_sheets" / "2026-09-12.json")
+    charge_sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
+
+    with pytest.raises(ValueError, match="price sheet endpoint mismatch"):
+        price_sheet.for_profile(repinned)
+    with pytest.raises(ValueError, match="charge model endpoint mismatch"):
+        charge_sheet.for_profile(repinned)
+    assert core.decode_includes_reasoning(repinned) is None
 
 
 def test_expansion_decision_is_explicit_and_deferred_without_fresh_payloads() -> None:
@@ -531,6 +589,9 @@ def test_frozen_snapshot_has_all_perception_profiles_and_matches_runtime() -> No
     ]
     assert frozen["notes"]["campaigns"] == ["prompt", "aamas2027"]
     assert frozen["judge_profile"] == load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
+    assert (
+        frozen["charge_model"] == ChargeModelSheet.load(EVAL_ROOT / "charge_model.json").to_dict()
+    )
     for row in frozen["prompts"]:
         assert len(row["system_sha256"]) == len(row["user_sha256"]) == 64
         assert row["system"] and row["user"]
@@ -1544,3 +1605,132 @@ def test_pre_correction_checkpoint_call_fields_migrate_into_report_schema() -> N
     assert record.provider_round_trips == 10
     assert record.external_actions == 0
     assert "step_unit" not in record.to_dict()
+
+
+# The coefficients this campaign charges both arms through, frozen 2026-09-14. Transcribed here
+# rather than read from the file for the same reason PRE_ADAPTIVE_RICH_PROMPT_HASHES is: a test
+# that reads the artifact it is guarding only proves the artifact is self-consistent. These are
+# the numbers every result recorded from now on is comparable against, so an edit to the file has
+# to reach a reviewer as a failing assertion carrying the old value, not as a silent re-freeze.
+FROZEN_CHARGE_COEFFICIENTS = {
+    "gpt-5.4-2026-03-05": (
+        0.7983868960830829,
+        8.262206274881219e-06,
+        2.1935240172758537e-06,
+        0.0040476600308827,
+    ),
+    "moonshotai/kimi-k2.5": (
+        0.6992090542621108,
+        5.771790593571848e-05,
+        3.803953335095508e-05,
+        0.0036699476558258058,
+    ),
+}
+
+# What kimi's coefficients were before 2026-09-14, when the fit read this endpoint's reasoning
+# tokens as decoded in addition to `completion_tokens` rather than inside it. Kept as a named
+# exclusion rather than deleted: the wrong values were published, they are a factor of two apart
+# on `a0`, and re-running the fit under the other convention reproduces them exactly — so the way
+# this comes back is someone re-deriving the file, not someone typing a digit wrong.
+SUPERSEDED_KIMI_A0_SECONDS = 0.3508
+
+
+def test_the_frozen_charge_model_pins_the_corrected_coefficients() -> None:
+    sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
+    assert set(sheet.models) == set(FROZEN_CHARGE_COEFFICIENTS)
+    for model, expected in FROZEN_CHARGE_COEFFICIENTS.items():
+        row = sheet.models[model]
+        assert (
+            row.a0_seconds,
+            row.seconds_per_uncached_input_token,
+            row.seconds_per_cached_input_token,
+            row.seconds_per_output_token,
+        ) == expected, model
+    kimi = sheet.models["moonshotai/kimi-k2.5"]
+    assert kimi.a0_seconds != pytest.approx(SUPERSEDED_KIMI_A0_SECONDS, abs=1e-3)
+    # The rates the paper reports are derived, never stored, so they cannot disagree with the
+    # coefficients that are actually multiplied.
+    assert kimi.r_out_tokens_per_second == pytest.approx(272.5, abs=0.1)
+    assert sheet.models["gpt-5.4-2026-03-05"].r_out_tokens_per_second == pytest.approx(
+        247.1, abs=0.1
+    )
+
+
+def test_the_charge_model_copies_the_decode_convention_and_cannot_drift_from_it(
+    tmp_path: Path,
+) -> None:
+    """The convention's home is `DECODE_INCLUDES_REASONING`; this file only repeats it.
+
+    It has to repeat it, because it decides which regressor the coefficients beside it were fitted
+    against — freezing `a0` without freezing that leaves it underdetermined, and the two readings
+    put kimi's a0 a factor of two apart. Repeating a value is how copies drift, so a disagreement
+    is an error rather than a precedence question: whichever side is wrong, the coefficients no
+    longer describe the endpoint they are charged to.
+    """
+    raw = json.loads((EVAL_ROOT / "charge_model.json").read_text())
+    for model, row in raw["models"].items():
+        assert (
+            core.DECODE_INCLUDES_REASONING[
+                core.EndpointIdentity.create(row["provider"], model, row["provider_routing"])
+            ]
+            == (row["decode_includes_reasoning"])
+        )
+
+    raw["models"]["moonshotai/kimi-k2.5"]["decode_includes_reasoning"] = False
+    drifted = tmp_path / "drifted.json"
+    drifted.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="decode_includes_reasoning"):
+        ChargeModelSheet.load(drifted)
+
+
+def test_the_charge_model_rejects_an_endpoint_it_cannot_price(tmp_path: Path) -> None:
+    raw = json.loads((EVAL_ROOT / "charge_model.json").read_text())
+    row = dict(raw["models"]["moonshotai/kimi-k2.5"])
+    # A coefficient the fit could not identify can come back non-positive, which would price
+    # tokens as free or as time refunded. Unusable, and it must not be charged silently.
+    raw["models"] = {"moonshotai/kimi-k2.5": row | {"seconds_per_cached_input_token": -1e-6}}
+    negative = tmp_path / "negative.json"
+    negative.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="must be positive"):
+        ChargeModelSheet.load(negative)
+
+    raw["models"] = {"some/unmeasured-model": row}
+    unknown = tmp_path / "unknown.json"
+    unknown.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="declares no decode convention"):
+        ChargeModelSheet.load(unknown)
+
+
+def test_the_charge_is_one_frozen_function_both_arms_are_metered_through() -> None:
+    """`charge_for` returns exactly what `react_engine.ChargeModel` expects.
+
+    The ReAct baseline is charged by handing this callable to the engine, and S-ORA is charged by
+    the same numbers; an arm computing its own would be measuring its provider rather than its
+    architecture, which is the whole point of freezing them.
+    """
+    sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
+    profile = load_profiles(EVAL_ROOT / "profiles.json")["kimi-k2.5-prompt"]
+    charge = sheet.charge_for(profile)
+    row = sheet.models["moonshotai/kimi-k2.5"]
+    assert charge(0, 0, 0) == pytest.approx(row.a0_seconds)
+    assert charge(10_000, 0, 500) == pytest.approx(
+        row.a0_seconds
+        + 10_000 * row.seconds_per_uncached_input_token
+        + 500 * row.seconds_per_output_token
+    )
+    # The first argument stays total input at this seam. Increasing its cached subset must make an
+    # otherwise identical call cheaper, which catches accidentally charging that subset twice.
+    assert charge(10_000, 5_000, 0) < charge(10_000, 0, 0)
+    charge(10, 11, 0)
+    assert charge.cached_input_clamps == 1
+    unknown = replace(profile, model="some/unmeasured-model")
+    with pytest.raises(ValueError, match="no coefficients"):
+        sheet.charge_for(unknown)
+
+
+def test_every_runnable_profile_is_chargeable() -> None:
+    """An unchargeable profile does not fail — it falls back to measured wall clock, which makes
+    that arm incomparable with the arms that were charged, and nothing in the result says so."""
+    sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
+    for profile in load_profiles(EVAL_ROOT / "profiles.json").values():
+        assert sheet.for_profile(profile).provider == profile.provider, profile.name

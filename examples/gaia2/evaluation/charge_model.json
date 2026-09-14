@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "effective_date": "2026-09-14",
+  "measured_date": "2026-09-13",
+  "unit": "seconds",
+  "form": "a0_seconds + uncached_input*seconds_per_uncached_input_token + cached_input*seconds_per_cached_input_token + output*seconds_per_output_token",
+  "models": {
+    "gpt-5.4-2026-03-05": {
+      "provider": "openai",
+      "provider_routing": null,
+      "a0_seconds": 0.7983868960830829,
+      "seconds_per_uncached_input_token": 8.262206274881219e-06,
+      "seconds_per_cached_input_token": 2.1935240172758537e-06,
+      "seconds_per_output_token": 0.0040476600308827,
+      "decode_includes_reasoning": true,
+      "fit": {
+        "rows_fitted": 186,
+        "rows_excluded": 26,
+        "r_squared": 0.9915,
+        "residual_mean_seconds": 0.095,
+        "residual_sd_seconds": 1.107,
+        "max_absolute_residual_seconds": 11.39,
+        "rows_at_lowest_output_level": 28,
+        "median_call_seconds": 5.01,
+        "a0_share_of_median_call": 0.159,
+        "t_statistics": {
+          "a0_seconds": 31.0,
+          "seconds_per_uncached_input_token": 8.2,
+          "seconds_per_cached_input_token": 1.6,
+          "seconds_per_output_token": 88.5
+        },
+        "standard_errors": {
+          "a0_seconds": 2.58e-02,
+          "seconds_per_uncached_input_token": 1.01e-06,
+          "seconds_per_cached_input_token": 1.40e-06,
+          "seconds_per_output_token": 4.57e-05
+        },
+        "unidentified_coefficients": [
+          "seconds_per_cached_input_token"
+        ]
+      },
+      "note": "Cached-input prefill is not distinguishable from zero on this endpoint (t=1.6), and it is frozen anyway rather than dropped to zero: a coefficient the grid could not pin is still the best available estimate, and substituting zero would be a second, unmeasured decision. Report it with its t-statistic and let the sensitivity analysis carry it. Its contribution at the median call is 0.0% either way."
+    },
+    "moonshotai/kimi-k2.5": {
+      "provider": "openrouter",
+      "provider_routing": {
+        "only": ["venice"],
+        "order": ["venice"],
+        "allow_fallbacks": false
+      },
+      "a0_seconds": 0.6992090542621108,
+      "seconds_per_uncached_input_token": 5.771790593571848e-05,
+      "seconds_per_cached_input_token": 3.803953335095508e-05,
+      "seconds_per_output_token": 0.0036699476558258058,
+      "decode_includes_reasoning": true,
+      "fit": {
+        "rows_fitted": 189,
+        "rows_excluded": 23,
+        "r_squared": 0.8858,
+        "residual_mean_seconds": 0.048,
+        "residual_sd_seconds": 3.896,
+        "max_absolute_residual_seconds": 18.28,
+        "rows_at_lowest_output_level": 30,
+        "median_call_seconds": 4.91,
+        "a0_share_of_median_call": 0.142,
+        "t_statistics": {
+          "a0_seconds": 4.2,
+          "seconds_per_uncached_input_token": 5.0,
+          "seconds_per_cached_input_token": 2.7,
+          "seconds_per_output_token": 13.8
+        },
+        "standard_errors": {
+          "a0_seconds": 1.65e-01,
+          "seconds_per_uncached_input_token": 1.16e-05,
+          "seconds_per_cached_input_token": 1.43e-05,
+          "seconds_per_output_token": 2.65e-04
+        },
+        "unidentified_coefficients": []
+      },
+      "note": "These are the corrected coefficients. An earlier set was published on 2026-09-13 from a fit that treated this endpoint's reasoning tokens as decoded *in addition to* completion_tokens (a0 0.351 s, R_out 289 tok/s); that convention was wrong, and no number from it may be quoted. See decode_includes_reasoning below and the price sheet's note for this model."
+    }
+  },
+  "notes": {
+    "decode_includes_reasoning": "Copied, not authored here. The convention is an endpoint property and its home is DECODE_INCLUDES_REASONING in examples/gaia2/evaluation/core.py, keyed by the same (provider, model, provider_routing) identity as this artifact; this file repeats it because it determines which regressor the coefficients beside it were fitted against, and a frozen coefficient whose convention is not frozen with it is underdetermined. ChargeModelSheet.load fails if the two disagree, so the copy cannot drift. Set the declared value only from a generation that stops on its own: on a call truncated by the output cap, completion_tokens is clamped to the cap while reasoning_tokens arrives by a separate count that can overshoot it, so the two look disjoint whether or not they are. Reading grid rows that way is what put the wrong value here for kimi and halved its a0.",
+    "billing": "Deliberately absent. This file prices *time*, never money; cost is the price sheet's job. Both measured endpoints also bill reasoning inside completion_tokens, which is why calculate_call_cost charges output_tokens alone, but that is a separate fact recorded in the price sheet's per-model note — the artifact a repin already forces someone to re-read.",
+    "drift": "These are frozen constants, and real provider latency will drift away from them over a multi-week sweep without the charge moving. That is the provider-independence the freeze exists to buy, not a defect to re-fit away. The endpoint identity catches a declared repin but cannot catch a provider silently moving service behind an unchanged routing pin. Re-run the validation against real calls from both arms once at the end of the sweep as a reported drift check.",
+    "grid": "Fitted by weighted (IRLS) least squares over a designed latency grid measured 2026-09-13 for $20.38, one arm per endpoint, warm-ups and errored rows excluded by the fit_eligible flag rather than discarded. The grid data and the fit script are deliberately untracked so that they cannot perturb the baseline's dirty-diff hash; this file is the tracked record of what they produced.",
+    "a0_disclosure": "a0 is a per-call constant and S-ORA's headline claim is that it makes fewer calls, so the share of charged time it accounts for is exactly the part a reader will call circular. Measured at the median call it is 15.9% (gpt-5.4-2026-03-05) and 14.2% (moonshotai/kimi-k2.5). Report the a0=0 recomputation alongside the headline rather than letting it be found."
+  }
+}

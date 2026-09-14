@@ -28,6 +28,7 @@ from examples.gaia2.evaluation.core import (
     GAIA_SUITES,
     BudgetPolicy,
     CallUsage,
+    ChargeModelSheet,
     EvaluationRecord,
     JudgeProfile,
     ManifestLockedError,
@@ -50,7 +51,7 @@ from examples.gaia2.evaluation.core import (
 EVAL_ROOT = Path(__file__).parent
 PROMPT_ROOT = EVAL_ROOT / "campaigns" / "prompt"
 DEFAULT_SCENARIO_ROOT = Path("examples/gaia2/scenarios")
-DEFAULT_PRICE_SHEET = EVAL_ROOT / "price_sheets" / "2026-09-02.json"
+DEFAULT_PRICE_SHEET = EVAL_ROOT / "price_sheets" / "2026-09-12.json"
 
 
 def _git_output(*args: str) -> str | None:
@@ -158,8 +159,8 @@ def _check_command(args: argparse.Namespace) -> int:
     if not sheets:
         raise ValueError("no dated price sheet is available")
     for profile in profiles.values():
-        if not any(profile.model in sheet.models for sheet in sheets):
-            raise ValueError(f"no dated price sheet covers profile model {profile.model}")
+        if not any(profile.endpoint_identity() in sheet.endpoints for sheet in sheets):
+            raise ValueError(f"no dated price sheet covers profile endpoint {profile.name}")
     frozen = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
     rendered = build_prompt_snapshot(source_revision=frozen["provenance"]["source_revision"])
     if rendered["prompts"] != frozen["prompts"]:
@@ -169,6 +170,13 @@ def _check_command(args: argparse.Namespace) -> int:
         raise ValueError("the frozen evaluation profiles no longer match profiles.json")
     if frozen.get("judge_profile") != judge_profile.to_dict():
         raise ValueError("the frozen judge profile no longer matches judge.json")
+    charge_model = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
+    if frozen.get("charge_model") != charge_model.to_dict():
+        raise ValueError("the frozen charge model no longer matches charge_model.json")
+    for profile in profiles.values():
+        # Every profile a campaign can run has to be chargeable, or the arm silently falls back to
+        # measured wall clock and stops being comparable with the arms that were charged.
+        charge_model.for_profile(profile)
     contract = run_contract_suite()
     neutral = run_neutral_suite()
     if contract.failed or neutral.failed:
@@ -353,7 +361,7 @@ def _call_records_and_cost(
         for usage in usages:
             cost = calculate_call_cost(
                 sheet,
-                profile.model,
+                profile,
                 CallUsage(
                     input_tokens=usage.input_tokens,
                     cached_input_tokens=usage.cached_input_tokens,
@@ -691,6 +699,8 @@ def _run_command(args: argparse.Namespace) -> int:
         raise ValueError(f"profiles are not declared for prompt: {', '.join(wrong_campaign)}")
     manifests = load_manifests(PROMPT_ROOT / "manifests")
     sheet = PriceSheet.load(Path(args.price_sheet))
+    for name in args.profile:
+        sheet.for_profile(profiles[name])
     selection = RunSelection(
         profiles=tuple(args.profile),
         suites=tuple(args.suite),

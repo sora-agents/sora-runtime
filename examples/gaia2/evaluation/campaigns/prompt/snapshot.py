@@ -9,6 +9,7 @@ from typing import Any
 
 from examples.gaia2.evaluation.core import (
     SCHEMA_VERSION,
+    ChargeModelSheet,
     load_judge_profile,
     load_profiles,
     sha256_text,
@@ -229,6 +230,12 @@ def build_frozen_baseline(
     snapshot["judge_profile"] = load_judge_profile(
         root / "campaigns" / "prompt" / "judge.json"
     ).to_dict()
+    # The charge model belongs under the same sha256 gate as the prompts, for the same reason:
+    # editing a coefficient silently invalidates comparison with every number recorded before the
+    # edit, and the failure is not visible in any result. A second, coefficient-specific tripwire
+    # would only be a second thing to forget. ``to_dict`` carries the file's own digest, so a
+    # change to any part of it — a note as much as a number — reddens the baseline test.
+    snapshot["charge_model"] = ChargeModelSheet.load(root / "charge_model.json").to_dict()
     snapshot["notes"] = {
         "campaigns": ["prompt", "aamas2027"],
         "contains_live_model_output": False,
@@ -248,6 +255,12 @@ def build_frozen_baseline(
             "prop_reads",
             "distinct_prop_reads",
         ],
+        "charge_model": (
+            "frozen latency coefficients, charged identically to both scaffold arms so that the "
+            "comparison measures architecture rather than provider speed. They are constants and "
+            "will drift from live provider latency over the sweep without the charge moving, which "
+            "is the provider-independence the freeze buys, not a defect"
+        ),
         "prompt_profile": "gpt-5.4-medium-prompt",
         "cross_family_profile": "kimi-k2.5-prompt",
         "paper_transfer_profile": "gpt-5.4-high-paper",

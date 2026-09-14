@@ -3,16 +3,24 @@
   "effective_date": "2026-09-12",
   "currency": "USD",
   "models": {
-    "gpt-5.4-2026-03-05": [
+    "gpt-5.4-2026-03-05": {
+      "provider": "openai",
+      "provider_routing": null,
+      "tiers": [
       {"max_input_tokens": 272000, "input_per_million": 2.5, "cached_input_per_million": 0.25, "output_per_million": 15.0},
       {"max_input_tokens": null, "input_per_million": 5.0, "cached_input_per_million": 0.5, "output_per_million": 22.5}
-    ],
-    "moonshotai/kimi-k2.5": [
+      ]
+    },
+    "moonshotai/kimi-k2.5": {
+      "provider": "openrouter",
+      "provider_routing": {"only": ["venice"], "order": ["venice"], "allow_fallbacks": false},
+      "tiers": [
       {"max_input_tokens": null, "input_per_million": 0.532, "cached_input_per_million": 0.209, "output_per_million": 3.325}
-    ]
+      ]
+    }
   },
   "notes": {
-    "moonshotai/kimi-k2.5": "OpenRouter Venice endpoint rates, read from the endpoints API on 2026-09-12; routing is pinned to venice and fallbacks are disabled. Rates are a property of the pinned endpoint, not of the model, so this row moves whenever the pin does: the preceding sheet priced deepinfra at 0.45/0.07/2.25 and would under-charge this pin by roughly half on output and threefold on cached input. Venice also serves a 256k context against the 262k the other endpoints offer, which is above anything either arm sends but is the endpoint's limit rather than the model's.",
+    "moonshotai/kimi-k2.5": "OpenRouter Venice endpoint rates, read from the endpoints API on 2026-09-12; routing is pinned to venice and fallbacks are disabled. Rates are a property of the pinned endpoint, not of the model, so this row moves whenever the pin does: the preceding sheet priced deepinfra at 0.45/0.07/2.25 and would under-charge this pin by roughly half on output and threefold on cached input. Venice also serves a 256k context against the 262k the other endpoints offer, which is above anything either arm sends but is the endpoint's limit rather than the model's. Billing convention, verified 2026-09-14 against this endpoint's own reported usage.cost: reasoning tokens are reported *inside* completion_tokens and are billed there, so the output rate applies to completion_tokens alone and reasoning_tokens must not be added on top. An uncapped call reporting (22 prompt, 115 completion, 113 reasoning) was charged 3.94079e-04, exactly 22*0.532/M + 115*3.325/M. Verify this only on a call that stops on its own: on a truncated call both counts are clamped independently and reasoning can appear to exceed completion, which is not evidence that they are disjoint. Rates here are OpenRouter's charged rates and sit 5% below Venice's own published list (0.56 / 3.50 / 0.22); the probes matched these, not the list. This is a property of the pin, not of the model: re-verify whenever these rates are re-read.",
     "gpt-5.4-2026-03-05": "Carried forward unchanged from the 2026-09-02 sheet and not re-verified on this date; only the kimi row was re-read, because only its pin moved."
   }
 }
