@@ -155,10 +155,14 @@ def test_the_agent_builder_wires_what_are_hands_back(
 
     monkeypatch.setattr(AgentBuilder, "build", fake_build)
     builder = MeteredAgentBuilder(MeteredEngineBuilder(profile))
+    assert built.max_iterations == 80
+    assert built.react_agent.max_iterations == 80
     returned = builder.build(agent_config=object(), env=object())
 
     assert returned is built  # ARE's agent, not a wrapper around it
     assert set(seen) == {"agent_config", "env"}  # arguments passed through untouched
+    assert built.max_iterations == 200
+    assert built.react_agent.max_iterations == 200
     built.pause_env()
     assert engine.brackets == 1
 
@@ -329,6 +333,31 @@ def test_a_crash_is_recorded_as_an_exception_not_a_failure(
     assert result.exception is boom
 
 
+def test_max_iterations_error_is_recorded_as_the_llm_call_limit(
+    profile: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ARE reports cap exhaustion in its inner agent log, not as a raised exception."""
+    from are.simulation.scenario_runner import ScenarioRunner
+
+    def fake_run(self: Any, config: Any, scenario: Any) -> Any:
+        self.agent_builder.agent = SimpleNamespace(
+            react_agent=SimpleNamespace(
+                get_agent_logs=lambda: [SimpleNamespace(error="MaxIterationsAgentError")]
+            )
+        )
+        return _validation(success=False, rationale="Max iterations reached")
+
+    monkeypatch.setattr(ScenarioRunner, "run", fake_run)
+    result = run_react_on_scenario(
+        SimpleNamespace(scenario_id="s1", judge=object(), initialize=lambda: None),
+        profile,
+        log_fn=lambda _m: None,
+    )
+
+    assert result.exception is None
+    assert result.terminal_cause == "llm_call_limit"
+
+
 def test_the_runner_keeps_the_environment_are_built(
     profile: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -467,7 +496,11 @@ def test_the_agent_are_builds_comes_back_latching(
     """The whole chain, since each half is useless alone: the builder is the only object that sees
     the agent, the runner is the only one that holds the verdict, and one line joins them."""
     monkeypatch.setattr(
-        AgentBuilder, "build", lambda self, **_kw: SimpleNamespace(run_scenario=lambda: "done")
+        AgentBuilder,
+        "build",
+        lambda self, **_kw: SimpleNamespace(
+            react_agent=SimpleNamespace(), run_scenario=lambda: "done"
+        ),
     )
     runner, _ = build_runner(profile)
     runner.environment = SimpleNamespace(

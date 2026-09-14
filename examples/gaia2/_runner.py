@@ -200,12 +200,13 @@ def _terminal_cause(
     success: bool | None,
     *,
     inference_errors: tuple[str, ...] = (),
+    max_iterations_reached: bool = False,
 ) -> str:
     if _context_overflow(exc) or any(_context_overflow(error) for error in inference_errors):
         return "context_overflow"
     if exc is not None or inference_errors:
         return "infrastructure_error"
-    if stop_reason == "llm_call_limit":
+    if stop_reason == "llm_call_limit" or max_iterations_reached:
         return "llm_call_limit"
     if timeline_expired or stop_reason == "timeout":
         return "timeout"

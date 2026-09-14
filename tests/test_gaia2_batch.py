@@ -459,6 +459,32 @@ def test_terminal_cause_reads_provider_failures_captured_off_cycle() -> None:
     )
 
 
+def test_terminal_cause_reads_ares_logged_iteration_exhaustion() -> None:
+    assert (
+        _terminal_cause(
+            None,
+            False,
+            None,
+            False,
+            max_iterations_reached=True,
+        )
+        == "llm_call_limit"
+    )
+
+
+def test_terminal_cause_keeps_a_raised_error_ahead_of_iteration_exhaustion() -> None:
+    assert (
+        _terminal_cause(
+            RuntimeError("runner crashed"),
+            False,
+            None,
+            None,
+            max_iterations_reached=True,
+        )
+        == "infrastructure_error"
+    )
+
+
 # -- the pause cap: bound a stalled judge without bounding a slow scenario ------------------------
 
 

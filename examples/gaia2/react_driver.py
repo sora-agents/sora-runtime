@@ -69,7 +69,7 @@ from are.simulation.agents.llm.llm_engine_builder import LLMEngineBuilder
 from are.simulation.scenario_runner import ScenarioRunner
 from are.simulation.scenarios.config import ScenarioRunnerConfig
 
-from examples.gaia2._runner import RunResult, _run_number_of
+from examples.gaia2._runner import RunResult, _run_number_of, _terminal_cause
 from examples.gaia2.evaluation.core import (
     MODEL_SNAPSHOTS,
     ModelProfile,
@@ -84,6 +84,7 @@ from examples.gaia2.react_engine import ChargeModel, MeteredLiteLLMEngine
 log = logging.getLogger(__name__)
 
 EVAL_ROOT = Path(__file__).resolve().parent / "evaluation"
+GAIA_LOGICAL_AGENT_LLM_CALL_LIMIT = 200
 
 
 class MeteredEngineBuilder(LLMEngineBuilder):  # type: ignore[misc]  # ARE is untyped
@@ -173,12 +174,38 @@ def wire_run_end(agent: Any, latch: Any) -> Any:
 
 
 class MeteredAgentBuilder(AgentBuilder):  # type: ignore[misc]  # ARE is untyped
-    """ARE's agent, with the bracket wired and the end of its run latched. The build stays ARE's."""
+    """ARE's agent, with the experiment's cap and metering hooks applied after its own build.
+
+    ARE defaults both the wrapper and its inner ReAct loop to 80 iterations. The inner counter is
+    the logical-call admission limit: it includes errored attempts, survives across scenario turns,
+    and produces ARE's judged max-iterations message when exhausted. Set both copies after
+    delegation because ARE's builder overwrites the inner value from the wrapper default while it
+    constructs the agent.
+    """
 
     on_run_end: Any = None
+    agent: Any = None
 
     def build(self, *args: Any, **kwargs: Any) -> Any:
-        return wire_run_end(wire_bracket(super().build(*args, **kwargs)), self.on_run_end)
+        agent = super().build(*args, **kwargs)
+        agent.max_iterations = GAIA_LOGICAL_AGENT_LLM_CALL_LIMIT
+        agent.react_agent.max_iterations = GAIA_LOGICAL_AGENT_LLM_CALL_LIMIT
+        self.agent = agent
+        return wire_run_end(wire_bracket(agent), self.on_run_end)
+
+    def max_iterations_reached(self) -> bool:
+        """Read ARE's terminal marker, which is logged rather than raised."""
+        react_agent = getattr(self.agent, "react_agent", None)
+        get_logs = getattr(react_agent, "get_agent_logs", None)
+        if not callable(get_logs):
+            return False
+        try:
+            return any(
+                getattr(entry, "error", None) == "MaxIterationsAgentError" for entry in get_logs()
+            )
+        except Exception:  # a diagnostic must never cost the run its real result
+            log.warning("max-iterations probe failed", exc_info=True)
+            return False
 
 
 class CapturingScenarioRunner(ScenarioRunner):  # type: ignore[misc]  # ARE is untyped
@@ -443,13 +470,24 @@ def run_react_on_scenario(
 
     from sora.adapters.are_sim import ValidationOutcome
 
+    expired = runner.timeline_expired()
+    typed_exc = exc if isinstance(exc, Exception) else None
+    terminal_cause = _terminal_cause(
+        typed_exc,
+        expired,
+        None,
+        success if isinstance(success, bool) else None,
+        max_iterations_reached=runner.agent_builder.max_iterations_reached(),
+    )
+
     return RunResult(
         outcome=ValidationOutcome(success=success, rationale=getattr(result, "rationale", None)),
         environment=env,
         duration=duration,
-        exception=exc if isinstance(exc, Exception) else None,
+        exception=typed_exc,
         write_counts=counts,
-        timeline_expired=runner.timeline_expired(),
+        timeline_expired=expired,
+        terminal_cause=terminal_cause,
         judge_recording=(
             None
             if collector is None
