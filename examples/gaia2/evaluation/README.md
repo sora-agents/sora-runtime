@@ -56,8 +56,8 @@ Price rows, frozen latency coefficients, and decode-count conventions are bound 
 declared `(provider, model, provider_routing)` endpoint identity. A profile repin therefore fails
 the offline check and live-run preflight instead of silently reusing measurements from another
 backend. This key cannot detect a provider moving weights or service behind an unchanged routing
-pin; validating the frozen coefficients against real calls from both arms remains a separate
-end-of-sweep drift check.
+pin; `python -m examples.gaia2.charge_drift` validates the frozen coefficients against real calls
+from both arms once before the sweep and again at its end.
 
 Remove `--dry-run` only after reviewing the matrix, configuring the profile's credential variable,
 and confirming that the scenario root contains the ignored Gaia2 payloads. Acceptance runs also

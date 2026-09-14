@@ -464,6 +464,28 @@ that **91% of the ReAct arm's input tokens came back cached**, against an S-ORA 
 are unique per call — `R_cache` is nearly the whole of the baseline's input cost, not a refinement
 on it.
 
+`charge_drift.py` is the second post-hoc check. An endpoint/profile digest catches a declared
+repin, and the OpenRouter catalogue guard catches an alias resolving to a different canonical
+model, but neither can see service move behind an unchanged identity. Run a paired pilot before
+the sweep and repeat the command over the full call logs afterwards:
+
+```console
+python3 -m examples.gaia2.charge_drift \
+    --profile kimi-k2.5-prompt \
+    --sora runs/sora/llm_calls.jsonl \
+    --react runs/react/llm_calls.jsonl
+```
+
+The audit applies the frozen coefficients to each real call, including one intercept per reported
+round trip, and reports MAPE plus aggregate signed bias for each arm. It passes only when each
+arm's absolute signed bias is at most 15% and the between-arm bias gap is at most 10 percentage
+points. Those are drift gates, not an invitation to re-fit: a failure records that live service no
+longer resembles the frozen accounting unit closely enough to validate its neutrality. Rows with
+incomplete usage, missing cache detail, invalid token splits, or non-positive latency are reported
+as excluded; an arm with no usable rows fails closed. The file arguments are arm-specific and a
+wrong arm or model is an error rather than a filtered row. Repeat `--sora` and `--react` to combine
+the per-capability files in a whole sweep without rewriting them.
+
 The charge model is `a0 + uncached_in/R_in + cached_in/R_cache + out/R_out`, frozen before the
 sweep and applied identically to both arms. Its coefficients cannot be fitted from the agents'
 own calls: neither arm varies prompt length independently of answer length, so an ordinary

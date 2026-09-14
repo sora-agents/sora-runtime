@@ -1656,6 +1656,23 @@ def test_the_frozen_charge_model_pins_the_corrected_coefficients() -> None:
     )
 
 
+def test_the_charge_model_snapshot_rejects_two_endpoints_for_one_model() -> None:
+    """Schema v1 serializes rows under model ids, so a second endpoint cannot be represented.
+
+    Keep that limitation loud: collapsing the endpoint map by model would otherwise omit one row
+    from ``to_dict()``, including from the baseline snapshot whose equality is the freeze gate.
+    """
+    sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
+    endpoint, row = next(iter(sheet.endpoints.items()))
+    second = core.EndpointIdentity.create("other-provider", endpoint.model, {"only": ["other"]})
+    ambiguous = replace(sheet, endpoints={endpoint: row, second: row})
+
+    with pytest.raises(ValueError, match="more than one endpoint for model"):
+        _ = ambiguous.models
+    with pytest.raises(ValueError, match="more than one endpoint for model"):
+        ambiguous.to_dict()
+
+
 def test_the_charge_model_copies_the_decode_convention_and_cannot_drift_from_it(
     tmp_path: Path,
 ) -> None:

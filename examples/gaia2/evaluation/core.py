@@ -931,7 +931,18 @@ class ChargeModelSheet:
 
     @property
     def models(self) -> Mapping[str, ChargeCoefficients]:
-        return {endpoint.model: row for endpoint, row in self.endpoints.items()}
+        models: dict[str, ChargeCoefficients] = {}
+        for endpoint, row in self.endpoints.items():
+            if endpoint.model in models:
+                # Artifact schema v1 stores rows under model ids and therefore cannot serialize
+                # two endpoints for one model. Refuse that state instead of letting ``to_dict``
+                # collapse one row out of the digest-compared campaign snapshot.
+                raise ValueError(
+                    f"charge model has more than one endpoint for model {endpoint.model}; "
+                    "schema v1 cannot represent both"
+                )
+            models[endpoint.model] = row
+        return models
 
     def charge_for(self, profile: ModelProfile) -> TotalInputCharge:
         """The per-call charge both arms are metered through, bound to one model.

@@ -3,16 +3,17 @@
 Why this exists
 ---------------
 The charge model that freezes ARE's clock during generation is
-``charge = a0 + input_tokens / R_in + output_tokens / R_out``, computed identically for both the
-S-ORA arm and the ReAct baseline. Computing it — and, before that, validating the coefficients
-against calls the two arms really made — needs one row per model round-trip with the token counts,
-the measured latency and enough identity to say which arm and which call site produced it.
+``charge = a0 + uncached_input/R_in + cached_input/R_cache + output/R_out``, computed identically
+for both the S-ORA arm and the ReAct baseline. Computing it — and, before that, validating the
+coefficients against calls the two arms really made — needs one row per model round-trip with the
+token counts, the measured latency and enough identity to say which arm and which call site
+produced it.
 
-Neither arm records that today. S-ORA emits the numbers as ``sora.llm`` log records, but they
-survive only as text in whatever the operator redirected, and the *text* form drops
-``cached_input_tokens`` — which the cache-aware fit needs. ARE's ReAct agent discards its token
-counts entirely (see ``react_engine``). This module is the one schema both write into, so a run's
-calls are comparable across arms without a per-arm parser.
+Neither arm's native run artifact records that. S-ORA emits the numbers as ``sora.llm`` log
+records, but their *text* form drops ``cached_input_tokens`` — which the cache-aware fit needs —
+and ARE's ReAct agent discards its token counts entirely (see ``react_engine``). This module is the
+one durable schema both harnesses write into, so a run's calls are comparable across arms without
+a per-arm parser.
 
 The JSONL is the source of truth for the fit and for billing. It is deliberately *not* the same
 channel as the charge itself: ARE's clock sees only the single ``completion_duration`` float the
