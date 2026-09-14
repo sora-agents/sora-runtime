@@ -464,7 +464,30 @@ that **91% of the ReAct arm's input tokens came back cached**, against an S-ORA 
 are unique per call — `R_cache` is nearly the whole of the baseline's input cost, not a refinement
 on it.
 
-`charge_drift.py` is the second post-hoc check. An endpoint/profile digest catches a declared
+After the coefficients are frozen, `charge_range.py` performs the stricter paired-arm audit against
+the regressors the charge actually multiplies:
+
+```console
+python3 -m examples.gaia2.charge_range \
+    --profile kimi-k2.5-prompt \
+    --sora runs/sora/llm_calls.jsonl \
+    --react runs/react/llm_calls.jsonl
+```
+
+The measured box is `[1000, 64000]` uncached input tokens, `[0, 64000]` cached input tokens, and
+`[16, 8192]` decode tokens on both endpoints. Decode is stated in its physical terms and obtained
+through the convention frozen in `ChargeModelSheet`; for both shipped endpoints it is exactly
+`completion_tokens`, with reasoning already contained, rather than completion plus reasoning.
+The checker reports, per arm and axis, both the fraction of calls and the fraction of token mass
+outside the box. It fails closed on missing coverage or any value outside: applying the frozen
+coefficient there is unmeasured extrapolation, not merely a more uncertain estimate. Repeat
+`--sora` and `--react` to combine per-capability files. The script reads only existing artifacts
+and never re-runs the untracked fit. A S-ORA parser repair can produce one logical row whose token
+fields sum multiple provider round trips. The measured box applies to each crossing, so the checker
+excludes that aggregate and fails it as uncertifiable rather than treating its sum as one request or
+scaling the bounds and potentially hiding an individual outlier.
+
+`charge_drift.py` is the other post-hoc check. An endpoint/profile digest catches a declared
 repin, and the OpenRouter catalogue guard catches an alias resolving to a different canonical
 model, but neither can see service move behind an unchanged identity. Run a paired pilot before
 the sweep and repeat the command over the full call logs afterwards:

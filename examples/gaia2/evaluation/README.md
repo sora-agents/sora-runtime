@@ -57,7 +57,13 @@ declared `(provider, model, provider_routing)` endpoint identity. A profile repi
 the offline check and live-run preflight instead of silently reusing measurements from another
 backend. This key cannot detect a provider moving weights or service behind an unchanged routing
 pin; `python -m examples.gaia2.charge_drift` validates the frozen coefficients against real calls
-from both arms once before the sweep and again at its end.
+from both arms once before the sweep and again at its end. After calls exist,
+`python -m examples.gaia2.charge_range` also checks both arms against the measured charge box. Its
+decode interval is `[16, 8192]` on both shipped endpoints, expressed as `completion_tokens` because
+their frozen conventions include reasoning there; anything outside the box is reported as
+unmeasured extrapolation, and the command never re-runs the fit. A logical row that sums multiple
+provider round trips also fails closed: without per-round-trip usage, its aggregate cannot certify
+that every crossing stayed inside the measured box.
 
 Remove `--dry-run` only after reviewing the matrix, configuring the profile's credential variable,
 and confirming that the scenario root contains the ignored Gaia2 payloads. Acceptance runs also
