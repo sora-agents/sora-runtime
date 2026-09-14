@@ -41,6 +41,8 @@ from openai import AsyncOpenAI, Timeout
 from examples.gaia2.evaluation.core import (
     MODEL_SNAPSHOTS,
     ModelProfile,
+    decode_includes_reasoning,
+    decode_tokens,
     load_profiles,
     served_snapshot,
 )
@@ -324,6 +326,10 @@ class LatencyGrid:
         self.manifest_path = manifest_path
         self.calibration = _Calibration()
         self._profile_sha256 = profile_digest(profile)
+        # Resolved once per run and written onto every row. The fit needs it to know what the
+        # decode regressor is, and reconstructing it later from a command-line flag is how a
+        # published coefficient ends up underdetermined by the files it was derived from.
+        self._decode_includes_reasoning = decode_includes_reasoning(profile)
         self.served_snapshot = snapshot
         self._client = client if client is not None else self._build_client(profile, api_key)
         self._manifest: Any = None
@@ -437,6 +443,11 @@ class LatencyGrid:
             finish_reason=f"error:{error}" if error else finish_reason,
             usage_captured=captured,
         )
+        decode = decode_tokens(
+            output_tokens if captured else None,
+            reasoning,
+            includes_reasoning=self._decode_includes_reasoning,
+        )
         manifest = {
             "call_id": record.call_id,
             "cell_id": cell.cell_id,
@@ -463,7 +474,23 @@ class LatencyGrid:
             "reported_input_tokens": input_tokens if captured else None,
             "reported_output_tokens": output_tokens if captured else None,
             "reported_cached_input_tokens": cached,
+            # The fit's decode regressor, resolved here rather than by whoever runs the fit.
+            # None means this endpoint reports reasoning tokens and has not declared whether
+            # `completion_tokens` already contains them — an undefined regressor, not a small one.
+            "reported_decode_tokens": decode,
+            "decode_includes_reasoning": self._decode_includes_reasoning,
             "input_on_target": _on_target(input_tokens if captured else None, cell.input_tokens),
+            # Checked against `completion_tokens`, the quantity `max_completion_tokens` bounds on
+            # both endpoints measured so far, and so the only one the cell can be said to have hit
+            # or missed. Every grid row on both arms ends by truncation, which makes this check
+            # vacuous in practice — `completion_tokens` comes back clamped to exactly the designed
+            # cap — and that is worth knowing rather than mistaking for a filter doing work: the
+            # rows this run excludes are excluded as warm-ups and errors, never here.
+            #
+            # It is deliberately *not* checked against `reported_decode_tokens`. On a truncated row
+            # the two counts are clamped independently, so `reasoning_tokens` can overshoot
+            # `completion_tokens` by a few tokens without meaning anything; treating that as a
+            # missed target would discard otherwise-valid rows over a reporting artifact.
             "output_on_target": _on_target(output_tokens if captured else None, cell.output_tokens),
             # Reported against the prefix the cell asked to have cached. Diagnostic, not a filter:
             # a cached cell whose prefix missed is still a valid observation of the input term at
@@ -483,12 +510,19 @@ class LatencyGrid:
             # uncached arm keeps a None here: its prompts are unique per call, so the fit reads it
             # as the zero it is, and requiring a count there would discard the whole grid on every
             # provider that reports no cache detail at all.
+            #
+            # `decode is not None` is the same refusal one column over: an endpoint that reports
+            # reasoning tokens without a declared convention leaves the decode regressor undefined,
+            # and the two readings differ by a factor of two on a reasoning model. An endpoint that
+            # reports no reasoning at all is unaffected — the convention only matters once there is
+            # something for it to decide.
             "fit_eligible": (
                 not cell.warmup
                 and phase == "grid"
                 and error is None
                 and captured
                 and (cached is not None or not cell.cached)
+                and decode is not None
                 and _on_target(output_tokens, cell.output_tokens) is True
             ),
             "error": error,

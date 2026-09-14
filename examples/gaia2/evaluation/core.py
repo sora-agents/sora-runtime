@@ -293,6 +293,64 @@ def served_snapshot(profile: ModelProfile) -> str | None:
     return None
 
 
+# Whether a provider's ``completion_tokens`` already contains the reasoning tokens it reports
+# separately. Both endpoints measured so far do, but it must stay a declaration rather than an
+# assumption, because where the two counts are disjoint the tokens the model actually decoded are
+# their *sum*, and reading ``completion_tokens`` as the decode work would then silently under-count
+# it — in the latency grid, by pushing the difference into ``a0``.
+#
+# Keyed by ``(provider, model)`` rather than by model alone because this is a property of the
+# endpoint, not of the weights: the same model served from two providers can report either way, so
+# a repin owes this table a new entry exactly as it owes a new price sheet.
+#
+# **Establish the value from an *uncapped* generation, never from grid rows.** The tempting test is
+# arithmetic and one-sided — reasoning cannot exceed completion if it is contained in it, and 31 of
+# kimi's 217 usage-carrying grid rows report more reasoning than completion. That test is invalid
+# here and reading it the obvious way is what put ``False`` in this table until 2026-09-14. Every
+# grid row is generated against a tight ``max_completion_tokens`` and finishes ``length``: all 217
+# report ``completion_tokens`` clamped to exactly the designed cap, while ``reasoning_tokens``
+# arrives by a different count that can overshoot it by a few tokens. Two counts truncated
+# differently look disjoint whether or not they are, so a capped row carries no information about
+# the convention at all.
+#
+# What settles it is one generation that stops on its own, where content and reasoning can be
+# compared against the total. On the pinned Venice endpoint, 2026-09-14, ``finish_reason=stop``:
+# content "391" (~2 tokens) with 113 reasoning tokens reported ``completion_tokens=115``; a 120-word
+# answer (794 characters, ~167 tokens) with 3,099 reasoning tokens reported 3,266. Both are
+# content + reasoning to within a token or two, so reasoning is contained, exactly as on OpenAI.
+DECODE_INCLUDES_REASONING: dict[tuple[str, str], bool] = {
+    ("openai", "gpt-5.4-2026-03-05"): True,
+    ("openrouter", "moonshotai/kimi-k2.5"): True,
+}
+
+
+def decode_includes_reasoning(profile: ModelProfile) -> bool | None:
+    """Whether this endpoint folds reasoning into ``completion_tokens``, or None if undeclared.
+
+    None is a third answer, not a default: an unrecorded endpoint that reports reasoning at all has
+    an *undefined* decode count, and a caller that guesses either way is fabricating a regressor or
+    a charge. Callers must treat None as "cannot be used", the same way the grid already treats a
+    cached cell whose provider reported no cache count."""
+    return DECODE_INCLUDES_REASONING.get((profile.provider, profile.model))
+
+
+def decode_tokens(
+    completion: int | None, reasoning: int | None, *, includes_reasoning: bool | None
+) -> int | None:
+    """The tokens the model actually decoded, or None where that cannot be determined.
+
+    Reasoning of zero or None makes the convention irrelevant, which is why an undeclared endpoint
+    is not automatically unusable — only one that reports reasoning it might or might not have
+    already counted."""
+    if completion is None:
+        return None
+    if not reasoning:
+        return completion
+    if includes_reasoning is None:
+        return None
+    return completion if includes_reasoning else completion + reasoning
+
+
 def load_profiles(path: Path) -> dict[str, ModelProfile]:
     raw = json.loads(path.read_text())
     if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
@@ -681,8 +739,20 @@ def calculate_call_cost(sheet: PriceSheet, model: str, usage: CallUsage) -> Cost
     uncached_tokens = usage.input_tokens - cached_tokens
     uncached_cost = uncached_tokens / 1_000_000 * tier.input_per_million
     cached_cost = cached_tokens / 1_000_000 * tier.cached_input_per_million
-    # Provider usage already includes reasoning in output. ``reasoning_tokens`` is descriptive and
-    # must not be charged again.
+    # Charged on ``output_tokens`` alone, because on both measured endpoints ``completion_tokens``
+    # already contains the reasoning tokens reported beside it (see ``DECODE_INCLUDES_REASONING``),
+    # so this charges them exactly once. Confirmed on the pinned Venice endpoint against
+    # OpenRouter's own reported ``usage.cost`` on 2026-09-14: a call reporting (22 prompt, 115
+    # completion, 113 reasoning) was charged 3.94079e-04, which is 22*0.532/M + 115*3.325/M to
+    # every reported digit — the 113 reasoning tokens are inside the 115 and are paid for there.
+    # Adding ``reasoning_tokens`` on top would very nearly double this arm's output cost.
+    #
+    # ``reasoning_tokens`` is therefore descriptive: carried for reporting, never a cost term. The
+    # combination that would break this is an endpoint that reports reasoning *outside*
+    # ``completion_tokens`` and bills it; no usage payload distinguishes that after the fact, and it
+    # is a property of the pinned endpoint, so a repin re-opens it exactly as it re-opens the rates.
+    # The recipe is one uncapped call with ``"usage": {"include": true}`` — a call truncated by the
+    # output cap cannot answer it, since both counts are then clamped independently.
     output_cost = usage.output_tokens / 1_000_000 * tier.output_per_million
     return CostResult(
         agent_cost=uncached_cost + cached_cost + output_cost,

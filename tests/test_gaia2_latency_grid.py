@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from examples.gaia2 import latency_grid
+from examples.gaia2.evaluation import core
 from examples.gaia2.evaluation.core import load_profiles
 from examples.gaia2.latency_grid import (
     CALIBRATION_CALLS,
@@ -418,6 +419,111 @@ async def test_a_failed_call_is_still_written_and_excluded(
     assert row["seconds"] > 0
     assert outcome.manifest["error"] == "RuntimeError"
     assert outcome.manifest["fit_eligible"] is False
+
+
+def _grid_for(profile: Any, tmp_path: Path) -> tuple[LatencyGrid, _FakeClient]:
+    client = _FakeClient([])
+    runner = LatencyGrid(
+        profile,
+        spec=GridSpec(blocks=1),
+        writer=LLMCallWriter(tmp_path / "other.jsonl"),
+        manifest_path=tmp_path / "other.manifest",
+        client=client,
+    )
+    runner.calibration.freeze()
+    return runner, client
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_that_folds_reasoning_into_completion_decodes_completion(
+    grid: tuple[LatencyGrid, _FakeClient, LLMCallWriter],
+) -> None:
+    """OpenAI counts reasoning inside `completion_tokens`, so the two must not be added: doing so
+    would double the decode regressor on exactly the rows where reasoning dominates."""
+    runner, client, _ = grid
+    client.responses = [_response(prompt=4_000, completion=4_096, reasoning=4_096)]
+    outcome = await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=4_096))
+    assert outcome.manifest["decode_includes_reasoning"] is True
+    assert outcome.manifest["reported_decode_tokens"] == 4_096
+    assert outcome.manifest["fit_eligible"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_row_is_not_evidence_about_the_convention(
+    tmp_path: Path,
+) -> None:
+    """The pinned Venice endpoint reports reasoning *inside* `completion_tokens`, like OpenAI.
+
+    It is declared `True` despite grid rows that report more reasoning than completion, because
+    those rows are all truncated: `completion_tokens` comes back clamped to the cap while
+    `reasoning_tokens` arrives by a separate count that can overshoot it. Reading that overshoot as
+    proof the counts are disjoint is what put `False` in the table until 2026-09-14, and it doubled
+    this arm's decode regressor. Only an uncapped generation settles the question, so this shape
+    must decode to `completion` and never to the sum.
+    """
+    profile = load_profiles(EVAL_ROOT / "profiles.json")["kimi-k2.5-prompt"]
+    runner, client = _grid_for(profile, tmp_path)
+    client.responses = [_response(prompt=4_000, completion=64, reasoning=65, model=profile.model)]
+    outcome = await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=64))
+    assert outcome.manifest["decode_includes_reasoning"] is True
+    assert outcome.manifest["reported_decode_tokens"] == 64
+    assert outcome.manifest["output_on_target"] is True
+    assert outcome.manifest["fit_eligible"] is True
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_declared_to_report_reasoning_separately_decodes_the_sum(
+    tmp_path: Path, profile: Any
+) -> None:
+    """No endpoint measured so far reports reasoning outside `completion_tokens`, but the reading
+    has to stay available: it is a per-endpoint declaration, and a repin can land on one that does.
+    Declared here rather than borrowed from a real profile, so that no test asserts a convention
+    about a live endpoint that the endpoint does not actually follow."""
+    disjoint = replace(profile, model="some/disjoint-model")
+    monkeypatched = dict(core.DECODE_INCLUDES_REASONING)
+    monkeypatched[(disjoint.provider, disjoint.model)] = False
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(core, "DECODE_INCLUDES_REASONING", monkeypatched)
+        runner, client = _grid_for(disjoint, tmp_path)
+        client.responses = [
+            _response(prompt=4_000, completion=4_096, reasoning=204, model=disjoint.model)
+        ]
+        outcome = await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=4_096))
+    assert outcome.manifest["decode_includes_reasoning"] is False
+    assert outcome.manifest["reported_decode_tokens"] == 4_300
+    assert outcome.manifest["fit_eligible"] is True
+
+
+@pytest.mark.asyncio
+async def test_an_undeclared_endpoint_reporting_reasoning_is_kept_but_not_fitted(
+    tmp_path: Path, profile: Any
+) -> None:
+    """An unrecorded endpoint's decode count is undefined, not approximately known: the two
+    readings differ by a factor of two on a reasoning model. Same refusal as a cached cell whose
+    provider reported no cache count — keep the paid row, keep it out of the fit."""
+    runner, client = _grid_for(replace(profile, model="some/unmeasured-model"), tmp_path)
+    client.responses = [
+        _response(prompt=4_000, completion=4_096, reasoning=204, model="some/unmeasured-model")
+    ]
+    outcome = await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=4_096))
+    assert outcome.manifest["decode_includes_reasoning"] is None
+    assert outcome.manifest["reported_decode_tokens"] is None
+    assert outcome.manifest["fit_eligible"] is False
+    assert outcome.record.reasoning_tokens == 204  # kept, not nulled
+
+
+@pytest.mark.asyncio
+async def test_an_undeclared_endpoint_that_reports_no_reasoning_is_still_fitted(
+    tmp_path: Path, profile: Any
+) -> None:
+    """The convention only matters once there is something for it to decide. Refusing every
+    undeclared endpoint outright would exclude every non-reasoning model for a question that
+    never arises there."""
+    runner, client = _grid_for(replace(profile, model="some/unmeasured-model"), tmp_path)
+    client.responses = [_response(prompt=4_000, completion=4_096, model="some/unmeasured-model")]
+    outcome = await runner.run_cell(GridCell(input_tokens=4_000, output_tokens=4_096))
+    assert outcome.manifest["reported_decode_tokens"] == 4_096
+    assert outcome.manifest["fit_eligible"] is True
 
 
 @pytest.mark.asyncio
