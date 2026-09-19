@@ -454,6 +454,8 @@ def _live_gaia_record(
     judge_profile: JudgeProfile,
     max_wall_seconds: float,
     max_agent_llm_calls: int,
+    charge_sheet: ChargeModelSheet | None = None,
+    wall_clock: bool = False,
 ) -> EvaluationRecord:
     # Every ARE/provider import is below all dry-run and budget gates.
     from examples.gaia2._runner import run_scenario
@@ -475,12 +477,18 @@ def _live_gaia_record(
         offline_validation=judge_profile.offline_validation,
         relax_verdict_case=judge_profile.relax_verdict_case,
     )
+    charge_sheet = charge_sheet or ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
+    charge = None if wall_clock else charge_sheet.charge_for(profile)
     result = run_scenario(
         scenario,
         config=str(config_path),
         max_wall_seconds=max_wall_seconds,
         read_stdin=False,
+        charge=charge,
+        charge_model_identity=charge.identity if charge is not None else None,
+        charge_model_digest=charge_sheet.digest if charge is not None else None,
     )
+    raw_anomalies = int(getattr(result, "raw_cached_input_anomalies", 0))
     calls, agent_cost, upper_bound = _call_records_and_cost(result.llm_report, profile, sheet)
     missing = surplus = 0
     if result.write_counts is not None:
@@ -534,6 +542,28 @@ def _live_gaia_record(
         decision_cycles=result.decision_cycles,
         prop_reads=result.prop_reads,
         distinct_prop_reads=len(result.prop_reads_by_property),
+        charged_seconds=float(
+            getattr(
+                result, "charged_seconds", charge.charged_seconds if charge is not None else 0.0
+            )
+        ),
+        charge_model_identity=charge.identity if charge is not None else None,
+        charge_model_digest=charge_sheet.digest if charge is not None else None,
+        cached_input_clamps=charge.cached_input_clamps if charge is not None else 0,
+        raw_cached_input_anomalies=raw_anomalies,
+        charge_accounting_consistent=(
+            None if charge is None else charge.cached_input_clamps == raw_anomalies
+        ),
+        clock_mode="wall" if charge is None else "token_charged",
+        inference_charge_policy=getattr(
+            result, "inference_charge_policy", "serialized_sum" if charge is not None else None
+        ),
+        llm_wall_seconds=float(getattr(result, "llm_wall_seconds", 0.0)),
+        llm_wall_union_seconds=float(getattr(result, "llm_wall_union_seconds", 0.0)),
+        llm_charged_union_seconds=float(getattr(result, "llm_charged_union_seconds", 0.0)),
+        llm_round_trips=int(getattr(result, "llm_round_trips", 0)),
+        llm_max_in_flight=int(getattr(result, "llm_max_in_flight", 0)),
+        llm_overlapped_round_trips=int(getattr(result, "llm_overlapped_round_trips", 0)),
     )
 
 
@@ -699,6 +729,7 @@ def _run_command(args: argparse.Namespace) -> int:
         raise ValueError(f"profiles are not declared for prompt: {', '.join(wrong_campaign)}")
     manifests = load_manifests(PROMPT_ROOT / "manifests")
     sheet = PriceSheet.load(Path(args.price_sheet))
+    charge_sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
     for name in args.profile:
         sheet.for_profile(profiles[name])
     selection = RunSelection(
@@ -837,6 +868,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 judge_profile=judge_profile,
                 max_wall_seconds=args.max_wall_seconds,
                 max_agent_llm_calls=args.max_agent_llm_calls,
+                charge_sheet=charge_sheet,
+                wall_clock=args.wall_clock,
             )
         _append_checkpoint(checkpoint, entry.key, record)
         records.append(record)
@@ -945,6 +978,14 @@ def _parser() -> argparse.ArgumentParser:
         help="optional assertion; must match the campaign's pinned judge endpoint",
     )
     run.add_argument("--max-wall-seconds", type=float, default=1200.0)
+    run.add_argument(
+        "--wall-clock",
+        action="store_true",
+        help=(
+            "Run Gaia cases on elapsed wall time rather than the frozen token charge. Produces a "
+            "separate robustness result that is not timing-comparable to charged runs."
+        ),
+    )
     run.add_argument("--max-agent-llm-calls", type=int, default=200)
     run.set_defaults(handler=_run_command)
     report = commands.add_parser("report", help="combine baseline/candidate checkpoints")
@@ -958,7 +999,7 @@ def _parser() -> argparse.ArgumentParser:
     report.set_defaults(handler=_report_command)
     aamas2027 = campaigns.add_parser(
         "aamas2027",
-        help="reserved campaign name for the later frozen AAMAS 2027 protocol",
+        help="show the AAMAS 2027 protocol-freeze candidate",
     )
     aamas2027.set_defaults(handler=_aamas2027_status)
     return parser
@@ -966,7 +1007,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def _aamas2027_status(args: argparse.Namespace) -> int:
     del args
-    print("aamas2027 campaign is reserved; its protocol and run matrix are not frozen yet")
+    print(
+        "aamas2027 has an uncommitted protocol-freeze candidate and exact Gaia2 mini manifest; "
+        "run it through examples.gaia2.batch after the checkpoint is reviewed and committed"
+    )
     return 0
 
 

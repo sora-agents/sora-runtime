@@ -824,6 +824,7 @@ class TotalInputCharge:
 
     coefficients: ChargeCoefficients
     cached_input_clamps: int = 0
+    charged_seconds: float = 0.0
 
     def __call__(self, total_input: int, cached_input: int, output: int) -> float:
         uncached_input = total_input - cached_input
@@ -832,7 +833,21 @@ class TotalInputCharge:
             # cached work, clamp only the impossible residual, and leave an inspectable count.
             self.cached_input_clamps += 1
             uncached_input = 0
-        return self.coefficients.charged_seconds(uncached_input, cached_input, output)
+        charged = self.coefficients.charged_seconds(uncached_input, cached_input, output)
+        self.charged_seconds += charged
+        return charged
+
+    @property
+    def identity(self) -> dict[str, Any]:
+        return {
+            "model": self.coefficients.model,
+            "provider": self.coefficients.provider,
+            "provider_routing": (
+                json.loads(self.coefficients.provider_routing_json)
+                if self.coefficients.provider_routing_json is not None
+                else None
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -1078,6 +1093,11 @@ def decide_acceptance_expansion(
     return ExpansionDecision(required, tuple(reasons), status)
 
 
+# Rows predating the explicit clock field. Distinct from "wall" — a legacy run may have
+# been either, and that unknowability is exactly what must not be averaged into a W2 report.
+LEGACY_CLOCK_MODE = "legacy"
+
+
 @dataclass(frozen=True)
 class EvaluationRecord:
     arm: Arm
@@ -1126,6 +1146,20 @@ class EvaluationRecord:
     # diagnostic, never a score input.
     prop_reads: int = 0
     distinct_prop_reads: int = 0
+    charged_seconds: float = 0.0
+    charge_model_identity: dict[str, Any] | None = None
+    charge_model_digest: str | None = None
+    cached_input_clamps: int = 0
+    raw_cached_input_anomalies: int = 0
+    charge_accounting_consistent: bool | None = None
+    clock_mode: str | None = None
+    inference_charge_policy: str | None = None
+    llm_wall_seconds: float = 0.0
+    llm_wall_union_seconds: float = 0.0
+    llm_charged_union_seconds: float | None = 0.0
+    llm_round_trips: int = 0
+    llm_max_in_flight: int = 0
+    llm_overlapped_round_trips: int = 0
 
     @property
     def accounted_agent_cost(self) -> float:
@@ -1182,4 +1216,32 @@ def record_from_dict(raw: dict[str, Any]) -> EvaluationRecord:
     row.setdefault("provider_round_trips", row.pop("round_trips", 0))
     row.pop("step_unit", None)
     row["call_records"] = tuple(row.get("call_records", ()))
+    row.setdefault("charged_seconds", 0.0)
+    row.setdefault("charge_model_identity", None)
+    row.setdefault("charge_model_digest", None)
+    row.setdefault("cached_input_clamps", 0)
+    row.setdefault("raw_cached_input_anomalies", 0)
+    row.setdefault(
+        "charge_accounting_consistent",
+        (
+            row["cached_input_clamps"] == row["raw_cached_input_anomalies"]
+            if row.get("charge_model_digest") is not None
+            else None
+        ),
+    )
+    # A row written before the clock became explicit carries no mode at all. Reading that as
+    # "nothing to compare" makes a legacy row invisible to the mixing check, so a legacy run
+    # silently passes as homogeneous next to a wall or token-charged one. Naming it instead
+    # keeps a uniformly legacy report readable while making any mixture fail the same way a
+    # wall/charged mixture does.
+    row.setdefault(
+        "clock_mode", "token_charged" if row.get("charge_model_digest") else LEGACY_CLOCK_MODE
+    )
+    row.setdefault("inference_charge_policy", None)
+    row.setdefault("llm_wall_seconds", 0.0)
+    row.setdefault("llm_wall_union_seconds", 0.0)
+    row.setdefault("llm_charged_union_seconds", 0.0)
+    row.setdefault("llm_round_trips", 0)
+    row.setdefault("llm_max_in_flight", 0)
+    row.setdefault("llm_overlapped_round_trips", 0)
     return EvaluationRecord(**row)

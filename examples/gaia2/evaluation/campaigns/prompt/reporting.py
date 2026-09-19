@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from examples.gaia2.evaluation.core import (
     GAIA_SUITES,
+    LEGACY_CLOCK_MODE,
     NON_EVALUABLE_GAIA_TERMINAL_CAUSES,
     EvaluationRecord,
     decide_acceptance_expansion,
@@ -16,6 +18,21 @@ from examples.gaia2.evaluation.core import (
 )
 
 STATISTICAL_BOOTSTRAP_SEED = 20260831
+
+
+def _optional_sum(values: Iterable[float | None]) -> float | None:
+    """Sum that propagates unavailability instead of dropping it.
+
+    Used for the parallel-charge counterfactual, which a run reports as None when its crossings
+    did not share one time axis. Skipping those would produce a total whose denominator no longer
+    matches the row's run count, which is worse than having no number at all.
+    """
+    total = 0.0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return total
 
 
 def _quality_score(record: EvaluationRecord) -> float | None:
@@ -187,6 +204,21 @@ def build_report(
     reduces_tool_catalog: bool = False,
     fresh_expansion_payloads_available: bool = False,
 ) -> dict[str, Any]:
+    mismatched_charges = [
+        record
+        for record in records
+        if record.charge_accounting_consistent is False
+        or (
+            record.charge_accounting_consistent is not None
+            and record.cached_input_clamps != record.raw_cached_input_anomalies
+        )
+    ]
+    if mismatched_charges:
+        raise ValueError("cached-input clamp counts disagree with raw usage anomaly counts")
+    # A missing mode is a legacy row, not an absence of evidence; see core.LEGACY_CLOCK_MODE.
+    clock_modes = {record.clock_mode or LEGACY_CLOCK_MODE for record in records}
+    if len(clock_modes) > 1:
+        raise ValueError(f"report mixes incomparable clock modes: {sorted(clock_modes)}")
     gaia_records = [
         record for record in records if record.suite in {"familiar", "development", "acceptance"}
     ]
@@ -317,6 +349,20 @@ def build_report(
                     if record.agent_llm_call_limit is not None
                 }
             ),
+            "charge_models": [
+                {"identity": json.loads(identity), "digest": digest}
+                for identity, digest in sorted(
+                    {
+                        (
+                            json.dumps(record.charge_model_identity, sort_keys=True),
+                            record.charge_model_digest,
+                        )
+                        for record in records
+                        if record.charge_model_identity is not None
+                        and record.charge_model_digest is not None
+                    }
+                )
+            ],
         },
         "cases": [record.to_dict(detailed_acceptance=detailed_acceptance) for record in records],
         "aggregates": {
@@ -337,6 +383,45 @@ def build_report(
                 "total": known_agent_cost + unknown_agent_cost_reserve + total_judge_reserve,
                 "agent_cost_is_upper_bound": any(
                     record.agent_cost_upper_bound for record in records
+                ),
+            },
+            "simulated_clock": {
+                "charged_seconds": sum(record.charged_seconds for record in records),
+                "clock_modes": sorted(clock_modes),
+                "inference_charge_policies": sorted(
+                    {
+                        record.inference_charge_policy
+                        for record in records
+                        if record.inference_charge_policy is not None
+                    }
+                ),
+                "llm_wall_seconds": sum(record.llm_wall_seconds for record in records),
+                "llm_wall_union_seconds": sum(record.llm_wall_union_seconds for record in records),
+                "llm_wall_overlap_seconds": sum(
+                    max(0.0, record.llm_wall_seconds - record.llm_wall_union_seconds)
+                    for record in records
+                ),
+                # One unavailable run makes the group's counterfactual unavailable too: summing
+                # the rest would silently report a total over fewer runs than the row claims.
+                "llm_charged_union_seconds": _optional_sum(
+                    record.llm_charged_union_seconds for record in records
+                ),
+                "llm_charged_overlap_seconds": _optional_sum(
+                    None
+                    if record.llm_charged_union_seconds is None
+                    else max(0.0, record.charged_seconds - record.llm_charged_union_seconds)
+                    for record in records
+                ),
+                "llm_round_trips": sum(record.llm_round_trips for record in records),
+                "llm_max_in_flight": max(
+                    (record.llm_max_in_flight for record in records), default=0
+                ),
+                "llm_overlapped_round_trips": sum(
+                    record.llm_overlapped_round_trips for record in records
+                ),
+                "cached_input_clamps": sum(record.cached_input_clamps for record in records),
+                "raw_cached_input_anomalies": sum(
+                    record.raw_cached_input_anomalies for record in records
                 ),
             },
             "acceptance_expansion": expansion,

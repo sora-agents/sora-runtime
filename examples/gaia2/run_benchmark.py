@@ -29,17 +29,16 @@ otherwise consume the scenario's full duration after successful work. A wall-clo
 (``--max-wall-seconds``) is the safety valve; ``--exit-when-idle`` opts back into the old
 single-turn quiet-window heuristic.
 
-The binding budget is usually neither of those: ARE's event loop sleeps one real second per tick, so
-``scenario.duration`` (1000s by default) is a **real-time** allowance for the whole run. Overrun it
-and the environment stops mid-run — later turns are never delivered, and the result then looks
-exactly like an agent that did nothing, so the run reports ``timeline_expired`` above its own
-verdict. ``--scenario-duration`` raises it, which does not distort the scripted world — no Gaia2
-event is pinned to an absolute timestamp, every delay is relative to the dependency that fires it,
-so a larger budget does not shift the schedule. What it does cost is comparability: the simulated
-clock advances one second per real second, so a longer run leaves ``get_current_time`` further along
-than a fast one, and a number produced under an overridden duration is not comparable to a published
-one. It also does not rescue a slow model on the *time* capability, whose events are released on a
-~4-minute real-time cadence measured from the opening user message, not from the budget.
+The binding budget is usually neither of those: ``scenario.duration`` (1000s by default) is a
+**simulated-time** allowance for the whole run. Idle time remains wall-clock paced, but the harness
+freezes the environment around each physical model call and advances it by the call's frozen token
+charge. The pre-registered rule sums concurrent calls as a conservative single inference lane and
+reports their observed wall-time union separately. ``--wall-clock`` disables the generation freeze
+for a separately labeled robustness run. Overrun the allowance and the environment stops mid-run —
+later turns are never delivered, and the result then looks exactly like an agent that did nothing,
+so the run reports ``timeline_expired`` above its own verdict. ``--scenario-duration`` raises that
+allowance. It does not shift the scripted schedule: Gaia2 delays are relative to the dependency
+that fires them. A score obtained under an override is still not comparable to the stock duration.
 
 Without ``--judge-model`` the run is unscored (the judge no-op), useful for a quick trajectory
 check — but on a *multi-turn* scenario it also silently stops after turn 1, because the later turns'
@@ -52,12 +51,16 @@ full batch harness) build on this same file.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from examples.gaia2.llm_calls import LLMCallWriter
 
 _DEFAULT_CONFIG = "examples/gaia2/agent.yaml"
+_DEFAULT_PROFILES = Path(__file__).resolve().parent / "evaluation" / "profiles.json"
+_CHARGE_MODEL = Path(__file__).resolve().parent / "evaluation" / "charge_model.json"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -140,15 +143,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="SECONDS",
         help=(
             "Override the scenario's own duration (default 1000 for a JSON benchmark scenario). "
-            "ARE's event loop is wall-clock paced -- one real second per tick -- so this is the "
-            "real-time budget the agent has to finish EVERY turn, and a slow model has the "
-            "environment expire mid-run rather than merely scoring badly. Raising it hands the "
-            "agent more time, not more of the scripted world: no event is pinned to an absolute "
-            "timestamp, and the scheduled ones (the Time capability releases calendar events "
-            "31-221s after the opening message) are relative to a dependency, so the override "
-            "does not move them. What it does change is how far the simulated clock drifts from "
-            "the scenario's start_time. A score obtained under an override is not comparable to "
-            "a published one."
+            "This is the simulated-time budget for every turn. Idle time is wall-clock paced, "
+            "while physical model calls advance it by their frozen token charge. Raising it hands "
+            "the agent more time, not more of the scripted world: scheduled events are relative "
+            "to a dependency, so the override does not move them. A score obtained under an "
+            "override is not comparable to one using the stock duration."
         ),
     )
     parser.add_argument(
@@ -159,6 +158,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Safety cap: stop after this much wall-clock even if the timeline has not ended "
             "(default 1200). The normal stop is the scenario timeline completing (see below)."
+        ),
+    )
+    parser.add_argument(
+        "--wall-clock",
+        action="store_true",
+        help=(
+            "Run the scenario on elapsed wall time instead of freezing model calls and applying "
+            "the frozen token charge. This is a robustness mode; its timing result is not "
+            "comparable to a token-charged run."
+        ),
+    )
+    parser.add_argument(
+        "--charge-profile",
+        metavar="NAME",
+        help=(
+            "Explicit frozen profile to use for token charging when automatic config matching is "
+            "ambiguous. It must still match --config exactly and cannot be combined with "
+            "--wall-clock or --allow-unfrozen-config."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unfrozen-config",
+        action="store_true",
+        help=(
+            "Allow a config outside the frozen profile set for a local/development run. This "
+            "necessarily uses wall time because no frozen coefficients exist for the config."
         ),
     )
     parser.add_argument(
@@ -179,9 +204,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--llm-calls",
         metavar="PATH",
         help=(
-            "Append one JSON line per model call (tokens, cache reads, measured latency) to this "
-            "file. This is what the charge model is fitted and validated against; the run's own "
-            "summary is unaffected."
+            "Append one JSON line per model call (tokens, cache reads, measured latency, frozen "
+            "charge) to this file. This is what the charge model is fitted and validated against."
         ),
     )
     return parser.parse_args(argv)
@@ -209,12 +233,42 @@ def main(argv: list[str] | None = None) -> None:
 
     # Lazy: ARE and the LLM client are optional dependency groups, only needed for an actual run.
     from examples.gaia2._runner import run_scenario
+    from examples.gaia2.batch import _check_operating_point, _profile_for_config
+    from examples.gaia2.evaluation.core import ChargeModelSheet, load_profiles
     from sora.adapters.are_sim import (
         attach_judge,
         initialize_turns,
         load_scenario,
         populate_oracle_events,
     )
+
+    profiles = load_profiles(_DEFAULT_PROFILES)
+    profile = None
+    if args.charge_profile and args.wall_clock:
+        raise SystemExit("--charge-profile and --wall-clock are mutually exclusive")
+    if args.charge_profile and args.allow_unfrozen_config:
+        raise SystemExit("--charge-profile and --allow-unfrozen-config are mutually exclusive")
+    if args.allow_unfrozen_config:
+        if not os.path.isfile(args.config):
+            raise SystemExit(f"--config does not exist: {args.config}")
+        args.wall_clock = True
+        print("unfrozen config: using wall clock (development mode; not sweep-comparable)")
+    elif args.charge_profile:
+        if args.charge_profile not in profiles:
+            raise SystemExit(
+                f"unknown charge profile {args.charge_profile!r}; have {sorted(profiles)}"
+            )
+        profile = profiles[args.charge_profile]
+        if not os.path.isfile(args.config):
+            raise SystemExit(f"--config does not exist: {args.config}")
+        _check_operating_point(profile, args.config)
+        print(f"explicit charge profile {profile.name} -> {profile.model} at {profile.endpoint}")
+    else:
+        # Wall-clock is a timing policy, not permission to drift off the frozen operating point.
+        profile = _profile_for_config(profiles, args.config)
+    charge_sheet = ChargeModelSheet.load(_CHARGE_MODEL)
+    profile_charge = None if profile is None else charge_sheet.charge_for(profile)
+    charge = None if args.wall_clock else profile_charge
 
     print(f"loading scenario {args.scenario!r} ...", flush=True)
     scenario: Any = load_scenario(args.scenario)
@@ -290,6 +344,9 @@ def main(argv: list[str] | None = None) -> None:
             verdict_parse="stock" if args.strict_verdict_case else "case-insensitive",
             llm_calls=llm_calls,
             scenario_id=getattr(scenario, "scenario_id", None),
+            charge=charge,
+            charge_model_identity=(profile_charge.identity if profile_charge is not None else None),
+            charge_model_digest=charge_sheet.digest if profile_charge is not None else None,
         )
     except KeyboardInterrupt:
         print("\nrun aborted (Ctrl-C) — skipping validation")
@@ -298,6 +355,35 @@ def main(argv: list[str] | None = None) -> None:
         if llm_calls is not None:
             llm_calls.close()
             print(f"    wrote {llm_calls.written} model calls to {llm_calls.path}")
+
+    raw_anomalies = int(getattr(result, "raw_cached_input_anomalies", 0))
+    if charge is not None and charge.cached_input_clamps != raw_anomalies:
+        print(
+            "warning: charge clamp count disagrees with independently counted raw usage "
+            f"anomalies ({charge.cached_input_clamps} != {raw_anomalies})"
+        )
+    if charge is None:
+        print("scenario clock: wall (robustness mode; not comparable to token-charged runs)")
+    else:
+        assert profile is not None
+        print(
+            f"simulated clock: {float(getattr(result, 'charged_seconds', 0.0)):.2f}s charged "
+            f"({profile.name}, {charge_sheet.digest})"
+        )
+        print(
+            "inference charge sensitivity: "
+            f"sum={float(getattr(result, 'charged_seconds', 0.0)):.2f}s, "
+            f"parallel-union={float(getattr(result, 'llm_charged_union_seconds', 0.0)):.2f}s "
+            "(trajectory policy: serialized_sum); "
+            f"wall sum/union={float(getattr(result, 'llm_wall_seconds', 0.0)):.2f}/"
+            f"{float(getattr(result, 'llm_wall_union_seconds', 0.0)):.2f}s"
+        )
+        print(
+            "inference concurrency: "
+            f"max={int(getattr(result, 'llm_max_in_flight', 0))}, "
+            f"overlapped={int(getattr(result, 'llm_overlapped_round_trips', 0))}/"
+            f"{int(getattr(result, 'llm_round_trips', 0))} physical crossings"
+        )
 
     _print_score(result, scored=bool(args.judge_model))
     _report_judge_recording(result.judge_recording, args.judge_recording)

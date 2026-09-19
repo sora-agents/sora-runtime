@@ -1751,3 +1751,83 @@ def test_every_runnable_profile_is_chargeable() -> None:
     sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
     for profile in load_profiles(EVAL_ROOT / "profiles.json").values():
         assert sheet.for_profile(profile).provider == profile.provider, profile.name
+
+
+def test_report_carries_charge_identity_digest_and_anomaly_totals() -> None:
+    record = EvaluationRecord(
+        arm="candidate",
+        profile="gpt-5.4-medium-prompt",
+        suite="development",
+        capability="time",
+        case_id="clock",
+        repeat=0,
+        score=1.0,
+        passed=True,
+        charged_seconds=12.5,
+        charge_model_identity={
+            "model": "gpt-5.4-2026-03-05",
+            "provider": "openai",
+            "provider_routing": None,
+        },
+        charge_model_digest="digest",
+        cached_input_clamps=1,
+        raw_cached_input_anomalies=1,
+        clock_mode="token_charged",
+        inference_charge_policy="serialized_sum",
+        llm_wall_seconds=15.0,
+        llm_wall_union_seconds=12.0,
+        llm_charged_union_seconds=8.0,
+        llm_round_trips=4,
+        llm_max_in_flight=2,
+        llm_overlapped_round_trips=3,
+    )
+
+    report = build_report([record])
+
+    assert report["provenance"]["charge_models"] == [
+        {"identity": record.charge_model_identity, "digest": "digest"}
+    ]
+    assert report["aggregates"]["simulated_clock"] == {
+        "charged_seconds": 12.5,
+        "clock_modes": ["token_charged"],
+        "inference_charge_policies": ["serialized_sum"],
+        "llm_wall_seconds": 15.0,
+        "llm_wall_union_seconds": 12.0,
+        "llm_wall_overlap_seconds": 3.0,
+        "llm_charged_union_seconds": 8.0,
+        "llm_charged_overlap_seconds": 4.5,
+        "llm_round_trips": 4,
+        "llm_max_in_flight": 2,
+        "llm_overlapped_round_trips": 3,
+        "cached_input_clamps": 1,
+        "raw_cached_input_anomalies": 1,
+    }
+    assert report["cases"][0]["charge_model_digest"] == "digest"
+
+
+def test_report_fails_when_charge_clamps_disagree_with_raw_usage() -> None:
+    record = EvaluationRecord(
+        arm="candidate",
+        profile="profile",
+        suite="development",
+        capability="time",
+        case_id="clock",
+        repeat=0,
+        score=None,
+        passed=None,
+        cached_input_clamps=1,
+        raw_cached_input_anomalies=0,
+        charge_accounting_consistent=False,
+    )
+
+    with pytest.raises(ValueError, match="clamp counts disagree"):
+        build_report([record])
+
+
+def test_report_fails_when_clock_modes_are_mixed() -> None:
+    base = EvaluationRecord.example(arm="baseline", suite="development", case_id="clock", score=1.0)
+    charged = replace(base, clock_mode="token_charged")
+    wall = replace(base, arm="candidate", clock_mode="wall")
+
+    with pytest.raises(ValueError, match="incomparable clock modes"):
+        build_report([charged, wall])
