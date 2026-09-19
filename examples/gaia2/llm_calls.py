@@ -15,10 +15,9 @@ and ARE's ReAct agent discards its token counts entirely (see ``react_engine``).
 one durable schema both harnesses write into, so a run's calls are comparable across arms without
 a per-arm parser.
 
-The JSONL is the source of truth for the fit and for billing. It is deliberately *not* the same
-channel as the charge itself: ARE's clock sees only the single ``completion_duration`` float the
-engine hands back per step, and that float can undercount (see ``react_engine``), while every
-round-trip lands here regardless.
+The JSONL is the source of truth for the fit and for billing. It is deliberately *not* the clock
+control channel: the harness resumes each arm's pause bracket from its own per-crossing account,
+while every physical round-trip lands here regardless.
 """
 
 from __future__ import annotations
@@ -26,12 +25,26 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import asdict, dataclass
+import time
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
+
+from sora.llm import CompletionRequest, LLMClient, current_llm_call_id, llm_call_scope
 
 Arm = Literal["sora", "react", "grid"]
+
+
+class Charge(Protocol):
+    def __call__(self, total_input: int, cached_input: int, output: int) -> float: ...
+
+
+class GenerationClock(Protocol):
+    def pause_generation(self) -> int: ...
+    def generation_charge_time(self, token: int) -> float: ...
+    def resume_generation(self, token: int, offset: float) -> None: ...
 
 
 def read_finish_reason(response: Any) -> str | None:
@@ -80,6 +93,114 @@ def read_usage(response: Any) -> tuple[int, int | None, int, int | None, str | N
 
 
 @dataclass(frozen=True)
+class RoundTripWindow:
+    """One physical model crossing on the wall and counterfactual charged-clock axes."""
+
+    started_at: float
+    finished_at: float
+    charged_seconds: float
+    # Scenario elapsed time on the parallel-charge sensitivity axis when this crossing was
+    # admitted. Calls admitted before any sibling settles share a coordinate; a follow-up admitted
+    # after a completion starts at the settled parallel frontier instead.
+    charged_started_at: float | None = None
+
+    @property
+    def wall_seconds(self) -> float:
+        return max(0.0, self.finished_at - self.started_at)
+
+
+def _interval_union_seconds(intervals: Iterable[tuple[float, float]]) -> float:
+    intervals = sorted((start, max(start, end)) for start, end in intervals)
+    if not intervals:
+        return 0.0
+    total = 0.0
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        total += current_end - current_start
+        current_start, current_end = start, end
+    return total + current_end - current_start
+
+
+def wall_time_union_seconds(windows: Iterable[RoundTripWindow]) -> float:
+    """Return the union of physical model-call wall intervals, counting overlap once."""
+    return _interval_union_seconds((window.started_at, window.finished_at) for window in windows)
+
+
+def charged_time_union_seconds(windows: Iterable[RoundTripWindow]) -> float | None:
+    """Return the union counterfactual for parallel token-charged inference, or None.
+
+    The axis is chosen once for the whole collection, never per window. ``charged_started_at`` is
+    scenario-elapsed time on the charged clock; ``started_at`` is host ``time.monotonic``. Those
+    are different origins *and* different rates, so sweeping an interval union across a mixture of
+    the two produces a number in no coordinate system at all — it is not merely imprecise.
+
+    A run can genuinely produce the mixture: a crossing admitted after the online judge stopped
+    the environment gets the no-op token and so carries no charged coordinate, while every earlier
+    crossing in the same run does. Rather than emit a plausible-looking figure into a paid
+    artifact, the union is declared unavailable for that run. A collection where *no* window has
+    the coordinate is a pre-freeze record and still has one coherent axis, so it keeps the host
+    monotonic reading.
+    """
+    material = tuple(windows)
+    if not material:
+        return 0.0
+    charged = [window.charged_started_at is not None for window in material]
+    if any(charged) and not all(charged):
+        return None
+    return _interval_union_seconds(
+        (
+            start := (
+                window.charged_started_at
+                if window.charged_started_at is not None
+                else window.started_at
+            ),
+            start + max(0.0, window.charged_seconds),
+        )
+        for window in material
+    )
+
+
+@dataclass(frozen=True)
+class RoundTripConcurrency:
+    """Host-wall concurrency observed across physical model crossings."""
+
+    round_trips: int
+    max_in_flight: int
+    overlapped_round_trips: int
+
+
+def round_trip_concurrency(windows: Iterable[RoundTripWindow]) -> RoundTripConcurrency:
+    """Count physical crossings and positive-duration overlap on the host wall clock."""
+    material = tuple(windows)
+    overlapped: set[int] = set()
+    events: list[tuple[float, int, int]] = []
+    for index, window in enumerate(material):
+        start = window.started_at
+        end = max(start, window.finished_at)
+        if end <= start:
+            continue
+        # Ends sort before starts at the same instant, so touching intervals do not overlap.
+        events.append((start, 1, index))
+        events.append((end, -1, index))
+
+    active: set[int] = set()
+    max_in_flight = 0
+    for _at, delta, index in sorted(events, key=lambda event: (event[0], event[1])):
+        if delta < 0:
+            active.discard(index)
+            continue
+        if active:
+            overlapped.add(index)
+            overlapped.update(active)
+        active.add(index)
+        max_in_flight = max(max_in_flight, len(active))
+    return RoundTripConcurrency(len(material), max_in_flight, len(overlapped))
+
+
+@dataclass(frozen=True)
 class LLMCallRecord:
     """One logical model call. ``round_trips`` is how many times the wire was actually crossed for
     it — a parser-repair pass on the S-ORA side, a malformed-output retry on the ReAct side — with
@@ -106,6 +227,9 @@ class LLMCallRecord:
     round_trips: int
     finish_reason: str | None
     charged_seconds: float | None = None
+    # One entry per physical crossing. Unlike the aggregate ``seconds``, these intervals preserve
+    # overlap on both the host and charged-clock axes after a paid sweep.
+    round_trip_windows: tuple[RoundTripWindow, ...] = ()
     scenario_id: str | None = None
     run_number: int | None = None
     # Groups the rows that one charged step produced. Set on the ReAct arm, where ARE calls the
@@ -204,6 +328,11 @@ class _Partial:
     finish_reason: str | None = None
     model: str | None = None
     semantic_label: str | None = None
+    charged_seconds: float | None = None
+    # Physical usage samples are retained because the frozen model has one intercept per crossing.
+    # Charging a repaired call from the aggregate row would pay that intercept only once.
+    usage_samples: list[tuple[int, int | None, int]] = field(default_factory=list)
+    round_trip_windows: list[RoundTripWindow] = field(default_factory=list)
 
     @property
     def usage_complete(self) -> bool:
@@ -238,6 +367,17 @@ class _Partial:
         self.finish_reason = getattr(record, "llm_finish_reason", None) or self.finish_reason
         self.model = getattr(record, "llm_observed_model", None) or self.model
         self.semantic_label = getattr(record, "llm_semantic_label", None) or self.semantic_label
+        input_tokens = getattr(record, "llm_input_tokens", None)
+        output_tokens = getattr(record, "llm_output_tokens", None)
+        cached_input_tokens = getattr(record, "llm_cached_input_tokens", None)
+        if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+            self.usage_samples.append(
+                (
+                    input_tokens,
+                    cached_input_tokens if isinstance(cached_input_tokens, int) else None,
+                    output_tokens,
+                )
+            )
 
     def add_done(self, record: logging.LogRecord) -> None:
         self.done_records += 1
@@ -264,18 +404,24 @@ class SoraCallRecorder(logging.Handler):
 
     def __init__(
         self,
-        writer: LLMCallWriter,
+        writer: LLMCallWriter | None,
         *,
         model: str | None = None,
         scenario_id: str | None = None,
         run_number: int | None = None,
+        charge: Charge | None = None,
     ) -> None:
         super().__init__(level=logging.INFO)
         self._writer = writer
         self._model = model
         self._scenario_id = scenario_id
         self._run_number = run_number
+        self._charge = charge
         self._partials: dict[str, _Partial] = {}
+        self._closed_round_trip_windows: tuple[RoundTripWindow, ...] = ()
+        self._lock = threading.RLock()
+        self.raw_cached_input_anomalies = 0
+        self.charged_seconds = 0.0
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -283,14 +429,22 @@ class SoraCallRecorder(logging.Handler):
             call_id = getattr(record, "llm_call_id", None)
             if not isinstance(call_id, str):
                 return
-            if event == "usage":
-                self._partials.setdefault(call_id, _Partial()).add_usage(record)
-            elif event == "done":
-                self._partials.setdefault(call_id, _Partial()).add_done(record)
+            with self._lock:
+                if event == "usage":
+                    partial = self._partials.setdefault(call_id, _Partial())
+                    partial.add_usage(record)
+                    cached = getattr(record, "llm_cached_input_tokens", None)
+                    total = getattr(record, "llm_input_tokens", None)
+                    if isinstance(cached, int) and isinstance(total, int) and cached > total:
+                        self.raw_cached_input_anomalies += 1
+                elif event == "done":
+                    self._partials.setdefault(call_id, _Partial()).add_done(record)
         except Exception:  # a diagnostic must never take down the run it is observing
             self.handleError(record)
 
     def _flush(self, call_id: str, partial: _Partial) -> None:
+        if self._writer is None:
+            return
         self._writer.write(
             LLMCallRecord(
                 call_id=call_id,
@@ -307,14 +461,156 @@ class SoraCallRecorder(logging.Handler):
                 scenario_id=self._scenario_id,
                 run_number=self._run_number,
                 usage_captured=partial.usage_complete,
+                charged_seconds=partial.charged_seconds,
+                round_trip_windows=tuple(partial.round_trip_windows),
             )
         )
+
+    def begin_round_trip(self, call_id: str) -> int:
+        """Return this logical call's usage index before one physical crossing begins."""
+        with self._lock:
+            return len(self._partials.setdefault(call_id, _Partial()).usage_samples)
+
+    def finish_round_trip(
+        self,
+        call_id: str,
+        usage_index: int,
+        *,
+        started_at: float,
+        finished_at: float,
+        charged_started_at: float | None = None,
+    ) -> float:
+        """Price exactly one crossing, including the fixed term when usage was unavailable."""
+        with self._lock:
+            partial = self._partials.setdefault(call_id, _Partial())
+            sample = (
+                partial.usage_samples[usage_index]
+                if usage_index < len(partial.usage_samples)
+                else None
+            )
+            if self._charge is None:
+                charged = 0.0
+            elif sample is None:
+                charged = self._charge(0, 0, 0)
+            else:
+                total, cached, output = sample
+                # Unknown cache usage is conservatively uncached input.
+                charged = self._charge(total, cached or 0, output)
+            if self._charge is not None:
+                partial.charged_seconds = (partial.charged_seconds or 0.0) + charged
+            partial.round_trip_windows.append(
+                RoundTripWindow(
+                    started_at=started_at,
+                    finished_at=max(started_at, finished_at),
+                    charged_seconds=charged,
+                    charged_started_at=charged_started_at,
+                )
+            )
+            if self._charge is not None:
+                self.charged_seconds += charged
+            return charged
+
+    @property
+    def round_trip_windows(self) -> tuple[RoundTripWindow, ...]:
+        with self._lock:
+            current = tuple(
+                window
+                for partial in self._partials.values()
+                for window in partial.round_trip_windows
+            )
+            return self._closed_round_trip_windows + current
+
+    @property
+    def wall_seconds(self) -> float:
+        return sum(window.wall_seconds for window in self.round_trip_windows)
+
+    @property
+    def wall_union_seconds(self) -> float:
+        return wall_time_union_seconds(self.round_trip_windows)
+
+    @property
+    def charged_union_seconds(self) -> float | None:
+        # None when the run mixed charged and host-monotonic coordinates; see the function.
+        return charged_time_union_seconds(self.round_trip_windows)
+
+    @property
+    def concurrency(self) -> RoundTripConcurrency:
+        return round_trip_concurrency(self.round_trip_windows)
 
     def close(self) -> None:
         # Every row is written here, in the order the calls first appeared. A call that never got
         # its `done` (the process died between the two records) still lands, with seconds=None
         # rather than being dropped: the file has to stay a complete account of what was billed.
-        for call_id, partial in list(self._partials.items()):
-            self._flush(call_id, partial)
-        self._partials.clear()
+        with self._lock:
+            for call_id, partial in list(self._partials.items()):
+                self._flush(call_id, partial)
+            self._closed_round_trip_windows += tuple(
+                window
+                for partial in self._partials.values()
+                for window in partial.round_trip_windows
+            )
+            self._partials.clear()
         super().close()
+
+
+class ClockedSoraLLMClient:
+    """Time every physical S-ORA round-trip and optionally freeze ARE around it."""
+
+    def __init__(
+        self,
+        inner: LLMClient,
+        *,
+        clock: GenerationClock | None,
+        recorder: SoraCallRecorder,
+    ) -> None:
+        self._inner = inner
+        self._clock = clock
+        self._recorder = recorder
+        self.model = getattr(inner, "model", None)
+
+    @property
+    def logical_calls_admitted(self) -> int:
+        value = getattr(self._inner, "logical_calls_admitted", 0)
+        return int(value) if isinstance(value, int) else 0
+
+    @property
+    def logical_call_limit_exceeded(self) -> bool:
+        return bool(getattr(self._inner, "logical_call_limit_exceeded", False))
+
+    async def complete(self, request: CompletionRequest) -> str:
+        # Establishing the scope outside the metering decorator gives this wrapper the same id the
+        # usage/done records carry. A parser repair enters an existing scope and therefore charges
+        # a second physical crossing without creating a second logical call.
+        with llm_call_scope() as call_id:
+            assert current_llm_call_id.get() == call_id
+            started_at = time.monotonic()
+            usage_index = self._recorder.begin_round_trip(call_id)
+            token = self._clock.pause_generation() if self._clock is not None else None
+            charged_started_at: float | None = None
+            try:
+                if self._clock is not None and token is not None and token != 0:
+                    # Probed inside the guarded region on purpose. The line above has already
+                    # frozen the world, so from here on every exit path owes a resume; reading
+                    # the charge axis before the `try` put one statement outside that guarantee.
+                    charged_started_at = self._clock.generation_charge_time(token)
+                return await self._inner.complete(request)
+            finally:
+                # Releasing the freeze is the one step that must happen. ARE's loop thread waits
+                # on `pause_event` with no timeout, so a raise between here and `resume_generation`
+                # does not fail one call -- it parks the scenario forever, and the wall-clock
+                # watchdog is then the only thing that ends the run.
+                charged = 0.0
+                try:
+                    charged = self._recorder.finish_round_trip(
+                        call_id,
+                        usage_index,
+                        started_at=started_at,
+                        finished_at=time.monotonic(),
+                        charged_started_at=charged_started_at,
+                    )
+                finally:
+                    # Charging zero for a crossing whose usage could not be recorded understates
+                    # simulated time for that call. That is the deliberate direction: the run
+                    # stays live and the loss is visible as a missing round-trip in the trace.
+                    if self._clock is not None and token is not None:
+                        self._clock.resume_generation(token, charged)

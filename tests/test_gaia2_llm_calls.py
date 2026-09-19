@@ -16,6 +16,7 @@ is the one asserted directly.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import logging
@@ -25,7 +26,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from examples.gaia2.llm_calls import LLMCallRecord, LLMCallWriter, SoraCallRecorder
+from examples.gaia2.evaluation.core import ChargeCoefficients, TotalInputCharge
+from examples.gaia2.llm_calls import (
+    ClockedSoraLLMClient,
+    LLMCallRecord,
+    LLMCallWriter,
+    RoundTripWindow,
+    SoraCallRecorder,
+    charged_time_union_seconds,
+    round_trip_concurrency,
+    wall_time_union_seconds,
+)
 
 from sora.llm import (
     CompletionRequest,
@@ -322,6 +333,284 @@ async def test_join_against_the_real_metered_client(
     assert row["semantic_label"] == "plan"
 
 
+def _charge() -> TotalInputCharge:
+    return TotalInputCharge(
+        ChargeCoefficients(
+            model="model",
+            provider="provider",
+            provider_routing_json=None,
+            a0_seconds=1.0,
+            seconds_per_uncached_input_token=0.1,
+            seconds_per_cached_input_token=0.01,
+            seconds_per_output_token=0.2,
+            decode_includes_reasoning=True,
+            fit={},
+            note="test",
+        )
+    )
+
+
+class _GenerationClock:
+    def __init__(self) -> None:
+        self.next_token = 0
+        self.active: set[int] = set()
+        self.completed: list[tuple[int, float]] = []
+        self.charge_time = 0.0
+        self.pause_origin: float | None = None
+        self.pending_charge = 0.0
+        self.parallel_frontier = 0.0
+        self.charge_starts: dict[int, float] = {}
+
+    def pause_generation(self) -> int:
+        if not self.active:
+            self.pause_origin = self.charge_time
+            self.pending_charge = 0.0
+            self.parallel_frontier = self.charge_time
+        self.next_token += 1
+        self.active.add(self.next_token)
+        self.charge_starts[self.next_token] = self.parallel_frontier
+        return self.next_token
+
+    def generation_charge_time(self, token: int) -> float:
+        return self.charge_starts[token]
+
+    def resume_generation(self, token: int, offset: float) -> None:
+        self.active.remove(token)
+        self.completed.append((token, offset))
+        self.pending_charge += offset
+        self.parallel_frontier = max(self.parallel_frontier, self.charge_starts.pop(token) + offset)
+        if not self.active:
+            assert self.pause_origin is not None
+            self.charge_time = self.pause_origin + self.pending_charge
+            self.pause_origin = None
+
+
+def test_wall_time_union_counts_overlapping_crossings_once() -> None:
+    windows = (
+        RoundTripWindow(started_at=10.0, finished_at=20.0, charged_seconds=7.0),
+        RoundTripWindow(started_at=12.0, finished_at=14.0, charged_seconds=2.0),
+        RoundTripWindow(started_at=25.0, finished_at=28.0, charged_seconds=3.0),
+    )
+
+    assert sum(window.wall_seconds for window in windows) == 15.0
+    assert wall_time_union_seconds(windows) == 13.0
+
+
+def test_charged_union_uses_charge_duration_not_provider_latency() -> None:
+    windows = (
+        RoundTripWindow(
+            started_at=10.0,
+            finished_at=11.0,
+            charged_seconds=4.0,
+            charged_started_at=2.0,
+        ),
+        RoundTripWindow(
+            started_at=10.7,
+            finished_at=11.0,
+            charged_seconds=4.0,
+            charged_started_at=2.0,
+        ),
+    )
+
+    assert sum(window.charged_seconds for window in windows) == 8.0
+    assert wall_time_union_seconds(windows) == pytest.approx(1.0)
+    assert charged_time_union_seconds(windows) == pytest.approx(4.0)
+
+
+def test_round_trip_concurrency_counts_depth_and_each_overlapped_crossing() -> None:
+    windows = (
+        RoundTripWindow(0.0, 4.0, 1.0),
+        RoundTripWindow(1.0, 2.0, 1.0),
+        RoundTripWindow(2.0, 3.0, 1.0),  # touches the second; overlaps only the first
+        RoundTripWindow(5.0, 6.0, 1.0),
+    )
+
+    stats = round_trip_concurrency(windows)
+
+    assert stats.round_trips == 4
+    assert stats.max_in_flight == 2
+    assert stats.overlapped_round_trips == 3
+
+
+async def test_sora_parser_repair_charges_each_physical_round_trip(tmp_path: Path) -> None:
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            log_llm_usage(
+                LLMUsage(input_tokens=10, cached_input_tokens=4, output_tokens=2, answer_chars=2),
+                request,
+            )
+            return "{}"
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    charge = _charge()
+    recorder = SoraCallRecorder(writer, charge=charge)
+    clock = _GenerationClock()
+    client = ClockedSoraLLMClient(MeteredLLMClient(_Client()), clock=clock, recorder=recorder)
+    log = logging.getLogger("sora")
+    log.setLevel(logging.INFO)
+    log.addHandler(recorder)
+    try:
+        with llm_call_scope():
+            await client.complete(_request())
+            await client.complete(_request())
+    finally:
+        log.removeHandler(recorder)
+        recorder.close()
+        writer.close()
+
+    (row,) = _rows(writer.path)
+    per_trip = 1.0 + 6 * 0.1 + 4 * 0.01 + 2 * 0.2
+    assert row["round_trips"] == 2
+    assert len(row["round_trip_windows"]) == 2
+    assert [window["charged_started_at"] for window in row["round_trip_windows"]] == pytest.approx(
+        [0.0, per_trip]
+    )
+    assert charged_time_union_seconds(recorder.round_trip_windows) == pytest.approx(2 * per_trip)
+    assert row["charged_seconds"] == pytest.approx(2 * per_trip)
+    assert charge.charged_seconds == pytest.approx(2 * per_trip)
+    assert [token for token, _seconds in clock.completed] == [1, 2]
+    assert [seconds for _token, seconds in clock.completed] == pytest.approx([per_trip, per_trip])
+    # Closing flushes rows but must not erase the offline sensitivity source.
+    assert len(recorder.round_trip_windows) == 2
+    assert recorder.wall_seconds > 0.0
+
+
+async def test_concurrent_sora_calls_stay_paused_until_reverse_order_completion(
+    tmp_path: Path,
+) -> None:
+    started = {name: asyncio.Event() for name in ("first", "second")}
+    release = {name: asyncio.Event() for name in ("first", "second")}
+
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            started[request.user].set()
+            await release[request.user].wait()
+            log_llm_usage(LLMUsage(input_tokens=1, output_tokens=1, answer_chars=1), request)
+            return "{}"
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    recorder = SoraCallRecorder(writer, charge=_charge())
+    clock = _GenerationClock()
+    client = ClockedSoraLLMClient(MeteredLLMClient(_Client()), clock=clock, recorder=recorder)
+    log = logging.getLogger("sora")
+    log.setLevel(logging.INFO)
+    log.addHandler(recorder)
+    requests = [
+        CompletionRequest(system="s", user=name, semantic_label="plan", prompt_version="1")
+        for name in ("first", "second")
+    ]
+    wall_seconds = 0.0
+    wall_union_seconds = 0.0
+    charged_union_seconds: float | None = 0.0
+    try:
+        tasks = [asyncio.create_task(client.complete(request)) for request in requests]
+        await asyncio.gather(*(event.wait() for event in started.values()))
+        assert len(clock.active) == 2
+        release["second"].set()
+        await tasks[1]
+        assert len(clock.active) == 1
+        release["first"].set()
+        await tasks[0]
+        wall_seconds = recorder.wall_seconds
+        wall_union_seconds = recorder.wall_union_seconds
+        charged_union_seconds = recorder.charged_union_seconds
+    finally:
+        log.removeHandler(recorder)
+        recorder.close()
+        writer.close()
+
+    assert [token for token, _charge_seconds in clock.completed] == [2, 1]
+    rows = _rows(writer.path)
+    assert len(rows) == 2
+    assert all(len(row["round_trip_windows"]) == 1 for row in rows)
+    assert {row["round_trip_windows"][0]["charged_started_at"] for row in rows} == {0.0}
+    assert wall_union_seconds < wall_seconds
+    assert charged_union_seconds is not None
+    assert charged_union_seconds < recorder.charged_seconds
+    assert recorder.concurrency.round_trips == 2
+    assert recorder.concurrency.max_in_flight == 2
+    assert recorder.concurrency.overlapped_round_trips == 2
+
+
+async def test_sora_failure_without_usage_still_pays_the_fixed_term(tmp_path: Path) -> None:
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            raise RuntimeError("provider failed")
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    charge = _charge()
+    recorder = SoraCallRecorder(writer, charge=charge)
+    clock = _GenerationClock()
+    client = ClockedSoraLLMClient(MeteredLLMClient(_Client()), clock=clock, recorder=recorder)
+    log = logging.getLogger("sora")
+    log.setLevel(logging.INFO)
+    log.addHandler(recorder)
+    try:
+        with pytest.raises(RuntimeError, match="provider failed"):
+            await client.complete(_request())
+    finally:
+        log.removeHandler(recorder)
+        recorder.close()
+        writer.close()
+
+    (row,) = _rows(writer.path)
+    assert row["usage_captured"] is False
+    assert row["charged_seconds"] == pytest.approx(1.0)
+    assert clock.completed == [(1, 1.0)]
+
+
+async def test_wall_clock_sora_records_a_window_without_pausing_or_charging(tmp_path: Path) -> None:
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            log_llm_usage(LLMUsage(input_tokens=2, output_tokens=1, answer_chars=1), request)
+            return "{}"
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    recorder = SoraCallRecorder(writer, charge=None)
+    client = ClockedSoraLLMClient(MeteredLLMClient(_Client()), clock=None, recorder=recorder)
+    log = logging.getLogger("sora")
+    log.setLevel(logging.INFO)
+    log.addHandler(recorder)
+    try:
+        await client.complete(_request())
+    finally:
+        log.removeHandler(recorder)
+        recorder.close()
+        writer.close()
+
+    (row,) = _rows(writer.path)
+    assert row["charged_seconds"] is None
+    assert len(row["round_trip_windows"]) == 1
+    assert row["round_trip_windows"][0]["charged_seconds"] == 0.0
+
+
+async def test_sora_cache_clamp_has_an_independent_raw_anomaly_count(tmp_path: Path) -> None:
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            log_llm_usage(
+                LLMUsage(input_tokens=5, cached_input_tokens=8, output_tokens=1, answer_chars=1),
+                request,
+            )
+            return "{}"
+
+    charge = _charge()
+    recorder = SoraCallRecorder(None, charge=charge)
+    client = ClockedSoraLLMClient(
+        MeteredLLMClient(_Client()), clock=_GenerationClock(), recorder=recorder
+    )
+    log = logging.getLogger("sora")
+    log.setLevel(logging.INFO)
+    log.addHandler(recorder)
+    try:
+        await client.complete(_request())
+    finally:
+        log.removeHandler(recorder)
+        recorder.close()
+
+    assert charge.cached_input_clamps == 1
+    assert recorder.raw_cached_input_anomalies == 1
+
+
 # -- the ReAct arm -------------------------------------------------------------------------------
 
 # Skip-gated per test rather than at module scope: the S-ORA half above needs no ARE, and a
@@ -572,7 +861,9 @@ def test_charge_model_replaces_measured_latency(
 
     assert metadata is not None
     assert metadata["completion_duration"] == pytest.approx(1.0 + 2.0 + 5.0)
-    assert _rows(writer.path)[0]["charged_seconds"] == pytest.approx(8.0)
+    row = _rows(writer.path)[0]
+    assert row["charged_seconds"] == pytest.approx(8.0)
+    assert len(row["round_trip_windows"]) == 1
     # The measurement survives beside the charge: a pricing rule has to stay auditable against it.
     assert metadata["measured_seconds"] > 0
 
@@ -914,3 +1205,83 @@ def test_from_profile_runs_the_arm_at_the_profiles_operating_point() -> None:
     assert sent["timeout"] == 600 and sent["num_retries"] == 0
     # Omitted settings are absent, never present-and-null.
     assert "reasoning_effort" not in sent and "top_p" not in sent
+
+
+def test_charged_union_is_unavailable_when_the_collection_mixes_time_axes() -> None:
+    """Scenario-elapsed and host-monotonic starts cannot share an interval sweep.
+
+    A run produces the mixture for real: a crossing admitted after the online judge stopped the
+    environment gets the no-op token and so carries no charged coordinate, while every earlier
+    crossing in the same run does. Sweeping both together yields a number in no coordinate system,
+    so the union is declared unavailable instead.
+    """
+    charged = RoundTripWindow(
+        started_at=1_000_000.0, finished_at=1_000_002.0, charged_seconds=2.0, charged_started_at=5.0
+    )
+    uncharted = RoundTripWindow(
+        started_at=1_000_003.0, finished_at=1_000_004.0, charged_seconds=1.0
+    )
+
+    assert charged_time_union_seconds([charged, uncharted]) is None
+    # Each half on its own is a single coherent axis and still reports.
+    assert charged_time_union_seconds([charged]) == pytest.approx(2.0)
+    assert charged_time_union_seconds([uncharted]) == pytest.approx(1.0)
+    assert charged_time_union_seconds([]) == 0.0
+
+
+async def test_a_failing_charge_probe_still_releases_the_frozen_world(tmp_path: Path) -> None:
+    """A raise between the freeze and the `try` used to park the scenario, not fail the call.
+
+    ARE's loop thread waits on `pause_event` with no timeout, so a crossing that acquires the
+    freeze and then dies before reaching its resume does not surface as an inference error -- the
+    environment simply never ticks again, and only the wall-clock watchdog ends the run.
+    """
+
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            raise AssertionError("the probe should fail before the provider is reached")
+
+    class _UnreadableClock(_GenerationClock):
+        def generation_charge_time(self, token: int) -> float:
+            raise RuntimeError("charge axis unavailable")
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    recorder = SoraCallRecorder(writer, charge=_charge())
+    clock = _UnreadableClock()
+    client = ClockedSoraLLMClient(MeteredLLMClient(_Client()), clock=clock, recorder=recorder)
+    try:
+        with pytest.raises(RuntimeError, match="charge axis unavailable"):
+            await client.complete(_request())
+    finally:
+        recorder.close()
+        writer.close()
+
+    assert clock.active == set(), "the freeze outlived the crossing that took it"
+    assert clock.completed == [(1, 1.0)], "the failed crossing still owes its fixed term"
+
+
+async def test_a_failing_recorder_still_releases_the_frozen_world(tmp_path: Path) -> None:
+    """The same leak on the other side of the call: teardown must reach `resume_generation`."""
+
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            return "answer"
+
+    class _BrokenRecorder(SoraCallRecorder):
+        def finish_round_trip(self, *args: Any, **kwargs: Any) -> float:
+            raise RuntimeError("recorder failed")
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    recorder = _BrokenRecorder(writer, charge=_charge())
+    clock = _GenerationClock()
+    client = ClockedSoraLLMClient(MeteredLLMClient(_Client()), clock=clock, recorder=recorder)
+    try:
+        with pytest.raises(RuntimeError, match="recorder failed"):
+            await client.complete(_request())
+    finally:
+        writer.close()
+
+    assert clock.active == set()
+    # Zero is the deliberate direction: an uncharged call understates simulated time, where a
+    # leaked freeze would hang the scenario outright.
+    assert clock.completed == [(1, 0.0)]

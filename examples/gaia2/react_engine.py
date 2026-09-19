@@ -2,17 +2,17 @@
 
 Why this exists
 ---------------
-ARE's own ReAct agent is charged for its thinking through exactly one channel: ``step()`` pauses
-the environment clock, calls the engine, and resumes it by ``completion_duration`` taken from the
-engine's metadata dict (``base_agent.py``; ``get_offset_from_time_config_mode`` returns that float
-verbatim in the default ``"measured"`` mode). The channel is ARE's own and is fully wired — but
+ARE's own ReAct agent brackets its thinking through exactly one channel: ``step()`` pauses the
+environment clock, calls the engine, and resumes it with an offset. The harness keeps that bracket
+but substitutes its independently computed charge for ARE's measured ``completion_duration`` — so
+provider latency cannot leak into the frozen clock. ARE's native
 ``LiteLLMEngine.chat_completion`` ends with ``return res, None``, throwing away a ``ModelResponse``
 that carries the entire ``usage`` block. Every shipped engine does the same, which is why every
 published leaderboard row describes an agent that thinks instantaneously.
 
-Feeding that dict is the whole integration: no patch to ARE is needed, a subclass suffices. The
-same object later carries the frozen charge (pass ``charge=``), so instrumenting the arm and
-charging it through one code path shared with S-ORA are the same class rather than two.
+No patch to ARE is needed: a subclass meters the calls and a harness-local pause wrapper applies
+the bracket charge. The same object carries both accounts (pass ``charge=``), so instrumentation
+and charging stay in one class rather than drifting into separate implementations.
 
 Four things that would otherwise bite
 -------------------------------------
@@ -75,8 +75,11 @@ from examples.gaia2.evaluation.core import ModelProfile
 from examples.gaia2.llm_calls import (
     LLMCallRecord,
     LLMCallWriter,
+    RoundTripWindow,
+    charged_time_union_seconds,
     read_finish_reason,
     read_usage,
+    wall_time_union_seconds,
 )
 
 # Seconds to charge for one round-trip, given (input_tokens, cached_input_tokens, output_tokens).
@@ -155,6 +158,9 @@ class _RoundTrip:
     reasoning_tokens: int | None
     seconds: float
     charged: float
+    started_at: float
+    finished_at: float
+    charged_started_at: float | None
 
 
 def _sum_known(values: Iterable[int | None]) -> int | None:
@@ -194,8 +200,13 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         self.settings = _CallSettings(dict(request_kwargs or {}), stream)
         self._bracket: list[_RoundTrip] = []
         self._bracket_wired = False
+        self._bracket_charged_started_at: float | None = None
+        self._unbracketed_charge_cursor = 0.0
         self.round_trips = 0
         self.brackets = 0
+        self.raw_cached_input_anomalies = 0
+        self.charged_seconds = 0.0
+        self.round_trip_windows: list[RoundTripWindow] = []
 
     @classmethod
     def from_profile(cls, profile: ModelProfile, **kwargs: Any) -> MeteredLiteLLMEngine:
@@ -254,7 +265,7 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
 
     # -- bracket -----------------------------------------------------------------------------
 
-    def begin_bracket(self) -> None:
+    def begin_bracket(self, charged_started_at: float | None = None) -> None:
         """Start a new generation bracket, discarding the previous one's tally.
 
         Called from the wrapped ``pause_env``, which ARE invokes once at the top of every
@@ -263,6 +274,7 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         self._bracket_wired = True
         self.brackets += 1
         self._bracket.clear()
+        self._bracket_charged_started_at = charged_started_at
 
     @property
     def bracketed(self) -> bool:
@@ -298,7 +310,7 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
             # Unwired, a bracket is one round-trip — all the engine can know without ARE's pause.
             self.brackets += 1
         bracket_id = f"react-{self.scenario_id or 'run'}-bracket-{self.brackets:05d}"
-        started = time.perf_counter()
+        started = time.monotonic()
         try:
             text, _ = super().chat_completion(messages, stop_sequences, **kwargs)
         except Exception as exc:
@@ -307,8 +319,12 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
             # a content-filtered `message.content=None`, a crossing that was billed in full. The
             # captured response is read on this path for exactly that reason; only a failure that
             # produced no response at all falls through to a fixed-term row.
+            finished = time.monotonic()
             trip, _reason, captured = self._trip(
-                *self._take_capture(), elapsed=time.perf_counter() - started
+                *self._take_capture(),
+                elapsed=finished - started,
+                started_at=started,
+                finished_at=finished,
             )
             self._record(
                 trip,
@@ -316,13 +332,18 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
                 captured=captured,
                 bracket_id=bracket_id,
             )
+            self._bracket.append(trip)
             raise
         finally:
             # Runs on the raising path too. Left set, it would apply this engine's operating point
             # to whatever else calls `completion` on this thread next.
             _capture.settings = None
+        finished = time.monotonic()
         trip, finish_reason, captured = self._trip(
-            *self._take_capture(), elapsed=time.perf_counter() - started
+            *self._take_capture(),
+            elapsed=finished - started,
+            started_at=started,
+            finished_at=finished,
         )
         self._record(trip, finish_reason=finish_reason, captured=captured, bracket_id=bracket_id)
         self._bracket.append(trip)
@@ -354,7 +375,13 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         return usage_chunk if self.stream else response
 
     def _trip(
-        self, response: Any, usage_chunk: Any, *, elapsed: float
+        self,
+        response: Any,
+        usage_chunk: Any,
+        *,
+        elapsed: float,
+        started_at: float,
+        finished_at: float,
     ) -> tuple[_RoundTrip, str | None, bool]:
         """One round-trip's record, priced. ``response`` of None is the crossing that produced no
         answer at all: no tokens, and a charge model prices it at its fixed per-call term — zero
@@ -363,11 +390,52 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         input_tokens, cached, output_tokens, reasoning, _, captured = read_usage(
             self._usage_source(response, usage_chunk)
         )
+        if captured and cached is not None and cached > input_tokens:
+            self.raw_cached_input_anomalies += 1
         # From the response either way: a streamed usage chunk carries no choices to read it off.
         finish_reason = read_finish_reason(response)
         charged = self._charge_for(input_tokens, cached, output_tokens, elapsed)
-        trip = _RoundTrip(input_tokens, cached, output_tokens, reasoning, elapsed, charged)
+        self.charged_seconds += charged
+        if self._bracket_wired and self._bracket_charged_started_at is not None:
+            charged_started_at = self._bracket_charged_started_at + sum(
+                prior.charged for prior in self._bracket
+            )
+        else:
+            charged_started_at = self._unbracketed_charge_cursor
+            self._unbracketed_charge_cursor += charged
+        trip = _RoundTrip(
+            input_tokens,
+            cached,
+            output_tokens,
+            reasoning,
+            elapsed,
+            charged,
+            started_at,
+            max(started_at, finished_at),
+            charged_started_at,
+        )
+        self.round_trip_windows.append(
+            RoundTripWindow(
+                trip.started_at,
+                trip.finished_at,
+                trip.charged,
+                trip.charged_started_at,
+            )
+        )
         return trip, finish_reason, captured
+
+    @property
+    def wall_seconds(self) -> float:
+        return sum(window.wall_seconds for window in self.round_trip_windows)
+
+    @property
+    def wall_union_seconds(self) -> float:
+        return wall_time_union_seconds(self.round_trip_windows)
+
+    @property
+    def charged_union_seconds(self) -> float | None:
+        # None when the run mixed charged and host-monotonic coordinates; see the function.
+        return charged_time_union_seconds(self.round_trip_windows)
 
     def _charge_for(
         self, input_tokens: int, cached: int | None, output_tokens: int, elapsed: float
@@ -377,6 +445,11 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         if self.charge is None:
             return elapsed
         return self.charge(input_tokens, cached or 0, output_tokens)
+
+    @property
+    def bracket_charge(self) -> float:
+        """Charge accumulated by the current step, including a trip that raised."""
+        return sum(trip.charged for trip in self._bracket)
 
     def _metadata(self, trip: _RoundTrip) -> dict[str, Any]:
         """Cumulative over the bracket when brackets are wired, this round-trip alone otherwise —
@@ -428,6 +501,14 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
                 round_trips=1,
                 finish_reason=finish_reason,
                 charged_seconds=trip.charged,
+                round_trip_windows=(
+                    RoundTripWindow(
+                        trip.started_at,
+                        trip.finished_at,
+                        trip.charged,
+                        trip.charged_started_at,
+                    ),
+                ),
                 scenario_id=self.scenario_id,
                 run_number=self.run_number,
                 usage_captured=captured,
