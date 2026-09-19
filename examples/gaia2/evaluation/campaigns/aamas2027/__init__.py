@@ -1,1 +1,1 @@
-"""Reserved home for the AAMAS 2027 evaluation protocol once it is frozen."""
+"""AAMAS 2027 evaluation protocol freeze candidate and exact scenario selection."""

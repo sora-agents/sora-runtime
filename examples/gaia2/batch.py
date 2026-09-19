@@ -47,8 +47,9 @@ at each row's ``trace_id`` for the trace payload — so all three must be presen
 path must resolve (hence the absolute ``--output-dir``). ``tests/test_gaia2_upload_compat.py`` locks
 this round-trip against the installed uploader.
 
-Arms. ``--arm sora`` (the default) runs S-ORA, configured by ``--config``; ``--arm react`` runs
-ARE's own published ReAct agent as the baseline, configured by ``--profile`` — the same model,
+Arms. ``--arm sora`` (the default) runs S-ORA, configured by ``--config`` and matched to exactly
+one frozen profile for charging; ``--arm react`` runs ARE's own published ReAct agent as the
+baseline, configured by ``--profile`` — the same model,
 reasoning setting and output cap the S-ORA arm is pointed at, which is what makes the two columns
 comparable, and which a react sweep checks against ``--config`` before spending anything rather
 than leaving to whoever wrote the command. Everything else — the judge and its verdict parse, the
@@ -65,8 +66,9 @@ root, and with it the layout the upload script walks.
         --profile gpt-5.4-medium-prompt \
         --judge-model claude-sonnet-5 --judge-provider anthropic --output-dir .sora/gaia2/pair
 
-The profile named there is the one whose operating point matches the shipped ``agent.yaml``; run
-the pair at a different one by moving *both* sides, not one.
+The profile named there is the one whose operating point matches the shipped ``agent.yaml``; the
+S-ORA command derives that same profile from the config and refuses an ambiguous or absent match.
+Run the pair at a different operating point by moving *both* sides, not one.
 
 Per-scenario isolation is per fresh ``AreSimulation``; app/global-state bleed across scenarios in
 one process is a known risk (a subprocess-per-scenario runner is the fallback if it bites) — fine
@@ -77,12 +79,17 @@ the plan iteration primitive lands, since multi-item tasks currently under-count
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
+from examples.gaia2.evaluation.core import LEGACY_CLOCK_MODE
 from examples.gaia2.llm_calls import LLMCallWriter
 
 _DEFAULT_CONFIG = "examples/gaia2/agent.yaml"
@@ -100,6 +107,208 @@ _CORE_CAPABILITIES = ("execution", "search", "adaptability", "time", "ambiguity"
 
 
 # -- pure helpers (no ARE import; unit-tested without the `are` extra) -----------------------------
+
+
+@dataclass(frozen=True)
+class SweepManifest:
+    """Exact, ordered Gaia2 inputs shared by every arm and model in a paid sweep."""
+
+    name: str
+    dataset: str
+    revision: str
+    split: str
+    cases: tuple[tuple[str, str], ...]
+    digest: str
+
+    def scenario_ids(self, capability: str) -> tuple[str, ...]:
+        return tuple(
+            case_id for case_capability, case_id in self.cases if case_capability == capability
+        )
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _load_sweep_manifest(path: str | Path) -> SweepManifest:
+    """Load a dataset-revision-pinned scenario selection for the batch runner.
+
+    Prompt-evaluation manifests deliberately require five cases, one per capability. A batch sweep
+    can instead pin any non-empty ordered subset of one or more capabilities, so it shares the
+    envelope but has its own validation rather than weakening that campaign's locked schema.
+    """
+
+    manifest_path = Path(path)
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SystemExit(f"--scenario-manifest does not exist: {manifest_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid JSON in --scenario-manifest {manifest_path}: {exc}") from exc
+
+    required = {"schema_version", "name", "dataset", "revision", "split", "cases"}
+    if not isinstance(raw, dict) or set(raw) != required or raw.get("schema_version") != 1:
+        raise SystemExit(
+            f"invalid sweep manifest {manifest_path}: expected exactly {sorted(required)} with "
+            "schema_version 1"
+        )
+    name = raw["name"]
+    dataset = raw["dataset"]
+    revision = raw["revision"]
+    split = raw["split"]
+    rows = raw["cases"]
+    if not all(isinstance(value, str) and value for value in (name, dataset, revision, split)):
+        raise SystemExit(
+            f"invalid sweep manifest {manifest_path}: name/dataset/revision/split must be "
+            "non-empty strings"
+        )
+    if not isinstance(rows, list) or not rows:
+        raise SystemExit(f"invalid sweep manifest {manifest_path}: cases must be a non-empty list")
+
+    cases: list[tuple[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"capability", "id"}:
+            raise SystemExit(
+                f"invalid sweep manifest {manifest_path}: every case must contain only "
+                "capability/id"
+            )
+        capability = row["capability"]
+        case_id = row["id"]
+        if not isinstance(capability, str) or not capability:
+            raise SystemExit(f"invalid sweep manifest capability in {manifest_path}: {row!r}")
+        if not isinstance(case_id, str) or not case_id:
+            raise SystemExit(f"invalid sweep manifest scenario id in {manifest_path}: {row!r}")
+        cases.append((capability, case_id))
+    ids = [case_id for _capability, case_id in cases]
+    if len(ids) != len(set(ids)):
+        raise SystemExit(f"invalid sweep manifest {manifest_path}: scenario ids must be unique")
+
+    return SweepManifest(
+        name=name,
+        dataset=dataset,
+        revision=revision,
+        split=split,
+        cases=tuple(cases),
+        digest=hashlib.sha256(_canonical_json(raw).encode()).hexdigest(),
+    )
+
+
+def _select_manifest_scenarios(
+    loaded: list[tuple[Any, Any]], manifest: SweepManifest, capability: str
+) -> list[tuple[Any, Any]]:
+    """Return fresh scenario objects in manifest order, failing before any paid artifact opens."""
+
+    wanted = manifest.scenario_ids(capability)
+    if not wanted:
+        raise RuntimeError(
+            f"sweep manifest {manifest.name!r} selects no scenarios for capability {capability!r}"
+        )
+    by_id: dict[str, tuple[Any, Any]] = {}
+    duplicates: set[str] = set()
+    for item in loaded:
+        scenario_id = str(item[0].scenario_id)
+        if scenario_id in by_id:
+            duplicates.add(scenario_id)
+        by_id[scenario_id] = item
+    if duplicates:
+        raise RuntimeError(f"Gaia2 loader returned duplicate scenario ids: {sorted(duplicates)}")
+    missing = [scenario_id for scenario_id in wanted if scenario_id not in by_id]
+    if missing:
+        raise RuntimeError(
+            f"sweep manifest {manifest.name!r} scenarios missing from "
+            f"{manifest.dataset}@{manifest.revision}/{capability}/{manifest.split}: {missing}"
+        )
+    return [by_id[scenario_id] for scenario_id in wanted]
+
+
+def _pinned_hf_scenarios(
+    *,
+    dataset: str,
+    capability: str,
+    split: str,
+    revision: str,
+    limit: int | None,
+) -> Iterator[tuple[Any, Any]]:
+    """Load one immutable HF revision without ARE's misnamed datasets keyword.
+
+    The installed ARE loader passes ``dataset_revision=`` to ``datasets.load_dataset``. That is a
+    builder-config parameter, not Hugging Face's repository selector (``revision=``), so it both
+    misses the normal cache and fails to pin the source commit. Keep the correction local to the
+    benchmark harness until ARE exposes the repository revision correctly.
+    """
+
+    from are.simulation.benchmark.scenario_loader import load_scenario
+    from are.simulation.data_handler.models import ExportedHuggingFaceMetadata
+    from datasets import load_dataset  # type: ignore[import-untyped]
+
+    loaded = load_dataset(
+        dataset,
+        name=capability,
+        revision=revision,
+        streaming=True,
+    )
+    if split not in loaded:
+        raise RuntimeError(f"split {split!r} not found in {dataset}@{revision}/{capability}")
+
+    for index, row in enumerate(loaded[split]):
+        if limit is not None and index >= limit:
+            break
+        scenario_id = row.get("scenario_id")
+        if not scenario_id:
+            continue
+        scenario, completed_events = load_scenario(
+            row["data"],
+            str(scenario_id),
+            False,
+            hf_metadata=ExportedHuggingFaceMetadata(
+                dataset=dataset,
+                split=split,
+                revision=revision,
+            ),
+        )
+        if scenario is None or completed_events is None:
+            continue
+        scenario.run_number = row.get("run_number")
+        yield scenario, completed_events
+
+
+def _verify_counterpart_manifest(args: argparse.Namespace, manifest: SweepManifest) -> None:
+    """Refuse a paid pair whose already-written arm used another scenario selection."""
+
+    counterpart_root = (
+        os.path.join(args.output_dir, "react") if args.arm == "sora" else args.output_dir
+    )
+    path = os.path.join(counterpart_root, "standard", args.capability, "output.jsonl")
+    if not os.path.isfile(path):
+        return
+    rows = _read_jsonl(path)
+    recorded_digests = [row.get("metadata", {}).get("scenario_manifest_digest") for row in rows]
+    if not recorded_digests or any(digest != manifest.digest for digest in recorded_digests):
+        raise RuntimeError(
+            f"counterpart arm {path} does not carry this sweep manifest digest "
+            f"{manifest.digest}: found "
+            f"{sorted({str(digest) for digest in recorded_digests}) or ['missing']}"
+        )
+    expected = {
+        (scenario_id, run_number)
+        for scenario_id in manifest.scenario_ids(args.capability)
+        for run_number in range(args.num_runs)
+    }
+    actual = {
+        (
+            str(row.get("metadata", {}).get("scenario_id")),
+            int(row.get("metadata", {}).get("run_number", -1)),
+        )
+        for row in rows
+    }
+    if actual != expected or len(rows) != len(expected):
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise RuntimeError(
+            f"counterpart arm {path} is not the same complete scenario/run matrix; "
+            f"rows={len(rows)}, expected_rows={len(expected)}, missing={missing}, "
+            f"unexpected={unexpected}"
+        )
 
 
 def _score_status(
@@ -182,6 +391,29 @@ _NOT_THE_OPERATING_POINT = frozenset(
 )
 
 
+def _configured_operating_point(config_path: str) -> dict[str, Any] | None:
+    if not os.path.isfile(config_path):
+        return None
+    from sora.bootstrap import load_yaml
+
+    return load_yaml(config_path).llm or {}
+
+
+def _operating_point_diffs(
+    profile: Any, configured: dict[str, Any] | None
+) -> list[tuple[str, Any, Any]]:
+    if configured is None:
+        return []
+    settings = profile.client_settings()
+    unset = "<unset>"
+    compared = (set(settings) | set(configured)) - _NOT_THE_OPERATING_POINT
+    return [
+        (name, settings.get(name, unset), configured.get(name, unset))
+        for name in sorted(compared)
+        if settings.get(name, unset) != configured.get(name, unset)
+    ]
+
+
 def _check_operating_point(profile: Any, config_path: str) -> None:
     """Refuse a react sweep whose profile does not run at the same operating point as the config.
 
@@ -198,19 +430,7 @@ def _check_operating_point(profile: Any, config_path: str) -> None:
     ``stream`` decides whether the token counts in the cost column were reported by the provider
     or reconstructed locally. A missing config is not an error — a react-only run has nothing to
     be compared against."""
-    if not os.path.exists(config_path):
-        return
-    from sora.bootstrap import load_yaml
-
-    configured = load_yaml(config_path).llm or {}
-    settings = profile.client_settings()
-    unset = "<unset>"
-    compared = (set(settings) | set(configured)) - _NOT_THE_OPERATING_POINT
-    diffs = [
-        (name, settings.get(name, unset), configured.get(name, unset))
-        for name in sorted(compared)
-        if settings.get(name, unset) != configured.get(name, unset)
-    ]
+    diffs = _operating_point_diffs(profile, _configured_operating_point(config_path))
     if not diffs:
         return
     detail = "\n".join(
@@ -223,6 +443,24 @@ def _check_operating_point(profile: Any, config_path: str) -> None:
         "config, change the config's llm: block to match the profile, or point --config at the "
         "config this profile pairs with."
     )
+
+
+def _profile_for_config(profiles: dict[str, Any], config_path: str) -> Any:
+    """Return the one frozen profile describing ``config_path``'s operating point."""
+    configured = _configured_operating_point(config_path)
+    if configured is None:
+        raise SystemExit(f"--config does not exist: {config_path}")
+    matching = [
+        profile for profile in profiles.values() if not _operating_point_diffs(profile, configured)
+    ]
+    if len(matching) != 1:
+        raise SystemExit(
+            f"--config must match exactly one frozen model profile; matched "
+            f"{[profile.name for profile in matching]}. Use --charge-profile to select between "
+            "matching frozen profiles, or --allow-unfrozen-config for an explicitly wall-clock "
+            "development run."
+        )
+    return matching[0]
 
 
 def _verdict_parse(args: argparse.Namespace) -> str | None:
@@ -245,6 +483,22 @@ def _jsonl_record(
     timeline_expired: bool = False,
     verdict_parse: str | None = None,
     judge_recording_path: str | None = None,
+    charged_seconds: float | None = None,
+    model_profile: str | None = None,
+    charge_model_identity: dict[str, Any] | None = None,
+    charge_model_digest: str | None = None,
+    cached_input_clamps: int | None = None,
+    raw_cached_input_anomalies: int | None = None,
+    charge_accounting_consistent: bool | None = None,
+    clock_mode: str | None = None,
+    inference_charge_policy: str | None = None,
+    llm_wall_seconds: float | None = None,
+    llm_wall_union_seconds: float | None = None,
+    llm_charged_union_seconds: float | None = None,
+    llm_round_trips: int | None = None,
+    llm_max_in_flight: int | None = None,
+    llm_overlapped_round_trips: int | None = None,
+    scenario_manifest_digest: str | None = None,
 ) -> dict[str, Any]:
     """One ``output.jsonl`` line, matching ARE's ``_export_benchmark_result_jsonl`` exactly:
     ``task_id``/``trace_id``/``score`` at top level, and a ``metadata`` dict with all-None values
@@ -281,6 +535,22 @@ def _jsonl_record(
         # where its judge answers went is a row nobody can ever re-score. Absolute, for the same
         # reason `trace_id` is — the re-scorer is a separate step, run from a different cwd.
         "judge_recording": judge_recording_path,
+        "charged_seconds": charged_seconds,
+        "model_profile": model_profile,
+        "charge_model_identity": charge_model_identity,
+        "charge_model_digest": charge_model_digest,
+        "cached_input_clamps": cached_input_clamps,
+        "raw_cached_input_anomalies": raw_cached_input_anomalies,
+        "charge_accounting_consistent": charge_accounting_consistent,
+        "clock_mode": clock_mode,
+        "inference_charge_policy": inference_charge_policy,
+        "llm_wall_seconds": llm_wall_seconds,
+        "llm_wall_union_seconds": llm_wall_union_seconds,
+        "llm_charged_union_seconds": llm_charged_union_seconds,
+        "llm_round_trips": llm_round_trips,
+        "llm_max_in_flight": llm_max_in_flight,
+        "llm_overlapped_round_trips": llm_overlapped_round_trips,
+        "scenario_manifest_digest": scenario_manifest_digest,
         # ARE's tool-call-count gate, recomputed offline (no judge model). Recorded only when it
         # FAILS: a failure is conclusive — the judge applies this gate before any per-event
         # matching — so it explains a zero that the rationale otherwise attributes to the
@@ -369,6 +639,16 @@ def _write_jsonl(path: str, records: list[dict[str, Any]]) -> None:
             f.write("\n")
 
 
+def _optional_sum(values: Iterable[Any]) -> float | None:
+    """Sum that propagates an unavailable parallel-charge counterfactual (see llm_calls)."""
+    total = 0.0
+    for value in values:
+        if value is None:
+            return None
+        total += float(value)
+    return total
+
+
 def _read_jsonl(path: str) -> list[dict[str, Any]]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -402,8 +682,135 @@ def aggregate(output_dir: str) -> dict[str, Any]:
             path = os.path.join(standard, name, "output.jsonl")
             if not os.path.isfile(path):
                 continue
-            p, scored, total = _pass_at_1(_read_jsonl(path))
-            configs[name] = {"pass_at_1": p, "scored": scored, "total": total}
+            rows = _read_jsonl(path)
+            p, scored, total = _pass_at_1(rows)
+            # Same rule as the per-record report: a row without a mode is a legacy row and is
+            # named as one, so it participates in the mixing check instead of being filtered out
+            # of it. Excluding it let a legacy run sit beside a charged one and still look
+            # homogeneous, which is the one mixture pass@1 must refuse.
+            clock_modes = sorted(
+                {
+                    str(row.get("metadata", {}).get("clock_mode") or LEGACY_CLOCK_MODE)
+                    for row in rows
+                }
+            )
+            mixed_clock_modes = len(clock_modes) > 1
+            manifest_markers = {
+                row.get("metadata", {}).get("scenario_manifest_digest") for row in rows
+            }
+            manifest_digests = sorted(
+                {str(digest) for digest in manifest_markers if digest is not None}
+            )
+            clamps = sum(int(row.get("metadata", {}).get("cached_input_clamps", 0)) for row in rows)
+            anomalies = sum(
+                int(row.get("metadata", {}).get("raw_cached_input_anomalies", 0)) for row in rows
+            )
+            accounting_mismatches = sum(
+                (
+                    row.get("metadata", {}).get("charge_accounting_consistent") is False
+                    or (
+                        row.get("metadata", {}).get("charge_accounting_consistent") is None
+                        and row.get("metadata", {}).get("clock_mode") != "wall"
+                        and "cached_input_clamps" in row.get("metadata", {})
+                        and "raw_cached_input_anomalies" in row.get("metadata", {})
+                        and int(row["metadata"]["cached_input_clamps"])
+                        != int(row["metadata"]["raw_cached_input_anomalies"])
+                    )
+                )
+                for row in rows
+            )
+            mixed_scenario_manifests = len(manifest_markers) > 1
+            configs[name] = {
+                # Timing policy changes trajectories, so a mixed file has no coherent aggregate
+                # score. The same is true of two different scenario selections. Keep the rows
+                # readable but refuse to promote either mixture as pass@1.
+                "pass_at_1": None if mixed_clock_modes or mixed_scenario_manifests else p,
+                "scored": scored,
+                "total": total,
+                "charged_seconds": sum(
+                    float(row.get("metadata", {}).get("charged_seconds", 0.0)) for row in rows
+                ),
+                "llm_wall_seconds": sum(
+                    float(row.get("metadata", {}).get("llm_wall_seconds", 0.0)) for row in rows
+                ),
+                "llm_wall_union_seconds": sum(
+                    float(row.get("metadata", {}).get("llm_wall_union_seconds", 0.0))
+                    for row in rows
+                ),
+                "llm_wall_overlap_seconds": sum(
+                    max(
+                        0.0,
+                        float(row.get("metadata", {}).get("llm_wall_seconds", 0.0))
+                        - float(row.get("metadata", {}).get("llm_wall_union_seconds", 0.0)),
+                    )
+                    for row in rows
+                ),
+                # A null union means that run mixed time axes and has no counterfactual; the
+                # group inherits the unavailability rather than averaging over a short count.
+                "llm_charged_union_seconds": _optional_sum(
+                    row.get("metadata", {}).get("llm_charged_union_seconds", 0.0) for row in rows
+                ),
+                "llm_charged_overlap_seconds": _optional_sum(
+                    None
+                    if row.get("metadata", {}).get("llm_charged_union_seconds", 0.0) is None
+                    else max(
+                        0.0,
+                        float(row.get("metadata", {}).get("charged_seconds", 0.0))
+                        - float(row.get("metadata", {}).get("llm_charged_union_seconds", 0.0)),
+                    )
+                    for row in rows
+                ),
+                "llm_round_trips": sum(
+                    int(row.get("metadata", {}).get("llm_round_trips", 0)) for row in rows
+                ),
+                "llm_max_in_flight": max(
+                    (int(row.get("metadata", {}).get("llm_max_in_flight", 0)) for row in rows),
+                    default=0,
+                ),
+                "llm_overlapped_round_trips": sum(
+                    int(row.get("metadata", {}).get("llm_overlapped_round_trips", 0))
+                    for row in rows
+                ),
+                "cached_input_clamps": clamps,
+                "raw_cached_input_anomalies": anomalies,
+                "charge_accounting_mismatches": accounting_mismatches,
+                "clock_modes": clock_modes,
+                "mixed_clock_modes": mixed_clock_modes,
+                "scenario_manifest_digests": manifest_digests,
+                "mixed_scenario_manifests": mixed_scenario_manifests,
+                "inference_charge_policies": sorted(
+                    {
+                        str(row.get("metadata", {}).get("inference_charge_policy"))
+                        for row in rows
+                        if row.get("metadata", {}).get("inference_charge_policy") is not None
+                    }
+                ),
+                "charge_models": [
+                    json.loads(encoded)
+                    for encoded in sorted(
+                        {
+                            json.dumps(
+                                {
+                                    "identity": row.get("metadata", {}).get(
+                                        "charge_model_identity"
+                                    ),
+                                    "digest": row.get("metadata", {}).get("charge_model_digest"),
+                                },
+                                sort_keys=True,
+                            )
+                            for row in rows
+                            if row.get("metadata", {}).get("charge_model_digest") is not None
+                        }
+                    )
+                ],
+                "model_profiles": sorted(
+                    {
+                        str(row.get("metadata", {}).get("model_profile"))
+                        for row in rows
+                        if row.get("metadata", {}).get("model_profile") is not None
+                    }
+                ),
+            }
     core = [
         configs[c]["pass_at_1"]
         for c in _CORE_CAPABILITIES
@@ -425,6 +832,34 @@ def _print_report(summary: dict[str, Any]) -> None:
         p = row["pass_at_1"]
         cell = "n/a" if p is None else f"{p:6.1%}"
         print(f"  {name:<14} {cell:>8}   {row['scored']}/{row['total']}")
+        if row.get("clock_modes"):
+            if row["mixed_clock_modes"]:
+                print("    WARNING: mixed clock modes; pass@1 suppressed as incomparable")
+            print(
+                f"    clock={','.join(row['clock_modes'])}  "
+                + (
+                    f"charged-sum/union={row['charged_seconds']:.2f}/"
+                    + (
+                        "unavailable  "
+                        if row["llm_charged_union_seconds"] is None
+                        else f"{row['llm_charged_union_seconds']:.2f}s  "
+                    )
+                    if "token_charged" in row["clock_modes"]
+                    else ""
+                )
+                + f"wall-sum/union={row['llm_wall_seconds']:.2f}/"
+                f"{row['llm_wall_union_seconds']:.2f}s  "
+                f"inference-concurrency=max {row['llm_max_in_flight']}, "
+                f"overlapped {row['llm_overlapped_round_trips']}/{row['llm_round_trips']}  "
+                f"cache-clamps={row['cached_input_clamps']}  "
+                f"accounting-mismatches={row['charge_accounting_mismatches']}"
+            )
+        if row.get("scenario_manifest_digests"):
+            print(
+                "    scenario-manifest="
+                + ",".join(digest[:12] for digest in row["scenario_manifest_digests"])
+                + ("  WARNING: mixed manifests" if row["mixed_scenario_manifests"] else "")
+            )
     overall = summary["overall"]
     if overall is not None:
         core = [
@@ -439,6 +874,9 @@ def _print_report(summary: dict[str, Any]) -> None:
 def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
     from are.simulation.benchmark.scenario_loader import setup_scenarios_iterator
 
+    sweep_manifest: SweepManifest | None = getattr(args, "sweep_manifest", None)
+    if sweep_manifest is not None:
+        _verify_counterpart_manifest(args, sweep_manifest)
     config_dir = os.path.join(_arm_root(args.output_dir, args.arm), "standard", args.capability)
     os.makedirs(config_dir, exist_ok=True)
     print(f"arm: {args.arm}  ->  {config_dir}")
@@ -454,6 +892,46 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
     record_judge = _require_judge_recording(args)
     if args.judge_model:
         print(f"judge-response recording: {'on' if record_judge else 'OFF (--no-judge-recording)'}")
+
+    def scenarios_for_run() -> Any:
+        revision = getattr(args, "hf_revision", None)
+        limit = None if sweep_manifest is not None else args.limit
+        if revision is None:
+            loaded = iter(
+                setup_scenarios_iterator(
+                    dataset_path=None,
+                    dataset_config=args.capability,
+                    dataset_split=args.split,
+                    hf=args.hf_dataset,
+                    hf_revision=None,
+                    load_completed_events=False,
+                    limit=limit,
+                )
+            )
+        else:
+            loaded = iter(
+                _pinned_hf_scenarios(
+                    dataset=args.hf_dataset,
+                    capability=args.capability,
+                    split=args.split,
+                    revision=revision,
+                    limit=limit,
+                )
+            )
+        if sweep_manifest is not None:
+            return _select_manifest_scenarios(list(loaded), sweep_manifest, args.capability)
+        try:
+            first = next(loaded)
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"Gaia2 loader returned zero scenarios for capability={args.capability!r}, "
+                f"split={args.split!r}; refusing to emit a clean 0/0 sweep"
+            ) from exc
+        return chain((first,), loaded)
+
+    # Probe before opening either artifact in truncate mode. A cache/revision miss in ARE's loader
+    # can otherwise replace a paid capability with empty files and print a deceptively clean 0/0.
+    first_run_scenarios = scenarios_for_run()
 
     records: list[dict[str, Any]] = []
     # Stream each record to output.jsonl as it's produced (and flush): a long sweep spends real
@@ -475,15 +953,7 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
         for run_number in range(args.num_runs):
             # Re-create the iterator each run so every run gets fresh, un-run scenario objects (a
             # scenario is stateful once played); HF caches locally, so re-iteration is cheap.
-            scenarios = setup_scenarios_iterator(
-                dataset_path=None,
-                dataset_config=args.capability,
-                dataset_split=args.split,
-                hf=args.hf_dataset,
-                hf_revision=None,
-                load_completed_events=False,
-                limit=args.limit,
-            )
+            scenarios = first_run_scenarios if run_number == 0 else scenarios_for_run()
             for scenario, _events in scenarios:
                 # Disambiguate this run's trace file: ARE's get_run_id keys the hf trace filename on
                 # scenario.run_number, so without this every run of a scenario writes
@@ -534,6 +1004,24 @@ def _run_one_scenario(
         populate_oracle_events,
     )
 
+    charge_model = getattr(args, "charge_model", None)
+    if charge_model is None:
+        from examples.gaia2.evaluation.core import ChargeModelSheet
+
+        charge_model = ChargeModelSheet.load(
+            Path(__file__).resolve().parent / "evaluation" / "charge_model.json"
+        )
+    profile_charge = (
+        charge_model.charge_for(args.model_profile) if args.model_profile is not None else None
+    )
+    profile_name = getattr(args.model_profile, "name", None)
+    charge = None if getattr(args, "wall_clock", False) else profile_charge
+    # A frozen-profile wall-clock run is the robustness counterpart of that operating point. Keep
+    # the identity/digest even though it is not applied; an explicitly unfrozen dev config has no
+    # such identity and leaves both absent.
+    charge_identity = profile_charge.identity if profile_charge is not None else None
+    charge_digest = charge_model.digest if profile_charge is not None else None
+
     try:
         if args.judge_model:
             attach_judge(
@@ -573,6 +1061,10 @@ def _run_one_scenario(
                 record_judge=record_judge,
                 verdict_parse=_verdict_parse(args),
                 log_fn=lambda msg: print(msg, flush=True),
+                charge=charge,
+                max_wall_seconds=args.max_wall_seconds,
+                charge_model_identity=charge_identity,
+                charge_model_digest=charge_digest,
             )
         else:
             result = run_scenario(
@@ -586,6 +1078,9 @@ def _run_one_scenario(
                 llm_calls=llm_calls,
                 scenario_id=scenario.scenario_id,
                 run_number=run_number,
+                charge=charge,
+                charge_model_identity=charge_identity,
+                charge_model_digest=charge_digest,
             )
     except Exception as e:  # this scenario's judge/preprocess failed — record it, keep sweeping
         return _jsonl_record(
@@ -595,6 +1090,16 @@ def _run_one_scenario(
             rationale=None,
             exception=e,
             trace_id=None,
+            charge_model_identity=charge_identity,
+            charge_model_digest=charge_digest,
+            model_profile=str(profile_name) if profile_name is not None else None,
+            cached_input_clamps=(charge.cached_input_clamps if charge is not None else None),
+            # The run never returned its independently observed count. Do not invent agreement or
+            # disagreement: the row remains readable and explicitly lacks the second measurement.
+            raw_cached_input_anomalies=None,
+            charge_accounting_consistent=None,
+            clock_mode="token_charged" if charge is not None else "wall",
+            scenario_manifest_digest=getattr(getattr(args, "sweep_manifest", None), "digest", None),
         )
 
     trace_id: str | None = None
@@ -636,6 +1141,22 @@ def _run_one_scenario(
         judge_recording_path=recording_path,
         timeline_expired=result.timeline_expired,
         verdict_parse=_verdict_parse(args),
+        charged_seconds=result.charged_seconds,
+        model_profile=str(profile_name) if profile_name is not None else None,
+        charge_model_identity=result.charge_model_identity,
+        charge_model_digest=result.charge_model_digest,
+        cached_input_clamps=result.cached_input_clamps,
+        raw_cached_input_anomalies=result.raw_cached_input_anomalies,
+        charge_accounting_consistent=result.charge_accounting_consistent,
+        clock_mode=result.clock_mode,
+        inference_charge_policy=result.inference_charge_policy,
+        llm_wall_seconds=result.llm_wall_seconds,
+        llm_wall_union_seconds=result.llm_wall_union_seconds,
+        llm_charged_union_seconds=result.llm_charged_union_seconds,
+        llm_round_trips=int(getattr(result, "llm_round_trips", 0)),
+        llm_max_in_flight=int(getattr(result, "llm_max_in_flight", 0)),
+        llm_overlapped_round_trips=int(getattr(result, "llm_overlapped_round_trips", 0)),
+        scenario_manifest_digest=getattr(getattr(args, "sweep_manifest", None), "digest", None),
     )
 
 
@@ -664,6 +1185,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"HuggingFace dataset repo (default: {_DEFAULT_HF_DATASET}).",
     )
     parser.add_argument(
+        "--hf-revision",
+        metavar="REVISION",
+        help="Pinned Hugging Face dataset revision. Set automatically by --scenario-manifest.",
+    )
+    parser.add_argument(
+        "--scenario-manifest",
+        type=Path,
+        metavar="JSON",
+        help=(
+            "Exact ordered scenario IDs for a comparable sweep. Pins dataset/revision/split, "
+            "records its digest on every row, and excludes --limit."
+        ),
+    )
+    parser.add_argument(
         "--arm",
         default="sora",
         choices=_ARMS,
@@ -688,6 +1223,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "selects the model, the reasoning setting and the output cap on that arm — the same "
             "operating point the S-ORA arm is configured at, which is what makes the two "
             "comparable."
+        ),
+    )
+    parser.add_argument(
+        "--charge-profile",
+        metavar="NAME",
+        help=(
+            "Explicit frozen charge profile for --arm sora when automatic config matching is "
+            "ambiguous. The selected profile must still match --config exactly. Cannot be used "
+            "with --wall-clock or --allow-unfrozen-config."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unfrozen-config",
+        action="store_true",
+        help=(
+            "Allow an S-ORA config outside the frozen profile set for local/development runs. "
+            "This necessarily uses wall time because no frozen coefficients exist for the config."
         ),
     )
     parser.add_argument(
@@ -757,9 +1309,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1200.0,
         metavar="SECONDS",
+        help="Per-scenario wall-clock safety cap for both arms (default 1200).",
+    )
+    parser.add_argument(
+        "--wall-clock",
+        action="store_true",
         help=(
-            "Per-scenario wall-clock safety cap for --arm sora (default 1200). The react arm is "
-            "bounded by ARE's own event loop instead, which exits at scenario.duration."
+            "Use elapsed wall time instead of the frozen token-charged clock. Intended only for "
+            "a separately labeled robustness sweep; results are not timing-comparable."
         ),
     )
     parser.add_argument("--verbose", action="store_true", help="Stream each scenario's trajectory.")
@@ -776,6 +1333,37 @@ def main(argv: list[str] | None = None) -> None:
     if not args.capability:
         raise SystemExit("--capability is required unless --report-only is given")
 
+    args.sweep_manifest = None
+    if args.scenario_manifest is not None:
+        if args.limit is not None:
+            raise SystemExit("--scenario-manifest and --limit are mutually exclusive")
+        manifest = _load_sweep_manifest(args.scenario_manifest)
+        if args.hf_dataset != manifest.dataset:
+            raise SystemExit(
+                f"--hf-dataset {args.hf_dataset!r} does not match sweep manifest dataset "
+                f"{manifest.dataset!r}"
+            )
+        if args.split != manifest.split:
+            raise SystemExit(
+                f"--split {args.split!r} does not match sweep manifest split {manifest.split!r}"
+            )
+        if args.hf_revision is not None and args.hf_revision != manifest.revision:
+            raise SystemExit(
+                f"--hf-revision {args.hf_revision!r} does not match sweep manifest revision "
+                f"{manifest.revision!r}"
+            )
+        if not manifest.scenario_ids(args.capability):
+            raise SystemExit(
+                f"sweep manifest {manifest.name!r} has no {args.capability!r} scenarios"
+            )
+        args.hf_revision = manifest.revision
+        args.sweep_manifest = manifest
+        print(
+            f"scenario manifest {manifest.name}: "
+            f"{len(manifest.scenario_ids(args.capability))} {args.capability} cases, "
+            f"digest={manifest.digest}"
+        )
+
     if args.judge_model and args.init_turns:
         # Only the first of the two takes effect (ARE's initialize_turns is idempotent), leaving the
         # judge as the turn gate — the opposite of what --init-turns asks for. Refuse, don't ignore.
@@ -786,28 +1374,63 @@ def main(argv: list[str] | None = None) -> None:
     # thing selects it differs by arm — agent.yaml's llm.model for S-ORA, the profile for ReAct —
     # and nothing downstream can tell a mislabeled trace from a correct one.
     args.model_profile = None
+    from examples.gaia2.evaluation.core import ChargeModelSheet, load_profiles
+
+    profiles = load_profiles(args.profiles_path)
+    args.charge_model = ChargeModelSheet.load(
+        Path(__file__).resolve().parent / "evaluation" / "charge_model.json"
+    )
     if args.arm == "react":
+        if args.charge_profile:
+            raise SystemExit("--charge-profile applies only to --arm sora")
+        if args.allow_unfrozen_config:
+            raise SystemExit("--allow-unfrozen-config applies only to --arm sora")
         if not args.profile:
             raise SystemExit("--arm react requires --profile (it selects the model for that arm)")
-        from examples.gaia2.evaluation.core import load_profiles
-
-        profiles = load_profiles(args.profiles_path)
         if args.profile not in profiles:
             raise SystemExit(f"unknown profile {args.profile!r}; have {sorted(profiles)}")
         args.model_profile = profiles[args.profile]
-        args.model = _resolve_react_label(args.model, args.model_profile)
+        args.charge_model.for_profile(args.model_profile)
         _check_operating_point(args.model_profile, args.config)
+        args.model = _resolve_react_label(args.model, args.model_profile)
         print(
             f"profile {args.model_profile.name} -> {args.model_profile.model} "
             f"at {args.model_profile.endpoint}"
         )
     else:
         if args.profile:
-            # Silently ignoring it would let a two-arm sweep script run the S-ORA arm at a model
-            # nobody chose, while the command line says otherwise.
             raise SystemExit(
-                "--profile applies to --arm react; --arm sora is configured by --config"
+                "--profile applies to --arm react; --arm sora derives its frozen charge profile "
+                "from --config"
             )
+        if args.charge_profile and args.wall_clock:
+            raise SystemExit("--charge-profile and --wall-clock are mutually exclusive")
+        if args.charge_profile and args.allow_unfrozen_config:
+            raise SystemExit("--charge-profile and --allow-unfrozen-config are mutually exclusive")
+        if args.allow_unfrozen_config:
+            if not os.path.isfile(args.config):
+                raise SystemExit(f"--config does not exist: {args.config}")
+            args.wall_clock = True
+            print("unfrozen config: using wall clock (development mode; not sweep-comparable)")
+        elif args.charge_profile:
+            if args.charge_profile not in profiles:
+                raise SystemExit(
+                    f"unknown charge profile {args.charge_profile!r}; have {sorted(profiles)}"
+                )
+            args.model_profile = profiles[args.charge_profile]
+            if not os.path.isfile(args.config):
+                raise SystemExit(f"--config does not exist: {args.config}")
+            _check_operating_point(args.model_profile, args.config)
+            print(
+                f"explicit charge profile {args.model_profile.name} -> "
+                f"{args.model_profile.model} at {args.model_profile.endpoint}"
+            )
+        else:
+            # Clock policy is independent of operating-point validation. A wall-clock robustness
+            # run still identifies the frozen profile it is a robustness check of.
+            args.model_profile = _profile_for_config(profiles, args.config)
+        if args.model_profile is not None:
+            args.charge_model.for_profile(args.model_profile)
         args.model = _resolve_model_label(args.model, args.config)
 
     # Absolutize the artifact root before anything writes under it: the HF trace path ARE returns

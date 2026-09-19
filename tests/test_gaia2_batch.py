@@ -7,6 +7,8 @@ here.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,15 +23,23 @@ from examples.gaia2._runner import (
     _terminal_cause,
 )
 from examples.gaia2.batch import (
+    SweepManifest,
     _arm_root,
     _check_operating_point,
     _jsonl_record,
+    _load_sweep_manifest,
     _parse_args,
     _pass_at_1,
+    _pinned_hf_scenarios,
+    _profile_for_config,
     _resolve_model_label,
     _resolve_react_label,
+    _run_capability,
+    _run_one_scenario,
     _score_status,
+    _select_manifest_scenarios,
     _verdict_parse,
+    _verify_counterpart_manifest,
     aggregate,
     main,
 )
@@ -305,7 +315,131 @@ def test_aggregate_empty_dir_is_safe(tmp_path: Path) -> None:
     assert summary == {"configs": {}, "overall": None}
 
 
+def test_aggregate_reports_charge_provenance_and_surfaces_anomaly_disagreement(
+    tmp_path: Path,
+) -> None:
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+    row: dict[str, Any] = {
+        "task_id": "clock",
+        "score": 1.0,
+        "metadata": {
+            "charged_seconds": 7.5,
+            "charge_model_identity": {"provider": "openai", "model": "gpt"},
+            "charge_model_digest": "digest",
+            "cached_input_clamps": 1,
+            "raw_cached_input_anomalies": 1,
+            "charge_accounting_consistent": True,
+            "inference_charge_policy": "serialized_sum",
+            "llm_wall_seconds": 9.0,
+            "llm_wall_union_seconds": 7.0,
+            "llm_charged_union_seconds": 5.5,
+            "llm_round_trips": 4,
+            "llm_max_in_flight": 2,
+            "llm_overlapped_round_trips": 3,
+            "scenario_manifest_digest": "manifest-digest",
+        },
+    }
+    path = cfg_dir / "output.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+
+    report = aggregate(str(tmp_path))["configs"]["time"]
+    assert report["charged_seconds"] == 7.5
+    assert report["llm_wall_seconds"] == 9.0
+    assert report["llm_wall_union_seconds"] == 7.0
+    assert report["llm_wall_overlap_seconds"] == 2.0
+    assert report["llm_charged_union_seconds"] == 5.5
+    assert report["llm_charged_overlap_seconds"] == 2.0
+    assert report["llm_round_trips"] == 4
+    assert report["llm_max_in_flight"] == 2
+    assert report["llm_overlapped_round_trips"] == 3
+    assert report["scenario_manifest_digests"] == ["manifest-digest"]
+    assert report["mixed_scenario_manifests"] is False
+    assert report["charge_accounting_mismatches"] == 0
+    assert report["inference_charge_policies"] == ["serialized_sum"]
+    assert report["charge_models"] == [
+        {
+            "identity": {"provider": "openai", "model": "gpt"},
+            "digest": "digest",
+        }
+    ]
+
+    row["metadata"]["raw_cached_input_anomalies"] = 0
+    row["metadata"]["charge_accounting_consistent"] = False
+    path.write_text(json.dumps(row) + "\n")
+    report = aggregate(str(tmp_path))["configs"]["time"]
+    assert report["charge_accounting_mismatches"] == 1
+
+
+def test_charge_accounting_mismatch_is_recorded_without_aborting_scenario(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    charge = SimpleNamespace(cached_input_clamps=1, identity={"model": "m"})
+    charge_model = SimpleNamespace(charge_for=lambda _profile: charge, digest="digest")
+    result = SimpleNamespace(
+        outcome=SimpleNamespace(success=None, rationale=None),
+        environment=None,
+        exception=None,
+        awaiting_input=[],
+        write_counts=None,
+        judge_recording=None,
+        timeline_expired=False,
+        charged_seconds=2.0,
+        charge_model_identity=charge.identity,
+        charge_model_digest="digest",
+        cached_input_clamps=1,
+        raw_cached_input_anomalies=0,
+        charge_accounting_consistent=False,
+        clock_mode="token_charged",
+        inference_charge_policy="serialized_sum",
+        llm_wall_seconds=3.0,
+        llm_wall_union_seconds=2.0,
+        llm_charged_union_seconds=1.5,
+        llm_round_trips=2,
+        llm_max_in_flight=2,
+        llm_overlapped_round_trips=2,
+    )
+    monkeypatch.setattr("examples.gaia2._runner.run_scenario", lambda *_a, **_k: result)
+    monkeypatch.setattr("sora.adapters.are_sim.populate_oracle_events", lambda _scenario: None)
+    args = Namespace(
+        charge_model=charge_model,
+        model_profile=object(),
+        judge_model=None,
+        judge_provider=None,
+        judge_endpoint=None,
+        strict_verdict_case=False,
+        init_turns=False,
+        arm="sora",
+        config="agent.yaml",
+        verbose=False,
+        max_wall_seconds=10.0,
+        model="m",
+        wall_clock=False,
+    )
+
+    row = _run_one_scenario(
+        SimpleNamespace(scenario_id="s"), 0, args, str(tmp_path), llm_calls=None
+    )
+
+    assert row["metadata"]["charge_accounting_consistent"] is False
+    assert row["metadata"]["llm_round_trips"] == 2
+    assert row["metadata"]["llm_max_in_flight"] == 2
+    assert row["metadata"]["llm_overlapped_round_trips"] == 2
+
+    config_dir = tmp_path / "standard" / "time"
+    config_dir.mkdir(parents=True)
+    (config_dir / "output.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    reported = aggregate(str(tmp_path))["configs"]["time"]
+    assert reported["llm_round_trips"] == 2
+    assert reported["llm_max_in_flight"] == 2
+    assert reported["llm_overlapped_round_trips"] == 2
+
+
 # -- _make_stop_when: the turn-aware predicate ----------------------------------------------------
+
+# The predicate takes an absolute monotonic instant, so a test that is not about the cap
+# names one no clock in these tests reaches -- including the fake clocks they install.
+_FAR_DEADLINE = 1e9
 
 
 def _agent_with(
@@ -348,13 +482,13 @@ def _sim(
 
 def test_stop_when_none_when_exit_when_idle_set() -> None:
     # Opting into the quiet-window heuristic means no custom predicate.
-    assert _make_stop_when(SimpleNamespace(), SimpleNamespace(), 8.0, 1200.0) is None
+    assert _make_stop_when(SimpleNamespace(), SimpleNamespace(), 8.0, _FAR_DEADLINE) is None
 
 
 def test_stop_when_rides_through_live_timeline() -> None:
     sim = _sim(running=True)
     agent = _agent_with([ActivityState.TERMINATED])  # even fully idle, a live timeline keeps going
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False
 
@@ -362,7 +496,7 @@ def test_stop_when_rides_through_live_timeline() -> None:
 def test_stop_when_ends_live_timeline_after_the_final_reply() -> None:
     sim = _sim(running=True, all_turns_answered=True)
     agent = _agent_with([ActivityState.TERMINATED])
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
 
     assert predicate() is True
@@ -372,7 +506,7 @@ def test_stop_when_ends_live_timeline_after_the_final_reply() -> None:
 def test_stop_when_waits_for_final_work_to_settle_after_the_final_reply() -> None:
     sim = _sim(running=True, all_turns_answered=True)
     agent = _agent_with([ActivityState.READY])
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
 
     assert predicate() is False
@@ -380,15 +514,17 @@ def test_stop_when_waits_for_final_work_to_settle_after_the_final_reply() -> Non
 
 def test_stop_when_stops_once_timeline_done_and_all_terminated() -> None:
     sim = _sim(running=False)
-    predicate = _make_stop_when(sim, _agent_with([ActivityState.TERMINATED]), None, 1200.0)
+    predicate = _make_stop_when(sim, _agent_with([ActivityState.TERMINATED]), None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is True
+    # Not because the cap elapsed: the run completed.
+    assert predicate.reason == "verification_completion"
 
 
 def test_stop_when_waits_for_in_flight_activity_after_timeline_done() -> None:
     sim = _sim(running=False)
     agent = _agent_with([ActivityState.TERMINATED, ActivityState.READY])
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False  # timeline ended but the agent still has work in flight
 
@@ -406,7 +542,7 @@ def test_stop_when_enforces_the_explicit_logical_agent_call_limit() -> None:
         _sim(running=True),
         _agent_with([ActivityState.READY], logical_call_limit_exceeded=True),
         None,
-        1200.0,
+        _FAR_DEADLINE,
     )
     assert predicate is not None
     assert predicate() is True
@@ -418,7 +554,7 @@ def test_stop_when_does_not_treat_decision_cycles_as_benchmark_steps() -> None:
         _sim(running=True),
         _agent_with([ActivityState.READY], cycle_count=10_000),
         None,
-        1200.0,
+        _FAR_DEADLINE,
     )
     assert predicate is not None
     assert predicate() is False
@@ -496,7 +632,7 @@ def test_stop_when_rides_through_a_judge_pause() -> None:
     every later turn is lost."""
     sim = _sim(running=True, paused=True)
     agent = _agent_with([ActivityState.BLOCKED], [ConditionWait()])
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False
 
@@ -508,7 +644,7 @@ def test_stop_when_a_pause_that_never_ends_is_a_stall(monkeypatch: pytest.Monkey
     clock = 1000.0
     monkeypatch.setattr("examples.gaia2._runner.time.monotonic", lambda: clock)
     sim = _sim(running=True, paused=True)
-    predicate = _make_stop_when(sim, _agent_with([ActivityState.READY]), None, 1200.0)
+    predicate = _make_stop_when(sim, _agent_with([ActivityState.READY]), None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False  # the first poll only starts the pause clock
 
@@ -525,7 +661,7 @@ def test_stop_when_pause_allowance_resets_between_turns(monkeypatch: pytest.Monk
     monkeypatch.setattr("examples.gaia2._runner.time.monotonic", lambda: clock)
     paused = True
     sim = SimpleNamespace(is_running=lambda: True, is_paused=lambda: paused)
-    predicate = _make_stop_when(sim, _agent_with([ActivityState.READY]), None, 1200.0)
+    predicate = _make_stop_when(sim, _agent_with([ActivityState.READY]), None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False
 
@@ -537,6 +673,63 @@ def test_stop_when_pause_allowance_resets_between_turns(monkeypatch: pytest.Monk
     assert predicate() is False
     clock += _runner.MAX_PAUSE_SECONDS - 1
     assert predicate() is False
+
+
+# -- _wall_deadline: one cap over the same phases on both arms ------------------------------------
+
+
+def _fake_sim(environments: list[Any]) -> Any:
+    """A simulation whose ``environment()`` yields each entry in turn, then repeats the last."""
+
+    def environment() -> Any:
+        return environments[0] if len(environments) == 1 else environments.pop(0)
+
+    return SimpleNamespace(environment=environment)
+
+
+def test_wall_deadline_stops_the_environment_once_the_cap_passes() -> None:
+    stopped = threading.Event()
+    env = SimpleNamespace(stop=stopped.set)
+
+    with _runner._wall_deadline(_fake_sim([env]), time.monotonic() - 1.0) as expired:
+        assert stopped.wait(2.0), "the deadline never reached the environment"
+
+    assert expired() is True
+
+
+def test_wall_deadline_waits_for_an_environment_that_does_not_exist_yet() -> None:
+    """The cap must not retire when it fires before the environment is published.
+
+    Returning at that point leaves the timeout flagged but never enforced, so a run whose setup is
+    what overran would then proceed uncapped -- the failure this guards is a silent one.
+    """
+    stopped = threading.Event()
+    env = SimpleNamespace(stop=stopped.set)
+    # Two polls see nothing; only the third finds a constructed environment.
+    sim = _fake_sim([None, None, env])
+
+    with _runner._wall_deadline(sim, time.monotonic() - 1.0):
+        assert stopped.wait(2.0), "the watchdog retired before the environment appeared"
+
+
+def test_wall_deadline_leaves_a_run_that_finishes_in_time_alone() -> None:
+    stopped = threading.Event()
+    env = SimpleNamespace(stop=stopped.set)
+
+    with _runner._wall_deadline(_fake_sim([env]), time.monotonic() + 600.0) as expired:
+        assert expired() is False
+
+    assert not stopped.is_set()
+
+
+def test_wall_deadline_survives_an_environment_probe_that_raises() -> None:
+    """Construction can fail or tear down mid-probe; the watchdog must not die of it."""
+
+    def environment() -> Any:
+        raise RuntimeError("not constructed")
+
+    with _runner._wall_deadline(SimpleNamespace(environment=environment), time.monotonic() - 1.0):
+        time.sleep(0.2)
 
 
 # -- --init-turns: turn wiring without a judge ----------------------------------------------------
@@ -613,6 +806,57 @@ def test_a_plain_run_still_replays_the_oracle_for_the_write_count_gate(monkeypat
     assert calls == ["oracle"]
 
 
+def test_single_scenario_driver_wires_one_frozen_charge(monkeypatch: Any) -> None:
+    from examples.gaia2.run_benchmark import main
+
+    _patch_seams(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def run(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(success=None, rationale=None),
+            exception=None,
+            write_counts=None,
+            judge_recording=None,
+            charged_seconds=0.0,
+            raw_cached_input_anomalies=0,
+        )
+
+    monkeypatch.setattr("examples.gaia2._runner.run_scenario", run)
+    main(["--scenario", "s.json"])
+
+    charge = captured["charge"]
+    assert captured["charge_model_identity"] == charge.identity
+    assert captured["charge_model_digest"]
+    assert charge.cached_input_clamps == 0
+
+
+def test_single_scenario_driver_can_run_on_wall_clock(monkeypatch: Any) -> None:
+    from examples.gaia2.run_benchmark import main
+
+    _patch_seams(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def run(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(success=None, rationale=None),
+            exception=None,
+            write_counts=None,
+            judge_recording=None,
+            charged_seconds=0.0,
+            raw_cached_input_anomalies=0,
+        )
+
+    monkeypatch.setattr("examples.gaia2._runner.run_scenario", run)
+    main(["--scenario", "s.json", "--wall-clock"])
+
+    assert captured["charge"] is None
+    assert captured["charge_model_identity"]["model"] == "gpt-5.4-2026-03-05"
+    assert captured["charge_model_digest"] is not None
+
+
 def test_a_failed_oracle_replay_does_not_abort_the_run(monkeypatch: Any) -> None:
     """The replay exists only to report ARE's write-count gate, which is extra information about a
     run that is otherwise perfectly runnable — and this is the unscored path, where nobody asked to
@@ -663,7 +907,7 @@ def _asking(prompt: str = "Stuck on 'x': ... How should I proceed?") -> SimpleNa
 def test_stop_when_stops_on_a_question_nobody_is_left_to_answer() -> None:
     sim = _sim(running=False)  # timeline over: no further user turn is coming
     agent = _agent_with([ActivityState.BLOCKED], [InputWait(prompt="How should I proceed?")])
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is True
 
@@ -674,7 +918,7 @@ def test_stop_when_lets_a_live_timeline_answer_the_question() -> None:
     recoverable state rather than saving wall clock."""
     sim = _sim(running=True)
     agent = _agent_with([ActivityState.BLOCKED], [InputWait(prompt="How should I proceed?")])
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False
 
@@ -684,7 +928,7 @@ def test_stop_when_still_waits_on_an_activity_blocked_for_a_signal() -> None:
     settle after the timeline stops, so the narrower InputWait test is the deliberate one."""
     sim = _sim(running=False)
     agent = _agent_with([ActivityState.BLOCKED], [SignalWait(signal_name="job_done")])
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False
 
@@ -695,7 +939,7 @@ def test_stop_when_a_question_does_not_excuse_work_still_in_flight() -> None:
         [ActivityState.READY, ActivityState.BLOCKED],
         [None, InputWait(prompt="How should I proceed?")],
     )
-    predicate = _make_stop_when(sim, agent, None, 1200.0)
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False  # the other activity can still make progress
 
@@ -744,6 +988,183 @@ def test_jsonl_record_omits_the_key_for_an_ordinary_run() -> None:
     assert "awaiting_input" not in rec["metadata"]
 
 
+# -- exact-ID sweep manifests --------------------------------------------------------------------
+
+
+def _manifest_json(cases: list[dict[str, str]] | None = None) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "name": "shared-time",
+        "dataset": "meta-agents-research-environments/gaia2",
+        "revision": "deadbeef",
+        "split": "validation",
+        "cases": cases
+        if cases is not None
+        else [
+            {"capability": "time", "id": "scenario-b"},
+            {"capability": "time", "id": "scenario-a"},
+        ],
+    }
+
+
+def test_sweep_manifest_pins_revision_order_and_canonical_digest(tmp_path: Path) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    raw = _manifest_json()
+    first.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    second.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+
+    manifest = _load_sweep_manifest(first)
+
+    assert manifest.revision == "deadbeef"
+    assert manifest.scenario_ids("time") == ("scenario-b", "scenario-a")
+    assert manifest.digest == _load_sweep_manifest(second).digest
+
+
+def test_paper_manifest_is_the_complete_five_capability_gaia2_mini_selection() -> None:
+    manifest = _load_sweep_manifest(
+        Path("examples/gaia2/evaluation/campaigns/aamas2027/mini-validation.json")
+    )
+
+    assert manifest.name == "aamas2027-gaia2-mini-validation"
+    assert manifest.revision == "78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99"
+    assert manifest.digest == "123b92db986d09fea93b92f7bccaa5c3f08c35c77939f91fc97c5c3820fc416b"
+    assert len(manifest.cases) == 160
+    assert {
+        capability: len(manifest.scenario_ids(capability))
+        for capability in ("execution", "search", "adaptability", "time", "ambiguity")
+    } == {
+        "execution": 32,
+        "search": 32,
+        "adaptability": 32,
+        "time": 32,
+        "ambiguity": 32,
+    }
+
+
+def test_pinned_hf_loader_uses_repository_revision_not_builder_parameter(
+    monkeypatch: Any,
+) -> None:
+    import datasets  # type: ignore[import-untyped]
+    from are.simulation.benchmark import scenario_loader
+
+    captured: dict[str, Any] = {}
+
+    def fake_load_dataset(dataset: str, **kwargs: Any) -> dict[str, list[dict[str, Any]]]:
+        captured["dataset"] = dataset
+        captured.update(kwargs)
+        return {"validation": [{"scenario_id": "scenario-a", "data": "{}", "run_number": 7}]}
+
+    scenario = SimpleNamespace(scenario_id="scenario-a", run_number=None)
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(
+        scenario_loader,
+        "load_scenario",
+        lambda *_args, **_kwargs: (scenario, []),
+    )
+
+    rows = list(
+        _pinned_hf_scenarios(
+            dataset="dataset",
+            capability="time",
+            split="validation",
+            revision="commit-sha",
+            limit=None,
+        )
+    )
+
+    assert captured == {
+        "dataset": "dataset",
+        "name": "time",
+        "revision": "commit-sha",
+        "streaming": True,
+    }
+    assert rows == [(scenario, [])]
+    assert scenario.run_number == 7
+
+
+def test_sweep_manifest_rejects_duplicate_scenario_ids(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.json"
+    path.write_text(
+        json.dumps(
+            _manifest_json(
+                [
+                    {"capability": "time", "id": "same"},
+                    {"capability": "time", "id": "same"},
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="must be unique"):
+        _load_sweep_manifest(path)
+
+
+def test_manifest_selection_is_exact_and_manifest_ordered() -> None:
+    manifest = SweepManifest(
+        name="shared-time",
+        dataset="dataset",
+        revision="revision",
+        split="validation",
+        cases=(("time", "scenario-b"), ("time", "scenario-a")),
+        digest="digest",
+    )
+    loaded = [
+        (SimpleNamespace(scenario_id="scenario-a"), "events-a"),
+        (SimpleNamespace(scenario_id="unselected"), "events-extra"),
+        (SimpleNamespace(scenario_id="scenario-b"), "events-b"),
+    ]
+
+    selected = _select_manifest_scenarios(loaded, manifest, "time")
+
+    assert [scenario.scenario_id for scenario, _events in selected] == [
+        "scenario-b",
+        "scenario-a",
+    ]
+
+
+def test_manifest_selection_fails_before_running_when_an_id_is_missing() -> None:
+    manifest = SweepManifest(
+        name="shared-time",
+        dataset="dataset",
+        revision="revision",
+        split="validation",
+        cases=(("time", "missing"),),
+        digest="digest",
+    )
+
+    with pytest.raises(RuntimeError, match="missing"):
+        _select_manifest_scenarios([], manifest, "time")
+
+
+def test_counterpart_arm_must_have_same_complete_manifest_matrix(tmp_path: Path) -> None:
+    counterpart = tmp_path / "standard" / "time"
+    counterpart.mkdir(parents=True)
+    row = _jsonl_record(
+        scenario_id="scenario-a",
+        run_number=0,
+        success=True,
+        rationale=None,
+        exception=None,
+        trace_id="trace",
+        scenario_manifest_digest="other",
+    )
+    (counterpart / "output.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    manifest = SweepManifest(
+        name="shared-time",
+        dataset="dataset",
+        revision="revision",
+        split="validation",
+        cases=(("time", "scenario-a"),),
+        digest="expected",
+    )
+    args = Namespace(output_dir=str(tmp_path), arm="react", capability="time", num_runs=1)
+
+    with pytest.raises(RuntimeError, match="does not carry"):
+        _verify_counterpart_manifest(args, manifest)
+
+
 # -- the two arms share a sweep root without sharing its files -------------------------------------
 
 
@@ -782,6 +1203,361 @@ def test_a_react_label_that_names_the_profiles_model_is_kept() -> None:
 
 def test_the_arm_defaults_to_sora() -> None:
     assert _parse_args(["--capability", "execution"]).arm == "sora"
+
+
+def test_batch_exposes_wall_clock_robustness_mode() -> None:
+    args = _parse_args(["--capability", "time", "--wall-clock"])
+    assert args.wall_clock is True
+
+
+def test_scenario_manifest_and_loader_order_limit_are_mutually_exclusive(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(_manifest_json([{"capability": "time", "id": "scenario-a"}])),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        main(
+            [
+                "--capability",
+                "time",
+                "--scenario-manifest",
+                str(manifest),
+                "--limit",
+                "1",
+            ]
+        )
+
+
+def test_scenario_manifest_supplies_pinned_revision_and_digest(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    captured: dict[str, Any] = {}
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(_manifest_json([{"capability": "mini", "id": "scenario-a"}])),
+        encoding="utf-8",
+    )
+    derived = _profile("gpt-5.4-medium-prompt")
+    monkeypatch.setattr("examples.gaia2.batch._profile_for_config", lambda *_a: derived)
+    monkeypatch.setattr(
+        "examples.gaia2.batch._resolve_model_label", lambda _label, _config: "local-model"
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch._run_capability", lambda args: captured.update(vars(args)) or []
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch.aggregate", lambda _path: {"configs": {}, "overall": None}
+    )
+    monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
+    monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
+
+    main(["--capability", "mini", "--scenario-manifest", str(manifest_path)])
+
+    assert captured["hf_revision"] == "deadbeef"
+    assert captured["sweep_manifest"].digest == _load_sweep_manifest(manifest_path).digest
+
+
+def test_wall_clock_sora_still_derives_the_frozen_profile(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    derived = _profile("gpt-5.4-medium-prompt")
+    monkeypatch.setattr("examples.gaia2.batch._profile_for_config", lambda *_a: derived)
+    monkeypatch.setattr(
+        "examples.gaia2.batch._resolve_model_label", lambda _label, _config: "local-model"
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch._run_capability", lambda args: captured.update(vars(args)) or []
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch.aggregate", lambda _path: {"configs": {}, "overall": None}
+    )
+    monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
+    monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
+
+    main(
+        [
+            "--capability",
+            "mini",
+            "--config",
+            "examples/gaia2/agent.yaml",
+            "--wall-clock",
+        ]
+    )
+
+    assert captured["model_profile"] is derived
+    assert captured["wall_clock"] is True
+
+
+def test_allow_unfrozen_config_implies_wall_clock_without_profile_derivation(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "examples.gaia2.batch._profile_for_config",
+        lambda *_a: pytest.fail("an explicitly unfrozen config has no frozen profile"),
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch._resolve_model_label", lambda _label, _config: "local-model"
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch._run_capability", lambda args: captured.update(vars(args)) or []
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch.aggregate", lambda _path: {"configs": {}, "overall": None}
+    )
+    monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
+    monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
+
+    main(
+        [
+            "--capability",
+            "mini",
+            "--config",
+            "examples/gaia2/agent.dev.yaml",
+            "--allow-unfrozen-config",
+        ]
+    )
+
+    assert captured["model_profile"] is None
+    assert captured["wall_clock"] is True
+
+
+def test_charge_profile_overrides_automatic_sora_derivation(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "examples.gaia2.batch._profile_for_config",
+        lambda *_a: pytest.fail("explicit override must bypass derivation"),
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch._resolve_model_label", lambda _label, _config: "local-model"
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch._run_capability", lambda args: captured.update(vars(args)) or []
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.batch.aggregate", lambda _path: {"configs": {}, "overall": None}
+    )
+    monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
+    monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
+
+    main(
+        [
+            "--capability",
+            "mini",
+            "--config",
+            "examples/gaia2/agent.yaml",
+            "--charge-profile",
+            "gpt-5.4-medium-prompt",
+        ]
+    )
+
+    assert captured["model_profile"].name == "gpt-5.4-medium-prompt"
+
+
+def test_charge_profile_must_match_the_sora_config() -> None:
+    with pytest.raises(SystemExit, match="reasoning_effort"):
+        main(
+            [
+                "--capability",
+                "mini",
+                "--config",
+                "examples/gaia2/agent.yaml",
+                "--charge-profile",
+                "gpt-5.4-high-paper",
+            ]
+        )
+
+
+@pytest.mark.parametrize("other", ["--wall-clock", "--allow-unfrozen-config"])
+def test_charge_profile_rejects_conflicting_profile_modes(other: str) -> None:
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        main(
+            [
+                "--capability",
+                "mini",
+                "--charge-profile",
+                "gpt-5.4-medium-prompt",
+                other,
+            ]
+        )
+
+
+def test_aggregate_suppresses_pass_at_1_for_mixed_clock_modes(tmp_path: Path) -> None:
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+    rows = [
+        {"task_id": "a", "score": 1.0, "metadata": {"clock_mode": "token_charged"}},
+        {"task_id": "b", "score": 0.0, "metadata": {"clock_mode": "wall"}},
+    ]
+    (cfg_dir / "output.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    report = aggregate(str(tmp_path))["configs"]["time"]
+
+    assert report["mixed_clock_modes"] is True
+    assert report["pass_at_1"] is None
+
+
+def test_aggregate_refuses_a_legacy_row_mixed_with_a_charged_one(tmp_path: Path) -> None:
+    """A row predating the clock field must not read as "nothing to compare".
+
+    Filtering the missing mode out of the set made a legacy run invisible to the check, so it sat
+    beside a charged run and the pair still looked homogeneous.
+    """
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+    rows = [
+        {"task_id": "a", "score": 1.0, "metadata": {"clock_mode": "token_charged"}},
+        {"task_id": "b", "score": 0.0, "metadata": {}},  # pre-W2 row: no clock_mode at all
+    ]
+    (cfg_dir / "output.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    report = aggregate(str(tmp_path))["configs"]["time"]
+
+    assert report["clock_modes"] == ["legacy", "token_charged"]
+    assert report["mixed_clock_modes"] is True
+    assert report["pass_at_1"] is None
+
+
+def test_aggregate_still_scores_a_uniformly_legacy_file(tmp_path: Path) -> None:
+    """Naming the legacy mode must not make old, self-consistent reports unreadable."""
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+    rows = [
+        {"task_id": "a", "score": 1.0, "metadata": {}},
+        {"task_id": "b", "score": 0.0, "metadata": {}},
+    ]
+    (cfg_dir / "output.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    report = aggregate(str(tmp_path))["configs"]["time"]
+
+    assert report["clock_modes"] == ["legacy"]
+    assert report["mixed_clock_modes"] is False
+    assert report["pass_at_1"] == pytest.approx(0.5)
+
+
+def test_aggregate_propagates_an_unavailable_charged_union(tmp_path: Path) -> None:
+    """One run without a coherent time axis makes the group's counterfactual unavailable."""
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "a",
+            "score": 1.0,
+            "metadata": {"clock_mode": "token_charged", "llm_charged_union_seconds": 4.0},
+        },
+        {
+            "task_id": "b",
+            "score": 1.0,
+            "metadata": {"clock_mode": "token_charged", "llm_charged_union_seconds": None},
+        },
+    ]
+    (cfg_dir / "output.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    report = aggregate(str(tmp_path))["configs"]["time"]
+
+    assert report["llm_charged_union_seconds"] is None
+    assert report["llm_charged_overlap_seconds"] is None
+    # The mixture is in one diagnostic, not in the timing policy, so the score still stands.
+    assert report["pass_at_1"] == pytest.approx(1.0)
+
+
+def test_aggregate_suppresses_pass_at_1_for_mixed_scenario_manifests(tmp_path: Path) -> None:
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+    rows = [
+        {
+            "task_id": "a",
+            "score": 1.0,
+            "metadata": {"scenario_manifest_digest": "manifest-a"},
+        },
+        {
+            "task_id": "b",
+            "score": 0.0,
+            "metadata": {"scenario_manifest_digest": "manifest-b"},
+        },
+    ]
+    (cfg_dir / "output.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    report = aggregate(str(tmp_path))["configs"]["time"]
+
+    assert report["mixed_scenario_manifests"] is True
+    assert report["pass_at_1"] is None
+
+
+def test_empty_dataset_refuses_before_truncating_sweep_artifacts(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from are.simulation.benchmark import scenario_loader
+
+    config_dir = tmp_path / "standard" / "mini"
+    config_dir.mkdir(parents=True)
+    output = config_dir / "output.jsonl"
+    calls = config_dir / "llm_calls.jsonl"
+    output.write_text("paid output\n")
+    calls.write_text("paid calls\n")
+    monkeypatch.setattr(scenario_loader, "setup_scenarios_iterator", lambda **_kwargs: iter(()))
+    args = Namespace(
+        output_dir=str(tmp_path),
+        arm="sora",
+        capability="mini",
+        split="validation",
+        hf_dataset="dataset",
+        limit=1,
+        num_runs=1,
+        judge_model=None,
+        no_judge_recording=False,
+    )
+
+    with pytest.raises(RuntimeError, match="zero scenarios"):
+        _run_capability(args)
+
+    assert output.read_text() == "paid output\n"
+    assert calls.read_text() == "paid calls\n"
+
+
+def test_manifest_is_fully_resolved_before_truncating_sweep_artifacts(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    config_dir = tmp_path / "standard" / "time"
+    config_dir.mkdir(parents=True)
+    output = config_dir / "output.jsonl"
+    calls = config_dir / "llm_calls.jsonl"
+    output.write_text("paid output\n", encoding="utf-8")
+    calls.write_text("paid calls\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "examples.gaia2.batch._pinned_hf_scenarios",
+        lambda **_kwargs: iter([(SimpleNamespace(scenario_id="present"), object())]),
+    )
+    manifest = SweepManifest(
+        name="shared-time",
+        dataset="dataset",
+        revision="revision",
+        split="validation",
+        cases=(("time", "missing"),),
+        digest="digest",
+    )
+    args = Namespace(
+        output_dir=str(tmp_path),
+        arm="sora",
+        capability="time",
+        split="validation",
+        hf_dataset="dataset",
+        hf_revision="revision",
+        limit=None,
+        num_runs=1,
+        judge_model=None,
+        no_judge_recording=False,
+        sweep_manifest=manifest,
+    )
+
+    with pytest.raises(RuntimeError, match="missing"):
+        _run_capability(args)
+
+    assert output.read_text(encoding="utf-8") == "paid output\n"
+    assert calls.read_text(encoding="utf-8") == "paid calls\n"
 
 
 def test_the_react_arm_without_a_profile_is_refused() -> None:
@@ -873,6 +1649,14 @@ def test_a_config_that_is_not_there_is_nothing_to_disagree_with(tmp_path: Path) 
     """A react-only run has no S-ORA side to be comparable with; refusing it would be refusing a
     run that the check has nothing to say about."""
     _check_operating_point(_profile("kimi-k2.5-prompt"), str(tmp_path / "absent.yaml"))
+
+
+def test_sora_profile_derivation_names_a_missing_config_directly(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="does not exist"):
+        _profile_for_config(
+            {"kimi-k2.5-prompt": _profile("kimi-k2.5-prompt")},
+            str(tmp_path / "absent.yaml"),
+        )
 
 
 def test_the_react_arm_checks_the_operating_point_before_spending() -> None:
