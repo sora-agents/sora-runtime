@@ -190,9 +190,16 @@ class AreSimulation:
     (``aui.wait_for_user_response = False``) — a follow-up user message arrives via the timeline and
     is picked up by ``AreTransport.receive``."""
 
-    def __init__(self, scenario: Any, *, config: Any | None = None) -> None:
+    def __init__(
+        self,
+        scenario: Any,
+        *,
+        config: Any | None = None,
+        environment_factory: Callable[..., Any] | None = None,
+    ) -> None:
         self._scenario = scenario
         self._config = config
+        self._environment_factory = environment_factory
         self._env: Any | None = None
         self._lock = threading.Lock()
         self._started = False
@@ -222,7 +229,8 @@ class AreSimulation:
         start_time = getattr(self._scenario, "start_time", None)
         if start_time and config.start_time is None:
             config = dataclasses.replace(config, start_time=start_time)
-        self._env = Environment(config=config)
+        environment_factory = self._environment_factory or Environment
+        self._env = environment_factory(config=config)
         # wait_for_end=False: registers apps, schedules the timeline, starts the event-loop thread,
         # and returns — the agent then drives its cycle against the live, ticking world.
         self._env.run(self._scenario, wait_for_end=False)
@@ -283,6 +291,51 @@ class AreSimulation:
         from are.simulation.types import EnvironmentState
 
         return bool(self._env.state == EnvironmentState.PAUSED)
+
+    def is_judge_paused(self) -> bool:
+        """True only for the online judge's pause, excluding agent inference freezes.
+
+        The charged Gaia2 environment exposes ``judge_paused``.  Falling back to the stock state
+        preserves the old behavior for ordinary ``AreSimulation`` users whose environment has no
+        distinction to make.
+        """
+        if self._env is None or not self._started:
+            return False
+        judge_paused = getattr(self._env, "judge_paused", None)
+        if isinstance(judge_paused, bool):
+            return judge_paused
+        return self.is_paused()
+
+    def pause_generation(self) -> int:
+        """Begin one harness-owned model freeze on the live environment."""
+        if self._env is None or not self._started:
+            # A completion already in flight may unwind after stop(). Match ChargedEnvironment's
+            # token-zero sentinel instead of manufacturing a secondary inference failure.
+            return 0
+        pause = getattr(self._env, "pause_generation", None)
+        if not callable(pause):
+            raise TypeError("the configured ARE environment does not support generation pauses")
+        return int(pause())
+
+    def resume_generation(self, token: int, offset: float) -> None:
+        """Finish one model freeze with its independently computed simulated duration."""
+        if token == 0:
+            return
+        if self._env is None:
+            raise RuntimeError("start() before resuming generation")
+        resume = getattr(self._env, "resume_generation", None)
+        if not callable(resume):
+            raise TypeError("the configured ARE environment does not support generation pauses")
+        resume(token, max(0.0, float(offset)))
+
+    def generation_charge_time(self, token: int) -> float:
+        """Return the harness charged-axis coordinate for a just-paused model crossing."""
+        if self._env is None or not self._started:
+            raise RuntimeError("start() before reading the generation charge clock")
+        probe = getattr(self._env, "generation_charge_time", None)
+        if not callable(probe):
+            raise TypeError("the configured ARE environment has no generation charge clock")
+        return float(probe(token))
 
     def all_turns_answered(self) -> bool:
         """True once the agent has completed a user reply for every benchmark turn.

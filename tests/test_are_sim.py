@@ -232,6 +232,15 @@ def test_reading_the_clock_before_the_simulation_starts_is_an_error_not_wall_clo
         sim.now()
 
 
+def test_generation_pause_before_start_is_a_noop_sentinel() -> None:
+    sim = AreSimulation(scenario=SimpleNamespace())
+
+    token = sim.pause_generation()
+    sim.resume_generation(token, 5.0)
+
+    assert token == 0
+
+
 async def test_the_workspace_carries_the_simulations_clock() -> None:
     sim = FakeSimulation([FakeEmailApp()])
     workspace = (await _adapter(sim).discover())[0]
