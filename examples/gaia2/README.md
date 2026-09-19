@@ -102,6 +102,9 @@ python -m examples.gaia2.run_benchmark \
 | `--no-judge-recording` | Skip recording them (and the both-parse comparison) |
 | `--init-turns` | Deliver every turn of a multi-turn scenario **without** a judge. Excludes `--judge-model` |
 | `--max-wall-seconds` | Safety cap, default 1200 |
+| `--wall-clock` | Robustness mode: use elapsed wall time instead of the frozen token charge. Not timing-comparable to the main sweep |
+| `--charge-profile NAME` | Resolve an ambiguous frozen-profile match explicitly. The named profile must still match the config; excludes `--wall-clock` |
+| `--allow-unfrozen-config` | Permit a local/unlisted config and necessarily use wall time. Development-only; excludes `--charge-profile` |
 | `--exit-when-idle SECONDS` | Old single-turn quiet-window stop. Only correct for single-turn scenarios |
 | `--verbose` / `--log-file PATH` | Stream / mirror the full trajectory |
 | `--llm-calls PATH` | Append one JSON line per model call — tokens, cache reads, measured latency |
@@ -137,8 +140,54 @@ sweep — `judge_responses/{scenario}.run{n}.json` per run, named in that row's
 capabilities.
 
 Flags mirror `run_benchmark.py`, plus: `--capability` (the dataset config to run), `--split`,
-`--hf-dataset`, `--output-dir`, `--num-runs` (Gaia2 uses 3), `--limit`, and `--model` (the label
-recorded in the trace — match it to `agent.yaml`'s `llm.model`).
+`--hf-dataset`, `--hf-revision`, `--scenario-manifest`, `--output-dir`, `--num-runs` (Gaia2 uses
+3), `--limit`, and `--model` (the label recorded in the trace — match it to `agent.yaml`'s
+`llm.model`). `--limit` is for loader-order smoke tests. A comparable paid subset uses
+`--scenario-manifest`, which is mutually exclusive with `--limit` and pins an ordered exact-ID set
+at an immutable dataset revision.
+
+The sweep manifest reuses the evaluation manifests' envelope without their five-capability
+restriction:
+
+```json
+{
+  "schema_version": 1,
+  "name": "time-shared-set",
+  "dataset": "meta-agents-research-environments/gaia2",
+  "revision": "<immutable dataset commit>",
+  "split": "validation",
+  "cases": [
+    {"capability": "time", "id": "scenario_universe_..."}
+  ]
+}
+```
+
+Batch loads and validates the entire selection before opening artifacts, runs in manifest order,
+records the canonical manifest digest on every row, and refuses an already-written counterpart arm
+whose digest or `(scenario_id, run_number)` matrix differs. The manifest can contain several
+capabilities, but one batch invocation still runs the requested `--capability` only.
+
+The paper freeze candidate uses
+[`evaluation/campaigns/aamas2027/mini-validation.json`](evaluation/campaigns/aamas2027/mini-validation.json):
+all 32 scenarios selected by Gaia2 `mini` for each of the five capabilities. The cases are recorded
+under `execution`, `search`, `adaptability`, `time`, and `ambiguity`, rather than under a synthetic
+`mini` result bucket. Each invocation therefore loads the corresponding full capability config and
+selects the mini IDs, preserving the normal per-capability reports and equal-weight five-way
+aggregate while evaluating exactly the mini suite.
+
+Run each capability separately with the same manifest; repeat the loop for each arm and operating
+point in the frozen run matrix:
+
+```bash
+for capability in execution search adaptability time ambiguity; do
+  python -m examples.gaia2.batch \
+    --capability "$capability" \
+    --scenario-manifest examples/gaia2/evaluation/campaigns/aamas2027/mini-validation.json \
+    --num-runs 3 \
+    --judge-model "$JUDGE_MODEL" --judge-provider "$JUDGE_PROVIDER" \
+    --output-dir .sora/gaia2/aamas2027
+done
+```
 
 ### `--arm` — which agent runs the sweep
 
@@ -170,6 +219,14 @@ tool-call gate, the record shape, pass@1, and `llm_calls.jsonl`. The point of ro
 through this one file is that a per-arm discrepancy in how a row is *scored* — rather than in how
 the agent performed — has nowhere to hide.
 
+`--wall-clock` changes only the clock policy. The S-ORA arm still derives and validates the frozen
+profile, and records its charge-model identity/digest, so a robustness row can be joined to the
+charged operating point it checks; batch rows also name the exact `model_profile`.
+`--charge-profile NAME` resolves an ambiguous match but does
+not bypass validation: the named profile must describe the config exactly. For a local/Ollama or
+otherwise unlisted config, pass `--allow-unfrozen-config`; because no frozen coefficients exist for
+that operating point, the flag necessarily selects wall time. A missing config is always an error.
+
 `gpt-5.4-medium-prompt` is the profile matching the shipped `agent.yaml`; to run the pair at
 another operating point, move both sides.
 
@@ -190,23 +247,38 @@ direction nothing in the artifacts would reveal:
   collapsed an errored react run would be a genuine miss while the equivalent S-ORA run was dropped
   from the denominator.
 
-- **Timeline expiry is latched when the agent stops, not when the row is written.** ARE pauses
-  nothing at shutdown — `Environment.stop()` leaves `TimeManager` running — and the first thing it
-  does after the agent returns is `scenario.validate()`, whose judge pass can take minutes. Read
-  off the clock afterwards, a run that finished inside its budget would report as expired and be
-  dropped from pass@1. The S-ORA arm latches at its own shutdown for the same reason.
+- **Timeline expiry is latched when the agent stops, not when the row is written.** The charged
+  clock resumes outside model calls, and the first thing ARE does after the agent returns is
+  `scenario.validate()`, whose judge pass can take minutes. Read off the clock afterwards, a run
+  that finished inside its budget could report as expired and be dropped from pass@1. The S-ORA
+  arm latches at its own shutdown for the same reason.
 
 `--init-turns` means the same thing on both arms — without a judge it decides whether turns 2..n
-are delivered at all — so a paired sweep compares equal work. `--max-wall-seconds` applies to the
-S-ORA arm; the react arm is bounded by ARE's own event loop, which exits at `scenario.duration`.
+are delivered at all — so a paired sweep compares equal work. `--max-wall-seconds` is the same
+1200-second scenario safety cap on both arms, over the same *span*: agent execution plus scoring,
+excluding artifact serialization. The span matters as much as the number — ARE's `ScenarioRunner`
+validates inside the call the ReAct watchdog wraps, so capping only S-ORA's agent loop would leave
+its judge pass, which can run for minutes, effectively uncapped on one arm alone. The separate 180-second watchdog applies only while
+the online judge holds the environment paused; an agent generation may legitimately approach its
+profile's 600-second transport timeout without being mistaken for a stalled judge.
 
 ### `llm_calls.jsonl` — one row per model call
 
 Written for every sweep, scored or not, and costing no tokens: `call_id`, `arm`, `model`,
 `semantic_label`, `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`,
-`seconds`, `round_trips`, `finish_reason`, plus `scenario_id` / `run_number` so one file holds a
-whole capability. `round_trips > 1` is one decision that crossed the wire more than once (a
-parser-repair pass on the S-ORA side), with the token fields summed across them.
+`seconds`, `charged_seconds`, `round_trip_windows`, `round_trips`, `finish_reason`, plus
+`scenario_id` / `run_number` so one file holds a whole capability. `seconds` remains the measured
+provider latency used by the drift audit; `charged_seconds` is what moved the simulated clock.
+Each `round_trip_windows` entry preserves one physical crossing's monotonic start/end, charge, and
+`charged_started_at`: the scenario elapsed time on a separate parallel-charge sensitivity axis
+when that crossing was admitted. Calls admitted before any sibling settles share a coordinate;
+after a completion, a newly admitted follow-up starts at the furthest settled parallel endpoint.
+The trajectory's serialized accumulator is deliberately not used for this coordinate. That makes
+two distinct overlap diagnostics recoverable offline without another paid run: provider wall
+intervals `[started_at, finished_at]`, and policy-relevant charged intervals
+`[charged_started_at, charged_started_at + charged_seconds]`. `round_trips > 1`
+is one decision that crossed the wire more than once (a parser-repair pass on the S-ORA side), with
+the token fields summed across them and one fixed charge term paid per crossing.
 
 The ReAct arm groups differently, because ARE calls the engine again on a malformed output and
 there is no logical-call id to reuse: each crossing is its own row, and `bracket_id` is what says
@@ -229,13 +301,53 @@ already in hand, and the row reports what that crossing actually cost. Only a cr
 produced no response at all bills the charge model's fixed per-call term alone. The fit excludes
 these rows; the bill does not.
 
+Every scenario constructs one `TotalInputCharge` from the frozen `charge_model.json` and reuses it
+for all of that scenario's calls. The environment clock is frozen while a physical model crossing
+is in flight, then advanced by its token charge. The fixed primary trajectory policy is
+`serialized_sum`: concurrent S-ORA calls are depth-counted so an early completion cannot resume the
+world underneath another call, and every overlapping call's charge is summed as though inference
+used one lane. This is deliberately conservative against S-ORA's asynchronous architecture. Run
+results report both wall sum/union and charged sum/union. The scenario row and reports name the
+concurrency diagnostics exactly as `llm_round_trips`, `llm_max_in_flight`, and
+`llm_overlapped_round_trips`; these mean all physical crossings, maximum simultaneous crossings on
+the host monotonic axis, and crossings sharing positive wall duration with another, respectively.
+The charged union is an online settled-frontier sensitivity, not a reconstructed causal DAG. An
+independent call admitted after an unrelated completion is conservatively placed at the settled
+frontier, so union elapsed is conservative-high and inferred parallel savings are a lower bound.
+Neither union retroactively changes the `serialized_sum` trajectory. Concurrency
+does not require multiple activities: background condition-retirement judgement deliberately runs
+without occupying an activity's `pending_inference`, and can overlap that activity's plan call.
+ReAct's malformed-output retries remain inside ARE's pause bracket, but the harness deliberately
+discards ARE's `completion_duration` offset and resumes with the independently computed bracket
+charge so measured provider latency cannot leak into the frozen clock. Missing cache
+detail is charged as uncached input; a call with no usage still pays the fixed term. A provider
+report with cached input greater than total input clamps only the negative uncached residual. Each
+run records the charge-model identity and digest, the clamp count, and a raw-usage anomaly count
+computed independently. A mismatch is recorded without aborting a paid batch; offline report
+verification rejects it.
+
+The dated [charged-clock experiment protocol](evaluation/charged-clock-protocol-2026-09-19.md)
+records the primary policy, sensitivity semantics, frozen artifact hashes, ex-ante overlap
+expectation, and operational gates. It becomes the pre-sweep checkpoint when committed together
+with the exact paid-scenario manifest before results are collected.
+
+ARE does not model tool-execution duration: its apps execute locally and expose no authored
+latency. Tool calls therefore acquire no generation-pause token. Their Python execution time is an
+implementation artifact rather than a quantity either arm is charged for; a Time smoke should
+still measure it once against simulated elapsed before the sweep. `--wall-clock` on the scenario,
+batch, ReAct, and evaluation drivers disables token charging for a separately labeled robustness
+run. The charged environment remains installed for its depth-counted judge pause and safe teardown,
+so this mode means wall-timed agent inference, not byte-for-byte stock ARE internals.
+
 Rows for a scenario are written when that scenario's recording ends, not as each call returns: a
 repaired call is two round-trips on one `call_id` and nothing in the stream marks the last of them,
 so the row can only be settled once the scenario's stream has. `batch.py` truncates the file once at
 the start of a capability sweep, alongside the `output.jsonl` it replaces — otherwise a re-run's
 rows would sit next to the previous sweep's under the same `scenario_id` and `run_number`, and the
 fit would count the stale ones a second time. `run_benchmark.py --llm-calls` appends, so several
-single-scenario runs can be pointed at one file deliberately.
+single-scenario runs can be pointed at one file deliberately. Monotonic timestamps are comparable
+only within one process invocation; split an appended file by invocation before computing interval
+unions across it.
 
 `examples.gaia2.react_engine.MeteredLiteLLMEngine` writes the same schema with `arm: "react"` for
 the ARE baseline, whose stock engine reports nothing at all — see that module for why ARE's own
@@ -509,12 +621,22 @@ as excluded; an arm with no usable rows fails closed. The file arguments are arm
 wrong arm or model is an error rather than a filtered row. Repeat `--sora` and `--react` to combine
 the per-capability files in a whole sweep without rewriting them.
 
+Run the paired range and drift audits before starting a paid sweep for both the OpenAI profile and
+the Venice-pinned Kimi profile, plus a short Time-capability smoke in which all scheduled events
+must arrive. Repeat the drift audit over the completed sweep logs. A failure is evidence that the
+live endpoint no longer matches the frozen accounting unit; record it and stop rather than
+re-fitting the coefficients inside the sweep.
+
 The charge model is `a0 + uncached_in/R_in + cached_in/R_cache + out/R_out`, frozen before the
 sweep and applied identically to both arms. Its coefficients cannot be fitted from the agents'
 own calls: neither arm varies prompt length independently of answer length, so an ordinary
 least-squares fit on stored trajectories returns a **negative** input coefficient — a longer prompt
 served faster. The grid exists to move the two axes independently, which is the only thing that
 identifies `R_in`.
+
+Because this clock changes the trajectory itself, timing results produced before the charged-clock
+integration are not comparable with results produced after it, even though the semantic prompts
+and their frozen snapshot did not change.
 
 Calls go through one plain `AsyncOpenAI` built from the named profile — deliberately neither arm's
 client. `a0` has to be the model's own per-call cost; measuring it through one arm's stack would

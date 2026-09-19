@@ -5,8 +5,22 @@ report serialization across two campaigns:
 
 - `prompt` evaluates frozen S-ORA prompt configurations on deterministic contract/neutral suites
   and the familiar, development, or locked-acceptance Gaia2 manifests.
-- `aamas2027` is reserved for the later paper protocol. Its dataset, scaffold arms, judge, clock
-  policy, and ablations are not frozen yet, so it cannot run experiments today.
+- `aamas2027` holds the paper protocol freeze candidate, including the exact Gaia2 mini scenario
+  selection. It remains uncommitted and must not produce paid results until its protocol checkpoint
+  is reviewed and committed.
+
+The [dated charged-clock protocol](charged-clock-protocol-2026-09-19.md) is the freeze candidate
+for the Gaia2 timing comparison. It becomes the pre-sweep record only when committed with the exact
+[Gaia2 mini manifest](campaigns/aamas2027/mini-validation.json) before paid results are collected.
+
+## Comparability breaks
+
+- 2026-09-12: the default billing sheet moved from `2026-09-02.json` to `2026-09-12.json` when the
+  Kimi endpoint was repinned from DeepInfra to Venice. This changes cost accounting, not the frozen
+  timing coefficients; the selected sheet date and digest remain report provenance.
+- 2026-09-16: Gaia timing moved from provider wall latency to the frozen token-charged clock.
+  Timing-gated results from before and after this integration are not comparable, although the
+  semantic prompts and their frozen snapshot did not change.
 
 Run commands from the repository root. The offline check opens no provider credential or
 acceptance payload:
