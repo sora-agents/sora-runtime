@@ -74,11 +74,22 @@ def test_are_builds_the_arm_at_the_profiles_operating_point(profile: Any, tmp_pa
     """ARE's config carries a model name and nothing else. Everything that makes the two arms the
     same experiment — reasoning setting, output cap, routing, streaming — comes from the profile."""
     writer = LLMCallWriter(tmp_path / "calls.jsonl")
-    builder = MeteredEngineBuilder(profile, writer=writer, scenario_id="scenario-7", run_number=2)
+
+    def charge(_input: int, _cached: int, _output: int) -> float:
+        return 1.0
+
+    builder = MeteredEngineBuilder(
+        profile,
+        writer=writer,
+        charge=charge,
+        scenario_id="scenario-7",
+        run_number=2,
+    )
     engine = builder.create_engine(LLMEngineConfig(model_name=profile.model))
     assert isinstance(engine, MeteredLiteLLMEngine)
     assert engine.scenario_id == "scenario-7" and engine.run_number == 2
     assert engine.writer is writer
+    assert engine.charge is charge
     assert engine.stream is profile.stream
     assert engine.settings.request_kwargs["reasoning_effort"] == "high"
     assert engine.settings.request_kwargs["max_completion_tokens"] == 16_384
@@ -591,6 +602,13 @@ def test_the_batch_harness_runs_the_react_arm_and_records_it(
     rows = [json.loads(line) for line in writer.path.read_text().splitlines() if line.strip()]
     assert rows and {row["arm"] for row in rows} == {"react"}
     assert {row["run_number"] for row in rows} == {2}
+    assert all(row["charged_seconds"] > 0 for row in rows)
+    assert record["metadata"]["charged_seconds"] == pytest.approx(
+        sum(row["charged_seconds"] for row in rows)
+    )
+    assert record["metadata"]["charge_model_digest"]
+    assert record["metadata"]["cached_input_clamps"] == 0
+    assert record["metadata"]["raw_cached_input_anomalies"] == 0
 
 
 def test_the_driver_initializes_the_scenario_itself(
@@ -882,5 +900,10 @@ def test_preflight_fails_a_route_that_answered_without_reporting_usage() -> None
 def test_preflight_needs_no_scenario_and_a_run_still_does() -> None:
     parsed = build_parser().parse_args(["--profile", PREFLIGHT_PROFILE, "--preflight"])
     assert parsed.scenario is None and parsed.preflight is True
+    assert (
+        build_parser()
+        .parse_args(["--profile", PREFLIGHT_PROFILE, "--preflight", "--wall-clock"])
+        .wall_clock
+    )
     with pytest.raises(SystemExit):
         main(["--profile", PREFLIGHT_PROFILE])

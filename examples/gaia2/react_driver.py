@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -78,7 +79,12 @@ from examples.gaia2.evaluation.core import (
 from examples.gaia2.evaluation.core import (
     served_snapshot as _served_snapshot,
 )
-from examples.gaia2.llm_calls import LLMCallWriter
+from examples.gaia2.llm_calls import (
+    LLMCallWriter,
+    charged_time_union_seconds,
+    round_trip_concurrency,
+    wall_time_union_seconds,
+)
 from examples.gaia2.react_engine import ChargeModel, MeteredLiteLLMEngine
 
 log = logging.getLogger(__name__)
@@ -144,7 +150,37 @@ def wire_bracket(agent: Any) -> Any:
     engine = getattr(agent, "llm_engine", None)
     pause_env = getattr(agent, "pause_env", None)
     if isinstance(engine, MeteredLiteLLMEngine) and pause_env is not None:
-        agent.pause_env = engine.wrap_pause_env(pause_env)
+        environment = getattr(pause_env, "__self__", None)
+        pause_generation = getattr(environment, "pause_generation", None)
+        resume_generation = getattr(environment, "resume_generation", None)
+        if callable(pause_generation) and callable(resume_generation):
+            active_token: int | None = None
+
+            def pause_charged_generation() -> None:
+                nonlocal active_token
+                active_token = int(pause_generation())
+                charge_time = getattr(environment, "generation_charge_time", None)
+                engine.begin_bracket(
+                    float(charge_time(active_token))
+                    if active_token != 0 and callable(charge_time)
+                    else None
+                )
+
+            def resume_charged_generation(offset: float) -> None:
+                nonlocal active_token
+                if active_token is None:
+                    return
+                token, active_token = active_token, None
+                # On an exception ARE's finally resumes with zero because no metadata returned.
+                # The engine still recorded and priced that crossing. Ignore ARE's argument on
+                # both paths so measured wall time can never leak back into the frozen clock.
+                del offset
+                resume_generation(token, engine.bracket_charge)
+
+            agent.pause_env = pause_charged_generation
+            agent.resume_env = resume_charged_generation
+        else:
+            agent.pause_env = engine.wrap_pause_env(pause_env)
     return agent
 
 
@@ -152,13 +188,12 @@ def wire_run_end(agent: Any, latch: Any) -> Any:
     """Call ``latch`` when the agent's loop returns, and hand the agent back.
 
     This is the only moment at which "did the world end under the agent?" has a stable answer.
-    ARE's clock is a wall clock that nothing pauses — ``Environment.stop()`` sets the stop event and
-    the state but leaves ``TimeManager`` running — and the very next thing ARE does after the agent
-    returns is ``scenario.validate()``, whose judge pass can take minutes. A verdict read off the
-    clock afterwards would drift True on any run that finished close enough to the budget, which is
-    a *successful* run being dropped from pass@1. The S-ORA arm latches at its own shutdown for
-    exactly this reason; this is where that instant is on ARE's side. Latched on the raising path
-    too, since a crashed run still has a real answer."""
+    The harness clock resumes after ``Environment.stop()``, and the very next thing ARE does after
+    the agent returns is ``scenario.validate()``, whose judge pass can take minutes. A verdict read
+    off the clock afterwards would drift True on any run that finished close enough to the budget,
+    which is a *successful* run being dropped from pass@1. The S-ORA arm latches at its own
+    shutdown for exactly this reason; this is where that instant is on ARE's side. Latched on the
+    raising path too, since a crashed run still has a real answer."""
     run_scenario = getattr(agent, "run_scenario", None)
     if latch is None or run_scenario is None:
         return agent
@@ -222,7 +257,7 @@ class CapturingScenarioRunner(ScenarioRunner):  # type: ignore[misc]  # ARE is u
       could not would have its timeouts scored as genuine failures while the other arm's were
       dropped — a bias in favour of whichever arm reports it, which is exactly the wrong direction
       here, since the slower arm is the one that expires. Latched when the agent's loop returns
-      rather than read when the row is built, because ARE's clock keeps running afterwards; see
+      rather than read when the row is built, because the clock keeps running afterwards; see
       :func:`wire_run_end`.
     * ``write_count_check`` — ARE's tool-call-count gate, recomputed offline for no tokens, and the
       only pass/fail signal an unscored sweep has.
@@ -235,6 +270,18 @@ class CapturingScenarioRunner(ScenarioRunner):  # type: ignore[misc]  # ARE is u
         super().__init__(*args, **kwargs)
         self.environment: Any = None
         self._expired: bool | None = None
+        self.wall_timed_out = False
+        self.judge_timed_out = False
+
+    def _run(self, config: Any, scenario: Any) -> Any:
+        # ScenarioRunner imported Environment into its module namespace. Patch that construction
+        # seam for this call only; copying ARE's _run would fork the baseline implementation.
+        from unittest.mock import patch
+
+        from examples.gaia2.simulated_clock import ChargedEnvironment
+
+        with patch("are.simulation.scenario_runner.Environment", ChargedEnvironment):
+            return super()._run(config, scenario)
 
     def _run_with_agent(self, scenario_id: str, scenario: Any, env: Any, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         self.environment = env
@@ -285,9 +332,9 @@ def build_runner(
 def runner_config(profile: ModelProfile, **overrides: Any) -> ScenarioRunnerConfig:
     """The published Gaia2 agent configuration, pointed at one profile.
 
-    ``simulated_generation_time_mode="measured"`` is ARE's own default and is what makes the
-    metadata's ``completion_duration`` advance the simulated clock — the single integration point
-    for freezing the environment during generation. ``max_turns`` is deliberately not set: the
+    ``simulated_generation_time_mode="measured"`` keeps ARE's native pause/resume path active; the
+    harness wrapper discards its computed offset and substitutes the frozen bracket charge.
+    ``max_turns`` is deliberately not set: the
     scenario's ``nb_turns`` overrides it anyway, and pinning it here would cap a multi-turn
     scenario at whatever this file guessed."""
     return ScenarioRunnerConfig(
@@ -314,6 +361,9 @@ def run_react_scenario(
     scenario_duration: float | None = None,
     output_dir: str | None = None,
     export: bool = False,
+    max_wall_seconds: float = 1200.0,
+    charge_model_identity: dict[str, Any] | None = None,
+    charge_model_digest: str | None = None,
     log_fn: Any = print,
 ) -> RunResult:
     """Load one scenario, preprocess it, and run it against ARE's agent.
@@ -358,6 +408,9 @@ def run_react_scenario(
         run_number=run_number,
         output_dir=output_dir,
         export=export,
+        max_wall_seconds=max_wall_seconds,
+        charge_model_identity=charge_model_identity,
+        charge_model_digest=charge_model_digest,
         log_fn=log_fn,
     )
 
@@ -394,6 +447,9 @@ def run_react_on_scenario(
     export: bool = False,
     record_judge: bool = False,
     verdict_parse: str | None = None,
+    max_wall_seconds: float = 1200.0,
+    charge_model_identity: dict[str, Any] | None = None,
+    charge_model_digest: str | None = None,
     log_fn: Any = print,
 ) -> RunResult:
     """Run ARE's agent against one **already preprocessed** scenario, as a :class:`RunResult`.
@@ -442,8 +498,49 @@ def run_react_on_scenario(
             # mid-run, so most judged events of a multi-turn scenario are decided inside run().
             collector = bracket.enter_context(record_judge_events())
 
+        stop_watchdog = threading.Event()
+
+        def watchdog() -> None:
+            deadline = time.monotonic() + max_wall_seconds
+            judge_paused_since: float | None = None
+            while not stop_watchdog.wait(0.05):
+                now = time.monotonic()
+                env = runner.environment
+                judge_paused = (
+                    bool(getattr(env, "judge_paused", False)) if env is not None else False
+                )
+                judge_paused_since = (
+                    now if judge_paused and judge_paused_since is None else judge_paused_since
+                )
+                if (
+                    judge_paused
+                    and judge_paused_since is not None
+                    and now - judge_paused_since >= 180.0
+                ):
+                    runner.judge_timed_out = True
+                if now >= deadline:
+                    runner.wall_timed_out = True
+                if runner.judge_timed_out or runner.wall_timed_out:
+                    if env is not None:
+                        env.stop()
+                        return
+                    # The deadline fired before `ScenarioRunner` published an environment, so
+                    # there is nothing to stop yet. Keep watching instead of retiring: returning
+                    # here leaves the timeout flagged but never enforced, and a run whose setup
+                    # is what overran would then proceed uncapped. `stop_watchdog` ends the loop
+                    # when the run finishes on its own.
+                    continue
+                if not judge_paused:
+                    judge_paused_since = None
+
+        watcher = threading.Thread(target=watchdog, name="Gaia2WallWatchdog", daemon=True)
+        watcher.start()
         started = time.monotonic()
-        result = runner.run(config, scenario)
+        try:
+            result = runner.run(config, scenario)
+        finally:
+            stop_watchdog.set()
+            watcher.join(timeout=1.0)
         duration = time.monotonic() - started
 
     env = runner.environment
@@ -475,11 +572,19 @@ def run_react_on_scenario(
     terminal_cause = _terminal_cause(
         typed_exc,
         expired,
-        None,
+        "timeout" if runner.wall_timed_out or runner.judge_timed_out else None,
         success if isinstance(success, bool) else None,
         max_iterations_reached=runner.agent_builder.max_iterations_reached(),
     )
 
+    charged_seconds = sum(engine.charged_seconds for engine in engine_builder.engines)
+    # The callable is one per scenario and sees every trip. Prefer its total when available so the
+    # result and the independently written per-call records expose the same accumulator.
+    charged_seconds = float(getattr(charge, "charged_seconds", charged_seconds))
+    all_windows = tuple(
+        window for engine in engine_builder.engines for window in engine.round_trip_windows
+    )
+    concurrency = round_trip_concurrency(all_windows)
     return RunResult(
         outcome=ValidationOutcome(success=success, rationale=getattr(result, "rationale", None)),
         environment=env,
@@ -497,6 +602,29 @@ def run_react_on_scenario(
                 verdict_parse=verdict_parse,
             )
         ),
+        charged_seconds=charged_seconds,
+        charge_model_identity=charge_model_identity,
+        charge_model_digest=charge_model_digest,
+        cached_input_clamps=int(getattr(charge, "cached_input_clamps", 0)),
+        raw_cached_input_anomalies=sum(
+            engine.raw_cached_input_anomalies for engine in engine_builder.engines
+        ),
+        charge_accounting_consistent=(
+            None
+            if charge is None
+            else int(getattr(charge, "cached_input_clamps", 0))
+            == sum(engine.raw_cached_input_anomalies for engine in engine_builder.engines)
+        ),
+        clock_mode="token_charged" if charge is not None else "wall",
+        inference_charge_policy="serialized_sum" if charge is not None else None,
+        llm_wall_seconds=sum(engine.wall_seconds for engine in engine_builder.engines),
+        # ReAct is serial today, but calculate the same sensitivity rather than assuming that
+        # implementation detail forever. Engines share one host monotonic-clock domain.
+        llm_wall_union_seconds=wall_time_union_seconds(all_windows),
+        llm_charged_union_seconds=charged_time_union_seconds(all_windows),
+        llm_round_trips=concurrency.round_trips,
+        llm_max_in_flight=concurrency.max_in_flight,
+        llm_overlapped_round_trips=concurrency.overlapped_round_trips,
     )
 
 
@@ -696,6 +824,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario-duration", type=float, default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--export", action="store_true", help="write ARE's HF trace")
+    parser.add_argument("--max-wall-seconds", type=float, default=1200.0)
+    parser.add_argument(
+        "--wall-clock",
+        action="store_true",
+        help=(
+            "Use measured model latency instead of the frozen token charge. This robustness "
+            "mode is not timing-comparable to token-charged runs."
+        ),
+    )
     parser.add_argument(
         "--preflight",
         action="store_true",
@@ -716,11 +853,17 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--scenario is required unless --preflight is given")
     print(f"profile {profile.name} -> {profile.model} at {profile.endpoint}  (arm: react)")
     writer = LLMCallWriter(args.llm_calls) if args.llm_calls else None
+    from examples.gaia2.evaluation.core import ChargeModelSheet
+
+    charge_sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
+    profile_charge = charge_sheet.charge_for(profile)
+    charge = None if args.wall_clock else profile_charge
     try:
         result = run_react_scenario(
             args.scenario,
             profile,
             writer=writer,
+            charge=charge,
             run_number=args.run_number,
             judge_model=args.judge_model,
             judge_provider=args.judge_provider,
@@ -728,11 +871,20 @@ def main(argv: list[str] | None = None) -> int:
             scenario_duration=args.scenario_duration,
             output_dir=args.output_dir,
             export=args.export,
+            max_wall_seconds=args.max_wall_seconds,
+            charge_model_identity=profile_charge.identity,
+            charge_model_digest=charge_sheet.digest,
         )
     finally:
         if writer is not None:
             writer.close()
             print(f"    wrote {writer.written} model calls to {writer.path}")
+    if result.charge_accounting_consistent is False:
+        print(
+            "warning: charge clamp count disagrees with independently counted raw usage "
+            f"anomalies ({result.cached_input_clamps} != "
+            f"{result.raw_cached_input_anomalies})"
+        )
     success = result.outcome.success
     verdict = "PASS" if success else "FAIL" if success is False else "UNSCORED"
     print(f"{verdict}: {result.outcome.rationale or result.exception or ''}")

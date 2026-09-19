@@ -16,12 +16,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from examples.gaia2.llm_calls import LLMCallWriter, SoraCallRecorder
+from examples.gaia2.llm_calls import (
+    Charge,
+    ClockedSoraLLMClient,
+    LLMCallWriter,
+    SoraCallRecorder,
+)
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +79,22 @@ class RunResult:
     prop_reads: int = 0
     prop_reads_by_property: dict[str, int] = field(default_factory=dict)
     judge_recording: Any = None
+    charged_seconds: float = 0.0
+    charge_model_identity: dict[str, Any] | None = None
+    charge_model_digest: str | None = None
+    cached_input_clamps: int = 0
+    raw_cached_input_anomalies: int = 0
+    charge_accounting_consistent: bool | None = None
+    clock_mode: str = "wall"
+    inference_charge_policy: str | None = None
+    llm_wall_seconds: float = 0.0
+    llm_wall_union_seconds: float = 0.0
+    # None when this run's crossings did not share one time axis, so the parallel-charge
+    # counterfactual is unavailable rather than zero.
+    llm_charged_union_seconds: float | None = 0.0
+    llm_round_trips: int = 0
+    llm_max_in_flight: int = 0
+    llm_overlapped_round_trips: int = 0
 
 
 StopReason = Literal["verification_completion", "llm_call_limit", "timeout"]
@@ -94,7 +116,13 @@ class _StopController:
         if now >= self.deadline:
             self.reason = "timeout"
             return True
-        if self.simulation.is_paused():
+        judge_pause_probe = getattr(self.simulation, "is_judge_paused", None)
+        judge_paused = (
+            bool(judge_pause_probe())
+            if callable(judge_pause_probe)
+            else bool(self.simulation.is_paused())
+        )
+        if judge_paused:
             self.paused_since = now if self.paused_since is None else self.paused_since
             if now - self.paused_since >= MAX_PAUSE_SECONDS:
                 self.reason = "timeout"
@@ -169,18 +197,60 @@ def _make_stop_when(
     simulation: Any,
     agent: Any,
     exit_when_idle: float | None,
-    max_wall_seconds: float,
+    deadline: float,
 ) -> _StopController | None:
     """The turn-aware done predicate (see ``run_benchmark.py``'s module docstring). Returns None
     when the caller opts into ``TerminalSession``'s own quiet-window heuristic (``exit_when_idle``
-    set), letting the session drive its old single-turn behavior unchanged."""
+    set), letting the session drive its old single-turn behavior unchanged.
+
+    The deadline is passed in rather than computed here because it has to govern scoring as well,
+    and this predicate is only polled while the decision cycle is running."""
     if exit_when_idle is not None:
         return None
-    return _StopController(
-        simulation=simulation,
-        agent=agent,
-        deadline=time.monotonic() + max_wall_seconds,
-    )
+    return _StopController(simulation=simulation, agent=agent, deadline=deadline)
+
+
+@contextlib.contextmanager
+def _wall_deadline(simulation: Any, deadline: float) -> Iterator[Callable[[], bool]]:
+    """Enforce one wall deadline across everything inside the block, not just the agent phase.
+
+    Both arms must be capped over the same phases or the cap is not a shared condition: ARE's
+    ``ScenarioRunner`` performs ``validate()`` inside the call the ReAct watchdog wraps, while
+    here the agent loop and scoring are separate statements, and ``_StopController`` is only
+    consulted from inside the decision cycle.  A judge pass can take minutes, so without this the
+    S-ORA arm is effectively uncapped over exactly the phase the other arm caps.
+
+    The lever is the one ARE gives either arm — stopping the environment — so a judge blocked on
+    the simulation is released the same way.  Artifact serialization stays outside the block: it
+    is bookkeeping, and killing it would lose the run's record rather than bound its cost."""
+    expired = threading.Event()
+    finished = threading.Event()
+
+    def watch() -> None:
+        while not finished.wait(0.05):
+            if time.monotonic() < deadline:
+                continue
+            expired.set()
+            env = None
+            try:
+                env = simulation.environment()
+            except Exception:  # not constructed yet, or already torn down
+                env = None
+            if env is not None:
+                with contextlib.suppress(Exception):
+                    env.stop()
+                return
+            # Deadline reached before the environment exists: there is nothing to stop yet, so
+            # keep watching rather than retiring — otherwise a slow construction outlives its own
+            # deadline unbounded.  The block's exit releases this thread either way.
+
+    watcher = threading.Thread(target=watch, name="Gaia2SoraWallDeadline", daemon=True)
+    watcher.start()
+    try:
+        yield expired.is_set
+    finally:
+        finished.set()
+        watcher.join(timeout=1.0)
 
 
 def _context_overflow(exc: Exception | str | None) -> bool:
@@ -237,16 +307,11 @@ def _terminal_inference_errors(llm_report: Any) -> tuple[str, ...]:
 
 @contextlib.contextmanager
 def _recording_llm_calls(
-    writer: LLMCallWriter,
-    *,
-    model: str | None,
-    scenario_id: str | None,
-    run_number: int | None,
+    recorder: SoraCallRecorder,
 ) -> Iterator[None]:
     """Attach the per-call recorder for one run and detach it again — a sweep runs many scenarios
     in one process, and a handler left on the logger would keep attributing later runs to this
     scenario's id."""
-    recorder = SoraCallRecorder(writer, model=model, scenario_id=scenario_id, run_number=run_number)
     sora_log = logging.getLogger("sora")
     # The session raises this to DEBUG for its own presenter, so in practice it is already open —
     # but a level left at the root default would drop every per-call record *before* any handler
@@ -281,6 +346,9 @@ def run_scenario(
     llm_calls: LLMCallWriter | None = None,
     scenario_id: str | None = None,
     run_number: int | None = None,
+    charge: Charge | None = None,
+    charge_model_identity: dict[str, Any] | None = None,
+    charge_model_digest: str | None = None,
 ) -> RunResult:
     """Run S-ORA against one loaded scenario to completion, then score it. Attach the judge (via
     ``are_sim.attach_judge``) *before* calling this if a real score is wanted; without it the run is
@@ -300,17 +368,21 @@ def run_scenario(
     tokens, cache reads and measured latency, which the charge model is fitted and validated
     against. It is a separate channel from ``llm_report``: that one summarizes this run, this one
     is the per-call record a later fit reads, and it is written for the *unscored* runs too."""
+    from examples.gaia2.simulated_clock import ChargedEnvironment
     from sora.adapters.are_sim import AreSimulation, ValidationOutcome, write_count_check
     from sora.bootstrap import build_agent
     from sora.cli import TerminalSession
 
-    simulation = AreSimulation(scenario)
+    simulation = AreSimulation(scenario, environment_factory=ChargedEnvironment)
     agent = build_agent(config, simulation=simulation)
+    # One instant, shared by the in-cycle predicate and the scoring-phase watchdog below, so the
+    # cap covers the same phases the ReAct arm's watchdog covers.
+    wall_deadline = time.monotonic() + max_wall_seconds
     stop_when = _make_stop_when(
         simulation,
         agent,
         exit_when_idle,
-        max_wall_seconds,
+        wall_deadline,
     )
 
     session = TerminalSession(
@@ -327,23 +399,46 @@ def run_scenario(
     # turn's release gate, so on a multi-turn scenario most judged events are decided mid-run, and
     # a bracket around validate() alone would record only the last one. Nothing here is entered
     # when `record_judge` is off, so an unrecorded run pays nothing.
+    recorder: SoraCallRecorder | None = None
+    original_llm: Any = None
     with contextlib.ExitStack() as bracket:
-        if llm_calls is not None:
-            # On the `sora` logger, the same stream `LLMMeter` and the CLI presenter read; the
-            # session attaches its own handlers to it independently, so ordering does not matter.
-            bracket.enter_context(
-                _recording_llm_calls(
-                    llm_calls,
-                    model=getattr(agent.procedural, "model", None),
-                    scenario_id=scenario_id,
-                    run_number=run_number,
-                )
+        # On the `sora` logger, the same stream `LLMMeter` and the CLI presenter read; the session
+        # attaches its own handlers independently. Keep the recorder even without a writer or a
+        # charge model: wall-clock robustness runs still need their overlap sensitivity in the
+        # result, and collecting it should not require a JSONL destination.
+        recorder = SoraCallRecorder(
+            llm_calls,
+            model=getattr(agent.procedural, "model", None),
+            scenario_id=scenario_id,
+            run_number=run_number,
+            charge=charge,
+        )
+        bracket.enter_context(_recording_llm_calls(recorder))
+        # Harness-only decoration: bootstrap still owns construction, while the benchmark times
+        # the completed client for this run alone. Every current agent-model entry point — the five
+        # activity actions plus off-cycle relevance and retirement judgement — resolves through
+        # this one ProceduralMemory client. That single seam is what makes the recorder complete;
+        # a future strategy that owns a separate client must be instrumented here too. With a
+        # charge model, the same wrapper freezes the scenario; in wall-clock robustness mode it
+        # only records windows.
+        original_llm = agent.procedural._llm
+        if original_llm is None:
+            if charge is not None:
+                raise ValueError("a charged Gaia2 run requires an LLM client")
+        else:
+            agent.procedural._llm = ClockedSoraLLMClient(
+                original_llm,
+                clock=simulation if charge is not None else None,
+                recorder=recorder,
             )
+            bracket.callback(setattr, agent.procedural, "_llm", original_llm)
         collector: Any = None
         if record_judge:
             from sora.adapters.are_judge import record_judge_events
 
             collector = bracket.enter_context(record_judge_events())
+
+        wall_expired = bracket.enter_context(_wall_deadline(simulation, wall_deadline))
 
         exc: Exception | None = None
         started = time.monotonic()
@@ -383,10 +478,16 @@ def run_scenario(
         except Exception:  # a diagnostic must never cost the run its real result
             log.warning("write-count check failed", exc_info=True)
 
+        # A deadline that fired during scoring is still a timeout: the run has no result it
+        # could have reached, and recording it as anything else would hide a capped judge pass.
+        stop_reason: StopReason | None = stop_when.reason if stop_when is not None else None
+        if stop_reason is None and wall_expired():
+            stop_reason = "timeout"
+
         terminal_cause = _terminal_cause(
             exc,
             expired,
-            stop_when.reason if stop_when is not None else None,
+            stop_reason,
             outcome.success if isinstance(outcome.success, bool) else None,
             inference_errors=_terminal_inference_errors(session.llm_report),
         )
@@ -430,5 +531,30 @@ def run_scenario(
                     run_number=_run_number_of(scenario, run_number),
                     verdict_parse=verdict_parse,
                 )
+            ),
+            charged_seconds=recorder.charged_seconds if recorder is not None else 0.0,
+            charge_model_identity=charge_model_identity,
+            charge_model_digest=charge_model_digest,
+            cached_input_clamps=int(getattr(charge, "cached_input_clamps", 0)),
+            raw_cached_input_anomalies=(
+                recorder.raw_cached_input_anomalies if recorder is not None else 0
+            ),
+            charge_accounting_consistent=(
+                None
+                if charge is None
+                else int(getattr(charge, "cached_input_clamps", 0))
+                == (recorder.raw_cached_input_anomalies if recorder is not None else 0)
+            ),
+            clock_mode="token_charged" if charge is not None else "wall",
+            inference_charge_policy="serialized_sum" if charge is not None else None,
+            llm_wall_seconds=recorder.wall_seconds if recorder is not None else 0.0,
+            llm_wall_union_seconds=(recorder.wall_union_seconds if recorder is not None else 0.0),
+            llm_charged_union_seconds=(
+                recorder.charged_union_seconds if recorder is not None else 0.0
+            ),
+            llm_round_trips=(recorder.concurrency.round_trips if recorder is not None else 0),
+            llm_max_in_flight=(recorder.concurrency.max_in_flight if recorder is not None else 0),
+            llm_overlapped_round_trips=(
+                recorder.concurrency.overlapped_round_trips if recorder is not None else 0
             ),
         )
