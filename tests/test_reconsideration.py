@@ -75,11 +75,15 @@ from sora.types import (
     ObservableProperty,
     OperationAck,
     OperationInvocation,
+    PendingCondition,
+    PendingConditionState,
     PendingInference,
     Plan,
     PropertyChange,
     Signal,
+    SignalWait,
     Step,
+    Until,
 )
 
 _ORIGIN = WorkspaceOrigin(adapter="fake", address="fake://ws")
@@ -318,6 +322,57 @@ async def test_revalidate_sees_the_bindings_the_data_ops_produced(tmp_path: Path
     assert "evt-7" in user  # ...and what it actually holds, not just its name
 
 
+def _armed(when: str, then: str, *, until: str | None = None) -> PendingConditionState:
+    return PendingConditionState(
+        condition=PendingCondition(
+            watch=SignalWait(signal_name="state_changed", source="t", path="events", kind="added"),
+            when=when,
+            then=then,
+            until=Until(text=until) if until is not None else None,
+        )
+    )
+
+
+async def test_revalidate_sees_the_conditions_already_armed(tmp_path: Path) -> None:
+    # The waiting half of a maintenance plan is invisible in `remaining_steps`: that tail begins
+    # AFTER the in-progress sub-goal step, and the sub-goal step is where the `pending` condition
+    # is declared. A judge shown only the tail sees a plan whose body does one pass and then
+    # reports back, against a goal that asked for a window of watching — and answers "invalid",
+    # correctly, to the question it was asked. An observed run discarded nine plans that way, each
+    # discard costing a full re-inference. So the armed conditions go into the prompt.
+    llm = FakeLLMClient('{"valid": true}')
+    proc = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    goal = "for the next four minutes, drop events that clash with anything newly added"
+    plan = Plan(id="p", goal=goal, steps=[invoke_step("t", "report_op")])
+    activity = Activity(id="a", goal=goal, context={}, plan=plan)
+    activity.pending_conditions.append(
+        _armed(
+            "one or more events are added",
+            "delete the preexisting events that overlap them",
+            until="4 minutes have passed",
+        )
+    )
+
+    assert await proc.revalidate(activity) is True
+    _system, user = llm.calls[-1]
+    assert "one or more events are added" in user  # what it is waiting for
+    assert "delete the preexisting events that overlap them" in user  # ...and what it will then do
+    assert "4 minutes have passed" in user  # ...and when it stops
+
+
+async def test_revalidate_says_so_when_nothing_is_armed(tmp_path: Path) -> None:
+    # "(none)" rather than an omitted section: an absent heading is indistinguishable from a prompt
+    # that forgot to mention conditions, and the judge needs "nothing is being watched for" as a
+    # positive claim when it decides whether a short remaining body is a gap.
+    llm = FakeLLMClient('{"valid": true}')
+    proc = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=llm)
+    plan = Plan(id="p", goal="g", steps=[invoke_step("t", "write_op")])
+
+    assert await proc.revalidate(Activity(id="a", goal="g", context={}, plan=plan)) is True
+    _system, user = llm.calls[-1]
+    assert "Conditions already armed and watching:\n(none)" in user
+
+
 async def test_revalidate_fail_soft_treats_malformed_answer_as_valid(tmp_path: Path) -> None:
     proc = ProceduralMemory(FileMemoryBackend(tmp_path / "p"), llm=FakeLLMClient("not json at all"))
     activity = Activity(id="a", goal="g", context={}, plan=Plan(id="p", goal="g", steps=[]))
@@ -401,6 +456,37 @@ async def test_hot_gate_fires_revalidation_then_invalid_reinfers(tmp_path: Path)
     assert replanned.step is None
     assert activity.plan is None  # invalidated -> Reason will re-infer next
     assert activity.reconsider_verdict is None  # consumed
+
+
+async def test_discard_trace_names_the_conditions_that_were_armed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A verdict comes back as a bare boolean, so a discard leaves no recoverable reason. The one
+    thing that separates "the plan really was stale" from "the agent was waiting on a condition
+    that already covers this change" is whether anything was armed — and a run that discarded nine
+    plans with a condition armed throughout said nothing about it anywhere in its trace."""
+    cycle, working = await _cycle(
+        tmp_path, reconsideration=BeforeWrites(), verdict_response='{"valid": false}'
+    )
+    activity = _write_activity(working)
+    activity.reconsider_baseline = _perception_signature(working)
+    working.signals.append(Percept("t", Signal("follow_up", {}), 0.0))  # gate hot
+    activity.pending_conditions.append(
+        _armed("one or more events are added", "delete the events that overlap them")
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="sora.strategies"):
+        await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+        await _resolve_revalidate(cycle)
+        await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+        assert activity.plan is None  # discarded
+
+    armed = [
+        r.getMessage() for r in caplog.records if "condition(s) armed on activity" in r.getMessage()
+    ]
+    assert len(armed) == 1
+    assert "one or more events are added" in armed[0]
+    assert "delete the events that overlap them" in armed[0]
 
 
 async def test_invalidated_then_re_inferred_plans_are_both_traced(

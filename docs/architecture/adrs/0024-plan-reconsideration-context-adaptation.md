@@ -173,6 +173,21 @@ At a checkpoint the cycle runs a two-tier check:
 loops. An agent's own action that *does* legitimately invalidate the plan is caught the same way —
 nothing is excluded a priori.
 
+**Tier 2 only dissolves what it can see, and the armed conditions were missing (2026-09-20).** The
+paragraph above assumes the judgment can always reason its way to *still valid*. A measured run
+showed the assumption has a precondition. Inside a maintenance window the agent's correctness rests
+on a `pending` condition, and that condition is declared on the sub-goal step that is *currently
+executing* — so it is absent from the remaining tail by construction, since `remaining_steps` begins
+after it. The judgment was therefore shown a watcher with its watch removed: a body that does one
+pass and then reports back, against a goal asking for a window of watching. It answered *invalid* —
+correctly, for the question it was asked — nine times in one run, each answer costing a full
+re-inference. The fix is rendering, not policy: the activity's armed conditions now go into the
+prompt alongside the executed history and the bindings, for the same reason both of those do. The
+general lesson is that "the model can judge relevance" holds only over what the prompt actually
+renders, so each thing the plan's correctness rests on has to be rendered explicitly; a verdict
+returning a bare boolean also makes such a gap invisible afterwards, which is why the discard trace
+now names what was armed.
+
 ### The change-gate is pluggable (efference on the cooperative path)
 
 Tier 1's *how do I compute the signature* is a per-agent seam — `strategies.change_gate`, a

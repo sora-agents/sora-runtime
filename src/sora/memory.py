@@ -84,6 +84,7 @@ from sora.types import (
     CompletedOperation,
     ConditionVerdict,
     PendingCondition,
+    PendingConditionState,
     Plan,
     PropertyReadMeter,
     RelevanceCandidate,
@@ -1548,16 +1549,47 @@ def render_pending(pending: tuple[PendingCondition, ...]) -> str:
         return ""
     lines = ["pending:"]
     for index, condition in enumerate(pending):
-        watch = {
-            "signal": condition.watch.signal_name,
-            "source": condition.watch.source,
-            "path": condition.watch.path,
-        }
-        lines.append(f"{index}: watch {json.dumps(watch, default=str)}")
-        lines.append(f"   when  {condition.when}")
-        lines.append(f"   then  {condition.then}")
-        if condition.until is not None:
-            lines.append(f"   until {condition.until.text}")
+        lines.extend(_condition_block(index, condition))
+    return "\n".join(lines)
+
+
+def _condition_block(index: int, condition: PendingCondition) -> list[str]:
+    """One condition's lines, shared by every rendering of a condition so the trace, the plan
+    prompt and the revalidation prompt describe a waiter identically."""
+    watch = {
+        "signal": condition.watch.signal_name,
+        "source": condition.watch.source,
+        "path": condition.watch.path,
+    }
+    lines = [
+        f"{index}: watch {json.dumps(watch, default=str)}",
+        f"   when  {condition.when}",
+        f"   then  {condition.then}",
+    ]
+    if condition.until is not None:
+        lines.append(f"   until {condition.until.text}")
+    return lines
+
+
+def render_armed_conditions(states: Sequence[PendingConditionState]) -> str:
+    """The conditions an activity is *currently* watching for — the revalidation prompt's view.
+
+    Distinct from ``render_pending``, which renders a plan's *declared* conditions, because by the
+    time a context-adaptation checkpoint fires the conditions that matter have been lifted onto the
+    activity and the step that declared them is no longer in the remaining tail: ``remaining_steps``
+    begins *after* the in-progress sub-goal step, and a maintenance window's condition lives on
+    exactly that step. A judge shown only the tail therefore sees a plan with no waiting mechanism
+    anywhere in it, and correctly answers "invalid" to the question it was asked — while the agent
+    is in fact doing the right thing and waiting. Observed doing so nine times in one run.
+
+    ``(none)`` rather than ``""`` so the section's shape does not depend on whether anything is
+    armed: "nothing is being watched for" is a claim the judge needs, and an absent heading reads
+    as a prompt that forgot to mention it."""
+    if not states:
+        return "(none)"
+    lines: list[str] = []
+    for index, state in enumerate(states):
+        lines.extend(_condition_block(index, state.condition))
     return "\n".join(lines)
 
 
@@ -2242,6 +2274,11 @@ class ProceduralMemory:
             f"{render_history(activity.history, _HISTORY_RENDER_REVALIDATE)}\n"
             f"Intermediate values already computed:\n{render_bindings(activity.bindings)}\n"
             f"Remaining plan steps:\n{steps_text}\n"
+            # The waiting half of the plan. `remaining_steps` above starts *after* the in-progress
+            # sub-goal step, which is where a maintenance window's condition is declared — so
+            # without this the judge sees a watcher with its watch removed.
+            f"Conditions already armed and watching:\n"
+            f"{render_armed_conditions(activity.pending_conditions)}\n"
             + (
                 f"Observed properties:\n{render_properties(snapshot.properties)}\n"
                 if channels.properties

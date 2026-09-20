@@ -65,6 +65,7 @@ from sora.data_ops import (
 )
 from sora.memory import (
     percept_snapshot,
+    render_armed_conditions,
     render_plan,
     render_steps,
 )
@@ -325,6 +326,19 @@ class DefaultReasonStrategy:
         reset, the same churn breaker, the same superseded bundle handed to the replanning prompt.
         Only ``cause`` differs, and it exists so a trace can say which resolution took the plan."""
         log.info("reason: plan invalidated by %s for %r", cause, activity.goal)
+        # What was armed at the moment of the discard — read BEFORE the reset, so it reports the
+        # world the verdict was formed in. A verdict carries no rationale back (the call answers a
+        # bare boolean), so this is the only thing that distinguishes "the plan really was stale"
+        # from "the agent was correctly waiting on a condition that covers the change". A run that
+        # discards repeatedly while a condition sits armed is the second case, and nothing else in
+        # the trace says so.
+        if activity.pending_conditions:
+            log.debug(
+                "reason: %d condition(s) armed on activity %s when the plan was invalidated\n%s",
+                len(activity.pending_conditions),
+                activity.id,
+                render_armed_conditions(activity.pending_conditions),
+            )
         activity.reset_for_replan()  # -> re-infer next cycle against the current world
         # A moving world no longer counts toward the replan breaker (see
         # _replanning_would_loop), so this is the only place the pile-up shows: the agent is

@@ -824,12 +824,17 @@
           "name": "system.validity"
         },
         {
+          "characters": 674,
+          "dynamic": false,
+          "name": "system.armed-conditions"
+        },
+        {
           "characters": 90,
           "dynamic": false,
           "name": "system.response-contract"
         },
         {
-          "characters": 237,
+          "characters": 283,
           "dynamic": true,
           "name": "user.context"
         }
@@ -840,10 +845,10 @@
         "renderer": "ProceduralMemory.revalidate",
         "system_symbol": "REVALIDATE_SYSTEM_PROMPT"
       },
-      "system": "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. You are given the goal, what the agent has ALREADY DONE (the operations executed so far with their results, and the intermediate values its earlier steps computed and named), the plan's REMAINING steps, and the new messages. The plan is INVALID if the new information changes what the remaining steps should do — a follow-up that changes a detail the plan acted on, or a precondition that no longer holds. It is VALID if the work already executed plus the remaining steps still achieve the goal; the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps only: work an executed operation already accomplished, or a value already computed and named, does not have to reappear in them — a remaining step that reads such a value is satisfied by it, not evidence of a gap.\nRespond with ONLY a JSON object {\"valid\": true} or {\"valid\": false} — no prose, no fences.",
-      "system_sha256": "7e2cbe98ac81176e8a7e26c622a5a32e04874b1cc1a0b8bdcb64a188c0d143f7",
-      "user": "Goal: Find the requested record\nResults of operations already executed:\n(nothing executed yet)\nIntermediate values already computed:\n(none)\nRemaining plan steps:\n0: send {\"to\": \"user\", \"content\": {\"text\": \"done\"}}\nRecent messages:\n(none)",
-      "user_sha256": "c82ecee2661b62045ea40f5aebdab26bf330d8b094cfdb933ec4b1252a43cda7"
+      "system": "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. You are given the goal, what the agent has ALREADY DONE (the operations executed so far with their results, and the intermediate values its earlier steps computed and named), the plan's REMAINING steps, and the new messages. The plan is INVALID if the new information changes what the remaining steps should do — a follow-up that changes a detail the plan acted on, or a precondition that no longer holds. It is VALID if the work already executed plus the remaining steps still achieve the goal; the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps only: work an executed operation already accomplished, or a value already computed and named, does not have to reappear in them — a remaining step that reads such a value is satisfied by it, not evidence of a gap.\nYou are also given the conditions the agent has ARMED — watches it registered against the world, each with the `when` it is waiting for and the `then` it will run when that happens. These are part of the plan, not a gap in it. A change that an armed condition is already watching for is being handled, so it does not by itself make the plan invalid, and the remaining steps are not expected to mention it or to repeat what the `then` will do. Where the goal asks the agent to watch over a window, WAITING IS THE WORK: a short remaining body is not evidence the goal was abandoned. Judge whether the remaining steps TOGETHER WITH the armed conditions still achieve the goal.\nRespond with ONLY a JSON object {\"valid\": true} or {\"valid\": false} — no prose, no fences.",
+      "system_sha256": "7d1ead1b5358a68a67dd0bdc5de4b5e68b97c5178513c6228410c7d859af58c3",
+      "user": "Goal: Find the requested record\nResults of operations already executed:\n(nothing executed yet)\nIntermediate values already computed:\n(none)\nRemaining plan steps:\n0: send {\"to\": \"user\", \"content\": {\"text\": \"done\"}}\nConditions already armed and watching:\n(none)\nRecent messages:\n(none)",
+      "user_sha256": "e360463d728f20c18442bf867bea044e076463779cd358880686a3b971439838"
     },
     {
       "perception_channels": {
@@ -1312,12 +1317,17 @@
           "name": "system.validity"
         },
         {
+          "characters": 674,
+          "dynamic": false,
+          "name": "system.armed-conditions"
+        },
+        {
           "characters": 90,
           "dynamic": false,
           "name": "system.response-contract"
         },
         {
-          "characters": 275,
+          "characters": 321,
           "dynamic": true,
           "name": "user.context"
         }
@@ -1328,10 +1338,10 @@
         "renderer": "ProceduralMemory.revalidate",
         "system_symbol": "REVALIDATE_SYSTEM_PROMPT"
       },
-      "system": "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. You are given the goal, what the agent has ALREADY DONE (the operations executed so far with their results, and the intermediate values its earlier steps computed and named), the plan's REMAINING steps, and the new signals and messages. The plan is INVALID if the new information changes what the remaining steps should do — a follow-up that changes a detail the plan acted on, or a precondition that no longer holds. It is VALID if the work already executed plus the remaining steps still achieve the goal; the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps only: work an executed operation already accomplished, or a value already computed and named, does not have to reappear in them — a remaining step that reads such a value is satisfied by it, not evidence of a gap.\nRespond with ONLY a JSON object {\"valid\": true} or {\"valid\": false} — no prose, no fences.",
-      "system_sha256": "f124007ab2e6926c80818d57ddef0ffdcac4e7a26219c9dd753416a0e3da80f3",
-      "user": "Goal: Find the requested record\nResults of operations already executed:\n(nothing executed yet)\nIntermediate values already computed:\n(none)\nRemaining plan steps:\n0: send {\"to\": \"user\", \"content\": {\"text\": \"done\"}}\nObserved signals:\n(none observed yet)\nRecent messages:\n(none)",
-      "user_sha256": "a6d61e6a81725a1ca1acb2ef860ef11bc7d496b3e82a3a62037d27562dbec859"
+      "system": "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. You are given the goal, what the agent has ALREADY DONE (the operations executed so far with their results, and the intermediate values its earlier steps computed and named), the plan's REMAINING steps, and the new signals and messages. The plan is INVALID if the new information changes what the remaining steps should do — a follow-up that changes a detail the plan acted on, or a precondition that no longer holds. It is VALID if the work already executed plus the remaining steps still achieve the goal; the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps only: work an executed operation already accomplished, or a value already computed and named, does not have to reappear in them — a remaining step that reads such a value is satisfied by it, not evidence of a gap.\nYou are also given the conditions the agent has ARMED — watches it registered against the world, each with the `when` it is waiting for and the `then` it will run when that happens. These are part of the plan, not a gap in it. A change that an armed condition is already watching for is being handled, so it does not by itself make the plan invalid, and the remaining steps are not expected to mention it or to repeat what the `then` will do. Where the goal asks the agent to watch over a window, WAITING IS THE WORK: a short remaining body is not evidence the goal was abandoned. Judge whether the remaining steps TOGETHER WITH the armed conditions still achieve the goal.\nRespond with ONLY a JSON object {\"valid\": true} or {\"valid\": false} — no prose, no fences.",
+      "system_sha256": "276ee6d09ebe29c3ef92724832f29d4dbd8474ee313aaf990e5065a8f186bf43",
+      "user": "Goal: Find the requested record\nResults of operations already executed:\n(nothing executed yet)\nIntermediate values already computed:\n(none)\nRemaining plan steps:\n0: send {\"to\": \"user\", \"content\": {\"text\": \"done\"}}\nConditions already armed and watching:\n(none)\nObserved signals:\n(none observed yet)\nRecent messages:\n(none)",
+      "user_sha256": "ecb1b6eb8b4906f287c47fadc7bb2bc62693e3641b94d863c7a1e5ea01d7ab50"
     },
     {
       "perception_channels": {
@@ -1805,12 +1815,17 @@
           "name": "system.validity"
         },
         {
+          "characters": 674,
+          "dynamic": false,
+          "name": "system.armed-conditions"
+        },
+        {
           "characters": 90,
           "dynamic": false,
           "name": "system.response-contract"
         },
         {
-          "characters": 316,
+          "characters": 362,
           "dynamic": true,
           "name": "user.context"
         }
@@ -1821,10 +1836,10 @@
         "renderer": "ProceduralMemory.revalidate",
         "system_symbol": "REVALIDATE_SYSTEM_PROMPT"
       },
-      "system": "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. You are given the goal, what the agent has ALREADY DONE (the operations executed so far with their results, and the intermediate values its earlier steps computed and named), the plan's REMAINING steps, and the new observed state and messages. The plan is INVALID if the new information changes what the remaining steps should do — a follow-up that changes a detail the plan acted on, or a precondition that no longer holds. It is VALID if the work already executed plus the remaining steps still achieve the goal; the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps only: work an executed operation already accomplished, or a value already computed and named, does not have to reappear in them — a remaining step that reads such a value is satisfied by it, not evidence of a gap.\nRespond with ONLY a JSON object {\"valid\": true} or {\"valid\": false} — no prose, no fences.",
-      "system_sha256": "937ba9910d840300bdea6f921d21125aacb1c93d95dc54c8fae2597d784bf0c5",
-      "user": "Goal: Find the requested record\nResults of operations already executed:\n(nothing executed yet)\nIntermediate values already computed:\n(none)\nRemaining plan steps:\n0: send {\"to\": \"user\", \"content\": {\"text\": \"done\"}}\nObserved properties:\n(none observed yet)\nObserved signals:\n(none observed yet)\nRecent messages:\n(none)",
-      "user_sha256": "0604a54e23ef1e610ed2d189220e0e2757825a267d280490a42983832fb4650a"
+      "system": "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. You are given the goal, what the agent has ALREADY DONE (the operations executed so far with their results, and the intermediate values its earlier steps computed and named), the plan's REMAINING steps, and the new observed state and messages. The plan is INVALID if the new information changes what the remaining steps should do — a follow-up that changes a detail the plan acted on, or a precondition that no longer holds. It is VALID if the work already executed plus the remaining steps still achieve the goal; the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps only: work an executed operation already accomplished, or a value already computed and named, does not have to reappear in them — a remaining step that reads such a value is satisfied by it, not evidence of a gap.\nYou are also given the conditions the agent has ARMED — watches it registered against the world, each with the `when` it is waiting for and the `then` it will run when that happens. These are part of the plan, not a gap in it. A change that an armed condition is already watching for is being handled, so it does not by itself make the plan invalid, and the remaining steps are not expected to mention it or to repeat what the `then` will do. Where the goal asks the agent to watch over a window, WAITING IS THE WORK: a short remaining body is not evidence the goal was abandoned. Judge whether the remaining steps TOGETHER WITH the armed conditions still achieve the goal.\nRespond with ONLY a JSON object {\"valid\": true} or {\"valid\": false} — no prose, no fences.",
+      "system_sha256": "ebb90d993b59312d50a47d5274dc279b0a912ad98e841c3af6b5958994d344b8",
+      "user": "Goal: Find the requested record\nResults of operations already executed:\n(nothing executed yet)\nIntermediate values already computed:\n(none)\nRemaining plan steps:\n0: send {\"to\": \"user\", \"content\": {\"text\": \"done\"}}\nConditions already armed and watching:\n(none)\nObserved properties:\n(none observed yet)\nObserved signals:\n(none observed yet)\nRecent messages:\n(none)",
+      "user_sha256": "47e4b43664dc236b07c843f140cd095f68c89d5d40172baef956730a2180cf8c"
     },
     {
       "perception_channels": {
@@ -2298,12 +2313,17 @@
           "name": "system.validity"
         },
         {
+          "characters": 674,
+          "dynamic": false,
+          "name": "system.armed-conditions"
+        },
+        {
           "characters": 90,
           "dynamic": false,
           "name": "system.response-contract"
         },
         {
-          "characters": 278,
+          "characters": 324,
           "dynamic": true,
           "name": "user.context"
         }
@@ -2314,10 +2334,10 @@
         "renderer": "ProceduralMemory.revalidate",
         "system_symbol": "REVALIDATE_SYSTEM_PROMPT"
       },
-      "system": "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. You are given the goal, what the agent has ALREADY DONE (the operations executed so far with their results, and the intermediate values its earlier steps computed and named), the plan's REMAINING steps, and the new observed properties and messages. The plan is INVALID if the new information changes what the remaining steps should do — a follow-up that changes a detail the plan acted on, or a precondition that no longer holds. It is VALID if the work already executed plus the remaining steps still achieve the goal; the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps only: work an executed operation already accomplished, or a value already computed and named, does not have to reappear in them — a remaining step that reads such a value is satisfied by it, not evidence of a gap.\nRespond with ONLY a JSON object {\"valid\": true} or {\"valid\": false} — no prose, no fences.",
-      "system_sha256": "bcd79f5a1fc90672b07cd1a2ca89dcb3f1e16836216763e064216fdf27bd2f23",
-      "user": "Goal: Find the requested record\nResults of operations already executed:\n(nothing executed yet)\nIntermediate values already computed:\n(none)\nRemaining plan steps:\n0: send {\"to\": \"user\", \"content\": {\"text\": \"done\"}}\nObserved properties:\n(none observed yet)\nRecent messages:\n(none)",
-      "user_sha256": "288d2185dc4565806933526ff5f77d0c4657847b3a9e75f5daadadd6be4f7afb"
+      "system": "You are deciding whether an IN-PROGRESS plan is still VALID given the latest observations. You are given the goal, what the agent has ALREADY DONE (the operations executed so far with their results, and the intermediate values its earlier steps computed and named), the plan's REMAINING steps, and the new observed properties and messages. The plan is INVALID if the new information changes what the remaining steps should do — a follow-up that changes a detail the plan acted on, or a precondition that no longer holds. It is VALID if the work already executed plus the remaining steps still achieve the goal; the agent's OWN prior actions do not by themselves invalidate it. Judge the remaining steps only: work an executed operation already accomplished, or a value already computed and named, does not have to reappear in them — a remaining step that reads such a value is satisfied by it, not evidence of a gap.\nYou are also given the conditions the agent has ARMED — watches it registered against the world, each with the `when` it is waiting for and the `then` it will run when that happens. These are part of the plan, not a gap in it. A change that an armed condition is already watching for is being handled, so it does not by itself make the plan invalid, and the remaining steps are not expected to mention it or to repeat what the `then` will do. Where the goal asks the agent to watch over a window, WAITING IS THE WORK: a short remaining body is not evidence the goal was abandoned. Judge whether the remaining steps TOGETHER WITH the armed conditions still achieve the goal.\nRespond with ONLY a JSON object {\"valid\": true} or {\"valid\": false} — no prose, no fences.",
+      "system_sha256": "4affbea2b5ae63ca805a6cfd8785be1fa74a0bd57742be51a53db1c6719fa92b",
+      "user": "Goal: Find the requested record\nResults of operations already executed:\n(nothing executed yet)\nIntermediate values already computed:\n(none)\nRemaining plan steps:\n0: send {\"to\": \"user\", \"content\": {\"text\": \"done\"}}\nConditions already armed and watching:\n(none)\nObserved properties:\n(none observed yet)\nRecent messages:\n(none)",
+      "user_sha256": "6c6850c5413c53302ccc6fbcaa96bac726401b690dc64e4e7c64731a9fce6420"
     },
     {
       "perception_channels": {
@@ -2489,8 +2509,8 @@
   ],
   "provenance": {
     "prompt_source_dirty_diff_sha256": null,
-    "source_dirty_diff_sha256": "f1a668a7a1af719b32f317aff9e4d63c596b52dcda90fd128fb709979ea92c16",
-    "source_revision": "45e573623fd5b3148fa02d44bf3a1c978ba442cc"
+    "source_dirty_diff_sha256": "7999c7c8895cb90abb6dc48cb755ae83eb5af193f7b16686a8343936ff85e982",
+    "source_revision": "4f1f21fdbb912bcc069c6f485117b1a727e03b1d"
   },
   "schema_version": 1
 }

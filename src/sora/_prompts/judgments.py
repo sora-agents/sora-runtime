@@ -186,6 +186,23 @@ REVALIDATE_PROMPT = PromptManifest(
             ),
         ),
         PromptModule(
+            name="armed-conditions",
+            text=(
+                "You are also given the conditions the agent has ARMED — "
+                "watches it registered against the world, each with the "
+                "`when` it is waiting for and the `then` it will run when "
+                "that happens. These are part of the plan, not a gap in it. "
+                "A change that an armed condition is already watching for is "
+                "being handled, so it does not by itself make the plan "
+                "invalid, and the remaining steps are not expected to "
+                "mention it or to repeat what the `then` will do. Where the "
+                "goal asks the agent to watch over a window, WAITING IS THE "
+                "WORK: a short remaining body is not evidence the goal was "
+                "abandoned. Judge whether the remaining steps TOGETHER WITH "
+                "the armed conditions still achieve the goal.\n"
+            ),
+        ),
+        PromptModule(
             name="response-contract",
             text=(
                 'Respond with ONLY a JSON object {"valid": true} or {"valid": '

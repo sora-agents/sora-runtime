@@ -91,6 +91,14 @@ def test_a_profile_maps_onto_one_request_both_direct_callers_send() -> None:
 
 # Keep this independent of the regeneratable baseline: these hashes preserve
 # comparison with campaigns run before adaptive prompt fitting.
+#
+# Re-baselined rows, with the date a number recorded before it stopped being comparable:
+#   revalidate, 2026-09-20 — the prompt gained the activity's armed pending conditions (a
+#   `system.armed-conditions` module and a user-prompt section). Without them the judge was shown a
+#   maintenance window's plan with its watch removed and invalidated it correctly-but-wrongly; one
+#   Time run discarded nine plans that way. Only `revalidate` moved, and only where context
+#   adaptation is on — the other six labels are byte-identical, so a campaign that ran at
+#   `context_adaptation: none` is unaffected.
 PRE_ADAPTIVE_RICH_PROMPT_HASHES = {
     "plan": (
         "5b7ee1722e0fc2e83717d9ae8cede2f354a871a3c31faa9d889c36f3372a5c35",
@@ -105,8 +113,8 @@ PRE_ADAPTIVE_RICH_PROMPT_HASHES = {
         "df70b45cd8d4bbb21d4190255fc9b5147073ad8a0cf803b4c2fcc810b35098d2",
     ),
     "revalidate": (
-        "937ba9910d840300bdea6f921d21125aacb1c93d95dc54c8fae2597d784bf0c5",
-        "0604a54e23ef1e610ed2d189220e0e2757825a267d280490a42983832fb4650a",
+        "ebb90d993b59312d50a47d5274dc279b0a912ad98e841c3af6b5958994d344b8",
+        "47e4b43664dc236b07c843f140cd095f68c89d5d40172baef956730a2180cf8c",
     ),
     "condition": (
         "ef6ff04830f41c1db22cd7f55f6734f4e7dbb3f89d44c48d6d2e9fe94e67c20e",
