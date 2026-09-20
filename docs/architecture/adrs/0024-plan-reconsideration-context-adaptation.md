@@ -267,6 +267,40 @@ sub-goal) is **rejected**:
   parent and *acts on it* — the silent wrong side effect this ADR exists to prevent — and a model
   biased toward minimal change errs that way. Blank-slate has no such failure mode.
 
+**The one frame the clear does keep: a live condition's (2026-09-20).** The last bullet was wrong as
+stated, and a measured run showed how. `reset_for_replan()` clears the plan and the stack but does
+*not* clear `pending_conditions` — those are kept for the reason `window_deadlines` are, since no
+plan produced the fact that the agent is waiting. So the slate was only half blank. Inside an open
+maintenance window one context-adaptation discard cleared the frame that owned the window's watch,
+leaving the condition armed with a `declared_by` naming a frame that no longer existed; the
+mechanism that keeps a maintenance frame from popping early
+([ADR-0027](0027-achievement-and-maintenance-goals.md)) silently went false with it, and the
+top-level `send_message_to_user` the goal asked for was deleted. The agent watched the window out
+correctly, performed exactly the right deletions, and then terminated without saying anything. **No
+replacement plan could have recovered the step**: a plan body runs to exhaustion *before* it blocks
+on its conditions, so a report written into the flat replacement would fire inside the window, which
+that goal explicitly forbade. "After the watch" is expressible only as a step of a frame holding the
+watch — the thing that had just been deleted.
+
+So `reset_for_replan()` now keeps the frames a **still-armed condition holds**, dropping every frame
+below them, and this is a narrow exception rather than a retreat from the bullets above. It is not a
+guess at how far staleness reached — it is the *same predicate* Reason already applies before popping
+a frame, called from both places so the two cannot drift: a discard must not be able to delete a
+frame the runtime would refuse to walk past. That defeats the first and fourth bullets (there is no
+depth index to get wrong, in either direction) and the third (a maintenance window's goal is a
+standing commitment bounded by a clock, not a question about the world that drift can stale). The
+second is answered rather than avoided: `bindings` are still cleared, so a surviving parent step that
+reads a `{"$bind": ...}` the discarded sub-plan produced resolves to nothing, is reported as a plan
+defect, and replans — loud and caught by the replan breaker, never the silent wrong side effect the
+bullet is about.
+
+One thing had to follow the stack with it. A kept frame means the replacement plan *is* that frame's
+sub-plan, so the replan is inferred against the **frame's sub-goal**, not `Activity.goal`, and keeps
+its `SupersededPlan` (a replan is the one case where "a previous plan for this goal" is true of the
+bundle, which is why `_infer_` drops it only for a goal that was never planned). Planning the
+activity's goal there would put the user's whole request one level inside itself — under the notice
+that tells a sub-plan its goal did not come from the user, which is true only of the sub-goal.
+
 **What recovers the cost instead: the replan sees the plan it replaces.** `reset_for_replan()` parks
 the discard as a `SupersededPlan` (active frame + `step_index` + suspended parents) on
 `Activity.superseded`, and the planning prompt renders its **un-run tail**, flattened across the stack
@@ -277,8 +311,9 @@ needs no frame ownership, no fallible frame index, and no partially-trusted stac
 bundle when the replacement installs, and a cached-plan reuse clears it too (it installs a plan without
 spending an inference to consume it), so it is read by at most one inference. A *sub-goal* inference
 never sees it at all — `_infer_` drops it from the sub-goal's activity copy, since the bundle describes
-a plan for the activity's goal and the prompt introduces it as such, which would be a false statement
-about a sub-goal that was never planned, let alone abandoned.
+a plan that was *abandoned* and the prompt introduces it as such, which would be a false statement
+about a sub-goal that was never planned in the first place. A replan inside a kept frame is told apart
+by having no plan of its own, and keeps the bundle (see the amendment above).
 
 This is the same principle as rendering `history` into the revalidation prompt above, applied to the
 other half of the loop: the re-check sees the work already done, and the re-infer that follows an

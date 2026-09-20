@@ -92,6 +92,26 @@ def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
     return goals
 
 
+def _active_frame_goal(activity: Activity) -> str | None:
+    """The sub-goal the activity is currently executing *inside*, or ``None`` at the top level.
+
+    Read off the innermost suspended frame — the ``subgoal`` step that pushed it — the same place
+    ``_ancestor_subgoal_goals`` reads from. It answers "what is the goal of the plan that would
+    replace the active one", which is the activity's own goal only when the stack is empty: a
+    frame's sub-plan is inferred against the sub-goal, never against the user's request, and a
+    replan that forgot the distinction would hand the planner the user's words under a prompt
+    asserting they are not the user's (see ``_render_goal_provenance``). ``None`` also for a frame
+    whose sub-goal step is unreadable, so the caller falls back to the activity's goal rather than
+    silently planning for some other frame's."""
+    if not activity.parent_frames:
+        return None
+    plan, index, _mark = activity.parent_frames[-1]
+    if not 0 <= index < len(plan.steps):  # defensive: a frame whose parent was replanned under it
+        return None
+    goal = plan.steps[index].params.get("goal")
+    return goal if isinstance(goal, str) and goal else None
+
+
 def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
     """Replace every ``{"$bind": name, "path": ...}`` in a template with the value at that path of
     the current loop ``element``, recursively. Only the named binding is substituted;

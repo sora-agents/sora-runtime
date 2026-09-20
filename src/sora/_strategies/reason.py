@@ -41,6 +41,7 @@ from sora._strategies.subgoals import (
     _SUBGOAL_HALTED,
     _SUBGOAL_RUNNING,
     _SUBGOAL_SPLICED,
+    _active_frame_goal,
     _ancestor_subgoal_goals,
     _expand_mechanical,
     _goal_token_overlap,
@@ -198,7 +199,16 @@ class DefaultReasonStrategy:
                 log.warning("reason: halting replanning for activity %s: %s", activity.id, halt)
                 await _await_input(cycle, activity, _replan_halt_prompt(activity, halt))
                 return result
-            plan = await cycle.procedural.retrieve(activity)  # reuse across runs (cheap)
+            # Which goal this replan is *for*. Normally the activity's — but a discard now leaves
+            # behind any frame a live condition holds (`reset_for_replan`), and the plan that
+            # replaces the discarded one occupies that frame, so the goal to plan is the frame's
+            # sub-goal. Handing it the activity's goal instead would plan the user's whole request
+            # one level inside itself, under a prompt that (rightly, for a sub-plan) asserts the
+            # goal did not come from the user. Cached retrieval is skipped for the same reason a
+            # first-time sub-plan skips it: the store is keyed by goal, and a sub-plan has never
+            # been a cache write.
+            frame_goal = _active_frame_goal(activity)
+            plan = None if frame_goal else await cycle.procedural.retrieve(activity)
             if plan is None:
                 # Miss -> fire _infer_ off-cycle: it moves the activity to RUNNING and returns at
                 # once, so the cycle never blocks on the model. The plan lands a later cycle via
@@ -210,6 +220,7 @@ class DefaultReasonStrategy:
                 await infer.execute(
                     cycle,
                     activity_id=activity.id,
+                    goal=frame_goal,  # None at the top level -> the activity's own goal
                     tools=catalog,
                     observed=observed,
                     messages=list(wm.messages),  # recent user instructions, snapshot at fire time

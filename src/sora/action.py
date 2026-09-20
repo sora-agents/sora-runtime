@@ -431,8 +431,9 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # The copy also carries the frame Observe *will* push when it installs the sub-plan
         # (inference.py's subgoal reconciliation), so the copy models the stack position the plan
         # is being written for rather than the parent's. That is what lets a PlanPrompt tell a
-        # sub-goal from a top-level goal — `parent_frames` is unambiguous here because the only
-        # other infer fires when `plan is None`, and a reset clears the whole stack with the plan.
+        # sub-goal from a top-level goal — `parent_frames` describes the stack the plan will run on
+        # either way: a fresh sub-goal gets its future frame seeded below, and a replan (the other
+        # caller, which fires with `plan is None`) inherits whatever frames survived the discard.
         # Seeding it (rather than adding a flag) keeps the PlanPrompt Protocol unchanged, so an
         # existing custom prompt keeps working and gains the ancestor chain for free. A condition
         # declared on the invoking step is already attributed to this future frame too; the default
@@ -442,16 +443,27 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         # depth without pushing, so seeding a frame here would describe a stack position the plan
         # will never occupy — and name the exhausted body it replaces as its parent.
         frames = list(activity.parent_frames)
+        # A *replan* also arrives with a goal override now — the sub-goal of whatever frame survived
+        # the discard (see `Activity.reset_for_replan`) — and is told apart by having no plan: it
+        # pushes nothing, because the plan it is about to produce takes the place of the one that
+        # was dropped rather than nesting under it, and it keeps its superseded bundle, because for
+        # a replan "a previous plan for this goal" is exactly what the bundle holds.
+        replanning = activity.plan is None
         if (
             goal is not None
-            and activity.plan is not None
+            and activity.plan is not None  # i.e. `not replanning`, spelled so the type narrows
             and kind is not InferenceKind.CONDITION_FOLLOWUP
         ):
             frames.append((activity.plan, activity.step_index, activity.history_mark))
         target = (
             activity
             if goal is None
-            else replace(activity, goal=goal, superseded=None, parent_frames=frames)
+            else replace(
+                activity,
+                goal=goal,
+                superseded=activity.superseded if replanning else None,
+                parent_frames=frames,
+            )
         )
         log.info("reason: inferring a plan for %r (%d tools)", target.goal, len(catalog))
         _spawn_tracked(self._tasks, self._call(cycle, target, inf_id, catalog, observed, messages))

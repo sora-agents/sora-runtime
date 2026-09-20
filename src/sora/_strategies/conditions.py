@@ -21,7 +21,6 @@ from sora.memory import (
 )
 from sora.perception import Percept
 from sora.types import (
-    GOAL_KIND_ACHIEVEMENT,
     GOAL_KIND_MAINTENANCE,
     SUBGOAL,
     ConditionWait,
@@ -314,30 +313,6 @@ def _frame_key(activity: Activity, depth: int = 0) -> tuple[tuple[str, int], ...
     return tuple((plan.id, index) for plan, index, _ in frames)
 
 
-def _frame_goal_kind(activity: Activity) -> str:
-    """The completion criterion declared for the frame the activity is currently executing.
-
-    Read off the `subgoal` step that pushed it — the same place `_ancestor_subgoal_goals` reads a
-    frame's goal from — rather than stored on the frame, so nothing has to migrate and a step's
-    params stay the one declaration. The top-level plan is nobody's sub-goal and is always an
-    achievement goal: it has no frame to hold, and an exhausted body with live conditions blocks
-    there anyway.
-
-    Only a frame has a kind, so a `goal_kind` on a MECHANICAL sub-goal reads as nothing: that
-    fan-out splices into the plan in place and pushes no frame of its own, and declares no
-    `pending` either (the conditions belong to the plan it was spliced into). Maintenance is served
-    by
-    such a fan-out from inside its own sub-plan — the frame that carries the kind — not by
-    labelling the fan-out step itself.
-    """
-    if not activity.parent_frames:
-        return GOAL_KIND_ACHIEVEMENT
-    parent_plan, index, _mark = activity.parent_frames[-1]
-    if index >= len(parent_plan.steps):  # defensive: a frame whose parent was replanned under it
-        return GOAL_KIND_ACHIEVEMENT
-    return goal_kind_of(parent_plan.steps[index])
-
-
 def _conditions_hold_frame(activity: Activity) -> bool:
     """Work this frame still owes, which popping to the parent would skip past (ADR-0027).
 
@@ -360,10 +335,11 @@ def _conditions_hold_frame(activity: Activity) -> bool:
     """
     if activity.condition_fired or activity.condition_verdict is not None:
         return True
-    if _frame_goal_kind(activity) != GOAL_KIND_MAINTENANCE:
-        return False
-    key = _frame_key(activity)
-    return any(state.declared_by == key for state in activity.pending_conditions)
+    # Asked of the *active* frame — the deepest one — by checking that the held prefix reaches all
+    # the way down. Deliberately the same call `reset_for_replan` makes: a discard must not be able
+    # to delete a frame this refuses to pop past, and two separate spellings of "held" could drift
+    # into letting it.
+    return 0 < len(activity.parent_frames) == activity.frames_held_by_conditions()
 
 
 def _body_exhausted(activity: Activity) -> bool:

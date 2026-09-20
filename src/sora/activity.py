@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from sora.types import SupersededPlan  # constructed at run time by reset_for_replan
+from sora.types import (  # used at run time by reset_for_replan / frames_held_by_conditions
+    GOAL_KIND_MAINTENANCE,
+    SupersededPlan,
+    goal_kind_of,
+)
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -234,6 +238,40 @@ class Activity:
         self.replan_trail.clear()
         self.replan_history_mark = len(self.history)
 
+    def frames_held_by_conditions(self) -> int:
+        """How many parent frames, counted from the outermost, a still-armed condition holds.
+
+        The same test Reason applies before popping a frame (``_conditions_hold_frame``), asked of
+        every depth at once rather than only the active one: a condition records the chain of
+        ``(plan id, sub-goal step index)`` that reaches the frame which declared it, so a
+        ``declared_by`` of length k belongs to the frame at ``parent_frames[k - 1]`` and is
+        meaningless without the whole prefix beneath it. The goal-kind half carries over unchanged —
+        only a **maintenance** frame is held by its own conditions, because an achievement frame's
+        contingency is exactly a condition meant to outlive it (ADR-0022) and keeps watching from
+        the activity after the pop.
+
+        A frame's kind is read off the ``subgoal`` step that pushed it rather than stored on the
+        frame, so a step's params stay the one declaration and nothing has to migrate. Only a frame
+        has a kind: a ``goal_kind`` on a MECHANICAL sub-goal reads as nothing here, since that
+        fan-out splices into the plan in place, pushes no frame, and declares no ``pending`` of its
+        own. The top-level plan is nobody's sub-goal and so is never held — it has no frame to hold,
+        and an exhausted body with live conditions blocks there anyway.
+
+        Deliberately a liveness test and not a staleness one: it never guesses how far a discard's
+        invalidation reached, it names the frames the runtime would already refuse to walk past.
+        """
+        held = 0
+        key: tuple[tuple[str, int], ...] = ()
+        for depth, (plan, index, _mark) in enumerate(self.parent_frames, start=1):
+            key += ((plan.id, index),)
+            if not 0 <= index < len(plan.steps):  # defensive, as _frame_goal_kind is
+                continue
+            if goal_kind_of(plan.steps[index]) != GOAL_KIND_MAINTENANCE:
+                continue
+            if any(state.declared_by == key for state in self.pending_conditions):
+                held = depth
+        return held
+
     def reset_for_replan(self, defect: str | None = None) -> None:
         """Drop the current plan and any in-flight/parked deliberation so Reason re-plans from
         scratch. A droppable inference in flight is invalidated and the activity returns to READY;
@@ -263,13 +301,21 @@ class Activity:
             )
         self.plan = None
         self.step_index = 0
-        # Clears the whole intention stack, deliberately: reconsideration is a whole-activity
-        # redirect, never frame-local. Popping only to the stale frame was considered and rejected
-        # (ADR-0024) — `bindings`/`history` are flat on the activity with no frame ownership, so a
-        # surviving parent step could read a binding produced by the sub-plan just discarded, and
-        # the frame's own goal string is authored by the parent's now-stale reasoning. The
-        # superseded bundle above is what recovers the lost work instead.
-        self.parent_frames.clear()
+        # Drop the intention stack down to the frames a still-armed condition holds. Reconsideration
+        # is a whole-activity redirect, and popping to an arbitrary *stale* frame was considered and
+        # rejected (ADR-0024): `bindings`/`history` are flat with no frame ownership, so a surviving
+        # parent step could read a binding produced by the sub-plan just discarded, and the frame's
+        # own goal string is authored by the parent's now-stale reasoning. Neither objection reaches
+        # a frame a live condition holds — that is not a guess about how far staleness spread but
+        # the very test Reason refuses to pop past, so keeping it preserves a commitment the discard
+        # never called into question. Clearing it left the slate only half blank: the conditions
+        # stay armed regardless (nothing below drops them, for the reason `window_deadlines` gives),
+        # so the full clear orphaned a watch against a frame that no longer existed and deleted the
+        # work owed *after* the window closes — which no flat replacement plan can re-express, since
+        # a body runs to exhaustion before it blocks on its conditions and a step written after the
+        # watch would therefore run inside the window rather than after it. Frames below the held
+        # prefix are still dropped, and the superseded bundle above recovers what they were doing.
+        del self.parent_frames[self.frames_held_by_conditions() :]
         # Drop the pipeline's intermediate bindings too: they were produced by (and are only
         # meaningful within) the plan being discarded. The runtime-seeded ones are the exception,
         # and by that same rule rather than against it: no plan produced them, so no plan's

@@ -24,7 +24,12 @@ from pathlib import Path
 from typing import Any
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
-from sora._strategies.conditions import _eligible_conditions, _lift_pending_conditions
+from sora._strategies.conditions import (
+    _conditions_hold_frame,
+    _eligible_conditions,
+    _frame_key,
+    _lift_pending_conditions,
+)
 from sora._strategies.subgoals import _goal_token_overlap
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
@@ -401,6 +406,107 @@ async def test_a_then_keeps_the_maintenance_frame_held_after_replacing_the_body(
 
     assert len(activity.parent_frames) == 1  # still monitoring
     assert activity.state is ActivityState.BLOCKED
+
+
+# -- a discard must not delete a frame the pop rule would not walk past ---------------------------
+#
+# `reset_for_replan` used to clear the whole intention stack while leaving `pending_conditions`
+# armed — half a blank slate. On the 2026-09-20 charged-clock Time run, one context-adaptation
+# discard inside a fired `then` therefore orphaned the window's watch against a frame that no
+# longer existed and deleted the top-level `send_message_to_user` the goal asked for, and the run
+# failed the write-count gate with the agent having sent nothing. No replacement plan could recover
+# the step: a body runs to exhaustion BEFORE it blocks on its conditions, so a send written into
+# the flat replacement would have reported mid-window, which that goal forbids.
+
+
+async def test_a_discard_keeps_the_maintenance_frame_its_condition_holds(tmp_path: Path) -> None:
+    """The frame is kept for exactly the reason Reason will not pop past it: the window is still
+    open, and the work owed after it closes lives on that frame's remaining steps."""
+    cycle, working = _cycle(tmp_path)
+    activity = _fanned_out(step_index=1, goal_kind="maintenance", pending=(_condition(),))
+    _lift_pending_conditions(activity, working)
+    working.activities[activity.id] = activity
+    declared_by = activity.pending_conditions[0].declared_by
+
+    activity.reset_for_replan(defect=None)
+
+    assert activity.plan is None  # the plan is gone, as always
+    assert [plan.id for plan, _, _ in activity.parent_frames] == ["parent"]  # the frame is not
+    assert len(activity.pending_conditions) == 1  # still armed...
+    assert declared_by == _frame_key(activity)  # ...and still naming a frame that exists
+    assert _conditions_hold_frame(activity)
+
+
+async def test_a_discard_still_clears_an_achievement_frame(tmp_path: Path) -> None:
+    """The narrowing is the pop rule and nothing wider. An achievement frame is never held by its
+    own condition (ADR-0022's contingency keeps watching from the activity after the pop), so a
+    discard clears it exactly as before — this is not "keep every frame that has a condition"."""
+    cycle, working = _cycle(tmp_path)
+    activity = _fanned_out(step_index=1, goal_kind="achievement", pending=(_condition(),))
+    _lift_pending_conditions(activity, working)
+    working.activities[activity.id] = activity
+
+    activity.reset_for_replan(defect=None)
+
+    assert activity.parent_frames == []
+    assert len(activity.pending_conditions) == 1  # watching from the activity, as it always did
+
+
+async def test_a_discard_clears_a_maintenance_frame_whose_window_has_closed(
+    tmp_path: Path,
+) -> None:
+    """Liveness, not goal kind: once the condition retires, the frame owes nothing and the
+    blank-slate default applies again."""
+    cycle, working = _cycle(tmp_path)
+    activity = _fanned_out(step_index=1, goal_kind="maintenance", pending=(_condition(),))
+    _lift_pending_conditions(activity, working)
+    working.activities[activity.id] = activity
+    activity.pending_conditions.clear()  # as applying a `retired` verdict leaves it
+
+    activity.reset_for_replan(defect=None)
+
+    assert activity.parent_frames == []
+
+
+async def test_a_replan_inside_a_kept_frame_plans_for_the_frames_sub_goal(tmp_path: Path) -> None:
+    """The goal has to follow the stack. A kept frame means the replacement plan is that frame's
+    sub-plan, so planning the activity's goal there would hand the planner the user's whole request
+    one level inside itself — and under the provenance notice that says the goal is NOT the user's,
+    which is only true of the sub-goal."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    activity = _fanned_out(step_index=1, goal_kind="maintenance", pending=(_condition(),))
+    _lift_pending_conditions(activity, working)
+    working.activities[activity.id] = activity
+    activity.reset_for_replan(defect="the event had already been deleted")
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, user = llm.calls[-1]
+    assert user.startswith(f"Goal: {_ANCESTOR_GOAL}\n")  # the frame's, not the activity's
+    assert "NOT a request from the user" in user  # ...which is what makes that notice true
+    # The superseded bundle still reaches a replan — it is dropped only for a goal that was never
+    # planned, and the plan this one replaces is a plan for exactly this frame.
+    assert "Its remaining, unexecuted steps were" in user
+
+
+async def test_a_top_level_replan_still_plans_for_the_activitys_own_goal(tmp_path: Path) -> None:
+    """The unchanged path, pinned: with nothing held there is no frame, so the goal is the
+    activity's and the sub-plan notice stays off."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    plan = Plan(id="top", goal="clear the conflicts", steps=[Step("wait", {})])
+    activity = Activity(id="a1", goal="clear the conflicts", context={}, plan=plan)
+    working.activities[activity.id] = activity
+    activity.reset_for_replan(defect="the event had already been deleted")
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, user = llm.calls[-1]
+    assert user.startswith("Goal: clear the conflicts\n")
+    assert "NOT a request from the user" not in user
 
 
 def test_a_lifted_condition_records_the_frame_that_declared_it(tmp_path: Path) -> None:
