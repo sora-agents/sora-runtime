@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from examples.gaia2.llm_calls import (
@@ -332,6 +334,66 @@ def _recording_llm_calls(
         recorder.close()
 
 
+# Keys whose *value* would be a live credential if someone inlined one instead of using
+# `api_key_env`. The echo exists to be pasted into issues and diffed across runs, so it must not be
+# the thing that leaks a key out of a config file.
+_SECRET_KEYS = ("api_key", "token", "secret", "password")
+
+
+def _config_echo(
+    config: str,
+    *,
+    charge: Charge | None,
+    charge_model_identity: dict[str, Any] | None,
+    charge_model_digest: str | None,
+    max_wall_seconds: float,
+    scenario_id: str | None,
+) -> str:
+    """The run's own provenance, written at the top of its ``--log-file``.
+
+    A trace records what the agent did, never what it was configured to do, and the two are not
+    recoverable from each other: a strategy setting that changes which cycles spend a model call
+    leaves behind only its consequences. Nor does git close the gap — a config is routinely edited
+    locally and never committed, so a run's effective settings can exist nowhere but the process
+    that has already exited. Echoing the file verbatim (not a parsed summary) keeps comments and
+    commented-out alternatives, which is usually where the reason for a setting lives.
+    """
+    path = Path(config)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:  # unreadable config is a run-level problem, not a logging one
+        raw = f"(could not read: {exc})"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    redacted = []
+    for line in raw.splitlines():
+        head, sep, value = line.partition(":")
+        key = head.strip().lstrip("- ").strip()
+        if sep and value.strip() and key in _SECRET_KEYS:
+            redacted.append(f"{head}: (redacted)")
+        else:
+            redacted.append(line)
+    lines = [
+        "=== run provenance " + "=" * 60,
+        f"scenario id      : {scenario_id or '(unknown)'}",
+        f"config path      : {path.resolve()}",
+        f"config sha256    : {digest}",
+        f"max wall seconds : {max_wall_seconds:g}",
+    ]
+    if charge is None:
+        lines.append("scenario clock   : wall (robustness mode; not token-charged)")
+    else:
+        lines.append("scenario clock   : charged (simulated time frozen across model calls)")
+        lines.append(f"charge digest    : {charge_model_digest or '(none)'}")
+        if charge_model_identity:
+            identity = ", ".join(f"{k}={v}" for k, v in sorted(charge_model_identity.items()))
+            lines.append(f"charge identity  : {identity}")
+    lines.append("--- agent config (verbatim) " + "-" * 52)
+    lines.extend(redacted)
+    lines.append("=" * 79)
+    lines.append("")
+    return "\n".join(lines)
+
+
 def run_scenario(
     scenario: Any,
     *,
@@ -393,6 +455,14 @@ def run_scenario(
         stop_when=stop_when,
         read_stdin=read_stdin,
         log_file=log_file,
+        log_preamble=_config_echo(
+            config,
+            charge=charge,
+            charge_model_identity=charge_model_identity,
+            charge_model_digest=charge_model_digest,
+            max_wall_seconds=max_wall_seconds,
+            scenario_id=scenario_id,
+        ),
     )
 
     # The bracket spans the run AND validate(): under online validation the judge is also each

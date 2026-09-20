@@ -6,13 +6,14 @@ here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from examples.gaia2 import _runner
@@ -1671,3 +1672,80 @@ def test_the_react_arm_checks_the_operating_point_before_spending() -> None:
                 "gpt-5.4-high-paper",
             ]
         )
+
+
+# -- run provenance echo --------------------------------------------------------------------------
+#
+# What produced a run but is not observable in its trace. A strategy setting changes which cycles
+# spend a model call and never says so in any record, and a config is routinely edited locally and
+# never committed — so once the process exits, its effective settings can exist nowhere at all.
+
+
+def test_config_echo_records_the_config_verbatim_with_its_digest(tmp_path: Path) -> None:
+    config = tmp_path / "agent.yaml"
+    config.write_text(
+        "agent:\n"
+        "  strategies:\n"
+        "    context_adaptation: none  # disabled to fit the judge's tolerance\n",
+        encoding="utf-8",
+    )
+
+    echo = _runner._config_echo(
+        str(config),
+        charge=None,
+        charge_model_identity=None,
+        charge_model_digest=None,
+        max_wall_seconds=1200.0,
+        scenario_id="scenario_universe_27",
+    )
+
+    # Verbatim, not a parsed summary: the comment is usually where the reason for a value lives.
+    assert "context_adaptation: none  # disabled to fit the judge's tolerance" in echo
+    assert "scenario_universe_27" in echo
+    assert str(config.resolve()) in echo
+    # Two runs that disagree are distinguishable without re-reading a file that has since moved on.
+    assert hashlib.sha256(config.read_bytes()).hexdigest() in echo
+    assert "wall (robustness mode" in echo
+
+
+def test_config_echo_names_the_charged_clock_and_its_charge_model(tmp_path: Path) -> None:
+    # A charged run's timings are meaningless against a wall-clock one, and the trace does not say
+    # which it was — so the echo has to, and against which frozen coefficients.
+    config = tmp_path / "agent.yaml"
+    config.write_text("agent:\n  name: x\n", encoding="utf-8")
+
+    echo = _runner._config_echo(
+        str(config),
+        charge=cast(Any, object()),
+        charge_model_identity={"model": "gpt-5.4-2026-03-05"},
+        charge_model_digest="c91e3535",
+        max_wall_seconds=3600.0,
+        scenario_id=None,
+    )
+
+    assert "charged (simulated time frozen" in echo
+    assert "c91e3535" in echo
+    assert "model=gpt-5.4-2026-03-05" in echo
+
+
+def test_config_echo_redacts_an_inlined_credential(tmp_path: Path) -> None:
+    # The echo is meant to be pasted into an issue and diffed across runs. A config that inlines a
+    # key rather than naming an env var must not make the log the thing that leaks it.
+    config = tmp_path / "agent.yaml"
+    config.write_text(
+        "agent:\n  llm:\n    api_key: sk-live-SECRET\n    api_key_env: OPENAI_API_KEY\n",
+        encoding="utf-8",
+    )
+
+    echo = _runner._config_echo(
+        str(config),
+        charge=None,
+        charge_model_identity=None,
+        charge_model_digest=None,
+        max_wall_seconds=1200.0,
+        scenario_id=None,
+    )
+
+    assert "sk-live-SECRET" not in echo
+    assert "(redacted)" in echo
+    assert "api_key_env: OPENAI_API_KEY" in echo  # the env *name* is not a secret, and is wanted
