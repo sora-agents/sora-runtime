@@ -883,6 +883,41 @@ async def test_log_file_captures_the_trace_and_is_written_to_disk(
     assert "\x1b[" not in captured  # no ANSI escapes in the file mirror
 
 
+async def test_log_preamble_is_written_above_the_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A caller-supplied preamble records what produced the run but is not observable in the trace
+    # — the agent configuration above all, which is routinely an uncommitted local edit and so
+    # survives nowhere else once the process exits. It has to land ABOVE the first trace line:
+    # appended at the end it would sit behind however many megabytes the run happened to emit.
+    agent = _build_agent(tmp_path)
+    agent.working.activities["a1"] = Activity(
+        id="a1", goal="what time is it?", context={}, state=ActivityState.TERMINATED
+    )
+    stdin = _PipeStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    log_path = tmp_path / "trace.log"
+
+    session = TerminalSession(
+        agent,
+        verbose=False,
+        poll_interval=0.0,
+        exit_when_idle=0.01,
+        log_file=log_path,
+        log_preamble="=== run provenance ===\ncontext_adaptation: none\n",
+    )
+    task = asyncio.create_task(session.run())
+    try:
+        await asyncio.wait_for(task, timeout=2)
+        assert task.exception() is None
+    finally:
+        stdin.close()
+
+    captured = log_path.read_text(encoding="utf-8")
+    assert captured.startswith("=== run provenance ===\ncontext_adaptation: none\n")
+    assert captured.index("context_adaptation: none") < captured.index("startup: joining workspace")
+
+
 async def test_banner_reflects_headless_scenario_driven_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

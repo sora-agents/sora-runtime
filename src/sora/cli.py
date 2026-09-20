@@ -260,6 +260,7 @@ class TerminalSession:
         stop_when: Callable[[], bool] | None = None,
         read_stdin: bool = True,
         log_file: str | Path | None = None,
+        log_preamble: str | None = None,
     ) -> None:
         communication = agent.communication
         # `_PresentableTransport` is a data-only Protocol — `isinstance` only proves `.sent`
@@ -308,6 +309,11 @@ class TerminalSession:
         # --verbose setting — the complete execution log (prompts, results, plans) that was
         # previously only obtainable by running --verbose and copy-pasting the terminal.
         self._log_file = log_file
+        # Text recorded at the very top of that file, before any trace line. For whatever produced
+        # the run but is not itself observable in the trace — the agent configuration being the
+        # motivating case: a setting that only ever existed as an uncommitted local edit leaves no
+        # evidence anywhere else, so a log read months later cannot say which one was in force.
+        self._log_preamble = log_preamble
         self._llm_report: LLMReport | None = None
 
     @property
@@ -334,6 +340,9 @@ class TerminalSession:
         file_presenter: _Presenter | None = None
         if self._log_file is not None:
             log_handle = await asyncio.to_thread(open, self._log_file, "w", encoding="utf-8")
+            if self._log_preamble:
+                log_handle.write(self._log_preamble.rstrip("\n") + "\n")
+                log_handle.flush()
             file_presenter = _Presenter(
                 verbose=True, console=_Console(stream=log_handle), color=False, show_debug=True
             )
