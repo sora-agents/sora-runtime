@@ -42,17 +42,42 @@ endpoint rather than the model), so re-running replaces the evidence rather than
   Timing-gated results from before and after this integration are not comparable, although the
   semantic prompts and their frozen snapshot did not change.
 
-Run commands from the repository root. The offline check opens no provider credential or
-acceptance payload:
+## Frozen prompt baseline
+
+The current one-repeat baseline uses the `gpt-5.4-medium-prompt` profile
+(`gpt-5.4-2026-03-05`, medium reasoning, 16,384 maximum output tokens) and the pinned
+`gpt-5.1-2025-11-13` ARE graph-per-event judge. Both use `OPENAI_API_KEY`. The run covers the
+contract suite, all 16 live-neutral cases, and five cases from each Gaia suite: familiar,
+development, and acceptance.
+
+Run every command below from the immutable source checkout or worktree that will produce the
+baseline. The ignored Gaia scenario files may live in a different checkout, so set their absolute
+path explicitly. Use a durable output directory that can be archived unchanged; do not use `/tmp`
+for the real run.
 
 ```console
-uv run python -m examples.gaia2.evaluation prompt check
+cd /absolute/path/to/sora-runtime-worktree
+export PROMPT_SCENARIO_ROOT=/absolute/path/to/main-checkout/examples/gaia2/scenarios
+export PROMPT_BASELINE_OUT=/absolute/path/to/baseline-archive/prompt-v2-gpt54-medium
+export PROMPT_PRICE_SHEET=examples/gaia2/evaluation/price_sheets/2026-09-12.json
 ```
 
-Render the current prompt matrix without changing the tracked baseline:
+### 1. Freeze the source and prompt snapshot
+
+Finish review and commit every runtime, harness, profile, judge, manifest, and prompt change before
+capturing the snapshot. Confirm that the source tree is clean and record its commit:
 
 ```console
-uv run python -m examples.gaia2.evaluation prompt snapshot
+git status --short
+git rev-parse HEAD
+```
+
+`git status --short` must print nothing. Then regenerate the seven canonical rendered prompt
+inputs and their hashes:
+
+```console
+uv run python -m examples.gaia2.evaluation prompt snapshot \
+  --output examples/gaia2/evaluation/campaigns/prompt/baseline.json
 ```
 
 The snapshot records each of the seven semantic calls across all four perception profiles:
@@ -63,28 +88,71 @@ hashes, declared channels, and per-module character counts from `CompletionReque
 sensitivity control; the default `adaptive` fit removes instructions for channels that the
 environment does not declare.
 
-Inspect an exact three-repeat Gaia matrix and its cumulative reserve without running it:
+Review and commit `baseline.json` before making any candidate prompt change or starting the paid
+run. Capturing it from a clean source commit leaves unambiguous revision and dirty-state provenance;
+the subsequent artifact-only commit does not change the runtime prompts represented by the
+snapshot. The snapshot also freezes all evaluation profiles and settings, model identifiers, and
+the pinned judge configuration. The dated price sheet and manifest digests are recorded by the run
+report rather than embedded in the prompt snapshot.
+
+### 2. Run the offline preflight
+
+```console
+uv run python -m examples.gaia2.evaluation prompt check \
+  --scenario-root "$PROMPT_SCENARIO_ROOT" \
+  --require-scenarios
+```
+
+The expected output is:
+
+```text
+check passed: 3 profiles, 3 Gaia manifests, 24 contract cases, 16 neutral cases, 15/15 ignored scenario files available
+acceptance payloads remained locked and unopened
+```
+
+This command renders and compares the prompts, validates tracked profiles, judge, manifests, price
+sheets, contracts, neutral cases, and report serialization, and checks that exactly one scenario
+filename matches every Gaia manifest entry. For acceptance it verifies that resolution is rejected
+without acknowledgement; it does not open an acceptance scenario payload. The preflight makes no
+provider request and needs no credential.
+
+### 3. Review the exact matrix without spending money
+
+Start with an output directory that does not contain a checkpoint from another run. The dry-run
+uses the same selection, limits, and budget authorization as the paid run:
 
 ```console
 uv run python -m examples.gaia2.evaluation prompt run \
   --profile gpt-5.4-medium-prompt \
+  --suite contract \
+  --suite neutral \
+  --suite familiar \
   --suite development \
+  --suite acceptance \
   --arm baseline \
-  --gaia-repeats 3 \
-  --output-dir /tmp/sora-gaia2-prompt \
-  --price-sheet examples/gaia2/evaluation/price_sheets/2026-09-12.json \
-  --confirm-budget 180 \
+  --live-neutral \
+  --gaia-repeats 1 \
+  --output-dir "$PROMPT_BASELINE_OUT" \
+  --scenario-root "$PROMPT_SCENARIO_ROOT" \
+  --price-sheet "$PROMPT_PRICE_SHEET" \
+  --max-gaia-runs 15 \
+  --max-total-spend 60.50 \
+  --confirm-budget 60.50 \
+  --gaia-agent-reserve 3.00 \
+  --judge-reserve 0.50 \
+  --neutral-reserve 0.50 \
+  --max-wall-seconds 1200 \
+  --max-agent-llm-calls 200 \
   --dry-run
 ```
 
-Live Gaia runs admit at most 200 logical agent LLM calls by default. Every semantic call made by
-the agent counts, including plan, ground, select, revalidate, condition, retirement, and relevance;
-failed or later-discarded calls still consume an admission. Parser repair and provider/SDK retries
-inside one logical call are reported and billed as round trips but do not consume another
-admission. Override
-the guard explicitly with `--max-agent-llm-calls`. External actions and S-ORA decision cycles are
-reported separately as architectural diagnostics and do not define Gaia2 steps. The actual limit
-is stored with every live Gaia case and summarized in report provenance.
+The fresh matrix contains:
+
+- one aggregate contract record, covering all 24 contract cases;
+- 16 live-neutral records;
+- 15 Gaia records: five familiar, five development, and five acceptance;
+- 15 cumulative Gaia runs; and
+- a $60.50 conservative reserve: $53.00 for agent calls and $7.50 for judge calls.
 
 Price rows, frozen latency coefficients, and decode-count conventions are bound to the profile's
 declared `(provider, model, provider_routing)` endpoint identity. A profile repin therefore fails
@@ -104,15 +172,100 @@ and confirming that the scenario root contains the ignored Gaia2 payloads. Accep
 require `--ack-locked-acceptance` before any locked payload is opened. Contract and offline-neutral
 cases run once even when `--gaia-repeats` is greater than one.
 
-Combine one or more checkpoint files into the canonical report:
+Dry-run exits before acceptance acknowledgement, credential resolution, provider construction, or
+scenario loading. Review the complete printed matrix before authorizing the live run.
+
+### 4. Execute or resume the baseline
+
+Configure `OPENAI_API_KEY`, remove `--dry-run`, and explicitly acknowledge the locked acceptance
+payloads:
+
+```console
+uv run python -m examples.gaia2.evaluation prompt run \
+  --profile gpt-5.4-medium-prompt \
+  --suite contract \
+  --suite neutral \
+  --suite familiar \
+  --suite development \
+  --suite acceptance \
+  --arm baseline \
+  --live-neutral \
+  --gaia-repeats 1 \
+  --output-dir "$PROMPT_BASELINE_OUT" \
+  --scenario-root "$PROMPT_SCENARIO_ROOT" \
+  --price-sheet "$PROMPT_PRICE_SHEET" \
+  --max-gaia-runs 15 \
+  --max-total-spend 60.50 \
+  --confirm-budget 60.50 \
+  --gaia-agent-reserve 3.00 \
+  --judge-reserve 0.50 \
+  --neutral-reserve 0.50 \
+  --max-wall-seconds 1200 \
+  --max-agent-llm-calls 200 \
+  --ack-locked-acceptance
+```
+
+`--ack-locked-acceptance` only permits the selected acceptance files to be resolved and opened. It
+does not alter scoring, reveal acceptance details in the final report, or bypass any other check.
+The pinned judge is attached automatically; the optional `--judge-model`, `--judge-provider`, and
+`--judge-endpoint` arguments are assertions and are rejected if they differ from the pin.
+
+The checkpoint is append-only. Re-running the identical command skips completed matrix entries, so
+an interruption between cases resumes safely. A Gaia attempt ending in a timeout, context overflow,
+infrastructure error, LLM-call limit, or unscored completion is checkpointed but remains pending for
+retry. That attempt still consumed a real run and budget: review `checkpoint.jsonl`, then explicitly
+raise `--max-gaia-runs`, `--max-total-spend`, and `--confirm-budget` enough to cover the retry. Do not
+delete the failed attempt to make a ceiling pass.
+
+Live Gaia cases print the judge verdict and terminal cause as each case finishes. Consequently, an
+attended run is not blind to acceptance outcomes. If acceptance must remain a holdout until a
+candidate is finalized, defer the acceptance suite and run it later from this immutable baseline
+checkout, or capture and seal the live output without inspecting it. Do not let an acceptance
+result influence a prompt revision; a case that does influence development is no longer a holdout
+and must be replaced.
+
+Live Gaia runs admit at most 200 logical agent LLM calls per case. Every semantic call counts,
+including plan, ground, select, revalidate, condition, retirement, and relevance; failed or
+later-discarded calls still consume an admission. Parser repair and provider/SDK retries within one
+logical call are billed as additional provider round trips but do not consume another admission.
+External actions and S-ORA decision cycles are recorded separately and are not Gaia steps.
+
+### 5. Verify completion and produce the report
+
+After the live command finishes, rerun the dry-run command from step 3 against the same output
+directory. Every matrix entry should show `checkpoint_status: "complete"`, `gaia_runs` should be
+zero, and the command should schedule no paid work. Invalid attempts remain visible as additional
+checkpoint rows even after a successful retry.
+
+Create the canonical report without acceptance details:
 
 ```console
 uv run python -m examples.gaia2.evaluation prompt report \
-  --input /tmp/sora-gaia2-prompt/checkpoint.jsonl \
-  --output /tmp/sora-gaia2-prompt/report.json \
-  --price-sheet examples/gaia2/evaluation/price_sheets/2026-09-12.json
+  --input "$PROMPT_BASELINE_OUT/checkpoint.jsonl" \
+  --output "$PROMPT_BASELINE_OUT/report.json" \
+  --price-sheet "$PROMPT_PRICE_SHEET"
 ```
 
+Do not pass `--include-acceptance-details` for a normal baseline report. That flag only disables
+report-time redaction of acceptance prompts, oracles, and trajectories already present in input
+records; it neither unlocks nor reruns acceptance cases.
+
+### 6. Archive the frozen baseline
+
+Archive these outputs and inputs together:
+
+- `checkpoint.jsonl`, `report.json`, and the generated `configs/` directory;
+- the exact source commit ID and any recorded source dirty-diff hash;
+- `campaigns/prompt/baseline.json`, `profiles.json`, and `campaigns/prompt/judge.json`;
+- `price_sheets/2026-09-12.json`;
+- all three prompt manifest files and their digests from `report.json`; and
+- any captured process output or external diagnostic artifacts associated with the run.
+
+Store checksums outside the archive or put the archive in read-only/immutable storage. Candidate
+runs must use the same scenarios, profile, judge, price sheet, harness behavior, limits, reserves,
+and repeat count; only the intended prompt changes and `--arm candidate` should differ. Use a new
+candidate output directory rather than mixing baseline and candidate checkpoints during execution;
+the `prompt report` command accepts multiple `--input` arguments when producing the paired report.
+
 Normal reports redact locked acceptance prompts, oracles, and detailed trajectories. The harness
-does not make a paid call unless `prompt run` is invoked without `--dry-run` and with an explicit
-live suite/profile selection.
+makes no paid call unless `prompt run` is invoked without `--dry-run` and has pending live entries.
