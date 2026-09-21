@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from examples.gaia2 import _runner
+from examples.gaia2 import _runner, batch
 from examples.gaia2._runner import (
     _awaiting_input,
     _context_overflow,
@@ -40,7 +40,7 @@ from examples.gaia2.batch import (
     _score_status,
     _select_manifest_scenarios,
     _verdict_parse,
-    _verify_counterpart_manifest,
+    _verify_counterpart_pairing,
     aggregate,
     main,
 )
@@ -308,12 +308,25 @@ def test_aggregate_equal_weights_core_capabilities(tmp_path: Path) -> None:
     assert summary["configs"]["search"]["pass_at_1"] == 0.5
     assert summary["configs"]["mini"]["pass_at_1"] == 0.0
     # equal-weight over the two *core* configs present: (1.0 + 0.5) / 2 = 0.75 — mini excluded.
-    assert summary["overall"] == 0.75
+    assert summary["exploratory_mean"] == 0.75
+    # ... but two of five capabilities is not a Gaia2 headline, whatever the mean of them is.
+    assert summary["overall"] is None
+    assert any("capabilities not run" in reason for reason in summary["headline_withheld"])
 
 
 def test_aggregate_empty_dir_is_safe(tmp_path: Path) -> None:
     summary = aggregate(str(tmp_path))
-    assert summary == {"configs": {}, "overall": None}
+    assert summary == {
+        "configs": {},
+        "overall": None,
+        "exploratory_mean": None,
+        "headline_withheld": (
+            "capabilities not run: execution, search, adaptability, time, ambiguity",
+            "scenario coverage unverified: no --scenario-manifest given",
+        ),
+        "overall_clock_modes": [],
+        "overall_scenario_manifest_digests": [],
+    }
 
 
 def test_aggregate_reports_charge_provenance_and_surfaces_anomaly_disagreement(
@@ -385,6 +398,8 @@ def test_charge_accounting_mismatch_is_recorded_without_aborting_scenario(
         write_counts=None,
         judge_recording=None,
         timeline_expired=False,
+        harness_truncation=None,
+        terminal_cause="unscored_completion",
         charged_seconds=2.0,
         charge_model_identity=charge.identity,
         charge_model_digest="digest",
@@ -1163,7 +1178,93 @@ def test_counterpart_arm_must_have_same_complete_manifest_matrix(tmp_path: Path)
     args = Namespace(output_dir=str(tmp_path), arm="react", capability="time", num_runs=1)
 
     with pytest.raises(RuntimeError, match="does not carry"):
-        _verify_counterpart_manifest(args, manifest)
+        _verify_counterpart_pairing(args, manifest)
+
+
+_PAIRED_PROFILE = "kimi-k2.5-prompt"
+
+
+def _paired_counterpart(
+    tmp_path: Path, *, clock_mode: str, model_profile: str | None = _PAIRED_PROFILE
+) -> tuple[Any, SweepManifest]:
+    """One already-written ReAct arm, and the `args` an S-ORA arm would run against it.
+
+    A real frozen profile rather than a stub: the clock mode this arm intends is derived from the
+    charge sheet the run itself would consult, and a stub would exercise a different derivation
+    than the one being guarded."""
+    counterpart = tmp_path / "react" / "standard" / "time"
+    counterpart.mkdir(parents=True)
+    row = _jsonl_record(
+        scenario_id="scenario-a",
+        run_number=0,
+        success=True,
+        rationale=None,
+        exception=None,
+        trace_id="trace",
+        scenario_manifest_digest="expected",
+        clock_mode=clock_mode,
+        model_profile=model_profile,
+    )
+    (counterpart / "output.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    manifest = SweepManifest(
+        name="shared-time",
+        dataset="dataset",
+        revision="revision",
+        split="validation",
+        cases=(("time", "scenario-a"),),
+        digest="expected",
+    )
+    args = Namespace(
+        output_dir=str(tmp_path),
+        arm="sora",
+        capability="time",
+        num_runs=1,
+        generation_free=True,
+        wall_clock=False,
+        charge_model=None,
+        model_profile=_profile(_PAIRED_PROFILE),
+    )
+    return args, manifest
+
+
+def test_a_pair_split_across_two_clock_conventions_is_refused_before_it_is_paid_for(
+    tmp_path: Path,
+) -> None:
+    """Both arms can be internally homogeneous, pass every per-file guard, and still not be a
+    comparison: a generation-free arm beside a token-charged one differs in the timing convention
+    as well as the architecture, and the difference that gets reported is the sum of the two."""
+    args, manifest = _paired_counterpart(tmp_path, clock_mode="token_charged")
+
+    with pytest.raises(RuntimeError, match="different clock convention"):
+        _verify_counterpart_pairing(args, manifest)
+
+
+def test_a_pair_split_across_two_operating_points_is_refused(tmp_path: Path) -> None:
+    """The profile carries the endpoint, and decode rate is an endpoint property — so two arms on
+    nominally the same model can still be timed against different hardware."""
+    args, manifest = _paired_counterpart(
+        tmp_path, clock_mode="generation_free", model_profile="some-other-profile"
+    )
+
+    with pytest.raises(RuntimeError, match="different operating point"):
+        _verify_counterpart_pairing(args, manifest)
+
+
+def test_a_counterpart_recording_no_provenance_is_refused_rather_than_assumed_to_match(
+    tmp_path: Path,
+) -> None:
+    """Both arms are written by this harness, so an absent field means the counterpart predates
+    the provenance — not that it happens to agree."""
+    args, manifest = _paired_counterpart(tmp_path, clock_mode="generation_free", model_profile=None)
+
+    with pytest.raises(RuntimeError, match="different operating point"):
+        _verify_counterpart_pairing(args, manifest)
+
+
+def test_a_matching_counterpart_passes(tmp_path: Path) -> None:
+    args, manifest = _paired_counterpart(tmp_path, clock_mode="generation_free")
+
+    _verify_counterpart_pairing(args, manifest)
 
 
 # -- the two arms share a sweep root without sharing its files -------------------------------------
@@ -1249,7 +1350,8 @@ def test_scenario_manifest_supplies_pinned_revision_and_digest(
         "examples.gaia2.batch._run_capability", lambda args: captured.update(vars(args)) or []
     )
     monkeypatch.setattr(
-        "examples.gaia2.batch.aggregate", lambda _path: {"configs": {}, "overall": None}
+        "examples.gaia2.batch.aggregate",
+        lambda _path, manifest=None: {"configs": {}, "overall": None},
     )
     monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
     monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
@@ -1271,7 +1373,8 @@ def test_wall_clock_sora_still_derives_the_frozen_profile(monkeypatch: Any) -> N
         "examples.gaia2.batch._run_capability", lambda args: captured.update(vars(args)) or []
     )
     monkeypatch.setattr(
-        "examples.gaia2.batch.aggregate", lambda _path: {"configs": {}, "overall": None}
+        "examples.gaia2.batch.aggregate",
+        lambda _path, manifest=None: {"configs": {}, "overall": None},
     )
     monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
     monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
@@ -1305,7 +1408,8 @@ def test_allow_unfrozen_config_implies_wall_clock_without_profile_derivation(
         "examples.gaia2.batch._run_capability", lambda args: captured.update(vars(args)) or []
     )
     monkeypatch.setattr(
-        "examples.gaia2.batch.aggregate", lambda _path: {"configs": {}, "overall": None}
+        "examples.gaia2.batch.aggregate",
+        lambda _path, manifest=None: {"configs": {}, "overall": None},
     )
     monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
     monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
@@ -1337,7 +1441,8 @@ def test_charge_profile_overrides_automatic_sora_derivation(monkeypatch: Any) ->
         "examples.gaia2.batch._run_capability", lambda args: captured.update(vars(args)) or []
     )
     monkeypatch.setattr(
-        "examples.gaia2.batch.aggregate", lambda _path: {"configs": {}, "overall": None}
+        "examples.gaia2.batch.aggregate",
+        lambda _path, manifest=None: {"configs": {}, "overall": None},
     )
     monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
     monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
@@ -1583,8 +1688,8 @@ def test_report_only_reads_the_arm_it_is_asked_for(tmp_path: Path) -> None:
         (d / "output.jsonl").write_text(
             json.dumps({"task_id": "s1", "trace_id": "t", "score": score, "metadata": {}}) + "\n"
         )
-    assert aggregate(_arm_root(str(tmp_path), "sora"))["overall"] == 1.0
-    assert aggregate(_arm_root(str(tmp_path), "react"))["overall"] == 0.0
+    assert aggregate(_arm_root(str(tmp_path), "sora"))["exploratory_mean"] == 1.0
+    assert aggregate(_arm_root(str(tmp_path), "react"))["exploratory_mean"] == 0.0
 
 
 # -- the two arms have to be the same experiment ------------------------------------------------
@@ -1749,3 +1854,366 @@ def test_config_echo_redacts_an_inlined_credential(tmp_path: Path) -> None:
     assert "sk-live-SECRET" not in echo
     assert "(redacted)" in echo
     assert "api_key_env: OPENAI_API_KEY" in echo  # the env *name* is not a secret, and is wanted
+
+
+# -- watchdog truncation -------------------------------------------------------------------------
+
+
+def test_a_watchdog_truncated_run_is_excluded_from_pass_at_1() -> None:
+    """The harness stopped this trajectory mid-flight, so its score measures how far the agent got
+    before the cap rather than how well it did.
+
+    Excluded for the same reason an expired timeline is. Kept as a separate field because both end
+    the run through ``Environment.stop()`` and are otherwise indistinguishable downstream — and
+    they have different causes and different fixes.
+
+    *Every* watchdog is excluded, not only the wall-clock cap: a stalled judge truncates the
+    trajectory exactly as much, and the two were briefly handled differently on the two arms — one
+    scored a stalled-judge run, the other excluded it under a label that said "wall clock"."""
+    records = [
+        {"score": 1.0, "metadata": {}},
+        {"score": 0.0, "metadata": {"harness_truncation": "wall_clock"}},
+        {"score": 0.0, "metadata": {"harness_truncation": "judge_stall"}},
+        {"score": 0.0, "metadata": {"timeline_expired": True}},
+    ]
+    pass_at_1, scored, total = batch._pass_at_1(records)
+    assert (pass_at_1, scored, total) == (1.0, 1, 4)
+
+
+def test_the_record_carries_why_the_run_stopped_and_the_cap_it_ran_under() -> None:
+    """``terminal_cause`` was computed on both arms and then dropped on the way into the artifact,
+    which left a truncated run looking exactly like one that finished. The cap belongs beside it:
+    under a frozen clock it is the only bound on a trajectory's length, so a row that does not
+    carry it cannot say whether its own truncation was plausible."""
+    record = batch._jsonl_record(
+        scenario_id="s",
+        run_number=0,
+        success=None,
+        rationale=None,
+        exception=None,
+        trace_id=None,
+        harness_truncation="judge_stall",
+        terminal_cause="timeout",
+        max_wall_seconds=3600.0,
+    )
+    # `terminal_cause` cannot carry this by itself: it reports both watchdogs *and* an expired
+    # timeline as "timeout", which is why the run needs a field that names which one fired.
+    assert record["metadata"]["harness_truncation"] == "judge_stall"
+    assert record["metadata"]["terminal_cause"] == "timeout"
+    assert record["metadata"]["max_wall_seconds"] == 3600.0
+
+
+def test_an_untruncated_record_keeps_ares_own_shape() -> None:
+    """The field names a watchdog only when one fired, so an ordinary row carries no truncation."""
+    record = batch._jsonl_record(
+        scenario_id="s",
+        run_number=0,
+        success=True,
+        rationale=None,
+        exception=None,
+        trace_id=None,
+        terminal_cause="verification_completion",
+    )
+    assert "harness_truncation" not in record["metadata"]
+
+
+# -- the generation-free watchdog default --------------------------------------------------------
+
+
+def test_generation_free_raises_the_watchdog_default_and_announces_it(
+    capsys: Any, monkeypatch: Any
+) -> None:
+    """Freezing the clock removes generation from the scenario's budget but not from the
+    operator's: real per-scenario time becomes the timeline *plus* the whole of generation, where a
+    wall-clock run is bounded by the timeline alone. Measured S-ORA scenarios project past 1200s
+    under that arithmetic while every ReAct one stays under it, so leaving the cap alone would
+    truncate one arm and not the other. Raised explicitly and announced rather than changed
+    globally in silence."""
+    monkeypatch.setattr(batch, "aggregate", lambda _root, manifest=None: {})
+    monkeypatch.setattr(batch, "_print_report", lambda _report: None)
+
+    batch.main(["--report-only", "out", "--generation-free"])
+    assert "using 3600s" in capsys.readouterr().out
+
+    batch.main(["--report-only", "out"])
+    assert "using 1200s" in capsys.readouterr().out
+
+
+def test_the_two_unfrozen_clocks_cannot_be_selected_together() -> None:
+    """They are different conventions, not a flag and its intensifier."""
+    with pytest.raises(SystemExit, match="pick one"):
+        batch.main(["--report-only", "out", "--wall-clock", "--generation-free"])
+
+
+# -- clock modes may not be spliced ----------------------------------------------------------------
+
+
+def _capability(
+    tmp_path: Any,
+    name: str,
+    clock_mode: str,
+    score: float,
+    *,
+    scenario_id: str | None = None,
+    manifest_digest: str | None = None,
+) -> None:
+    import os
+
+    d = os.path.join(str(tmp_path), "standard", name)
+    os.makedirs(d, exist_ok=True)
+    metadata: dict[str, Any] = {"clock_mode": clock_mode}
+    if scenario_id is not None:
+        metadata["scenario_id"] = scenario_id
+    if manifest_digest is not None:
+        metadata["scenario_manifest_digest"] = manifest_digest
+    with open(os.path.join(d, "output.jsonl"), "w") as fh:
+        fh.write(json.dumps({"score": score, "metadata": metadata}) + "\n")
+
+
+_SWEEP_DIGEST = "deadbeefcafe0000"
+
+
+def _complete_sweep(tmp_path: Any, clock_mode: str = "generation_free") -> SweepManifest:
+    """Five core capabilities, one scenario each, one clock, one manifest — the only shape that
+    earns a headline."""
+    for name in batch._CORE_CAPABILITIES:
+        _capability(
+            tmp_path,
+            name,
+            clock_mode,
+            1.0,
+            scenario_id=f"scenario-{name}",
+            manifest_digest=_SWEEP_DIGEST,
+        )
+    return SweepManifest(
+        name="test-mini",
+        dataset="d",
+        revision="r",
+        split="validation",
+        cases=tuple((name, f"scenario-{name}") for name in batch._CORE_CAPABILITIES),
+        digest=_SWEEP_DIGEST,
+    )
+
+
+def test_a_complete_homogeneous_manifest_backed_sweep_earns_the_headline(tmp_path: Any) -> None:
+    manifest = _complete_sweep(tmp_path)
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["headline_withheld"] == ()
+    assert summary["overall"] == 1.0
+
+
+def test_the_headline_is_withheld_when_a_capability_did_not_run(tmp_path: Any) -> None:
+    """The mean used to be taken over whatever was on disk, so a capability that failed to run
+    simply left the average — silently moving the headline with nothing in the number to say so."""
+    manifest = _complete_sweep(tmp_path)
+    (tmp_path / "standard" / "time" / "output.jsonl").unlink()
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["overall"] is None
+    assert "capabilities not run: time" in summary["headline_withheld"]
+    # Still readable as an in-progress sweep — under a name that cannot be mistaken for a result.
+    assert summary["exploratory_mean"] == 1.0
+
+
+def test_a_suppressed_capability_withholds_the_headline_rather_than_leaving_the_mean(
+    tmp_path: Any,
+) -> None:
+    """The sharpest version of the same hole: a capability whose own rows mix clock modes has its
+    pass@1 suppressed, and that used to *remove* it from the average — so detecting the mixture
+    made the headline more available instead of less."""
+    manifest = _complete_sweep(tmp_path)
+    path = tmp_path / "standard" / "time" / "output.jsonl"
+    with path.open("a") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "score": 0.0,
+                    "metadata": {
+                        "clock_mode": "generation_free",
+                        "scenario_id": "scenario-time",
+                        "scenario_manifest_digest": "a-different-manifest",
+                    },
+                }
+            )
+            + "\n"
+        )
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["configs"]["time"]["pass_at_1"] is None
+    assert summary["overall"] is None
+    assert "capabilities with no comparable pass@1: time" in summary["headline_withheld"]
+
+
+def test_the_headline_is_withheld_when_capabilities_ran_different_scenario_selections(
+    tmp_path: Any,
+) -> None:
+    manifest = _complete_sweep(tmp_path)
+    _capability(
+        tmp_path,
+        "time",
+        "generation_free",
+        1.0,
+        scenario_id="scenario-time",
+        manifest_digest="another-manifest",
+    )
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["overall"] is None
+    assert any("different scenario manifests" in reason for reason in summary["headline_withheld"])
+
+
+def test_the_headline_is_withheld_when_a_pinned_scenario_never_scored(tmp_path: Any) -> None:
+    """Coverage is the one gate the rows cannot answer on their own: they record what ran, never
+    what was supposed to. A scenario that errored out of every run leaves a shorter denominator
+    and no other trace."""
+    manifest = _complete_sweep(tmp_path)
+    manifest = SweepManifest(
+        name=manifest.name,
+        dataset=manifest.dataset,
+        revision=manifest.revision,
+        split=manifest.split,
+        cases=manifest.cases + (("time", "scenario-time-second"),),
+        digest=manifest.digest,
+    )
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["overall"] is None
+    assert (
+        "1 manifest scenarios not scored: time/scenario-time-second"
+        in (summary["headline_withheld"])
+    )
+
+
+def test_a_truncated_run_leaves_its_scenario_uncovered_rather_than_scored(tmp_path: Any) -> None:
+    """Coverage means the same thing by "scored" as pass@1 does. A watchdog-truncated run is
+    excluded from the score, so it cannot also count as having covered its scenario — otherwise a
+    capability whose every run was cut off would read as complete."""
+    manifest = _complete_sweep(tmp_path)
+    _capability(
+        tmp_path,
+        "time",
+        "generation_free",
+        1.0,
+        scenario_id="scenario-time",
+        manifest_digest=_SWEEP_DIGEST,
+    )
+    path = tmp_path / "standard" / "time" / "output.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "score": 1.0,
+                "metadata": {
+                    "clock_mode": "generation_free",
+                    "scenario_id": "scenario-time",
+                    "scenario_manifest_digest": _SWEEP_DIGEST,
+                    "harness_truncation": "judge_stall",
+                },
+            }
+        )
+        + "\n"
+    )
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["overall"] is None
+    assert any("not scored: time/scenario-time" in r for r in summary["headline_withheld"])
+
+
+def test_a_sweep_recording_no_manifest_digest_cannot_earn_the_headline(tmp_path: Any) -> None:
+    """The check used to be conditional on a digest being recorded at all, so the one shape with no
+    provenance whatsoever — five fully scored capabilities, one clock, every pinned scenario
+    covered, and nothing tying any of it to the manifest being reported against — passed every
+    other condition and took the headline."""
+    manifest = _complete_sweep(tmp_path)
+    for name in batch._CORE_CAPABILITIES:
+        _capability(tmp_path, name, "generation_free", 1.0, scenario_id=f"scenario-{name}")
+
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+
+    assert summary["overall"] is None
+    assert any("no digest recorded" in reason for reason in summary["headline_withheld"]), summary[
+        "headline_withheld"
+    ]
+
+
+def test_the_headline_is_withheld_without_a_manifest_to_check_coverage_against(
+    tmp_path: Any,
+) -> None:
+    """A complete-looking sweep is still only complete relative to a pinned selection. Without one
+    the denominator is unknown, and a headline over an unknown denominator is the failure the whole
+    gate exists for."""
+    _complete_sweep(tmp_path)
+    summary = batch.aggregate(str(tmp_path))
+    assert summary["overall"] is None
+    assert summary["headline_withheld"] == (
+        "scenario coverage unverified: no --scenario-manifest given",
+    )
+    assert summary["exploratory_mean"] == 1.0
+
+
+def test_the_headline_refuses_to_average_capabilities_that_ran_on_different_clocks(
+    tmp_path: Any,
+) -> None:
+    """Each capability file was already checked for mixing internally — but the headline is a mean
+    *across* files, and nothing stopped four generation-free capabilities and one token-charged
+    Time from being promoted into a single five-capability number. That is the exact splice the
+    per-file check exists to refuse, one level up, and it is the likeliest way it would happen: a
+    charged Time re-run is the one sensitivity worth doing separately."""
+    _capability(tmp_path, "execution", "generation_free", 1.0)
+    _capability(tmp_path, "time", "token_charged", 0.0)
+    summary = batch.aggregate(str(tmp_path))
+    assert summary["overall"] is None
+    assert (
+        "capabilities ran under different clock modes: generation_free, token_charged"
+        in summary["headline_withheld"]
+    )
+    assert summary["overall_clock_modes"] == ["generation_free", "token_charged"]
+    # Per-capability pass@1 survives: each file is internally homogeneous and still readable.
+    assert summary["configs"]["execution"]["pass_at_1"] == 1.0
+
+
+def test_one_clock_across_capabilities_is_not_itself_a_reason_to_withhold(tmp_path: Any) -> None:
+    manifest = _complete_sweep(tmp_path, clock_mode="generation_free")
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["overall_clock_modes"] == ["generation_free"]
+    assert not any("clock modes" in reason for reason in summary["headline_withheld"])
+
+
+def test_a_generation_free_run_reports_no_charge_accounting_mismatch(tmp_path: Any) -> None:
+    """The fallback comparison exists to police *this harness's* clamp bookkeeping against the
+    provider's raw usage figures. A generation-free run applies no clamp and computes no charge, so
+    the comparison has nothing to police — and a raw usage anomaly would otherwise be reported as
+    an accounting mismatch, which names the wrong component."""
+    import os
+
+    d = os.path.join(str(tmp_path), "standard", "execution")
+    os.makedirs(d)
+    with open(os.path.join(d, "output.jsonl"), "w") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "score": 1.0,
+                    "metadata": {
+                        "clock_mode": "generation_free",
+                        "cached_input_clamps": 0,
+                        "raw_cached_input_anomalies": 3,
+                    },
+                }
+            )
+            + "\n"
+        )
+    summary = batch.aggregate(str(tmp_path))
+    assert summary["configs"]["execution"]["charge_accounting_mismatches"] == 0
+
+
+def test_unfrozen_development_mode_cannot_also_ask_for_a_frozen_clock() -> None:
+    """--allow-unfrozen-config *selects* the wall clock, and it does so after the flag-conflict
+    check has already run. Left unchecked the pair is accepted, the run announces wall-clock
+    development mode, and then freezes anyway — an artifact that contradicts its own banner."""
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        batch.main(
+            [
+                "--arm",
+                "sora",
+                "--config",
+                "examples/gaia2/agent.yaml",
+                "--capability",
+                "execution",
+                "--allow-unfrozen-config",
+                "--generation-free",
+            ]
+        )

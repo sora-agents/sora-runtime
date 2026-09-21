@@ -89,7 +89,11 @@ from itertools import chain
 from pathlib import Path
 from typing import Any
 
-from examples.gaia2.evaluation.core import LEGACY_CLOCK_MODE
+from examples.gaia2.evaluation.core import (
+    LEGACY_CLOCK_MODE,
+    resolve_clock_mode,
+    resolve_max_wall_seconds,
+)
 from examples.gaia2.llm_calls import LLMCallWriter
 
 _DEFAULT_CONFIG = "examples/gaia2/agent.yaml"
@@ -272,8 +276,44 @@ def _pinned_hf_scenarios(
         yield scenario, completed_events
 
 
-def _verify_counterpart_manifest(args: argparse.Namespace, manifest: SweepManifest) -> None:
-    """Refuse a paid pair whose already-written arm used another scenario selection."""
+def _resolved_charge(args: argparse.Namespace) -> tuple[Any, Any, Any]:
+    """``(charge, profile_charge, charge_model)`` for this run.
+
+    One derivation rather than one per caller, because the pre-flight pairing check has to predict
+    the clock mode the rows will carry: a check deriving it separately could agree with itself and
+    still disagree with what the run went on to record."""
+    charge_model = getattr(args, "charge_model", None)
+    if charge_model is None:
+        from examples.gaia2.evaluation.core import ChargeModelSheet
+
+        charge_model = ChargeModelSheet.load(
+            Path(__file__).resolve().parent / "evaluation" / "charge_model.json"
+        )
+    profile = getattr(args, "model_profile", None)
+    profile_charge = charge_model.charge_for(profile) if profile is not None else None
+    charge = (
+        None
+        if getattr(args, "wall_clock", False) or getattr(args, "generation_free", False)
+        else profile_charge
+    )
+    return charge, profile_charge, charge_model
+
+
+def _intended_clock_mode(args: argparse.Namespace) -> str:
+    """The clock mode this arm's rows will carry, known before the first scenario runs."""
+    charge, _profile_charge, _sheet = _resolved_charge(args)
+    return resolve_clock_mode(charge, bool(getattr(args, "generation_free", False)))
+
+
+def _verify_counterpart_pairing(args: argparse.Namespace, manifest: SweepManifest) -> None:
+    """Refuse a paid pair whose already-written arm is not comparable to the one about to run.
+
+    Two arms are a comparison only if they differ in the architecture and nothing else. The
+    scenario selection was checked here from the start; the clock convention and the operating
+    point were not, so two individually valid arms — each internally homogeneous, each passing
+    every per-file guard — could be paired across different timing conventions or different
+    endpoints and produce a difference that is not the one being measured. Checked here, before
+    tokens are spent, because after the fact the only repair is to re-run the pair."""
 
     counterpart_root = (
         os.path.join(args.output_dir, "react") if args.arm == "sora" else args.output_dir
@@ -288,6 +328,22 @@ def _verify_counterpart_manifest(args: argparse.Namespace, manifest: SweepManife
             f"counterpart arm {path} does not carry this sweep manifest digest "
             f"{manifest.digest}: found "
             f"{sorted({str(digest) for digest in recorded_digests}) or ['missing']}"
+        )
+    _verify_counterpart_field(
+        rows,
+        path,
+        field="clock_mode",
+        expected=_intended_clock_mode(args),
+        what="clock convention",
+    )
+    profile_name = getattr(getattr(args, "model_profile", None), "name", None)
+    if profile_name is not None:
+        _verify_counterpart_field(
+            rows,
+            path,
+            field="model_profile",
+            expected=str(profile_name),
+            what="operating point",
         )
     expected = {
         (scenario_id, run_number)
@@ -308,6 +364,22 @@ def _verify_counterpart_manifest(args: argparse.Namespace, manifest: SweepManife
             f"counterpart arm {path} is not the same complete scenario/run matrix; "
             f"rows={len(rows)}, expected_rows={len(expected)}, missing={missing}, "
             f"unexpected={unexpected}"
+        )
+
+
+def _verify_counterpart_field(
+    rows: list[dict[str, Any]], path: str, *, field: str, expected: str, what: str
+) -> None:
+    """Refuse when the written arm disagrees with this one about ``field``.
+
+    A missing value is a disagreement too: these rows were written by the same harness, so an
+    absent field means the counterpart predates this provenance rather than that it happens to
+    match."""
+    found = sorted({str(row.get("metadata", {}).get(field)) for row in rows})
+    if found != [expected]:
+        raise RuntimeError(
+            f"counterpart arm {path} ran under a different {what}: this arm records "
+            f"{field}={expected}, the counterpart records {', '.join(found)}"
         )
 
 
@@ -479,6 +551,9 @@ def _jsonl_record(
     exception: BaseException | None,
     trace_id: str | None,
     awaiting_input: list[str] | None = None,
+    harness_truncation: str | None = None,
+    terminal_cause: str | None = None,
+    max_wall_seconds: float | None = None,
     write_counts: Any = None,
     timeline_expired: bool = False,
     verdict_parse: str | None = None,
@@ -523,6 +598,26 @@ def _jsonl_record(
         # qualifying them — an aggregate that averages these in is measuring the host, not the
         # agent. None otherwise, so an ordinary record stays byte-identical to ARE's own shape.
         "timeline_expired": timeline_expired or None,
+        # Which harness watchdog ended this run, when one did: `"wall_clock"` (`--max-wall-seconds`
+        # elapsed) or `"judge_stall"` (the scoring pass sat paused past its own cap). Either way the
+        # environment was stopped mid-trajectory. Recorded separately from `timeline_expired`
+        # because both stop the world the same way and are otherwise indistinguishable in the
+        # artifact, and because this one is the harness cutting a run short rather than the run
+        # reaching the end of its schedule. Excluded from pass@1 for that reason.
+        #
+        # One nullable name rather than a boolean per watchdog: the exclusion needs the union, and
+        # a pair of flags invites filtering on just one — which is exactly how a stalled-judge run
+        # kept scoring on one arm while the other excluded it under a label that misdiagnosed it.
+        # None when neither fired, so an ordinary record stays byte-identical to ARE's own shape.
+        "harness_truncation": harness_truncation,
+        # Why the run finally stopped, in the run's own taxonomy. Computed on both arms and, until
+        # now, dropped on the way into this record — which left a watchdog-truncated run looking
+        # exactly like one that finished.
+        "terminal_cause": terminal_cause,
+        # The watchdog value this run was given. Part of the timing configuration, not a harness
+        # detail: under a frozen clock the cap is the only bound on a trajectory's length, so a row
+        # that does not carry it cannot say whether its own truncation was plausible.
+        "max_wall_seconds": max_wall_seconds,
         # Scoring provenance, recorded on every scored record — including the default. Unlike the
         # diagnostics around it this is not "extra information about an ordinary run": the default
         # relaxes ARE's verdict parse, so a sweep's scores are obtained under a patched judge, and
@@ -654,27 +749,45 @@ def _read_jsonl(path: str) -> list[dict[str, Any]]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def _is_scored(record: dict[str, Any]) -> bool:
+    """Whether this run's score counts toward pass@1.
+
+    One predicate rather than a filter inlined at each consumer, because the headline's scenario
+    coverage check has to mean exactly the same thing by "scored" as pass@1 does — a coverage check
+    running on a looser rule would report a capability as complete on the strength of runs the
+    score itself threw away."""
+    return (
+        record.get("score") is not None
+        and not record.get("metadata", {}).get("timeline_expired", False)
+        # A watchdog-truncated run was stopped by this harness mid-trajectory, so its score
+        # measures how far the agent got before the cap, not how well it did. Excluded for the
+        # same reason an expired timeline is, and named separately because the two have different
+        # causes and different fixes. Any watchdog counts — the field names which one fired, and
+        # testing it for truth rather than for a particular value is what keeps a second watchdog
+        # from being added later without being excluded here.
+        and not record.get("metadata", {}).get("harness_truncation")
+    )
+
+
 def _pass_at_1(records: list[dict[str, Any]]) -> tuple[float | None, int, int]:
     """Pass@1 over one config's records = mean of the non-None scores (each record is one run;
-    unscored, errored, and timeline-expired records are excluded). Returns (pass@1 or None if
-    nothing scored, scored_count, total_count)."""
-    scores = [
-        record["score"]
-        for record in records
-        if record.get("score") is not None
-        and not record.get("metadata", {}).get("timeline_expired", False)
-    ]
+    unscored, errored, timeline-expired and watchdog-truncated records are excluded). Returns
+    (pass@1 or None if nothing scored, scored_count, total_count)."""
+    scores = [record["score"] for record in records if _is_scored(record)]
     total = len(records)
     if not scores:
         return None, 0, total
     return sum(scores) / len(scores), len(scores), total
 
 
-def aggregate(output_dir: str) -> dict[str, Any]:
-    """Read every ``{output_dir}/standard/{config}/output.jsonl`` and summarize. Returns
-    ``{"configs": {config: {"pass_at_1", "scored", "total"}}, "overall": float | None}`` where
-    ``overall`` is the equal-weight mean of pass@1 across the core capabilities that were actually
-    run (Gaia2's headline metric)."""
+def aggregate(output_dir: str, manifest: SweepManifest | None = None) -> dict[str, Any]:
+    """Read every ``{output_dir}/standard/{config}/output.jsonl`` and summarize.
+
+    ``overall`` is Gaia2's headline metric — the equal-weight mean of pass@1 across the five core
+    capabilities — and is ``None`` unless the results can carry it: all five present and scored, one
+    clock mode, one scenario manifest, and (against ``manifest``) every pinned scenario actually
+    scored. ``headline_withheld`` names each unmet condition. ``exploratory_mean`` is the mean over
+    whatever did score, for reading a sweep in progress; it is not a result."""
     standard = os.path.join(output_dir, "standard")
     configs: dict[str, dict[str, Any]] = {}
     if os.path.isdir(standard):
@@ -710,7 +823,12 @@ def aggregate(output_dir: str) -> dict[str, Any]:
                     row.get("metadata", {}).get("charge_accounting_consistent") is False
                     or (
                         row.get("metadata", {}).get("charge_accounting_consistent") is None
-                        and row.get("metadata", {}).get("clock_mode") != "wall"
+                        # Only a charged run has clamps to disagree about. A generation-free run
+                        # applies no cache clamp and computes no charge, so comparing its raw
+                        # usage anomalies against a structurally zero clamp count reports a
+                        # mismatch that describes the provider's usage figures, not this harness's
+                        # accounting — which is what this counter exists to police.
+                        and row.get("metadata", {}).get("clock_mode") == "token_charged"
                         and "cached_input_clamps" in row.get("metadata", {})
                         and "raw_cached_input_anomalies" in row.get("metadata", {})
                         and int(row["metadata"]["cached_input_clamps"])
@@ -771,6 +889,14 @@ def aggregate(output_dir: str) -> dict[str, Any]:
                     int(row.get("metadata", {}).get("llm_overlapped_round_trips", 0))
                     for row in rows
                 ),
+                "scored_scenario_ids": sorted(
+                    {
+                        str(row.get("metadata", {}).get("scenario_id"))
+                        for row in rows
+                        if _is_scored(row)
+                        and row.get("metadata", {}).get("scenario_id") is not None
+                    }
+                ),
                 "cached_input_clamps": clamps,
                 "raw_cached_input_anomalies": anomalies,
                 "charge_accounting_mismatches": accounting_mismatches,
@@ -811,13 +937,108 @@ def aggregate(output_dir: str) -> dict[str, Any]:
                     }
                 ),
             }
-    core = [
+    scored_core = [
         configs[c]["pass_at_1"]
         for c in _CORE_CAPABILITIES
         if c in configs and configs[c]["pass_at_1"] is not None
     ]
-    overall = sum(core) / len(core) if core else None
-    return {"configs": configs, "overall": overall}
+    exploratory_mean = sum(scored_core) / len(scored_core) if scored_core else None
+    withheld = _headline_withheld(configs, manifest)
+    return {
+        "configs": configs,
+        # The paper number, or nothing. Every earlier version of this key was a mean over whatever
+        # happened to be on disk, which is a useful development readout and a dangerous headline:
+        # a capability that failed to run, or ran under a second clock, or ran a different scenario
+        # selection, simply left the average — quietly raising or lowering it with no trace in the
+        # number itself. An incomplete result is now unavailable rather than approximate.
+        "overall": None if withheld else exploratory_mean,
+        # The same mean, named for what it is, so partial sweeps stay readable while they are in
+        # progress. Never promote this into a report.
+        "exploratory_mean": exploratory_mean,
+        "headline_withheld": withheld,
+        "overall_clock_modes": _promoted_values(configs, "clock_modes"),
+        "overall_scenario_manifest_digests": _promoted_values(configs, "scenario_manifest_digests"),
+    }
+
+
+def _promoted_values(configs: dict[str, dict[str, Any]], key: str) -> list[str]:
+    """The distinct values of a per-capability list field, across the core capabilities present."""
+    return sorted(
+        {
+            str(value)
+            for name in _CORE_CAPABILITIES
+            if name in configs
+            for value in configs[name].get(key, ())
+        }
+    )
+
+
+def _headline_withheld(
+    configs: dict[str, dict[str, Any]], manifest: SweepManifest | None
+) -> tuple[str, ...]:
+    """Every reason this set of results cannot be reported as one Gaia2 headline.
+
+    Each capability file already refuses to promote its own pass@1 when its rows mix clock modes or
+    scenario manifests, but the headline is a mean *across* files, and a per-file check cannot see
+    any of the ways that mean goes wrong: a capability that ran under a second clock, a capability
+    that ran a different scenario selection, a capability that is simply absent, and a capability
+    whose own pass@1 was suppressed — which used to drop out of the average silently, so suppressing
+    it made the headline *more* available rather than less.
+
+    Returned as reasons rather than a bool because "no headline" is not actionable on its own, and
+    because the operator needs to see which of these a sweep is one step away from fixing."""
+    reasons: list[str] = []
+
+    missing = [name for name in _CORE_CAPABILITIES if name not in configs]
+    if missing:
+        reasons.append(f"capabilities not run: {', '.join(missing)}")
+    unscorable = [
+        name
+        for name in _CORE_CAPABILITIES
+        if name in configs and configs[name]["pass_at_1"] is None
+    ]
+    if unscorable:
+        reasons.append(f"capabilities with no comparable pass@1: {', '.join(unscorable)}")
+
+    clock_modes = _promoted_values(configs, "clock_modes")
+    if len(clock_modes) > 1:
+        reasons.append(f"capabilities ran under different clock modes: {', '.join(clock_modes)}")
+
+    digests = _promoted_values(configs, "scenario_manifest_digests")
+    if len(digests) > 1:
+        reasons.append(
+            "capabilities ran under different scenario manifests: "
+            + ", ".join(digest[:12] for digest in digests)
+        )
+
+    # Coverage is the one gate that cannot be checked from the rows alone: they say what ran, never
+    # what was supposed to. Withheld rather than assumed when no manifest is given — a headline
+    # computed over an unknown denominator is the failure this gate exists for.
+    if manifest is None:
+        reasons.append("scenario coverage unverified: no --scenario-manifest given")
+    else:
+        # Not `if digests and ...`: rows that recorded no digest at all are the case this check
+        # most needs to catch. Missing provenance is not evidence of agreement with the manifest,
+        # and treating it as one let a fully scored five-capability sweep carrying no digest
+        # whatsoever earn the headline — the one shape where nothing else would have objected.
+        if digests != [manifest.digest]:
+            found = ", ".join(digest[:12] for digest in digests) or "no digest recorded"
+            reasons.append(
+                f"results do not carry this manifest's digest {manifest.digest[:12]}: {found}"
+            )
+        uncovered: list[str] = []
+        for name in _CORE_CAPABILITIES:
+            scored = set(configs.get(name, {}).get("scored_scenario_ids", ()))
+            uncovered.extend(
+                f"{name}/{scenario_id}"
+                for scenario_id in manifest.scenario_ids(name)
+                if scenario_id not in scored
+            )
+        if uncovered:
+            shown = ", ".join(uncovered[:5]) + (" ..." if len(uncovered) > 5 else "")
+            reasons.append(f"{len(uncovered)} manifest scenarios not scored: {shown}")
+
+    return tuple(reasons)
 
 
 def _print_report(summary: dict[str, Any]) -> None:
@@ -860,12 +1081,25 @@ def _print_report(summary: dict[str, Any]) -> None:
                 + ",".join(digest[:12] for digest in row["scenario_manifest_digests"])
                 + ("  WARNING: mixed manifests" if row["mixed_scenario_manifests"] else "")
             )
-    overall = summary["overall"]
+    overall = summary.get("overall")
     if overall is not None:
-        core = [
+        print(
+            f"  {'overall':<14} {overall:6.1%}   "
+            f"(equal-weight over {', '.join(_CORE_CAPABILITIES)})"
+        )
+        return
+    print("  overall        withheld — these results are not one Gaia2 headline:")
+    for reason in summary.get("headline_withheld", ()):
+        print(f"                 - {reason}")
+    exploratory = summary.get("exploratory_mean")
+    if exploratory is not None:
+        scored = [
             c for c in _CORE_CAPABILITIES if c in configs and configs[c]["pass_at_1"] is not None
         ]
-        print(f"  {'overall':<14} {overall:6.1%}   (equal-weight over {', '.join(core)})")
+        print(
+            f"                 exploratory mean over {len(scored)}/{len(_CORE_CAPABILITIES)} "
+            f"capabilities ({', '.join(scored)}) = {exploratory:.1%} — not a reportable result"
+        )
 
 
 # -- run (lazy ARE imports) -----------------------------------------------------------------------
@@ -876,7 +1110,7 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     sweep_manifest: SweepManifest | None = getattr(args, "sweep_manifest", None)
     if sweep_manifest is not None:
-        _verify_counterpart_manifest(args, sweep_manifest)
+        _verify_counterpart_pairing(args, sweep_manifest)
     config_dir = os.path.join(_arm_root(args.output_dir, args.arm), "standard", args.capability)
     os.makedirs(config_dir, exist_ok=True)
     print(f"arm: {args.arm}  ->  {config_dir}")
@@ -1004,18 +1238,8 @@ def _run_one_scenario(
         populate_oracle_events,
     )
 
-    charge_model = getattr(args, "charge_model", None)
-    if charge_model is None:
-        from examples.gaia2.evaluation.core import ChargeModelSheet
-
-        charge_model = ChargeModelSheet.load(
-            Path(__file__).resolve().parent / "evaluation" / "charge_model.json"
-        )
-    profile_charge = (
-        charge_model.charge_for(args.model_profile) if args.model_profile is not None else None
-    )
+    charge, profile_charge, charge_model = _resolved_charge(args)
     profile_name = getattr(args.model_profile, "name", None)
-    charge = None if getattr(args, "wall_clock", False) else profile_charge
     # A frozen-profile wall-clock run is the robustness counterpart of that operating point. Keep
     # the identity/digest even though it is not applied; an explicitly unfrozen dev config has no
     # such identity and leaves both absent.
@@ -1062,6 +1286,7 @@ def _run_one_scenario(
                 verdict_parse=_verdict_parse(args),
                 log_fn=lambda msg: print(msg, flush=True),
                 charge=charge,
+                generation_free=getattr(args, "generation_free", False),
                 max_wall_seconds=args.max_wall_seconds,
                 charge_model_identity=charge_identity,
                 charge_model_digest=charge_digest,
@@ -1079,6 +1304,7 @@ def _run_one_scenario(
                 scenario_id=scenario.scenario_id,
                 run_number=run_number,
                 charge=charge,
+                generation_free=getattr(args, "generation_free", False),
                 charge_model_identity=charge_identity,
                 charge_model_digest=charge_digest,
             )
@@ -1098,7 +1324,8 @@ def _run_one_scenario(
             # disagreement: the row remains readable and explicitly lacks the second measurement.
             raw_cached_input_anomalies=None,
             charge_accounting_consistent=None,
-            clock_mode="token_charged" if charge is not None else "wall",
+            clock_mode=resolve_clock_mode(charge, getattr(args, "generation_free", False)),
+            max_wall_seconds=args.max_wall_seconds,
             scenario_manifest_digest=getattr(getattr(args, "sweep_manifest", None), "digest", None),
         )
 
@@ -1140,6 +1367,9 @@ def _run_one_scenario(
         write_counts=result.write_counts,
         judge_recording_path=recording_path,
         timeline_expired=result.timeline_expired,
+        harness_truncation=result.harness_truncation,
+        terminal_cause=result.terminal_cause,
+        max_wall_seconds=args.max_wall_seconds,
         verdict_parse=_verdict_parse(args),
         charged_seconds=result.charged_seconds,
         model_profile=str(profile_name) if profile_name is not None else None,
@@ -1307,9 +1537,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-wall-seconds",
         type=float,
-        default=1200.0,
+        default=None,
         metavar="SECONDS",
-        help="Per-scenario wall-clock safety cap for both arms (default 1200).",
+        help=(
+            "Per-scenario wall-clock safety cap for both arms. Defaults to 1200, or to 3600 under "
+            "--generation-free, where a frozen clock makes real per-scenario time the scenario "
+            "timeline plus the whole of generation rather than the timeline alone. The value used "
+            "is announced and recorded on every row."
+        ),
     )
     parser.add_argument(
         "--wall-clock",
@@ -1319,15 +1554,55 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "a separately labeled robustness sweep; results are not timing-comparable."
         ),
     )
+    parser.add_argument(
+        "--generation-free",
+        action="store_true",
+        help=(
+            "Freeze the scenario across every model call and resume it by zero, so generation "
+            "costs the environment nothing. This is the legacy ARE in-process convention — that "
+            "pause/resume path reads a completion_duration that no shipped engine writes — so it "
+            "needs no calibration and has no coefficient that can drift. Excludes --wall-clock. "
+            "Recorded as clock_mode=generation_free, and not timing-comparable to token-charged "
+            "runs."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", help="Stream each scenario's trajectory.")
     return parser.parse_args(argv)
+
+
+# A frozen clock removes generation from the scenario's own budget but not from the operator's:
+# real per-scenario time becomes the scenario timeline *plus* the whole of generation, where a
+# wall-clock run is bounded by the timeline alone. Measured S-ORA Time scenarios project past 1200s
+# under that arithmetic while every ReAct one stays under it, so leaving the cap where it is would
+# truncate one arm and not the other — which is not a shared condition, and so not a comparison.
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
+    if args.wall_clock and args.generation_free:
+        raise SystemExit(
+            "--wall-clock and --generation-free are different clock conventions; pick one"
+        )
+    if args.max_wall_seconds is None:
+        args.max_wall_seconds = resolve_max_wall_seconds(None, args.generation_free)
+        print(
+            f"watchdog: --max-wall-seconds not given; using {args.max_wall_seconds:g}s "
+            f"({'generation-free' if args.generation_free else 'default'})"
+        )
+
     if args.report_only:
-        _print_report(aggregate(_arm_root(args.report_only, args.arm)))
+        # Loaded here rather than inherited from the sweep args, which are only assembled on the
+        # path that actually runs scenarios: without it a report of a finished sweep could never
+        # verify its own coverage, and would withhold the headline it was asked to produce.
+        _print_report(
+            aggregate(
+                _arm_root(args.report_only, args.arm),
+                manifest=(
+                    _load_sweep_manifest(args.scenario_manifest) if args.scenario_manifest else None
+                ),
+            )
+        )
         return
 
     if not args.capability:
@@ -1405,11 +1680,22 @@ def main(argv: list[str] | None = None) -> None:
             )
         if args.charge_profile and args.wall_clock:
             raise SystemExit("--charge-profile and --wall-clock are mutually exclusive")
+        if args.charge_profile and args.generation_free:
+            raise SystemExit("--charge-profile and --generation-free are mutually exclusive")
         if args.charge_profile and args.allow_unfrozen_config:
             raise SystemExit("--charge-profile and --allow-unfrozen-config are mutually exclusive")
         if args.allow_unfrozen_config:
             if not os.path.isfile(args.config):
                 raise SystemExit(f"--config does not exist: {args.config}")
+            # Checked here and not beside the --wall-clock/--generation-free conflict above,
+            # because this is the branch that *creates* the conflict: it selects the wall clock
+            # itself, after that check has already run. Without this the pair is accepted, the
+            # run announces wall-clock development mode, and then freezes anyway.
+            if args.generation_free:
+                raise SystemExit(
+                    "--allow-unfrozen-config selects the wall clock; it cannot be combined with "
+                    "--generation-free"
+                )
             args.wall_clock = True
             print("unfrozen config: using wall clock (development mode; not sweep-comparable)")
         elif args.charge_profile:
@@ -1453,7 +1739,12 @@ def main(argv: list[str] | None = None) -> None:
     ensure_local_fallback_fs()
 
     _run_capability(args)
-    _print_report(aggregate(_arm_root(args.output_dir, args.arm)))
+    _print_report(
+        aggregate(
+            _arm_root(args.output_dir, args.arm),
+            manifest=getattr(args, "sweep_manifest", None),
+        )
+    )
 
 
 if __name__ == "__main__":

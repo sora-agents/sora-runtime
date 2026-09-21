@@ -101,8 +101,9 @@ python -m examples.gaia2.run_benchmark \
 | `--judge-recording PATH` | Keep this run's raw judge responses as JSON, so it can be re-scored later |
 | `--no-judge-recording` | Skip recording them (and the both-parse comparison) |
 | `--init-turns` | Deliver every turn of a multi-turn scenario **without** a judge. Excludes `--judge-model` |
-| `--max-wall-seconds` | Safety cap, default 1200 |
+| `--max-wall-seconds` | Safety cap, default 1200 (3600 under `--generation-free`; see below) |
 | `--wall-clock` | Robustness mode: use elapsed wall time instead of the frozen token charge. Not timing-comparable to the main sweep |
+| `--generation-free` | Freeze the scenario across every model call and resume it by **zero**. Excludes `--wall-clock` and `--allow-unfrozen-config`. Recorded as `clock_mode=generation_free` |
 | `--charge-profile NAME` | Resolve an ambiguous frozen-profile match explicitly. The named profile must still match the config; excludes `--wall-clock` |
 | `--allow-unfrozen-config` | Permit a local/unlisted config and necessarily use wall time. Development-only; excludes `--charge-profile` |
 | `--exit-when-idle SECONDS` | Old single-turn quiet-window stop. Only correct for single-turn scenarios |
@@ -136,8 +137,18 @@ Writes, under `{output-dir}/standard/{capability}/`, one HF-format trace per (sc
 `output.jsonl` in ARE's own benchmark-result shape, `llm_calls.jsonl` (below), and — for a scored
 sweep — `judge_responses/{scenario}.run{n}.json` per run, named in that row's
 `metadata.judge_recording`.
-`--report-only` prints per-capability pass@1 and the equal-weight overall across the five core
-capabilities.
+`--report-only` prints per-capability pass@1, and the equal-weight `overall` across the five core
+capabilities **only when the results can carry one**: all five present and scored, one clock mode,
+one scenario manifest, and — checked against the `--scenario-manifest` the report is run with —
+every pinned scenario actually scored, by the same definition of "scored" pass@1 uses. Otherwise
+`overall` is withheld and each unmet condition is named. Coverage is the one condition the rows
+cannot answer by themselves, since they record what ran and never what was supposed to, so a report
+run without `--scenario-manifest` withholds the headline as unverified.
+
+An incomplete sweep still prints a mean, under the name `exploratory_mean` and labelled "not a
+reportable result". That distinction is the point: the mean used to be taken over whatever was on
+disk, so a capability that failed to run, ran on a second clock, or had its own pass@1 suppressed
+simply left the average — moving the headline with nothing in the number to show it.
 
 Flags mirror `run_benchmark.py`, plus: `--capability` (the dataset config to run), `--split`,
 `--hf-dataset`, `--hf-revision`, `--scenario-manifest`, `--output-dir`, `--num-runs` (Gaia2 uses
@@ -253,10 +264,21 @@ direction nothing in the artifacts would reveal:
   that finished inside its budget could report as expired and be dropped from pass@1. The S-ORA
   arm latches at its own shutdown for the same reason.
 
+- **A truncated run is recorded as truncated and excluded from pass@1.** Either watchdog —
+  `--max-wall-seconds` or the 180-second judge-pause cap — stops the world through
+  `Environment.stop()`, exactly as a timeline expiry and a rejected turn do, so without a field
+  saying so a cut-off trajectory is indistinguishable from a completed one. Rows carry
+  `harness_truncation` (`"wall_clock"` / `"judge_stall"` / absent) beside `terminal_cause` and the
+  `max_wall_seconds` the run used. One nullable name rather than a flag per watchdog, because the
+  scoring rule needs the union: a boolean pair invites filtering on one of them, which is how a
+  stalled-judge run once kept scoring on one arm while the other excluded it under a label naming
+  the wrong component. `terminal_cause` cannot carry this alone — it reports both watchdogs *and*
+  an expired timeline as `"timeout"`.
+
 `--init-turns` means the same thing on both arms — without a judge it decides whether turns 2..n
 are delivered at all — so a paired sweep compares equal work. `--max-wall-seconds` is the same
-1200-second scenario safety cap on both arms, over the same *span*: agent execution plus scoring,
-excluding artifact serialization. The span matters as much as the number — ARE's `ScenarioRunner`
+scenario safety cap on both arms — 1200 seconds, or 3600 under `--generation-free` — over the same
+*span*: agent execution plus scoring, excluding artifact serialization. The span matters as much as the number — ARE's `ScenarioRunner`
 validates inside the call the ReAct watchdog wraps, so capping only S-ORA's agent loop would leave
 its judge pass, which can run for minutes, effectively uncapped on one arm alone. The separate 180-second watchdog applies only while
 the online judge holds the environment paused; an agent generation may legitimately approach its
@@ -326,10 +348,25 @@ run records the charge-model identity and digest, the clamp count, and a raw-usa
 computed independently. A mismatch is recorded without aborting a paid batch; offline report
 verification rejects it.
 
-The dated [charged-clock experiment protocol](evaluation/charged-clock-protocol-2026-09-19.md)
-records the primary policy, sensitivity semantics, frozen artifact hashes, ex-ante overlap
-expectation, and operational gates. It becomes the pre-sweep checkpoint when committed together
-with the exact paid-scenario manifest before results are collected.
+### Which clock each entry point offers
+
+`--generation-free` is a **campaign mode**, exposed on the two entry points a paired sweep actually
+runs through: `batch.py` (both arms) and `react_driver.py` standalone. Both resolve the raised
+watchdog default from the same rule, so neither can offer the flag while silently keeping a cap
+that truncates the arm the raise exists for.
+
+`run_benchmark.py` and the `evaluation` CLI deliberately do **not** offer it. They are
+single-scenario development and audit tools whose timing output is not promoted into a campaign
+result, and adding a third convention to them would widen the surface on which a run can quietly
+disagree with its own label without making any reported number more comparable. A development run
+that needs the frozen clock should use `batch.py` with one capability.
+
+The dated charged-clock experiment protocol records the primary policy, sensitivity semantics,
+frozen artifact hashes, ex-ante overlap expectation, and operational gates. It is a working
+document and lives with the other untracked notes, at
+`.sora/notes/benchmarks/gaia2/charged-clock-protocol-2026-09-19.md`; what it pins is tracked
+independently, as the frozen artifacts themselves and the hashes the campaign gate checks them
+against.
 
 ARE does not model tool-execution duration: its apps execute locally and expose no authored
 latency. Tool calls therefore acquire no generation-pause token. Their Python execution time is an
@@ -558,7 +595,7 @@ runs, not something they gate. The corner calls are recorded like every other pa
 takes no `--profile` at all —
 
 ```console
-python3 -m examples.gaia2.latency_grid --range-check runs/react-pilot/llm_calls.jsonl
+python3 -m examples.gaia2.latency_grid --range-check .sora/runs/react-pilot/llm_calls.jsonl
 ```
 
 It bands an arm's recorded `llm_calls.jsonl` against the axes and applies the extension rule fixed
@@ -582,8 +619,8 @@ the regressors the charge actually multiplies:
 ```console
 python3 -m examples.gaia2.charge_range \
     --profile kimi-k2.5-prompt \
-    --sora runs/sora/llm_calls.jsonl \
-    --react runs/react/llm_calls.jsonl
+    --sora .sora/runs/sora/llm_calls.jsonl \
+    --react .sora/runs/react/llm_calls.jsonl
 ```
 
 The measured box is `[1000, 64000]` uncached input tokens, `[0, 64000]` cached input tokens, and
@@ -607,8 +644,8 @@ the sweep and repeat the command over the full call logs afterwards:
 ```console
 python3 -m examples.gaia2.charge_drift \
     --profile kimi-k2.5-prompt \
-    --sora runs/sora/llm_calls.jsonl \
-    --react runs/react/llm_calls.jsonl
+    --sora .sora/runs/sora/llm_calls.jsonl \
+    --react .sora/runs/react/llm_calls.jsonl
 ```
 
 The audit applies the frozen coefficients to each real call, including one intercept per reported
