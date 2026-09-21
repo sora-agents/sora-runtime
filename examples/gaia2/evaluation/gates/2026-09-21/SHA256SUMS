@@ -1,0 +1,9 @@
+d175daf2a8233af23da4d3fb90934bb01a4b0c56682292bec020f479700fc530  ./calls/gpt-react.llm_calls.jsonl
+4b9635dd446c9eb8c13a7fd47ef026d041c7f972ef8908ea098248f19a805cf4  ./calls/gpt-sora.llm_calls.jsonl
+877a73af6c4c046367f66f3a74da693b124cf039dcb4e9f56bec57759f2e4e92  ./calls/kimi-react.llm_calls.jsonl
+a58e4d5cff448457613e5122df976828a748fd0cb51b574ae52d36f620bb428b  ./calls/kimi-sora.llm_calls.jsonl
+bedb968329d649ac815d45f535c7cc08eb563ba937dae6dc58bda002e663bfee  ./preflight/preflight-gpt.jsonl
+3db9607d0304d624bb95036e0922dcd590f2e046628d866c031807abe02535c4  ./preflight/preflight-gpt.jsonl.manifest
+50ab939a8ed64f36c2bdd8768825de8300715d54be24027e94ecbd3d3b661047  ./preflight/preflight-kimi.jsonl
+df54092d31b730c90b18587882a4cc48e790a0881e866c3b576fd5d1aca84218  ./preflight/preflight-kimi.jsonl.manifest
+67906ed094b2eb7e87c0c0205ab4197943d2e5f7e7cac6875c88a7a910c00c3a  ./selection-manifest.json

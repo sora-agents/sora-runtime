@@ -1,0 +1,85 @@
+# Default S-ORA agent for the Gaia2 benchmark. Deliberately **generic** and scenario-agnostic:
+# it selects the in-process ARE workspace (`are-sim`) and ARE transport (user turns routed through
+# the scenario's AgentUserInterface), but names no scenario — a Gaia2 scenario is a per-run input
+# supplied by the benchmark driver, never config. The same config runs any Gaia2 scenario.
+#
+#     uv sync --all-extras --group are          # ARE package + the llm extra
+#     export ANTHROPIC_API_KEY=sk-ant-...        # or a .gitignored .env
+#     # score one scenario (the correctness gate):
+#     python -m examples.gaia2.run_benchmark \
+#         --scenario /path/to/gaia2_scenario.json \
+#         --judge-model claude-sonnet-5 --judge-provider anthropic --exit-when-idle 8
+#
+# See examples/gaia2/run_benchmark.py for the driver and its flags.
+agent:
+  name: gaia2-default
+  # Optional override for the deliberative sub-goal recursion breaker's depth cap
+  # (DefaultReasonStrategy): once the intention stack is this deep, a further deliberative sub-goal
+  # pauses to await user input instead of spending another plan-inference. Omitted here, so the
+  # strategy's own default applies; uncomment and raise it for a task with legitimately deep nested
+  # sub-goals. The overlap-based similarity guard catches most runaway recursion earlier; this is
+  # the outer backstop.
+  # max_subgoal_depth: 4
+  strategies:
+    # The model-backed default planner + default selection. No interrupt policy is wired here:
+    # core's default is NeverInterruptPolicy, which is correct for the static capabilities
+    # (Execution/Search). The dynamic axes (Adaptability/Time/Ambiguity) will want a
+    # reconsideration InterruptPolicy that re-plans on any state-change signal — that is
+    # per-capability tuning, still to be built; examples/are/sim/email_calendar/strategies.py's
+    # MailDiffInterruptPolicy is the template (it is email-specific, so not reused verbatim here).
+    reason: sora.strategies.DefaultReasonStrategy
+  memory:
+    semantic: file://./.sora/gaia2/semantic
+    procedural: file://./.sora/gaia2/procedural
+    episodic: file://./.sora/gaia2/episodic
+  llm:
+    # Hold this constant between the S-ORA run and the ReAct baseline for a fair same-model
+    # comparison. This is the *only* thing that selects the model — the batch driver's --model is
+    # just the label stamped into the exported trace, and it refuses to run if it names another one.
+    # model: claude-opus-4-8
+    client: sora.adapters.openai_llm.OpenAICompatLLMClient
+    model: gpt-5.4-2026-03-05
+    # model: moonshotai/kimi-k2.5
+    # base_url: https://openrouter.ai/api/v1
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    # Non-streamed to match the evaluation profile. The latency grid reads the same transport as
+    # both scaffold arms, and a per-call latency coefficient fitted on one transport does not
+    # transfer to another. That makes stall_timeout a total-duration cap rather than an inter-chunk
+    # silence bound, so it is deliberately sized as one: a call still running at 600s is aborted
+    # rather than waited out. That is a choice, not headroom. One ~3.9k-token completion is on
+    # record here taking ~14 minutes (see `sora/adapters/openai_llm.py`) and would now be killed;
+    # it was a rare incident, and a scenario's whole real-time budget is ~1000s, so a call that
+    # slow has already lost the scenario whether or not it is allowed to finish. Outside a measured
+    # comparison, streaming is the better default — it is what lets the timeout tell "stalled"
+    # from "slow".
+    stream: false
+    stall_timeout: 600.0
+    max_retries: 0
+    # The only line differing from `agent.yaml`. This file exists so the S-ORA arm can run at
+    # the operating point the charged-clock protocol actually names for the sweep: the frozen
+    # `gpt-5.4-high-paper` profile, the only one carrying the `aamas2027` campaign. The charge
+    # coefficients are keyed by model, so this profile and `gpt-5.4-medium-prompt` share them —
+    # which is precisely why an audit run at `medium` does not certify `high`.
+    reasoning_effort: high
+    # A multi-step plan behind reasoning overruns the 8192 default (thinking can take ~95% of the
+    # budget, truncating the plan JSON mid-serialization). The non-streaming ceiling that a large
+    # cap would trip belongs to the Anthropic SDK, not to the client selected above.
+    max_tokens: 16384
+    # Pinned rather than left to resolve: unset, OpenAI reads this as `auto` and picks a tier from
+    # whatever credits the account holds at the time, which would put the serving condition — and
+    # so the latency the charge coefficients are fitted from — outside this repo. `default` is the
+    # one value observed to resolve to itself; `fast` is accepted and served as `priority`. The
+    # evaluation profile carries the same pin, and a disagreement between the two fails the batch
+    # guard rather than running the arms at two operating points. OpenRouter ignores the parameter,
+    # so the commented-out route above would send it to no effect.
+    service_tier: default
+    instrument: true
+    max_logical_calls: 200
+  transport:
+    # ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies via
+    # send_message_to_user (the per-turn boundary Gaia2's online judge keys on).
+    kind: are
+  workspaces:
+    - origin: { adapter: are-sim, address: "insim:are" }
+      workspace_id: are

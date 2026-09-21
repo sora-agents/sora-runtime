@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "w2-gate-time-smoke",
+  "dataset": "meta-agents-research-environments/gaia2",
+  "revision": "78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99",
+  "split": "validation",
+  "cases": [
+    {
+      "capability": "time",
+      "id": "scenario_universe_21_xvc7uo"
+    },
+    {
+      "capability": "time",
+      "id": "scenario_universe_27_fcbx0i"
+    },
+    {
+      "capability": "time",
+      "id": "scenario_universe_30_68r6vs"
+    }
+  ]
+}

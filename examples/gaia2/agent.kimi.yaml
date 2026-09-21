@@ -1,0 +1,68 @@
+# Default S-ORA agent for the Gaia2 benchmark. Deliberately **generic** and scenario-agnostic:
+# it selects the in-process ARE workspace (`are-sim`) and ARE transport (user turns routed through
+# the scenario's AgentUserInterface), but names no scenario — a Gaia2 scenario is a per-run input
+# supplied by the benchmark driver, never config. The same config runs any Gaia2 scenario.
+#
+#     uv sync --all-extras --group are          # ARE package + the llm extra
+#     export ANTHROPIC_API_KEY=sk-ant-...        # or a .gitignored .env
+#     # score one scenario (the correctness gate):
+#     python -m examples.gaia2.run_benchmark \
+#         --scenario /path/to/gaia2_scenario.json \
+#         --judge-model claude-sonnet-5 --judge-provider anthropic --exit-when-idle 8
+#
+# See examples/gaia2/run_benchmark.py for the driver and its flags.
+agent:
+  name: gaia2-default
+  # Optional override for the deliberative sub-goal recursion breaker's depth cap
+  # (DefaultReasonStrategy): once the intention stack is this deep, a further deliberative sub-goal
+  # pauses to await user input instead of spending another plan-inference. Omitted here, so the
+  # strategy's own default applies; uncomment and raise it for a task with legitimately deep nested
+  # sub-goals. The overlap-based similarity guard catches most runaway recursion earlier; this is
+  # the outer backstop.
+  # max_subgoal_depth: 4
+  strategies:
+    # The model-backed default planner + default selection. No interrupt policy is wired here:
+    # core's default is NeverInterruptPolicy, which is correct for the static capabilities
+    # (Execution/Search). The dynamic axes (Adaptability/Time/Ambiguity) will want a
+    # reconsideration InterruptPolicy that re-plans on any state-change signal — that is
+    # per-capability tuning, still to be built; examples/are/sim/email_calendar/strategies.py's
+    # MailDiffInterruptPolicy is the template (it is email-specific, so not reused verbatim here).
+    reason: sora.strategies.DefaultReasonStrategy
+  memory:
+    semantic: file://./.sora/gaia2/semantic
+    procedural: file://./.sora/gaia2/procedural
+    episodic: file://./.sora/gaia2/episodic
+  llm:
+    # The Venice-pinned Kimi operating point, matching the frozen `kimi-k2.5-prompt` profile in
+    # evaluation/profiles.json field for field. The charge coefficients are frozen against that
+    # profile, so any divergence here makes the run uncertifiable rather than merely different.
+    client: sora.adapters.openai_llm.OpenAICompatLLMClient
+    model: moonshotai/kimi-k2.5
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    stream: false
+    stall_timeout: 600.0
+    max_retries: 0
+    reasoning:
+      enabled: true
+    temperature: 0.5
+    max_tokens: 16384
+    # Providers disagree on whether the output cap bounds the whole completion or the content
+    # alone, and one was observed alternating between both on identical requests, so the endpoint
+    # is pinned rather than routed.
+    provider_routing:
+      only:
+        - venice
+      order:
+        - venice
+      allow_fallbacks: false
+    router_metadata: true
+    instrument: true
+    max_logical_calls: 200
+  transport:
+    # ARE in-process transport: receive() drains the AUI's unread USER messages, send() replies via
+    # send_message_to_user (the per-turn boundary Gaia2's online judge keys on).
+    kind: are
+  workspaces:
+    - origin: { adapter: are-sim, address: "insim:are" }
+      workspace_id: are

@@ -154,7 +154,11 @@ def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
     assert "temperature" not in high.client_settings()
     kimi = profiles["kimi-k2.5-prompt"]
     assert kimi.model == "moonshotai/kimi-k2.5"
-    assert kimi.campaigns == ("prompt",)
+    # Both campaigns since 2026-09-21. The baseline already named this profile as the paper
+    # campaign's `cross_family_profile`, so running it there was always the intent and the
+    # single-campaign list was a provisioning omission — an arm cannot run under a campaign it is
+    # not provisioned for. Membership only: the operating point below is unchanged.
+    assert kimi.campaigns == ("prompt", "aamas2027")
     assert kimi.settings["temperature"].value == 0.5
     assert kimi.settings["reasoning"].value == {"enabled": True}
     # Every part of this pin was set by measurement, because none of it is visible in what the

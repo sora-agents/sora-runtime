@@ -2,9 +2,15 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
+      # Preserved gate evidence is excluded from both whitespace fixers. Those files are attested
+      # byte-for-byte by their own SHA256SUMS, so a hook that appends a newline to "tidy" one
+      # invalidates the checksum that is the entire reason the file is tracked — end-of-file-fixer
+      # did exactly that to selection-manifest.json the first time the directory was committed.
+      # Evidence is recorded as produced, not reformatted.
       - id: trailing-whitespace
-        exclude: '\.md$'
+        exclude: '(\.md$|^examples/gaia2/evaluation/gates/)'
       - id: end-of-file-fixer
+        exclude: '^examples/gaia2/evaluation/gates/'
       - id: check-toml
       - id: check-yaml
         exclude: ^mkdocs\.yml$

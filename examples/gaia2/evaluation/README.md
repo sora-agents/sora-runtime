@@ -9,9 +9,29 @@ report serialization across two campaigns:
   selection. It remains uncommitted and must not produce paid results until its protocol checkpoint
   is reviewed and committed.
 
-The [dated charged-clock protocol](charged-clock-protocol-2026-09-19.md) is the freeze candidate
-for the Gaia2 timing comparison. It becomes the pre-sweep record only when committed with the exact
-[Gaia2 mini manifest](campaigns/aamas2027/mini-validation.json) before paid results are collected.
+The dated charged-clock protocol is the freeze candidate for the Gaia2 timing comparison. It is a
+working document, kept with the other untracked notes at
+`.sora/notes/benchmarks/gaia2/charged-clock-protocol-2026-09-19.md`, alongside the gate report that
+records running its operational gates. What it pins is tracked here regardless: the frozen
+artifacts themselves, including the exact [Gaia2 mini manifest](campaigns/aamas2027/mini-validation.json),
+and the hashes `campaigns/prompt/baseline.json` holds them to.
+
+## The frozen charge coefficients are failing their audit
+
+The compact evidence for the 2026-09-21 charge audit is preserved in [`gates/2026-09-21/`](gates/2026-09-21/)
+— four paired `llm_calls.jsonl` row sets, both preflight corner grids with their manifests, and the
+scenario selection — and is verified by its [`SHA256SUMS`](gates/2026-09-21/SHA256SUMS). Against
+those rows the frozen coefficients in [`charge_model.json`](charge_model.json) failed the range and
+drift gates as run. Kimi's drift failure is at the target operating point and stands; the gpt-5.4
+measurement was taken at `gpt-5.4-medium-prompt` while the coefficients were fitted at
+`gpt-5.4-high-paper`, so reasoning effort is confounded with endpoint drift and that half is
+diagnostic only, an upper bound of unknown tightness rather than a measured error.
+
+The coefficients are unchanged: a failure against them is recorded, never re-fitted to reach green.
+The token-charged convention is therefore blocked, and the primary campaign convention is
+`generation_free`. This section stays until an audit passes — the rows are kept because paid
+measurement does not reproduce (decode is not deterministic, and the rate is a property of the
+endpoint rather than the model), so re-running replaces the evidence rather than recreating it.
 
 ## Comparability breaks
 

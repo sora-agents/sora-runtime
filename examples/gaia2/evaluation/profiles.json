@@ -33,7 +33,7 @@
       "model": "moonshotai/kimi-k2.5",
       "endpoint": "https://openrouter.ai/api/v1",
       "credential_env": "OPENROUTER_API_KEY",
-      "campaigns": ["prompt"],
+      "campaigns": ["prompt", "aamas2027"],
       "settings": {
         "reasoning_effort": {"status": "intentionally_omitted", "value": null},
         "reasoning": {"status": "sent", "value": {"enabled": true}},
