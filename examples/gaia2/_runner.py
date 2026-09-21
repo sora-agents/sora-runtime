@@ -24,6 +24,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from examples.gaia2.evaluation.core import (
+    freezes_clock,
+    harness_truncation,
+    resolve_clock_mode,
+)
 from examples.gaia2.llm_calls import (
     Charge,
     ClockedSoraLLMClient,
@@ -65,6 +70,16 @@ class RunResult:
     awaiting_input: list[str] = field(default_factory=list)
     write_counts: Any = None
     timeline_expired: bool = False
+    # Which harness watchdog, if any, ended this run: `"wall_clock"` (the per-scenario cap) or
+    # `"judge_stall"` (the scoring pass sat paused past `MAX_PAUSE_SECONDS`). Kept apart from
+    # `timeline_expired` because the two are indistinguishable downstream otherwise — both stop the
+    # world through `Environment.stop()` — and only this means the trajectory was cut off mid-flight
+    # rather than reaching the end of its scripted schedule.
+    #
+    # One nullable name rather than a boolean per watchdog, because the scoring rule needs the
+    # union and a boolean pair invites filtering on one of them: `terminal_cause` alone cannot carry
+    # it either, since it reports both watchdogs *and* an expired timeline as `"timeout"`.
+    harness_truncation: str | None = None
     llm_report: Any = None
     replan_count: int = 0
     terminal_cause: str | None = None
@@ -109,14 +124,14 @@ class _StopController:
     deadline: float
     paused_since: float | None = None
     reason: StopReason | None = None
+    # Which watchdog fired, when one did. `reason` collapses both onto `"timeout"` because that is
+    # the terminal cause either produces; this keeps the two separable for the scoring exclusion.
+    truncation: str | None = None
 
     def __call__(self) -> bool:
         now = time.monotonic()
         if self.agent.procedural.logical_call_limit_exceeded:
             self.reason = "llm_call_limit"
-            return True
-        if now >= self.deadline:
-            self.reason = "timeout"
             return True
         judge_pause_probe = getattr(self.simulation, "is_judge_paused", None)
         judge_paused = (
@@ -126,9 +141,21 @@ class _StopController:
         )
         if judge_paused:
             self.paused_since = now if self.paused_since is None else self.paused_since
-            if now - self.paused_since >= MAX_PAUSE_SECONDS:
-                self.reason = "timeout"
-                return True
+            judge_stalled = now - self.paused_since >= MAX_PAUSE_SECONDS
+        else:
+            judge_stalled = False
+        # Both conditions are evaluated before either is attributed, and the attribution is the
+        # rule the other arm uses. Stopping at the first true test instead blamed the wall cap
+        # whenever both had fired — the less specific of the two causes, and the opposite of what
+        # ReAct recorded for the same failure.
+        truncation = harness_truncation(
+            wall_timed_out=now >= self.deadline, judge_timed_out=judge_stalled
+        )
+        if truncation is not None:
+            self.reason = "timeout"
+            self.truncation = truncation
+            return True
+        if judge_paused:
             return False
         self.paused_since = None
         from sora.activity import ActivityState
@@ -344,6 +371,7 @@ def _config_echo(
     config: str,
     *,
     charge: Charge | None,
+    generation_free: bool = False,
     charge_model_identity: dict[str, Any] | None,
     charge_model_digest: str | None,
     max_wall_seconds: float,
@@ -379,7 +407,11 @@ def _config_echo(
         f"config sha256    : {digest}",
         f"max wall seconds : {max_wall_seconds:g}",
     ]
-    if charge is None:
+    if charge is None and generation_free:
+        lines.append(
+            "scenario clock   : generation-free (frozen across model calls, resumed by zero)"
+        )
+    elif charge is None:
         lines.append("scenario clock   : wall (robustness mode; not token-charged)")
     else:
         lines.append("scenario clock   : charged (simulated time frozen across model calls)")
@@ -409,6 +441,7 @@ def run_scenario(
     scenario_id: str | None = None,
     run_number: int | None = None,
     charge: Charge | None = None,
+    generation_free: bool = False,
     charge_model_identity: dict[str, Any] | None = None,
     charge_model_digest: str | None = None,
 ) -> RunResult:
@@ -460,6 +493,7 @@ def run_scenario(
             charge=charge,
             charge_model_identity=charge_model_identity,
             charge_model_digest=charge_model_digest,
+            generation_free=generation_free,
             max_wall_seconds=max_wall_seconds,
             scenario_id=scenario_id,
         ),
@@ -482,6 +516,7 @@ def run_scenario(
             scenario_id=scenario_id,
             run_number=run_number,
             charge=charge,
+            generation_free=generation_free,
         )
         bracket.enter_context(_recording_llm_calls(recorder))
         # Harness-only decoration: bootstrap still owns construction, while the benchmark times
@@ -492,13 +527,19 @@ def run_scenario(
         # charge model, the same wrapper freezes the scenario; in wall-clock robustness mode it
         # only records windows.
         original_llm = agent.procedural._llm
+        # Freezing is owned by the clock mode, not by whether a charge model happens to be
+        # attached: a generation-free run freezes exactly the same way and resumes by zero, which
+        # is what `recorder` returns with no charge. Deriving it from `charge is not None` alone is
+        # what made the two modes indistinguishable. Read off the same mode that gets recorded, so
+        # a row labelled `generation_free` cannot have run unfrozen.
+        frozen = freezes_clock(resolve_clock_mode(charge, generation_free))
         if original_llm is None:
-            if charge is not None:
-                raise ValueError("a charged Gaia2 run requires an LLM client")
+            if frozen:
+                raise ValueError("a frozen Gaia2 run requires an LLM client")
         else:
             agent.procedural._llm = ClockedSoraLLMClient(
                 original_llm,
-                clock=simulation if charge is not None else None,
+                clock=simulation if frozen else None,
                 recorder=recorder,
             )
             bracket.callback(setattr, agent.procedural, "_llm", original_llm)
@@ -551,8 +592,15 @@ def run_scenario(
         # A deadline that fired during scoring is still a timeout: the run has no result it
         # could have reached, and recording it as anything else would hide a capped judge pass.
         stop_reason: StopReason | None = stop_when.reason if stop_when is not None else None
+        truncation = stop_when.truncation if stop_when is not None else None
         if stop_reason is None and wall_expired():
             stop_reason = "timeout"
+        # The block-level deadline governs scoring too, and `_StopController` is only polled from
+        # inside the decision cycle — so a cap that fired during the judge pass is recorded here.
+        # A stall the controller already attributed keeps its name: the judge pass is where a stall
+        # happens, and this fallback cannot see one.
+        if truncation is None and wall_expired():
+            truncation = "wall_clock"
 
         terminal_cause = _terminal_cause(
             exc,
@@ -577,6 +625,7 @@ def run_scenario(
             # reinterprets every field beside it and losing it to a probe failure would be
             # worse than losing any single one of them.
             timeline_expired=expired,
+            harness_truncation=truncation,
             llm_report=session.llm_report,
             replan_count=sum(
                 getattr(activity, "replan_count", 0)
@@ -615,7 +664,7 @@ def run_scenario(
                 else int(getattr(charge, "cached_input_clamps", 0))
                 == (recorder.raw_cached_input_anomalies if recorder is not None else 0)
             ),
-            clock_mode="token_charged" if charge is not None else "wall",
+            clock_mode=resolve_clock_mode(charge, generation_free),
             inference_charge_policy="serialized_sum" if charge is not None else None,
             llm_wall_seconds=recorder.wall_seconds if recorder is not None else 0.0,
             llm_wall_union_seconds=(recorder.wall_union_seconds if recorder is not None else 0.0),

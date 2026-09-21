@@ -1097,6 +1097,96 @@ def decide_acceptance_expansion(
 # been either, and that unknowability is exactly what must not be averaged into a W2 report.
 LEGACY_CLOCK_MODE = "legacy"
 
+# The three timing conventions a run can be made under. They are not interchangeable and a file
+# mixing them has no coherent aggregate, which is why the mode is recorded per record rather than
+# inferred from whether a charge model was attached.
+#
+# ``token_charged``   freeze the scenario around every model crossing and resume it by a modelled
+#                     token charge.
+# ``generation_free`` freeze the same way and resume by zero. This is the legacy ARE in-process
+#                     convention: its default ``simulated_generation_time_mode="measured"`` pauses
+#                     the environment and resumes with ``completion_duration``, which no shipped
+#                     ARE engine ever writes, so every row produced through that harness had
+#                     generation costing nothing. Not every published row: the newer ``gaia2-cli``
+#                     leaderboard runs on a wall clock, so this convention is compatible with the
+#                     in-process harness rather than with "the leaderboard" generally.
+#                     Reproducible for a fixed trajectory, and requiring no calibration, because
+#                     there is no coefficient to drift.
+# ``wall``            never freeze; generation costs real elapsed time. Not reproducible — decode
+#                     rate is a property of the serving endpoint, not of the model.
+CLOCK_MODE_TOKEN_CHARGED = "token_charged"
+CLOCK_MODE_GENERATION_FREE = "generation_free"
+CLOCK_MODE_WALL = "wall"
+
+
+def resolve_clock_mode(charge: object | None, generation_free: bool) -> str:
+    """The recorded clock mode for one run's timing configuration.
+
+    Both arms derive the label here rather than each re-deriving it from ``charge is None``, which
+    is what let a generation-free run be indistinguishable from a wall-clock one: a zero charge and
+    no charge are the same object, and only the caller's intent separates them.
+
+    A charge *and* ``generation_free`` is a contradiction, and raises rather than resolving: the two
+    arms broke the tie in opposite directions — this function named the run ``token_charged`` and
+    S-ORA billed the crossing, while ReAct's per-call charge short-circuited to zero — so the pair
+    produced a row whose label disagreed with the clock it actually ran on. The CLIs already reject
+    it, but they are not the only callers, and a wrong label is undetectable after the fact."""
+    if charge is not None and generation_free:
+        raise ValueError(
+            "a charge model and generation-free are different clock conventions: a run cannot "
+            "bill generation and also resume by zero"
+        )
+    if charge is not None:
+        return CLOCK_MODE_TOKEN_CHARGED
+    return CLOCK_MODE_GENERATION_FREE if generation_free else CLOCK_MODE_WALL
+
+
+def harness_truncation(*, wall_timed_out: bool, judge_timed_out: bool) -> str | None:
+    """Which watchdog cut this run short, or None if neither did.
+
+    Named rather than or-ed into one flag: ReAct once reported a stalled judge as a wall-clock cap
+    hit, which excluded it from scoring under a label that misdiagnosed it, while S-ORA recorded the
+    same stall as neither and scored it. The judge check comes first because a stall is the more
+    specific finding — the wall cap can elapse *because* the judge stalled, and the reverse cannot
+    happen.
+
+    Shared by both arms so that precedence is one rule rather than two that happen to agree in the
+    cases anyone tested: S-ORA reached the same verdict by a different route and disagreed with this
+    one whenever both watchdogs had fired, which is exactly the case no test covered."""
+    if judge_timed_out:
+        return "judge_stall"
+    return "wall_clock" if wall_timed_out else None
+
+
+def freezes_clock(clock_mode: str) -> bool:
+    """Whether this clock mode stops the scenario for the duration of a model call.
+
+    Both frozen modes do; they differ only in what they resume by (a modelled charge, or zero).
+    Named rather than re-derived from ``charge is not None`` at each call site, which is what let a
+    generation-free run silently take the wall-clock path on both arms."""
+    return clock_mode != CLOCK_MODE_WALL
+
+
+# A frozen clock takes generation out of the scenario's budget but not out of the operator's: real
+# per-scenario time becomes the scenario timeline *plus* the whole of generation, where an unfrozen
+# run is bounded by the timeline alone. Measured S-ORA scenarios project past the ordinary cap under
+# that arithmetic while every ReAct one stays inside it, and a cap that fires on one arm only is not
+# a shared condition. Raised for this mode specifically rather than globally, so the value every
+# other mode has run under is left where it was.
+GENERATION_FREE_MAX_WALL_SECONDS = 3600.0
+DEFAULT_MAX_WALL_SECONDS = 1200.0
+
+
+def resolve_max_wall_seconds(given: float | None, generation_free: bool) -> float:
+    """The watchdog a run should use, given what the caller asked for and its clock mode.
+
+    Shared by every entry point so the two cannot drift apart: a CLI that offers
+    ``--generation-free`` but keeps the ordinary default silently truncates the arm the raised cap
+    exists for."""
+    if given is not None:
+        return given
+    return GENERATION_FREE_MAX_WALL_SECONDS if generation_free else DEFAULT_MAX_WALL_SECONDS
+
 
 @dataclass(frozen=True)
 class EvaluationRecord:

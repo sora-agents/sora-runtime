@@ -1285,3 +1285,104 @@ async def test_a_failing_recorder_still_releases_the_frozen_world(tmp_path: Path
     # Zero is the deliberate direction: an uncharged call understates simulated time, where a
     # leaked freeze would hang the scenario outright.
     assert clock.completed == [(1, 0.0)]
+
+
+# -- the generation-free clock on the S-ORA arm --------------------------------------------------
+
+
+async def test_generation_free_freezes_the_sora_clock_and_resumes_it_by_zero(
+    tmp_path: Path,
+) -> None:
+    """The branch this pins is the one that made the mode worth building.
+
+    A generation-free run reaches every S-ORA call site with ``charge=None`` — exactly as a
+    wall-clock run does — and before the mode was named, that meant no clock was handed to the
+    client at all, so the scenario ran *unfrozen* while its artifact said otherwise. The claim has
+    two halves and both matter: the scenario is stopped for the duration of the crossing, and it is
+    resumed by zero rather than by measured latency."""
+
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            log_llm_usage(
+                LLMUsage(
+                    input_tokens=900, cached_input_tokens=0, output_tokens=400, answer_chars=2
+                ),
+                request,
+            )
+            return "{}"
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    recorder = SoraCallRecorder(writer, charge=None, generation_free=True)
+    clock = _GenerationClock()
+    client = ClockedSoraLLMClient(MeteredLLMClient(_Client()), clock=clock, recorder=recorder)
+    log = logging.getLogger("sora")
+    log.setLevel(logging.INFO)
+    log.addHandler(recorder)
+    try:
+        with llm_call_scope():
+            await client.complete(_request())
+    finally:
+        log.removeHandler(recorder)
+        recorder.close()
+        writer.close()
+
+    # Frozen: the crossing took a pause token, and gave it back.
+    assert clock.active == set()
+    # Resumed by zero — not by the call's measured latency, which is what an unfrozen run would
+    # have charged and what makes a wall-clock result irreproducible across serving endpoints.
+    assert clock.completed == [(1, 0.0)]
+
+    row = json.loads((tmp_path / "calls.jsonl").read_text().splitlines()[-1])
+    # 0.0, not None: under this clock zero is an applied policy, where None means no clock billed
+    # the crossing at all. A row that cannot tell those apart cannot state its own convention.
+    assert row["charged_seconds"] == 0.0
+
+
+async def test_a_wall_clock_sora_run_is_handed_no_clock_at_all(tmp_path: Path) -> None:
+    """The contrast case: same ``charge=None``, no freeze, and nothing billed.
+
+    Kept beside the test above because the two are one decision read two ways, and the bug was
+    that only this behavior existed."""
+
+    class _Client:
+        async def complete(self, request: CompletionRequest) -> str:
+            log_llm_usage(
+                LLMUsage(
+                    input_tokens=900, cached_input_tokens=0, output_tokens=400, answer_chars=2
+                ),
+                request,
+            )
+            return "{}"
+
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    recorder = SoraCallRecorder(writer, charge=None)
+    client = ClockedSoraLLMClient(MeteredLLMClient(_Client()), clock=None, recorder=recorder)
+    log = logging.getLogger("sora")
+    log.setLevel(logging.INFO)
+    log.addHandler(recorder)
+    try:
+        with llm_call_scope():
+            await client.complete(_request())
+    finally:
+        log.removeHandler(recorder)
+        recorder.close()
+        writer.close()
+
+    row = json.loads((tmp_path / "calls.jsonl").read_text().splitlines()[-1])
+    assert row["charged_seconds"] is None
+
+
+def test_both_frozen_modes_freeze_and_only_the_unfrozen_one_does_not() -> None:
+    """The predicate the S-ORA arm reads to decide whether to hand the client a clock. Derived from
+    the recorded mode rather than from ``charge is not None``, so a row cannot be labelled
+    ``generation_free`` and have run unfrozen."""
+    from examples.gaia2.evaluation.core import (
+        CLOCK_MODE_GENERATION_FREE,
+        CLOCK_MODE_TOKEN_CHARGED,
+        CLOCK_MODE_WALL,
+        freezes_clock,
+    )
+
+    assert freezes_clock(CLOCK_MODE_TOKEN_CHARGED) is True
+    assert freezes_clock(CLOCK_MODE_GENERATION_FREE) is True
+    assert freezes_clock(CLOCK_MODE_WALL) is False

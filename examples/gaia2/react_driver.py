@@ -74,7 +74,10 @@ from examples.gaia2._runner import RunResult, _run_number_of, _terminal_cause
 from examples.gaia2.evaluation.core import (
     MODEL_SNAPSHOTS,
     ModelProfile,
+    harness_truncation,
     load_profiles,
+    resolve_clock_mode,
+    resolve_max_wall_seconds,
 )
 from examples.gaia2.evaluation.core import (
     served_snapshot as _served_snapshot,
@@ -108,12 +111,14 @@ class MeteredEngineBuilder(LLMEngineBuilder):  # type: ignore[misc]  # ARE is un
         *,
         writer: LLMCallWriter | None = None,
         charge: ChargeModel | None = None,
+        generation_free: bool = False,
         scenario_id: str | None = None,
         run_number: int | None = None,
     ) -> None:
         self.profile = profile
         self.writer = writer
         self.charge = charge
+        self.generation_free = generation_free
         self.scenario_id = scenario_id
         self.run_number = run_number
         self.engines: list[MeteredLiteLLMEngine] = []
@@ -129,6 +134,7 @@ class MeteredEngineBuilder(LLMEngineBuilder):  # type: ignore[misc]  # ARE is un
             self.profile,
             writer=self.writer,
             charge=self.charge,
+            generation_free=self.generation_free,
             scenario_id=self.scenario_id,
             run_number=self.run_number,
         )
@@ -310,6 +316,7 @@ def build_runner(
     *,
     writer: LLMCallWriter | None = None,
     charge: ChargeModel | None = None,
+    generation_free: bool = False,
     scenario_id: str | None = None,
     run_number: int | None = None,
 ) -> tuple[CapturingScenarioRunner, MeteredEngineBuilder]:
@@ -318,6 +325,7 @@ def build_runner(
         profile,
         writer=writer,
         charge=charge,
+        generation_free=generation_free,
         scenario_id=scenario_id,
         run_number=run_number,
     )
@@ -354,6 +362,7 @@ def run_react_scenario(
     *,
     writer: LLMCallWriter | None = None,
     charge: ChargeModel | None = None,
+    generation_free: bool = False,
     run_number: int | None = None,
     judge_model: str | None = None,
     judge_provider: str | None = None,
@@ -405,6 +414,7 @@ def run_react_scenario(
         profile,
         writer=writer,
         charge=charge,
+        generation_free=generation_free,
         run_number=run_number,
         output_dir=output_dir,
         export=export,
@@ -442,6 +452,7 @@ def run_react_on_scenario(
     *,
     writer: LLMCallWriter | None = None,
     charge: ChargeModel | None = None,
+    generation_free: bool = False,
     run_number: int | None = None,
     output_dir: str | None = None,
     export: bool = False,
@@ -484,6 +495,7 @@ def run_react_on_scenario(
         profile,
         writer=writer,
         charge=charge,
+        generation_free=generation_free,
         scenario_id=getattr(scenario, "scenario_id", None),
         run_number=run_number,
     )
@@ -592,6 +604,9 @@ def run_react_on_scenario(
         exception=typed_exc,
         write_counts=counts,
         timeline_expired=expired,
+        harness_truncation=harness_truncation(
+            wall_timed_out=runner.wall_timed_out, judge_timed_out=runner.judge_timed_out
+        ),
         terminal_cause=terminal_cause,
         judge_recording=(
             None
@@ -615,7 +630,7 @@ def run_react_on_scenario(
             else int(getattr(charge, "cached_input_clamps", 0))
             == sum(engine.raw_cached_input_anomalies for engine in engine_builder.engines)
         ),
-        clock_mode="token_charged" if charge is not None else "wall",
+        clock_mode=resolve_clock_mode(charge, generation_free),
         inference_charge_policy="serialized_sum" if charge is not None else None,
         llm_wall_seconds=sum(engine.wall_seconds for engine in engine_builder.engines),
         # ReAct is serial today, but calculate the same sensitivity rather than assuming that
@@ -824,13 +839,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario-duration", type=float, default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--export", action="store_true", help="write ARE's HF trace")
-    parser.add_argument("--max-wall-seconds", type=float, default=1200.0)
+    # Defaulted per clock mode rather than pinned here, so this CLI cannot offer
+    # --generation-free while keeping a cap that truncates the arm the raise is for.
+    parser.add_argument("--max-wall-seconds", type=float, default=None)
     parser.add_argument(
         "--wall-clock",
         action="store_true",
         help=(
             "Use measured model latency instead of the frozen token charge. This robustness "
             "mode is not timing-comparable to token-charged runs."
+        ),
+    )
+    parser.add_argument(
+        "--generation-free",
+        action="store_true",
+        help=(
+            "Freeze the scenario around every model crossing and resume it by zero, so "
+            "generation costs the environment nothing. The legacy ARE in-process convention. "
+            "Excludes --wall-clock, and is not timing-comparable to token-charged runs."
         ),
     )
     parser.add_argument(
@@ -857,13 +883,22 @@ def main(argv: list[str] | None = None) -> int:
 
     charge_sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
     profile_charge = charge_sheet.charge_for(profile)
-    charge = None if args.wall_clock else profile_charge
+    if args.wall_clock and args.generation_free:
+        raise SystemExit("--wall-clock and --generation-free are different clocks; pick one")
+    if args.max_wall_seconds is None:
+        args.max_wall_seconds = resolve_max_wall_seconds(None, args.generation_free)
+        print(
+            f"watchdog: --max-wall-seconds not given; using {args.max_wall_seconds:g}s "
+            f"({'generation-free' if args.generation_free else 'default'})"
+        )
+    charge = None if (args.wall_clock or args.generation_free) else profile_charge
     try:
         result = run_react_scenario(
             args.scenario,
             profile,
             writer=writer,
             charge=charge,
+            generation_free=args.generation_free,
             run_number=args.run_number,
             judge_model=args.judge_model,
             judge_provider=args.judge_provider,

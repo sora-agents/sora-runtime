@@ -26,9 +26,17 @@ from are.simulation.agents.agent_builder import AgentBuilder  # noqa: E402
 from are.simulation.agents.are_simulation_agent_config import LLMEngineConfig  # noqa: E402
 from are.simulation.agents.default_agent.are_simulation_main import ARESimulationAgent  # noqa: E402
 from are.simulation.time_manager import TimeManager  # noqa: E402
-from examples.gaia2.evaluation.core import MODEL_SNAPSHOTS, load_profiles  # noqa: E402
+from examples.gaia2.evaluation.core import (  # noqa: E402
+    CLOCK_MODE_GENERATION_FREE,
+    CLOCK_MODE_TOKEN_CHARGED,
+    CLOCK_MODE_WALL,
+    MODEL_SNAPSHOTS,
+    harness_truncation,
+    load_profiles,
+    resolve_clock_mode,
+)
 from examples.gaia2.latency_grid import EVAL_ROOT  # noqa: E402
-from examples.gaia2.llm_calls import LLMCallWriter  # noqa: E402
+from examples.gaia2.llm_calls import LLMCallWriter, SoraCallRecorder  # noqa: E402
 from examples.gaia2.react_driver import (  # noqa: E402
     CapturingScenarioRunner,
     MeteredAgentBuilder,
@@ -907,3 +915,136 @@ def test_preflight_needs_no_scenario_and_a_run_still_does() -> None:
     )
     with pytest.raises(SystemExit):
         main(["--profile", PREFLIGHT_PROFILE])
+
+
+# -- the generation-free clock ------------------------------------------------------------------
+
+
+def test_generation_free_charges_zero_where_wall_clock_charges_measured_time(
+    profile: Any,
+) -> None:
+    """The two unfrozen-looking modes are not the same mode.
+
+    Both reach the engine with ``charge=None``, and before this distinction existed that meant
+    "bill the crossing at its measured elapsed time" — i.e. wall clock. A generation-free run
+    freezes the scenario exactly as a charged one does and resumes it by zero, which is the legacy
+    ARE in-process convention. Reading the mode off ``charge is None`` made the two
+    indistinguishable in the artifact and impossible to select between on the command line."""
+    wall = MeteredEngineBuilder(profile).create_engine(LLMEngineConfig(model_name=profile.model))
+    free = MeteredEngineBuilder(profile, generation_free=True).create_engine(
+        LLMEngineConfig(model_name=profile.model)
+    )
+    assert wall._charge_for(1_000, 0, 500, 12.5) == 12.5
+    assert free._charge_for(1_000, 0, 500, 12.5) == 0.0
+    # A charge model still wins over both: generation-free is a choice not to price generation,
+    # not a way to silence a charge model that was asked for.
+    charged = MeteredEngineBuilder(profile, charge=lambda _i, _c, _o: 7.0).create_engine(
+        LLMEngineConfig(model_name=profile.model)
+    )
+    assert charged._charge_for(1_000, 0, 500, 12.5) == 7.0
+
+
+def test_the_three_clock_modes_are_recorded_distinctly() -> None:
+    """A file that mixes conventions has no coherent aggregate, so the label has to come from the
+    caller's intent rather than from whether a charge object happens to be attached."""
+    assert resolve_clock_mode(object(), False) == CLOCK_MODE_TOKEN_CHARGED
+    assert resolve_clock_mode(None, True) == CLOCK_MODE_GENERATION_FREE
+    assert resolve_clock_mode(None, False) == CLOCK_MODE_WALL
+
+
+def test_a_charge_model_and_generation_free_is_refused_rather_than_ranked() -> None:
+    """The pair used to resolve to ``token_charged`` on the claim that the caller got the stricter
+    of the two. The arms did not agree on that: S-ORA billed the crossing while ReAct's engine
+    charged zero, so the "stricter" reading was true of one arm only and the row's own label was
+    wrong for the other. There is no correct resolution of a contradiction, so it raises."""
+    with pytest.raises(ValueError, match="different clock conventions"):
+        resolve_clock_mode(object(), True)
+
+
+def test_neither_arm_can_be_built_with_a_charge_model_and_generation_free(profile: Any) -> None:
+    """The CLIs reject the pair, but they are not the only callers — and a mislabelled row is
+    undetectable once the run is over, so the refusal belongs at construction on both arms."""
+    with pytest.raises(ValueError, match="different clock conventions"):
+        SoraCallRecorder(None, charge=lambda *_: 1.0, generation_free=True)
+    with pytest.raises(ValueError, match="different clock conventions"):
+        MeteredLiteLLMEngine.from_profile(profile, charge=lambda *_: 1.0, generation_free=True)
+
+
+# -- which watchdog cut the run short ------------------------------------------------------------
+
+
+def test_a_stalled_judge_is_named_as_one_rather_than_as_a_wall_clock_cap() -> None:
+    """Both watchdogs truncate a trajectory and both must be excluded from scoring, but they are
+    different failures with different fixes: a wall cap says the run was too slow, a judge stall
+    says scoring hung. This arm used to collapse them onto the flag named for the cap, so a stalled
+    judge was excluded under a label that pointed at the wrong component — and the other arm, which
+    only ever recorded the cap, scored it.
+
+    The judge check wins where both fired: the cap can elapse *because* the judge stalled, so the
+    stall is the more specific finding and the reverse ordering cannot occur."""
+    assert harness_truncation(wall_timed_out=False, judge_timed_out=False) is None
+    assert harness_truncation(wall_timed_out=True, judge_timed_out=False) == "wall_clock"
+    assert harness_truncation(wall_timed_out=False, judge_timed_out=True) == "judge_stall"
+    assert harness_truncation(wall_timed_out=True, judge_timed_out=True) == "judge_stall"
+
+
+def _stop_controller(*, deadline_passed: bool, judge_paused: bool, paused_for: float) -> Any:
+    """A `_StopController` positioned at one point in the two watchdogs' truth table."""
+    import time
+
+    from examples.gaia2._runner import _StopController
+
+    now = time.monotonic()
+    return _StopController(
+        simulation=SimpleNamespace(
+            is_judge_paused=lambda: judge_paused, is_paused=lambda: judge_paused
+        ),
+        agent=SimpleNamespace(
+            procedural=SimpleNamespace(logical_call_limit_exceeded=False),
+            working=SimpleNamespace(activities={}),
+        ),
+        deadline=now - 1.0 if deadline_passed else now + 3600.0,
+        paused_since=now - paused_for if judge_paused else None,
+    )
+
+
+def test_both_arms_attribute_a_simultaneous_stall_and_cap_to_the_same_watchdog() -> None:
+    """The two arms reached the same verdict by different routes, and the routes disagreed exactly
+    where nothing tested them: S-ORA tested the wall deadline first, so a run that hit the cap
+    *while* the judge was stalled was recorded as a cap hit, where ReAct recorded a stall. Both are
+    correctly excluded either way — this is about the provenance being one rule rather than two."""
+    both = _stop_controller(deadline_passed=True, judge_paused=True, paused_for=600.0)
+    assert both() is True
+    assert both.reason == "timeout"
+    assert both.truncation == "judge_stall"
+    assert harness_truncation(wall_timed_out=True, judge_timed_out=True) == both.truncation
+
+
+def test_each_watchdog_alone_is_still_named_for_itself() -> None:
+    cap = _stop_controller(deadline_passed=True, judge_paused=False, paused_for=0.0)
+    assert cap() is True
+    assert cap.truncation == "wall_clock"
+
+    stall = _stop_controller(deadline_passed=False, judge_paused=True, paused_for=600.0)
+    assert stall() is True
+    assert stall.truncation == "judge_stall"
+
+
+def test_a_judge_pause_inside_its_budget_is_not_a_truncation() -> None:
+    """The pause is ordinary: scoring blocks the cycle for as long as the judge takes. Only sitting
+    there past the cap is a stall, and the controller has to keep waiting until then."""
+    paused = _stop_controller(deadline_passed=False, judge_paused=True, paused_for=1.0)
+    assert paused() is False
+    assert paused.truncation is None
+    assert paused.reason is None
+
+
+def test_the_generation_free_watchdog_default_is_shared_with_the_batch_harness() -> None:
+    """A CLI that offers --generation-free while keeping the ordinary cap truncates exactly the arm
+    the raised cap exists for, and does it silently. One rule, read from one place."""
+    from examples.gaia2.evaluation.core import resolve_max_wall_seconds
+
+    assert resolve_max_wall_seconds(None, True) == 3600.0
+    assert resolve_max_wall_seconds(None, False) == 1200.0
+    # An explicit value is always honored: the default is a default, not a policy.
+    assert resolve_max_wall_seconds(90.0, True) == 90.0

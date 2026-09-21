@@ -32,6 +32,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Protocol
 
+from examples.gaia2.evaluation.core import resolve_clock_mode
 from sora.llm import CompletionRequest, LLMClient, current_llm_call_id, llm_call_scope
 
 Arm = Literal["sora", "react", "grid"]
@@ -208,7 +209,8 @@ class LLMCallRecord:
     only one of them is a decision.
 
     ``seconds`` is measured wall clock at the client, and is what the fit uses; ``charged_seconds``
-    is what the run's charge model billed, and is None until a charge model is wired. Keeping both
+    is what the run's clock billed — a charge model's figure, or an explicit 0.0 under a
+    generation-free clock, and None only where nothing was billed at all (wall clock). Keeping both
     is the point: the second is a *pricing rule* and has to stay auditable against the first.
 
     A None token field means *not reported*, never a measured zero — a provider that omits
@@ -410,6 +412,7 @@ class SoraCallRecorder(logging.Handler):
         scenario_id: str | None = None,
         run_number: int | None = None,
         charge: Charge | None = None,
+        generation_free: bool = False,
     ) -> None:
         super().__init__(level=logging.INFO)
         self._writer = writer
@@ -417,6 +420,14 @@ class SoraCallRecorder(logging.Handler):
         self._scenario_id = scenario_id
         self._run_number = run_number
         self._charge = charge
+        # Under a generation-free clock the scenario is frozen and resumed by zero, so zero is an
+        # applied policy rather than a missing measurement. Recorded as 0.0 for that reason: None
+        # means "no charge model was wired", which is the wall-clock case and a different claim.
+        self._generation_free = generation_free
+        # Rejects a charge model handed in alongside generation-free. The two arms used to break
+        # that tie in opposite directions — this one billed the crossing, ReAct's engine zeroed it
+        # — under a row both labelled ``token_charged``.
+        self.clock_mode = resolve_clock_mode(charge, generation_free)
         self._partials: dict[str, _Partial] = {}
         self._closed_round_trip_windows: tuple[RoundTripWindow, ...] = ()
         self._lock = threading.RLock()
@@ -496,7 +507,7 @@ class SoraCallRecorder(logging.Handler):
                 total, cached, output = sample
                 # Unknown cache usage is conservatively uncached input.
                 charged = self._charge(total, cached or 0, output)
-            if self._charge is not None:
+            if self._charge is not None or self._generation_free:
                 partial.charged_seconds = (partial.charged_seconds or 0.0) + charged
             partial.round_trip_windows.append(
                 RoundTripWindow(

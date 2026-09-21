@@ -71,7 +71,11 @@ from are.simulation.agents.llm.litellm.litellm_engine import (
 )
 from litellm import stream_chunk_builder
 
-from examples.gaia2.evaluation.core import ModelProfile
+from examples.gaia2.evaluation.core import (
+    CLOCK_MODE_GENERATION_FREE,
+    ModelProfile,
+    resolve_clock_mode,
+)
 from examples.gaia2.llm_calls import (
     LLMCallRecord,
     LLMCallWriter,
@@ -185,6 +189,7 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         *,
         writer: LLMCallWriter | None = None,
         charge: ChargeModel | None = None,
+        generation_free: bool = False,
         scenario_id: str | None = None,
         run_number: int | None = None,
         request_kwargs: Mapping[str, Any] | None = None,
@@ -194,6 +199,15 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
         _install_response_capture()
         self.writer = writer
         self.charge = charge
+        # Freeze the scenario and resume it by zero — the legacy ARE in-process convention, where
+        # generation costs the environment nothing. Distinct from ``charge is None``, which means
+        # wall clock and bills the crossing at its measured elapsed time.
+        self.generation_free = generation_free
+        # Resolved once, here, for two reasons: it rejects a charge model handed in *alongside*
+        # generation-free — which used to leave this engine billing zero under a row labelled
+        # ``token_charged`` — and it makes the per-call branch below read off the same label the
+        # artifact carries, so a run cannot be charged in a way its own row denies.
+        self.clock_mode = resolve_clock_mode(charge, generation_free)
         self.scenario_id = scenario_id
         self.run_number = run_number
         self.stream = stream
@@ -442,6 +456,8 @@ class MeteredLiteLLMEngine(LiteLLMEngine):  # type: ignore[misc]  # ARE is untyp
     ) -> float:
         # An unreported cache figure bills as uncached: the charge model has to return a number,
         # and pricing the unknown at the cheaper rate would understate the arm.
+        if self.clock_mode == CLOCK_MODE_GENERATION_FREE:
+            return 0.0
         if self.charge is None:
             return elapsed
         return self.charge(input_tokens, cached or 0, output_tokens)
