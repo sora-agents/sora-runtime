@@ -20,6 +20,64 @@ from sora._prompts.core import (
 # costs nothing and keeps the number honest. When adding an example, do NOT reach for the scenario
 # you happen to be debugging.
 
+_NO_PROPERTY_REFERENCES = ""
+
+_NAME_MATCHING_WITHOUT_PROPERTIES = (
+    "When the value you match on is a NAME the USER phrased, `eq` "
+    "matches only the stored string in full, and people name "
+    "things approximately — they shorten a title, drop a subtitle "
+    "or an edition, reorder words, punctuate it differently — so a "
+    'goal saying "the Delft landscape" may be stored as "View of '
+    'Delft, oil on canvas (1661)". A mechanical `eq` on that '
+    "phrase matches NOTHING, and an empty result is "
+    "indistinguishable from the record not existing: the agent "
+    "goes on to tell the user the thing cannot be found while it "
+    "sits in the collection. So do NOT resolve a user-phrased name "
+    "with `eq`.\n"
+)
+
+_NAME_SEARCH_WITHOUT_PROPERTIES = (
+    "Use the tool's OWN search or lookup operation for that "
+    "instead — whatever the catalog calls it (a `search_*` / "
+    "`find_*` / `lookup_*` operation, or one taking a `query`, "
+    "`name` or `keyword` parameter). Matching an approximate name "
+    "against its own records is the job that operation exists to "
+    "do, and it is CHEAP: one call, no collection shipped to the "
+    "model. Only where the tool offers no such operation, call the "
+    "broadest suitable read operation and filter its returned "
+    'collection with a {"$decide": ...} predicate that accepts the '
+    "record whose stored name CONTAINS or paraphrases the user's "
+    "phrase — still never a mechanical `eq`. What flips the rule "
+    "is a FREE-FORM name, not who uttered the value: `eq` stays "
+    "right for anything the record stores verbatim out of a fixed "
+    "vocabulary — ids and keys, enumerated statuses and "
+    "categories, numbers, dates, booleans, and anything copied "
+    "from an earlier result — and the user naming one of those (a "
+    "city, a status) does not make it approximate.\n"
+    "Expect that search to come back with SEVERAL near-matches — "
+    "for an approximate name that is the normal outcome, not a "
+    "failure. Narrow them afterwards on the fields the goal "
+    "actually constrains (a date, a medium, a gallery), or ask the "
+    "user which one they meant. Do not re-tighten to an `eq` on "
+    "the name to cut the list down: that is the same mistake one "
+    "step later.\n"
+)
+
+_NARROWING_WITHOUT_PROPERTIES = (
+    "Where data is reachable through operations, narrow it before "
+    "acting: use a specific search or a date/range-bounded list "
+    "operation so a $from reference points at an unambiguous "
+    "result. Prefer an operation that accepts the narrowing as "
+    "parameters; otherwise apply a data-op to the returned "
+    "collection.\n"
+)
+
+_CURRENT_STATE_PREDICATES_WITHOUT_PROPERTIES = (
+    "A `$decide` predicate is judged only against the execution "
+    "context provided; it cannot reconstruct state from before a "
+    "change. "
+)
+
 PLAN_PROMPT = PromptManifest(
     semantic_label=PromptId.PLAN,
     prompt_version="1",
@@ -208,11 +266,11 @@ PLAN_PROMPT = PromptManifest(
             variants=(
                 PromptVariant(
                     channels=OPERATIONS_ONLY,
-                    text="",
+                    text=_NO_PROPERTY_REFERENCES,
                 ),
                 PromptVariant(
                     channels=SIGNALS_ONLY,
-                    text="",
+                    text=_NO_PROPERTY_REFERENCES,
                 ),
             ),
         ),
@@ -234,35 +292,11 @@ PLAN_PROMPT = PromptManifest(
             variants=(
                 PromptVariant(
                     channels=OPERATIONS_ONLY,
-                    text=(
-                        "When the value you match on is a NAME the USER phrased, `eq` "
-                        "matches only the stored string in full, and people name "
-                        "things approximately — they shorten a title, drop a subtitle "
-                        "or an edition, reorder words, punctuate it differently — so a "
-                        'goal saying "the Delft landscape" may be stored as "View of '
-                        'Delft, oil on canvas (1661)". A mechanical `eq` on that '
-                        "phrase matches NOTHING, and an empty result is "
-                        "indistinguishable from the record not existing: the agent "
-                        "goes on to tell the user the thing cannot be found while it "
-                        "sits in the collection. So do NOT resolve a user-phrased name "
-                        "with `eq`.\n"
-                    ),
+                    text=_NAME_MATCHING_WITHOUT_PROPERTIES,
                 ),
                 PromptVariant(
                     channels=SIGNALS_ONLY,
-                    text=(
-                        "When the value you match on is a NAME the USER phrased, `eq` "
-                        "matches only the stored string in full, and people name "
-                        "things approximately — they shorten a title, drop a subtitle "
-                        "or an edition, reorder words, punctuate it differently — so a "
-                        'goal saying "the Delft landscape" may be stored as "View of '
-                        'Delft, oil on canvas (1661)". A mechanical `eq` on that '
-                        "phrase matches NOTHING, and an empty result is "
-                        "indistinguishable from the record not existing: the agent "
-                        "goes on to tell the user the thing cannot be found while it "
-                        "sits in the collection. So do NOT resolve a user-phrased name "
-                        "with `eq`.\n"
-                    ),
+                    text=_NAME_MATCHING_WITHOUT_PROPERTIES,
                 ),
             ),
         ),
@@ -297,61 +331,11 @@ PLAN_PROMPT = PromptManifest(
             variants=(
                 PromptVariant(
                     channels=OPERATIONS_ONLY,
-                    text=(
-                        "Use the tool's OWN search or lookup operation for that "
-                        "instead — whatever the catalog calls it (a `search_*` / "
-                        "`find_*` / `lookup_*` operation, or one taking a `query`, "
-                        "`name` or `keyword` parameter). Matching an approximate name "
-                        "against its own records is the job that operation exists to "
-                        "do, and it is CHEAP: one call, no collection shipped to the "
-                        "model. Only where the tool offers no such operation, call the "
-                        "broadest suitable read operation and filter its returned "
-                        'collection with a {"$decide": ...} predicate that accepts the '
-                        "record whose stored name CONTAINS or paraphrases the user's "
-                        "phrase — still never a mechanical `eq`. What flips the rule "
-                        "is a FREE-FORM name, not who uttered the value: `eq` stays "
-                        "right for anything the record stores verbatim out of a fixed "
-                        "vocabulary — ids and keys, enumerated statuses and "
-                        "categories, numbers, dates, booleans, and anything copied "
-                        "from an earlier result — and the user naming one of those (a "
-                        "city, a status) does not make it approximate.\n"
-                        "Expect that search to come back with SEVERAL near-matches — "
-                        "for an approximate name that is the normal outcome, not a "
-                        "failure. Narrow them afterwards on the fields the goal "
-                        "actually constrains (a date, a medium, a gallery), or ask the "
-                        "user which one they meant. Do not re-tighten to an `eq` on "
-                        "the name to cut the list down: that is the same mistake one "
-                        "step later.\n"
-                    ),
+                    text=_NAME_SEARCH_WITHOUT_PROPERTIES,
                 ),
                 PromptVariant(
                     channels=SIGNALS_ONLY,
-                    text=(
-                        "Use the tool's OWN search or lookup operation for that "
-                        "instead — whatever the catalog calls it (a `search_*` / "
-                        "`find_*` / `lookup_*` operation, or one taking a `query`, "
-                        "`name` or `keyword` parameter). Matching an approximate name "
-                        "against its own records is the job that operation exists to "
-                        "do, and it is CHEAP: one call, no collection shipped to the "
-                        "model. Only where the tool offers no such operation, call the "
-                        "broadest suitable read operation and filter its returned "
-                        'collection with a {"$decide": ...} predicate that accepts the '
-                        "record whose stored name CONTAINS or paraphrases the user's "
-                        "phrase — still never a mechanical `eq`. What flips the rule "
-                        "is a FREE-FORM name, not who uttered the value: `eq` stays "
-                        "right for anything the record stores verbatim out of a fixed "
-                        "vocabulary — ids and keys, enumerated statuses and "
-                        "categories, numbers, dates, booleans, and anything copied "
-                        "from an earlier result — and the user naming one of those (a "
-                        "city, a status) does not make it approximate.\n"
-                        "Expect that search to come back with SEVERAL near-matches — "
-                        "for an approximate name that is the normal outcome, not a "
-                        "failure. Narrow them afterwards on the fields the goal "
-                        "actually constrains (a date, a medium, a gallery), or ask the "
-                        "user which one they meant. Do not re-tighten to an `eq` on "
-                        "the name to cut the list down: that is the same mistake one "
-                        "step later.\n"
-                    ),
+                    text=_NAME_SEARCH_WITHOUT_PROPERTIES,
                 ),
             ),
         ),
@@ -421,25 +405,11 @@ PLAN_PROMPT = PromptManifest(
             variants=(
                 PromptVariant(
                     channels=OPERATIONS_ONLY,
-                    text=(
-                        "Where data is reachable through operations, narrow it before "
-                        "acting: use a specific search or a date/range-bounded list "
-                        "operation so a $from reference points at an unambiguous "
-                        "result. Prefer an operation that accepts the narrowing as "
-                        "parameters; otherwise apply a data-op to the returned "
-                        "collection.\n"
-                    ),
+                    text=_NARROWING_WITHOUT_PROPERTIES,
                 ),
                 PromptVariant(
                     channels=SIGNALS_ONLY,
-                    text=(
-                        "Where data is reachable through operations, narrow it before "
-                        "acting: use a specific search or a date/range-bounded list "
-                        "operation so a $from reference points at an unambiguous "
-                        "result. Prefer an operation that accepts the narrowing as "
-                        "parameters; otherwise apply a data-op to the returned "
-                        "collection.\n"
-                    ),
+                    text=_NARROWING_WITHOUT_PROPERTIES,
                 ),
             ),
         ),
@@ -570,19 +540,11 @@ PLAN_PROMPT = PromptManifest(
             variants=(
                 PromptVariant(
                     channels=OPERATIONS_ONLY,
-                    text=(
-                        "A `$decide` predicate is judged only against the execution "
-                        "context provided; it cannot reconstruct state from before a "
-                        "change. "
-                    ),
+                    text=_CURRENT_STATE_PREDICATES_WITHOUT_PROPERTIES,
                 ),
                 PromptVariant(
                     channels=SIGNALS_ONLY,
-                    text=(
-                        "A `$decide` predicate is judged only against the execution "
-                        "context provided; it cannot reconstruct state from before a "
-                        "change. "
-                    ),
+                    text=_CURRENT_STATE_PREDICATES_WITHOUT_PROPERTIES,
                 ),
             ),
         ),
