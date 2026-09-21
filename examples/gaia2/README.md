@@ -179,7 +179,7 @@ whose digest or `(scenario_id, run_number)` matrix differs. The manifest can con
 capabilities, but one batch invocation still runs the requested `--capability` only.
 
 The paper freeze candidate uses
-[`evaluation/campaigns/aamas2027/mini-validation.json`](evaluation/campaigns/aamas2027/mini-validation.json):
+[`evaluation/campaigns/paper2027/mini-validation.json`](evaluation/campaigns/paper2027/mini-validation.json):
 all 32 scenarios selected by Gaia2 `mini` for each of the five capabilities. The cases are recorded
 under `execution`, `search`, `adaptability`, `time`, and `ambiguity`, rather than under a synthetic
 `mini` result bucket. Each invocation therefore loads the corresponding full capability config and
@@ -193,10 +193,10 @@ point in the frozen run matrix:
 for capability in execution search adaptability time ambiguity; do
   python -m examples.gaia2.batch \
     --capability "$capability" \
-    --scenario-manifest examples/gaia2/evaluation/campaigns/aamas2027/mini-validation.json \
+    --scenario-manifest examples/gaia2/evaluation/campaigns/paper2027/mini-validation.json \
     --num-runs 3 \
     --judge-model "$JUDGE_MODEL" --judge-provider "$JUDGE_PROVIDER" \
-    --output-dir .sora/gaia2/aamas2027
+    --output-dir .sora/gaia2/paper2027
 done
 ```
 
@@ -361,12 +361,11 @@ result, and adding a third convention to them would widen the surface on which a
 disagree with its own label without making any reported number more comparable. A development run
 that needs the frozen clock should use `batch.py` with one capability.
 
-The dated charged-clock experiment protocol records the primary policy, sensitivity semantics,
-frozen artifact hashes, ex-ante overlap expectation, and operational gates. It is a working
-document and lives with the other untracked notes, at
-`.sora/notes/benchmarks/gaia2/charged-clock-protocol-2026-09-19.md`; what it pins is tracked
-independently, as the frozen artifacts themselves and the hashes the campaign gate checks them
-against.
+[`evaluation/PROTOCOL.md`](evaluation/PROTOCOL.md) records the clock conventions and which one is
+primary, sensitivity semantics, frozen artifact hashes, the ex-ante overlap expectation, and the
+operational gates. The dated working notes behind it stay untracked under
+`.sora/notes/benchmarks/gaia2/`; what the protocol pins is tracked independently, as the frozen
+artifacts themselves and the hashes the campaign gate checks them against.
 
 ARE does not model tool-execution duration: its apps execute locally and expose no authored
 latency. Tool calls therefore acquire no generation-pause token. Their Python execution time is an

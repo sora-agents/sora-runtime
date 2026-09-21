@@ -5,16 +5,22 @@ report serialization across two campaigns:
 
 - `prompt` evaluates frozen S-ORA prompt configurations on deterministic contract/neutral suites
   and the familiar, development, or locked-acceptance Gaia2 manifests.
-- `aamas2027` holds the paper protocol freeze candidate, including the exact Gaia2 mini scenario
-  selection. It remains uncommitted and must not produce paid results until its protocol checkpoint
-  is reviewed and committed.
+- `paper2027` holds the paper protocol artifacts, including the exact Gaia2 mini scenario selection.
+  Its methodology is tracked in [`PROTOCOL.md`](PROTOCOL.md); the acceptance parameters and the
+  judge are not frozen yet, so no locked-acceptance payload may be opened until they are added there
+  and committed.
 
-The dated charged-clock protocol is the freeze candidate for the Gaia2 timing comparison. It is a
-working document, kept with the other untracked notes at
-`.sora/notes/benchmarks/gaia2/charged-clock-protocol-2026-09-19.md`, alongside the gate report that
-records running its operational gates. What it pins is tracked here regardless: the frozen
-artifacts themselves, including the exact [Gaia2 mini manifest](campaigns/aamas2027/mini-validation.json),
-and the hashes `campaigns/prompt/baseline.json` holds them to.
+[`PROTOCOL.md`](PROTOCOL.md) is the tracked statement of how the comparison is run: the three clock
+conventions and which one is primary, event delivery under a freeze, what the Time capability
+actually measures, the watchdog and truncation rules, the gated headline, the paired-arm audit, the
+frozen artifact hashes, the declared diagnostics, and the operational gates. It is not yet a
+pre-registration — the acceptance parameters and the judge are still open, and it says so.
+
+The dated working notes behind it, including the gate report that records running the operational
+gates, stay untracked at `.sora/notes/benchmarks/gaia2/`. What the protocol pins is tracked here:
+the frozen artifacts themselves, including the exact
+[Gaia2 mini manifest](campaigns/paper2027/mini-validation.json), and the hashes
+`campaigns/prompt/baseline.json` holds them to.
 
 ## The frozen charge coefficients are failing their audit
 

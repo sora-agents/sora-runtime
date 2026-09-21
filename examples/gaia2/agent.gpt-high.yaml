@@ -58,7 +58,7 @@ agent:
     max_retries: 0
     # The only line differing from `agent.yaml`. This file exists so the S-ORA arm can run at
     # the operating point the charged-clock protocol actually names for the sweep: the frozen
-    # `gpt-5.4-high-paper` profile, the only one carrying the `aamas2027` campaign. The charge
+    # `gpt-5.4-high-paper` profile, the only one carrying the `paper2027` campaign. The charge
     # coefficients are keyed by model, so this profile and `gpt-5.4-medium-prompt` share them —
     # which is precisely why an audit run at `medium` does not certify `high`.
     reasoning_effort: high

@@ -1172,18 +1172,18 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--reduces-tool-catalog", action="store_true")
     report.add_argument("--expansion-payloads-available", action="store_true")
     report.set_defaults(handler=_report_command)
-    aamas2027 = campaigns.add_parser(
-        "aamas2027",
+    paper2027 = campaigns.add_parser(
+        "paper2027",
         help="show the AAMAS 2027 protocol-freeze candidate",
     )
-    aamas2027.set_defaults(handler=_aamas2027_status)
+    paper2027.set_defaults(handler=_paper2027_status)
     return parser
 
 
-def _aamas2027_status(args: argparse.Namespace) -> int:
+def _paper2027_status(args: argparse.Namespace) -> int:
     del args
     print(
-        "aamas2027 has an uncommitted protocol-freeze candidate and exact Gaia2 mini manifest; "
+        "paper2027 has an uncommitted protocol-freeze candidate and exact Gaia2 mini manifest; "
         "run it through examples.gaia2.batch after the checkpoint is reviewed and committed"
     )
     return 0

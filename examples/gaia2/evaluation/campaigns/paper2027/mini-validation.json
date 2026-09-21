@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "name": "aamas2027-gaia2-mini-validation",
+  "name": "paper2027-gaia2-mini-validation",
   "dataset": "meta-agents-research-environments/gaia2",
   "revision": "78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99",
   "split": "validation",

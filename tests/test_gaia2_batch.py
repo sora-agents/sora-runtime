@@ -1039,12 +1039,12 @@ def test_sweep_manifest_pins_revision_order_and_canonical_digest(tmp_path: Path)
 
 def test_paper_manifest_is_the_complete_five_capability_gaia2_mini_selection() -> None:
     manifest = _load_sweep_manifest(
-        Path("examples/gaia2/evaluation/campaigns/aamas2027/mini-validation.json")
+        Path("examples/gaia2/evaluation/campaigns/paper2027/mini-validation.json")
     )
 
-    assert manifest.name == "aamas2027-gaia2-mini-validation"
+    assert manifest.name == "paper2027-gaia2-mini-validation"
     assert manifest.revision == "78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99"
-    assert manifest.digest == "123b92db986d09fea93b92f7bccaa5c3f08c35c77939f91fc97c5c3820fc416b"
+    assert manifest.digest == "cc6ebb08d388cc0e4dee635c0a031493c280972c033ba0712577413757515e3b"
     assert len(manifest.cases) == 160
     assert {
         capability: len(manifest.scenario_ids(capability))

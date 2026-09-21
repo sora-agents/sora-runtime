@@ -237,7 +237,7 @@ def build_frozen_baseline(
     # change to any part of it — a note as much as a number — reddens the baseline test.
     snapshot["charge_model"] = ChargeModelSheet.load(root / "charge_model.json").to_dict()
     snapshot["notes"] = {
-        "campaigns": ["prompt", "aamas2027"],
+        "campaigns": ["prompt", "paper2027"],
         "contains_live_model_output": False,
         "contains_gaia_payloads": False,
         "contains_oracles": False,

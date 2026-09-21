@@ -42,7 +42,7 @@
     {
       "campaigns": [
         "prompt",
-        "aamas2027"
+        "paper2027"
       ],
       "client": "sora.adapters.openai_llm.OpenAICompatLLMClient",
       "credential_env": "OPENAI_API_KEY",
@@ -56,7 +56,7 @@
           "status": "sent",
           "value": [
             "prompt",
-            "aamas2027"
+            "paper2027"
           ]
         },
         "client": {
@@ -326,7 +326,7 @@
     {
       "campaigns": [
         "prompt",
-        "aamas2027"
+        "paper2027"
       ],
       "client": "sora.adapters.openai_llm.OpenAICompatLLMClient",
       "credential_env": "OPENROUTER_API_KEY",
@@ -340,7 +340,7 @@
           "status": "sent",
           "value": [
             "prompt",
-            "aamas2027"
+            "paper2027"
           ]
         },
         "client": {
@@ -542,7 +542,7 @@
   "notes": {
     "campaigns": [
       "prompt",
-      "aamas2027"
+      "paper2027"
     ],
     "charge_model": "frozen latency coefficients, charged identically to both scaffold arms so that the comparison measures architecture rather than provider speed. They are constants and will drift from live provider latency over the sweep without the charge moving, which is the provider-independence the freeze buys, not a defect",
     "contains_credentials": false,
@@ -554,7 +554,7 @@
     "gaia_limit_unit": "logical_agent_llm_call",
     "gaia_logical_agent_llm_call_limit": 200,
     "gpt_5_4_temperature": "intentionally omitted; the reasoning profiles support only the default value 1",
-    "kimi_campaign_membership": "2026-09-21 re-freeze: kimi-k2.5-prompt gained aamas2027 alongside prompt. Campaign membership only — no request parameter, operating point, prompt, judge or charge-model figure changed, and the diff is the two campaign lists. The profile was already named here as the campaign's cross_family_profile, so the omission was provisioning, not a decision; the arm cannot run under a campaign it is not provisioned for.",
+    "kimi_campaign_membership": "2026-09-21 re-freeze: kimi-k2.5-prompt gained paper2027 alongside prompt. Campaign membership only — no request parameter, operating point, prompt, judge or charge-model figure changed, and the diff is the two campaign lists. The profile was already named here as the campaign's cross_family_profile, so the omission was provisioning, not a decision; the arm cannot run under a campaign it is not provisioned for.",
     "kimi_provider": "Venice endpoint pinned after DeepInfra retired its route; chosen by measurement, because the endpoint fixes the decode rate and the output-cap semantics that the latency grid depends on, and neither is visible in what a provider declares",
     "kimi_reasoning": "OpenRouter unified reasoning enabled with provider pinned",
     "kimi_snapshot_status": "stable alias; no dated OpenRouter snapshot",

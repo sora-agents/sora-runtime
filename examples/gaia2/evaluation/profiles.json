@@ -33,7 +33,7 @@
       "model": "moonshotai/kimi-k2.5",
       "endpoint": "https://openrouter.ai/api/v1",
       "credential_env": "OPENROUTER_API_KEY",
-      "campaigns": ["prompt", "aamas2027"],
+      "campaigns": ["prompt", "paper2027"],
       "settings": {
         "reasoning_effort": {"status": "intentionally_omitted", "value": null},
         "reasoning": {"status": "sent", "value": {"enabled": true}},
@@ -65,7 +65,7 @@
       "model": "gpt-5.4-2026-03-05",
       "endpoint": "https://api.openai.com/v1",
       "credential_env": "OPENAI_API_KEY",
-      "campaigns": ["prompt", "aamas2027"],
+      "campaigns": ["prompt", "paper2027"],
       "settings": {
         "reasoning_effort": {"status": "sent", "value": "high"},
         "reasoning": {"status": "intentionally_omitted", "value": null},

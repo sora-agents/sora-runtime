@@ -150,7 +150,7 @@ def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
     assert "temperature" not in medium.client_settings()
     assert medium.settings["max_output_tokens"].value == 16384
     high = profiles["gpt-5.4-high-paper"]
-    assert high.campaigns == ("prompt", "aamas2027")
+    assert high.campaigns == ("prompt", "paper2027")
     assert high.settings["reasoning_effort"].value == "high"
     assert high.settings["temperature"].status == "intentionally_omitted"
     assert high.settings["temperature"].value is None
@@ -161,7 +161,7 @@ def test_initial_profiles_freeze_exact_models_and_behavior_settings() -> None:
     # campaign's `cross_family_profile`, so running it there was always the intent and the
     # single-campaign list was a provisioning omission — an arm cannot run under a campaign it is
     # not provisioned for. Membership only: the operating point below is unchanged.
-    assert kimi.campaigns == ("prompt", "aamas2027")
+    assert kimi.campaigns == ("prompt", "paper2027")
     assert kimi.settings["temperature"].value == 0.5
     assert kimi.settings["reasoning"].value == {"enabled": True}
     # Every part of this pin was set by measurement, because none of it is visible in what the
@@ -613,7 +613,7 @@ def test_frozen_snapshot_has_all_perception_profiles_and_matches_runtime() -> No
     assert frozen["evaluation_profiles"] == [
         evaluation_profiles[name].to_dict() for name in sorted(evaluation_profiles)
     ]
-    assert frozen["notes"]["campaigns"] == ["prompt", "aamas2027"]
+    assert frozen["notes"]["campaigns"] == ["prompt", "paper2027"]
     assert frozen["judge_profile"] == load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
     assert (
         frozen["charge_model"] == ChargeModelSheet.load(EVAL_ROOT / "charge_model.json").to_dict()
@@ -1760,7 +1760,7 @@ def test_evaluation_cli_and_readme_name_both_campaigns() -> None:
     assert args.campaign == "prompt"
     readme = (EVAL_ROOT / "README.md").read_text()
     assert "python -m examples.gaia2.evaluation prompt check" in readme
-    assert "aamas2027" in readme
+    assert "paper2027" in readme
 
 
 def test_prompt_campaign_defaults_to_200_logical_agent_calls_not_cycles() -> None:

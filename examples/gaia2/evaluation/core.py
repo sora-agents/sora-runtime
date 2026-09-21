@@ -52,7 +52,7 @@ SETTING_NAMES = (
 )
 SettingStatus = Literal["sent", "intentionally_omitted", "provider_observed"]
 Arm = str
-Campaign = Literal["prompt", "aamas2027"]
+Campaign = Literal["prompt", "paper2027"]
 TerminalCause = Literal[
     "verification_completion",
     "llm_call_limit",
@@ -180,9 +180,9 @@ class ModelProfile:
         if (
             not isinstance(campaigns_raw, list)
             or not campaigns_raw
-            or any(campaign not in {"prompt", "aamas2027"} for campaign in campaigns_raw)
+            or any(campaign not in {"prompt", "paper2027"} for campaign in campaigns_raw)
         ):
-            raise ValueError("model profile campaigns must name prompt and/or aamas2027")
+            raise ValueError("model profile campaigns must name prompt and/or paper2027")
         if len(campaigns_raw) != len(set(campaigns_raw)):
             raise ValueError("model profile campaigns must be unique")
         retries = raw.get("sdk_max_retries")
