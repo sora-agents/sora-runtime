@@ -509,6 +509,87 @@ async def test_a_top_level_replan_still_plans_for_the_activitys_own_goal(tmp_pat
     assert "NOT a request from the user" not in user
 
 
+# -- the planner is told what is already being watched for ---------------------------------------
+#
+# The mirror of the revalidation prompt's own armed-conditions section. A replan taken beside an
+# open window was shown the plan's remaining work and nothing at all about the waiting half of it,
+# which leaves the planner two ways to be wrong: redeclare an equivalent waiter, or write the
+# `then`'s work inline, where it runs at once rather than when the change arrives.
+
+
+async def test_a_replan_beside_an_open_window_is_shown_what_is_armed(tmp_path: Path) -> None:
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    activity = _fanned_out(step_index=1, goal_kind="maintenance", pending=(_condition(),))
+    _lift_pending_conditions(activity, working)
+    working.activities[activity.id] = activity
+    activity.reset_for_replan(defect=None)
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, user = llm.calls[-1]
+    assert "Conditions already armed and watching:" in user
+    assert _THEN in user  # the `then` it will run, so the plan need not run it
+    assert "do NOT plan the work a `then` describes" in user
+
+
+async def test_a_plan_with_nothing_armed_renders_no_such_section(tmp_path: Path) -> None:
+    """The section is absent, not empty: a plan inferred with no armed conditions renders exactly
+    as it did before the section existed, which is what keeps earlier runs comparable."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    plan = Plan(id="top", goal="clear the conflicts", steps=[Step("wait", {})])
+    activity = Activity(id="a1", goal="clear the conflicts", context={}, plan=plan)
+    working.activities[activity.id] = activity
+    activity.reset_for_replan(defect=None)
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, user = llm.calls[-1]
+    assert "Conditions already armed" not in user
+
+
+async def test_a_then_is_not_shown_its_own_condition_as_armed(tmp_path: Path) -> None:
+    """A maintenance condition stays armed across its own firing, so the `then` it is pursuing is
+    planned while it is still in the list. Shown, the section would tell the planner not to do the
+    very work it was handed as the goal — and an empty plan is the honest reading of that."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    activity = _fanned_out(step_index=2, goal_kind="maintenance", pending=(_condition(),))
+    _lift_pending_conditions(activity, working)
+    working.activities[activity.id] = activity
+    activity.condition_batch = list(activity.pending_conditions)
+    activity.condition_verdict = ConditionVerdict(fired=(0,))
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, user = llm.calls[-1]
+    assert user.startswith(f"Goal: {_THEN}\n")  # planning the `then` itself
+    assert "Conditions already armed" not in user
+    assert activity.pending_conditions  # still armed — it is excluded, not retired
+
+
+async def test_a_governing_condition_is_not_listed_twice(tmp_path: Path) -> None:
+    """The sub-goal step's own condition is already rendered under the stronger governing contract.
+    Repeating it below would read as two waiters on one change — the thing both sections exist to
+    stop the planner from creating."""
+    llm = FakeLLMClient(json.dumps({"steps": []}))
+    cycle, working = _cycle(tmp_path, llm)
+    plan = Plan(id="p", goal="watch", steps=[_window_step("deliberative")])
+    activity = Activity(id="a1", goal="watch", context={}, plan=plan)
+    working.activities["a1"] = activity
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, user = llm.calls[-1]
+    assert "Governing pending conditions from the invoking sub-goal step" in user
+    assert "Conditions already armed" not in user
+
+
 def test_a_lifted_condition_records_the_frame_that_declared_it(tmp_path: Path) -> None:
     """Attribution is by FRAME, not by plan: a `then` that replaces a frame's body keeps the
     frame's identity, while a sibling sub-goal pushed at another step of the same parent is a

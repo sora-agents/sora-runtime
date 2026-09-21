@@ -906,6 +906,60 @@ def _render_governing_step_conditions(activity: Activity) -> str:
     )
 
 
+def _armed_beyond_governing(activity: Activity) -> list[PendingConditionState]:
+    """The activity's armed conditions, minus the ones this prompt must not show as "already
+    armed".
+
+    A *governing* condition is rendered by the section above, under the stronger contract that it
+    owns this sub-goal's whole lifecycle; listing it twice would read as two waiters on one change,
+    which is the exact mistake both sections exist to prevent.
+
+    A condition whose ``then`` is the goal being planned is this very plan:
+    ``_pursue_fired_condition`` pursues a firing by making its ``then`` the sub-goal string.
+    Shown, it would tell the planner not to do the work it was just asked to do, and the honest
+    reading of that instruction is an empty plan.
+    Matched on the text rather than on ``condition_fired`` because the text is what makes the two
+    the same piece of work: a maintenance condition stays armed across its own firing, so there is
+    no lifecycle flag that is reliably off here."""
+    governing = _governing_step_conditions(activity)
+    return [
+        state
+        for state in activity.pending_conditions
+        if not any(state.condition is condition for condition in governing)
+        and state.condition.then != activity.goal
+    ]
+
+
+def _render_armed_conditions_section(activity: Activity) -> str:
+    """The watches this plan is being written *alongside* — for the plan prompt, as the judge gets
+    them at revalidation.
+
+    Mostly a replan's section: a plan inferred while conditions are armed is, in practice, a
+    replacement for one that was discarded with its window still open, and the planner was
+    previously shown nothing about the waiting half of the work. What it wrote was therefore some
+    mixture of the two failures the wording below names — redeclaring an equivalent waiter (two
+    independent watches on one change, firing the `then` twice), or planning the `then`'s own work
+    inline, where it runs immediately instead of when the change arrives.
+
+    Empty when nothing qualifies, so a plan with no armed conditions renders byte-identically to
+    before this section existed — the framing lives here rather than in ``PLAN_SYSTEM_PROMPT`` for
+    the same reason the superseded-plan framing does: a custom ``PlanPrompt`` that drops the section
+    should not inherit a dangling instruction about one that is not there."""
+    states = _armed_beyond_governing(activity)
+    if not states:
+        return ""
+    return (
+        f"Conditions already armed and watching:\n{render_armed_conditions(states)}\n"
+        "These watches are already registered and are part of the work in progress, not a gap in "
+        "it. Each one runs its `then` by itself when its `when` comes true, so do NOT plan the "
+        "work a `then` describes and do NOT add steps to watch for, poll for, or wait on a change "
+        "one of them is already watching for. Do not declare a `pending` condition equivalent to "
+        "one of these either: a second waiter on the same change does the same work twice. Plan "
+        "only what is left to do besides them — waiting is itself work being done, so a short "
+        "plan here is not an incomplete one.\n\n"
+    )
+
+
 def default_plan_prompt(
     activity: Activity,
     tools: dict[str, Manual],
@@ -936,6 +990,7 @@ def _default_plan_user_prompt(
         f"Goal: {activity.goal}\n"
         f"{_render_goal_provenance(activity)}\n"
         f"{_render_governing_step_conditions(activity)}"
+        f"{_render_armed_conditions_section(activity)}"
         f"Available tools and their operations:\n{render_tools(tools, channels)}\n\n"
         + (
             f"Currently observed properties:\n{render_properties(observed.properties)}\n\n"
