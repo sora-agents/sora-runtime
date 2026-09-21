@@ -44,6 +44,60 @@ _admitted_meter_ids: contextvars.ContextVar[frozenset[int]] = contextvars.Contex
 )
 
 
+class RawLLMExchangeSink(Protocol):
+    """Optional context-local observer for exact provider request/response text."""
+
+    def record(
+        self,
+        request: CompletionRequest,
+        *,
+        response: str | None,
+        error: BaseException | None,
+        call_id: str,
+        inference_id: str | None,
+        elapsed_seconds: float,
+    ) -> None: ...
+
+
+_raw_exchange_sink: contextvars.ContextVar[RawLLMExchangeSink | None] = contextvars.ContextVar(
+    "raw_llm_exchange_sink", default=None
+)
+
+
+@contextmanager
+def capture_llm_exchanges(sink: RawLLMExchangeSink) -> Iterator[RawLLMExchangeSink]:
+    token = _raw_exchange_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _raw_exchange_sink.reset(token)
+
+
+def _capture_exchange(
+    request: CompletionRequest,
+    *,
+    response: str | None,
+    error: BaseException | None,
+    call_id: str,
+    inference_id: str | None,
+    elapsed_seconds: float,
+) -> None:
+    sink = _raw_exchange_sink.get()
+    if sink is None:
+        return
+    try:
+        sink.record(
+            request,
+            response=response,
+            error=error,
+            call_id=call_id,
+            inference_id=inference_id,
+            elapsed_seconds=elapsed_seconds,
+        )
+    except BaseException:
+        return
+
+
 @contextmanager
 def llm_call_scope() -> Iterator[str]:
     """Correlate one semantic LLM call without changing activity inference state."""
@@ -172,13 +226,16 @@ class LLMUsage:
     ``cached_input_tokens`` is the subset served from a cache. It is ``None`` when the provider did
     not report cache usage, distinct from an explicit zero cache hit. OpenAI reports total input as
     one inclusive figure, while Anthropic reports ordinary input, cache writes, and cache reads as
-    separate fields, so its adapter sums those fields at the provider boundary."""
+    separate fields, so its adapter sums those fields at the provider boundary.
+    ``cache_write_input_tokens`` retains a provider's explicit cache-creation count for audit only;
+    it is never inferred and remains part of the uncached portion of ``input_tokens``."""
 
     input_tokens: int
     output_tokens: int
     answer_chars: int
     reasoning_tokens: int | None = None
     cached_input_tokens: int | None = None
+    cache_write_input_tokens: int | None = None
 
     @property
     def answer_tokens(self) -> int:
@@ -232,6 +289,7 @@ def log_llm_usage(
             # None on the estimate path (Anthropic); an exact count when the provider reports one.
             "llm_reasoning_tokens": usage.reasoning_tokens,
             "llm_cached_input_tokens": usage.cached_input_tokens,
+            "llm_cache_write_input_tokens": usage.cache_write_input_tokens,
             "llm_call_id": call_id,
             "llm_inference_id": inference_id,
             "llm_finish_reason": finish_reason,
@@ -329,6 +387,8 @@ def log_llm_terminal_parse_failure() -> None:
     This is separate from malformed-field accounting: a dropped optional field can leave a usable
     answer, while a terminal parse failure yields no domain value at all. Evaluation needs both.
     """
+    from sora.diagnostics import emit_runtime_event
+
     inference_id = current_inference_id.get()
     call_id = _logical_call_id()
     _llm_log.info(
@@ -339,6 +399,11 @@ def log_llm_terminal_parse_failure() -> None:
             "llm_call_id": call_id,
             "llm_inference_id": inference_id,
         },
+    )
+    emit_runtime_event(
+        "plan.terminal_parse_failure",
+        cause="llm_parser",
+        payload={"call_id": call_id, "inference_id": inference_id},
     )
 
 
@@ -432,9 +497,31 @@ class MeteredLLMClient:
                 self._logical_calls_admitted += 1
             start = time.perf_counter()
             try:
-                return await self._inner.complete(request)
+                try:
+                    response = await self._inner.complete(request)
+                finally:
+                    elapsed = time.perf_counter() - start
+            except BaseException as error:
+                _capture_exchange(
+                    request,
+                    response=None,
+                    error=error,
+                    call_id=call_id,
+                    inference_id=current_inference_id.get(),
+                    elapsed_seconds=elapsed,
+                )
+                raise
+            else:
+                _capture_exchange(
+                    request,
+                    response=response,
+                    error=None,
+                    call_id=call_id,
+                    inference_id=current_inference_id.get(),
+                    elapsed_seconds=elapsed,
+                )
+                return response
             finally:
-                elapsed = time.perf_counter() - start
                 inference_id = current_inference_id.get()
                 _llm_log.info(
                     "~ llm %s(%.2fs)",
@@ -470,6 +557,7 @@ class LLMRoundTripUsage:
     output_tokens: int
     reasoning_tokens: int
     reasoning_tokens_exact: bool
+    cache_write_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -503,6 +591,7 @@ class LLMInferenceReport:
     malformed_fields_dropped: int
     malformed_fields_repaired: int
     terminal_parse_failures: int
+    cache_write_input_tokens: int | None = None
 
     @property
     def dynamic_section_share(self) -> float | None:
@@ -528,6 +617,7 @@ class LLMReport:
     malformed_fields_repaired: int
     terminal_parse_failures: int
     inferences: tuple[LLMInferenceReport, ...]
+    cache_write_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -561,6 +651,8 @@ class _InferenceAccumulator:
     malformed_fields_dropped: int = 0
     malformed_fields_repaired: int = 0
     terminal_parse_failures: int = 0
+    cache_write_input_tokens: int = 0
+    cache_write_unknown: bool = False
 
 
 class LLMMeter(logging.Handler):
@@ -585,6 +677,8 @@ class LLMMeter(logging.Handler):
         self.cached_input_tokens = 0
         self.cache_observed_input_tokens = 0
         self.cache_unknown_input_tokens = 0
+        self.cache_write_input_tokens: int | None = None
+        self._cache_write_unknown = False
         self.output_tokens = 0
         self.answer_chars = 0
         # Summed per-call deliberation tokens: each call contributes its OWN figure — the provider's
@@ -729,6 +823,7 @@ class LLMMeter(logging.Handler):
             self.usage_calls += 1
             input_tokens = getattr(record, "llm_input_tokens", 0)
             cached_input_tokens = getattr(record, "llm_cached_input_tokens", None)
+            cache_write_input_tokens = getattr(record, "llm_cache_write_input_tokens", None)
             output_tokens = getattr(record, "llm_output_tokens", 0)
             answer_chars = getattr(record, "llm_answer_chars", 0)
             reasoning_tokens = getattr(record, "llm_reasoning_tokens", None)
@@ -738,6 +833,13 @@ class LLMMeter(logging.Handler):
             else:
                 self.cached_input_tokens += cached_input_tokens
                 self.cache_observed_input_tokens += input_tokens
+            if cache_write_input_tokens is None:
+                self._cache_write_unknown = True
+                self.cache_write_input_tokens = None
+            elif not self._cache_write_unknown:
+                self.cache_write_input_tokens = (
+                    self.cache_write_input_tokens or 0
+                ) + cache_write_input_tokens
             self.output_tokens += output_tokens
             self.answer_chars += answer_chars
             # Add this call's own deliberation figure — exact when the provider reported one, else
@@ -771,6 +873,12 @@ class LLMMeter(logging.Handler):
                 cache_unknown_input_tokens=(
                     accumulator.cache_unknown_input_tokens
                     + (input_tokens if cached_input_tokens is None else 0)
+                ),
+                cache_write_input_tokens=(
+                    accumulator.cache_write_input_tokens + (cache_write_input_tokens or 0)
+                ),
+                cache_write_unknown=(
+                    accumulator.cache_write_unknown or cache_write_input_tokens is None
                 ),
                 output_tokens=accumulator.output_tokens + output_tokens,
                 finish_reasons=(
@@ -817,6 +925,11 @@ class LLMMeter(logging.Handler):
                         output_tokens=output_tokens,
                         reasoning_tokens=this_reasoning,
                         reasoning_tokens_exact=this_exact,
+                        cache_write_input_tokens=(
+                            cache_write_input_tokens
+                            if isinstance(cache_write_input_tokens, int)
+                            else None
+                        ),
                     ),
                 ),
             )
@@ -906,6 +1019,11 @@ class LLMMeter(logging.Handler):
                 malformed_fields_dropped=row.malformed_fields_dropped,
                 malformed_fields_repaired=row.malformed_fields_repaired,
                 terminal_parse_failures=row.terminal_parse_failures,
+                cache_write_input_tokens=(
+                    None
+                    if row.cache_write_unknown or not row.usages
+                    else row.cache_write_input_tokens
+                ),
             )
             for row in self._inferences.values()
         )
@@ -925,6 +1043,7 @@ class LLMMeter(logging.Handler):
             malformed_fields_repaired=self.malformed_fields_repaired,
             terminal_parse_failures=self.terminal_parse_failures,
             inferences=inferences,
+            cache_write_input_tokens=self.cache_write_input_tokens,
         )
 
     def _pooled(self) -> LLMUsage:

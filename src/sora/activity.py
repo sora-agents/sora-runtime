@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from sora.diagnostics import diagnostic_preview, emit_runtime_event, runtime_events_enabled
 from sora.types import (  # used at run time by reset_for_replan / frames_held_by_conditions
     GOAL_KIND_MAINTENANCE,
     SupersededPlan,
@@ -189,12 +190,63 @@ class Activity:
     # keys with a naming convention: no shared namespace means no collision to avoid in the first
     # place
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if not runtime_events_enabled():
+            object.__setattr__(self, name, value)
+            return
+        sentinel = object()
+        previous = getattr(self, name, sentinel)
+        object.__setattr__(self, name, value)
+        if previous is sentinel or previous is value:
+            return
+        activity_id = getattr(self, "id", None)
+        if not isinstance(activity_id, str):
+            return
+        if name == "state":
+            emit_runtime_event(
+                "activity.transition",
+                activity_id=activity_id,
+                cause="state_assignment",
+                payload={"from": previous, "to": value},
+            )
+        elif name == "plan":
+            event = (
+                "plan.installed"
+                if previous is None
+                else "plan.cleared"
+                if value is None
+                else "plan.replaced"
+            )
+            emit_runtime_event(
+                event,
+                activity_id=activity_id,
+                cause="plan_assignment",
+                payload=diagnostic_preview({"previous": previous, "plan": value}),
+            )
+        elif name in {"pending_operation", "pending_inference"}:
+            pending_kind = name.removeprefix("pending_")
+            emit_runtime_event(
+                f"pending_{pending_kind}.created"
+                if value is not None
+                else f"pending_{pending_kind}.cleared",
+                activity_id=activity_id,
+                cause="pending_assignment",
+                payload=diagnostic_preview({"previous": previous, "pending": value}),
+            )
+
     def discard_inference(self) -> None:
         """Invalidate an off-cycle infer/ground in flight (and any params it already parked): the
         late result is discarded on resolve because its id no longer matches the (now-cleared)
         pending_inference. Side-effect-free, unlike an external op, so always safe to drop. Leaves
         `state` untouched — the caller decides where the activity goes next (BLOCKED to await input,
         READY to re-plan, ...)."""
+        if self.pending_inference is not None:
+            emit_runtime_event(
+                "pending_inference.discarded",
+                activity_id=self.id,
+                cause="runtime_discard",
+                payload=diagnostic_preview({"pending": self.pending_inference}),
+            )
         self.pending_inference = None
         self.grounded_params = None
 
@@ -284,6 +336,14 @@ class Activity:
         the plan itself cannot work (its assumption about the world is false and will stay false),
         and leave it None when the plan was fine but the world moved under it. The replanning prompt
         reads it to decide whether to tell the planner to reuse this plan or to route around it."""
+        emit_runtime_event(
+            "plan.replan",
+            activity_id=self.id,
+            cause="plan_defect" if defect is not None else "context_changed",
+            payload=diagnostic_preview(
+                {"defect": defect, "step_index": self.step_index, "plan": self.plan}
+            ),
+        )
         self.replan_count += 1
         was_inferring = self.pending_inference is not None
         # Park what is being dropped for the *next* inference to read (ADR-0024): a blank-slate

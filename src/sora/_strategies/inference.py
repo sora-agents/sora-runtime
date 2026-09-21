@@ -10,6 +10,7 @@ from sora._strategies.conditions import (
     _unclosable_window,
 )
 from sora.activity import ActivityState
+from sora.diagnostics import emit_runtime_event, runtime_event_context
 from sora.llm import LLMOutcome, log_llm_discarded, log_llm_late_completion, log_llm_outcome
 from sora.memory import (
     render_plan,
@@ -135,6 +136,11 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
     completion (an LLM call can't be cut mid-generation) but its result is no longer wanted."""
     wm = cycle.working
     async for inf_id, res in cycle.inference_sink.drain():
+        emit_runtime_event(
+            "boundary.inference_result.received",
+            cause="inference_sink",
+            payload={"inference_id": inf_id, "result": res},
+        )
         outcome: LLMOutcome = (
             "unresolvable"
             if res.unresolvable is not None
@@ -166,6 +172,14 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                 baseline = activity.pending_inference.baseline  # set for plan/subgoal (ADR-0024)
                 scope = activity.pending_inference.scope  # its positional companion
                 activity.pending_inference = None
+                with runtime_event_context(activity_id=activity.id):
+                    emit_runtime_event(
+                        "pending_inference.resolved"
+                        if outcome == "success"
+                        else "pending_inference.failed",
+                        cause=f"inference_{outcome}",
+                        payload={"inference_id": inf_id, "kind": kind, "result": res},
+                    )
                 if res.unresolvable is not None:
                     # An escalation asked to resolve a reference reported that it names data
                     # this run never produced, instead of fabricating a value for it — grounding
@@ -421,3 +435,8 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
             # call ran to completion and was already metered, so its cost is real but wasted —
             # tell the meter to move it to the wasted bucket (a no-op when uninstrumented).
             log_llm_discarded(inf_id)
+            emit_runtime_event(
+                "pending_inference.discarded",
+                cause="stale_inference_result",
+                payload={"inference_id": inf_id, "result": res},
+            )

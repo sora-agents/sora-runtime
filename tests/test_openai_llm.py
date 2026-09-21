@@ -35,6 +35,7 @@ def _response(
     completion_tokens: int | None = None,
     reasoning_tokens: int | None = None,
     cached_tokens: int | None = None,
+    cache_write_tokens: int | None = None,
     finish_reason: str | None = "stop",
     with_usage: bool = True,
 ) -> SimpleNamespace:
@@ -52,7 +53,12 @@ def _response(
             prompt_tokens=prompt_tokens or 0,
             completion_tokens=completion_tokens or 0,
             prompt_tokens_details=(
-                SimpleNamespace(cached_tokens=cached_tokens) if cached_tokens is not None else None
+                SimpleNamespace(
+                    cached_tokens=cached_tokens,
+                    cache_creation_tokens=cache_write_tokens,
+                )
+                if cached_tokens is not None or cache_write_tokens is not None
+                else None
             ),
             completion_tokens_details=details,
         )
@@ -127,6 +133,16 @@ def test_usage_of_distinguishes_missing_cached_input_from_an_explicit_zero() -> 
     assert explicit_zero is not None
     assert missing.cached_input_tokens is None
     assert explicit_zero.cached_input_tokens == 0
+
+
+def test_usage_of_reads_only_explicit_cache_write_accounting() -> None:
+    exact = _usage_of(_response(prompt_tokens=42, cache_write_tokens=11), answer_chars=0)
+    unknown = _usage_of(_response(prompt_tokens=42), answer_chars=0)
+
+    assert exact is not None
+    assert unknown is not None
+    assert exact.cache_write_input_tokens == 11
+    assert unknown.cache_write_input_tokens is None
 
 
 def test_provider_observation_reads_openrouter_metadata_and_sdk_model_extra() -> None:

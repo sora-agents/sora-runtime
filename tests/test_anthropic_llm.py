@@ -35,7 +35,13 @@ def test_usage_of_normalizes_anthropic_cache_counts_into_total_input() -> None:
 
     usage = _usage_of(message, answer_chars=12)
 
-    assert usage == LLMUsage(1000, 80, answer_chars=12, cached_input_tokens=500)
+    assert usage == LLMUsage(
+        1000,
+        80,
+        answer_chars=12,
+        cached_input_tokens=500,
+        cache_write_input_tokens=300,
+    )
 
 
 def test_usage_of_treats_explicit_zero_cached_input_as_zero() -> None:

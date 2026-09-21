@@ -243,6 +243,8 @@ class LLMCallRecord:
     # unreadable, or only some of the round-trips reported one. Either way the fit has to skip the
     # row rather than read the fields it does carry as the whole call.
     usage_captured: bool = True
+    cache_write_input_tokens: int | None = None
+    inference_id: str | None = None
 
 
 class LLMCallWriter:
@@ -335,6 +337,9 @@ class _Partial:
     # Charging a repaired call from the aggregate row would pay that intercept only once.
     usage_samples: list[tuple[int, int | None, int]] = field(default_factory=list)
     round_trip_windows: list[RoundTripWindow] = field(default_factory=list)
+    cache_write_input_tokens: int | None = None
+    cache_write_complete: bool = True
+    inference_id: str | None = None
 
     @property
     def usage_complete(self) -> bool:
@@ -366,6 +371,11 @@ class _Partial:
             if value is not None:
                 current: int | None = getattr(self, field_name)
                 setattr(self, field_name, (current or 0) + int(value))
+        cache_write = getattr(record, "llm_cache_write_input_tokens", None)
+        if cache_write is None:
+            self.cache_write_complete = False
+        elif self.cache_write_complete:
+            self.cache_write_input_tokens = (self.cache_write_input_tokens or 0) + int(cache_write)
         self.finish_reason = getattr(record, "llm_finish_reason", None) or self.finish_reason
         self.model = getattr(record, "llm_observed_model", None) or self.model
         self.semantic_label = getattr(record, "llm_semantic_label", None) or self.semantic_label
@@ -380,6 +390,7 @@ class _Partial:
                     output_tokens,
                 )
             )
+        self.inference_id = getattr(record, "llm_inference_id", None) or self.inference_id
 
     def add_done(self, record: logging.LogRecord) -> None:
         self.done_records += 1
@@ -387,6 +398,7 @@ class _Partial:
         if isinstance(seconds, int | float):
             self.seconds = (self.seconds or 0.0) + float(seconds)
         self.semantic_label = self.semantic_label or getattr(record, "llm_semantic_label", None)
+        self.inference_id = self.inference_id or getattr(record, "llm_inference_id", None)
 
 
 class SoraCallRecorder(logging.Handler):
@@ -474,6 +486,10 @@ class SoraCallRecorder(logging.Handler):
                 usage_captured=partial.usage_complete,
                 charged_seconds=partial.charged_seconds,
                 round_trip_windows=tuple(partial.round_trip_windows),
+                cache_write_input_tokens=(
+                    partial.cache_write_input_tokens if partial.cache_write_complete else None
+                ),
+                inference_id=partial.inference_id,
             )
         )
 

@@ -10,6 +10,12 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sora.activity import Activity, ActivityState
+from sora.diagnostics import (
+    diagnostic_preview,
+    emit_runtime_event,
+    runtime_event_context,
+    runtime_events_enabled,
+)
 from sora.llm import current_inference_id
 from sora.manual import ToolRecord, WorkspaceRecord
 from sora.types import (
@@ -74,6 +80,139 @@ class ExternalAction(Protocol):
         ...
 
 
+class _ObservedInternalAction:
+    def __init__(self, inner: InternalAction, category: str) -> None:
+        self._inner = inner
+        self.name = inner.name
+        self._category = category
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> Any:
+        activity_id = kwargs.get("activity_id")
+        correlated = activity_id if isinstance(activity_id, str) and activity_id else None
+        with runtime_event_context(activity_id=correlated, cause=self.name):
+            emit_runtime_event(
+                "action.dispatch",
+                payload={
+                    "category": self._category,
+                    "name": self.name,
+                    "arguments": _diagnostic_arguments(kwargs, self._category),
+                },
+            )
+            try:
+                result = await self._inner.execute(cycle, **kwargs)
+            except BaseException as error:
+                emit_runtime_event(
+                    "action.result",
+                    payload={
+                        "category": self._category,
+                        "name": self.name,
+                        "ok": False,
+                        "error": diagnostic_preview(error),
+                    },
+                )
+                raise
+            emit_runtime_event(
+                "action.result",
+                payload={
+                    "category": self._category,
+                    "name": self.name,
+                    "ok": True,
+                    "result": _diagnostic_value(result),
+                },
+            )
+            return result
+
+
+def _diagnostic_value(value: Any) -> Any:
+    """Keep cycle-thread action evidence bounded without walking runtime object graphs."""
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        if len(value) <= 256:
+            return value
+        return {"type": "str", "length": len(value)}
+    summary: dict[str, Any] = {"type": type(value).__name__}
+    if isinstance(value, dict | list | tuple | set | frozenset):
+        summary["length"] = len(value)
+    return summary
+
+
+_DATA_OP_DIAGNOSTIC_FIELDS = frozenset(
+    {"activity_id", "bind", "by", "desc", "from", "n", "op", "out", "path", "source", "where"}
+)
+
+
+def _diagnostic_arguments(arguments: dict[str, Any], category: str) -> dict[str, Any]:
+    if category == "data_op":
+        budget = [128]
+        return {
+            name: (
+                diagnostic_preview(value, budget=budget)
+                if name in _DATA_OP_DIAGNOSTIC_FIELDS
+                else _diagnostic_value(value)
+            )
+            for name, value in arguments.items()
+        }
+    return {name: _diagnostic_value(value) for name, value in arguments.items()}
+
+
+class _ObservedExternalAction:
+    def __init__(self, inner: ExternalAction) -> None:
+        self._inner = inner
+        self.name = inner.name
+        self.requires_binding = inner.requires_binding
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def execute(
+        self,
+        registry: EnvironmentRegistry,
+        cycle: DecisionCycle,
+        *,
+        activity_id: str,
+        **kwargs: Any,
+    ) -> ActionAck:
+        correlated = activity_id or None
+        with runtime_event_context(activity_id=correlated, cause=self.name):
+            emit_runtime_event(
+                "action.dispatch",
+                payload={
+                    "category": "external",
+                    "name": self.name,
+                    "arguments": diagnostic_preview(kwargs),
+                },
+            )
+            try:
+                result = await self._inner.execute(
+                    registry, cycle, activity_id=activity_id, **kwargs
+                )
+            except BaseException as error:
+                emit_runtime_event(
+                    "action.result",
+                    payload={
+                        "category": "external",
+                        "name": self.name,
+                        "ok": False,
+                        "error": diagnostic_preview(error),
+                    },
+                )
+                raise
+            emit_runtime_event(
+                "action.result",
+                payload={
+                    "category": "external",
+                    "name": self.name,
+                    "ok": result.ok,
+                    "result": diagnostic_preview(result),
+                },
+            )
+            return result
+
+
 class ActionRegistry:
     def __init__(self) -> None:
         self._internal: dict[str, InternalAction] = {}
@@ -95,13 +234,16 @@ class ActionRegistry:
         self._data_ops[action.name] = action
 
     def internal(self, name: str) -> InternalAction:
-        return self._internal[name]
+        action = self._internal[name]
+        return _ObservedInternalAction(action, "internal") if runtime_events_enabled() else action
 
     def external(self, name: str) -> ExternalAction:
-        return self._external[name]
+        action = self._external[name]
+        return _ObservedExternalAction(action) if runtime_events_enabled() else action
 
     def data_op(self, name: str) -> InternalAction:
-        return self._data_ops[name]
+        action = self._data_ops[name]
+        return _ObservedInternalAction(action, "data_op") if runtime_events_enabled() else action
 
     def is_data_op(self, name: str) -> bool:
         return name in self._data_ops
@@ -321,6 +463,20 @@ class CreateActivityAction:  # predefined internal action: _create_activity_
             context=kwargs.get("context") or {},
         )
         cycle.working.activities[activity.id] = activity
+        emit_runtime_event(
+            "activity.created",
+            activity_id=activity.id,
+            cause=self.name,
+            payload=diagnostic_preview(
+                {"goal": activity.goal, "context": activity.context, "state": activity.state}
+            ),
+        )
+        emit_runtime_event(
+            "activity.transition",
+            activity_id=activity.id,
+            cause=self.name,
+            payload={"from": None, "to": activity.state},
+        )
         log.info("situate: created activity %s from goal %r", activity.id, activity.goal)
         return activity
 

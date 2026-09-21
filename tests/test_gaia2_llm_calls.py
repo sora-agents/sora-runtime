@@ -108,6 +108,7 @@ def test_usage_and_timing_join_into_one_row(recorded: Rows) -> None:
                 answer_chars=800,
                 reasoning_tokens=90,
                 cached_input_tokens=1024,
+                cache_write_input_tokens=128,
             ),
             _request(),
             finish_reason="stop",
@@ -123,6 +124,7 @@ def test_usage_and_timing_join_into_one_row(recorded: Rows) -> None:
     # The field the text log drops and the cache-aware fit needs; a provider that reports it must
     # survive the round trip through the record, not just through the summary tally.
     assert row["cached_input_tokens"] == 1024
+    assert row["cache_write_input_tokens"] == 128
     assert row["reasoning_tokens"] == 90
     assert row["seconds"] == pytest.approx(4.25)
     assert row["round_trips"] == 1
@@ -209,6 +211,7 @@ def test_absent_cache_field_stays_unknown_not_zero(recorded: Rows) -> None:
 
     (row,) = recorded()
     assert row["cached_input_tokens"] is None
+    assert row["cache_write_input_tokens"] is None
     assert row["reasoning_tokens"] is None
 
 

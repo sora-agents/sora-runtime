@@ -7,7 +7,8 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from contextlib import ExitStack
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -113,7 +114,10 @@ def _dirty_diff_hash(*, excluded: set[Path] | None = None) -> str | None:
         root = Path(root_raw)
         for relative in untracked_raw.splitlines():
             path = root / relative
-            if path.resolve() in excluded_resolved or not path.is_file():
+            resolved = path.resolve()
+            if any(resolved == item or resolved.is_relative_to(item) for item in excluded_resolved):
+                continue
+            if not path.is_file():
                 continue
             additions.append({"path": relative, "sha256": sha256_file(path)})
     if not diff and not additions:
@@ -307,8 +311,24 @@ def _checkpoint_records(path: Path) -> tuple[set[str], list[EvaluationRecord]]:
 
 def _append_checkpoint(path: Path, matrix_key: str, record: EvaluationRecord) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    stored = record.to_dict(detailed_acceptance=True)
+    if record.suite in GAIA_SUITES and record.diagnostics is not None:
+        relative = record.diagnostics.get("path")
+        if isinstance(relative, str):
+            artifact = Path(relative)
+            calls_path = (
+                artifact if artifact.is_absolute() else path.parent / artifact
+            ) / "llm_calls.json"
+            try:
+                exported_calls = json.loads(calls_path.read_text(encoding="utf-8"))
+                stored_calls = json.loads(json.dumps(stored["call_records"]))
+            except (OSError, TypeError, ValueError):
+                pass
+            else:
+                if isinstance(exported_calls, list) and exported_calls == stored_calls:
+                    stored["call_records"] = []
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"matrix_key": matrix_key, "record": record.to_dict()}))
+        handle.write(json.dumps({"matrix_key": matrix_key, "record": stored}))
         handle.write("\n")
         handle.flush()
 
@@ -367,6 +387,7 @@ def _call_records_and_cost(
                     cached_input_tokens=usage.cached_input_tokens,
                     output_tokens=usage.output_tokens,
                     reasoning_tokens=usage.reasoning_tokens,
+                    cache_write_input_tokens=getattr(usage, "cache_write_input_tokens", None),
                 ),
             )
             call_costs.append(cost)
@@ -376,6 +397,7 @@ def _call_records_and_cost(
                 {
                     "input_tokens": usage.input_tokens,
                     "cached_input_tokens": usage.cached_input_tokens,
+                    "cache_write_input_tokens": getattr(usage, "cache_write_input_tokens", None),
                     "output_tokens": usage.output_tokens,
                     "reasoning_tokens": usage.reasoning_tokens,
                     "reasoning_tokens_exact": usage.reasoning_tokens_exact,
@@ -403,6 +425,8 @@ def _call_records_and_cost(
         )
         rows.append(
             {
+                "call_id": getattr(call, "call_id", None),
+                "inference_id": getattr(call, "inference_id", None),
                 "semantic_label": call.semantic_label,
                 "prompt_version": call.prompt_version,
                 "prompt_hashes": {
@@ -418,6 +442,7 @@ def _call_records_and_cost(
                 "round_trip_usage": round_trip_usage,
                 "usage_available": call_usage_complete,
                 "cached_input_tokens": call.cached_input_tokens,
+                "cache_write_input_tokens": getattr(call, "cache_write_input_tokens", None),
                 "uncached_input_tokens": (
                     call.input_tokens
                     if call.cache_unknown_input_tokens
@@ -443,6 +468,13 @@ def _call_records_and_cost(
     return tuple(rows), total if usage_complete else None, upper_bound
 
 
+def _arm_live_judge_recording() -> bool:
+    from sora.adapters.are_judge import arm_judge_recording, judge_recording_armed
+
+    arm_judge_recording()
+    return judge_recording_armed()
+
+
 def _live_gaia_record(
     entry: Any,
     *,
@@ -454,8 +486,12 @@ def _live_gaia_record(
     judge_profile: JudgeProfile,
     max_wall_seconds: float,
     max_agent_llm_calls: int,
+    output_dir: Path,
     charge_sheet: ChargeModelSheet | None = None,
     wall_clock: bool = False,
+    diagnostics: bool = False,
+    source_revision: str = "unknown",
+    source_dirty_diff_sha256: str | None = None,
 ) -> EvaluationRecord:
     # Every ARE/provider import is below all dry-run and budget gates.
     from examples.gaia2._runner import run_scenario
@@ -469,6 +505,33 @@ def _live_gaia_record(
         ack_locked_acceptance=ack_locked_acceptance,
     )
     scenario = load_scenario(str(path))
+    attempt_dir: Path | None = None
+    runtime_events: Any = None
+    llm_capture: Any = None
+    session_log: Any = None
+    diagnostic_setup_error: str | None = None
+    if diagnostics:
+        from examples.gaia2.evaluation.campaigns.prompt.capture import (
+            BufferedLLMExchangeCapture,
+        )
+        from examples.gaia2.evaluation.diagnostics import (
+            BufferedSessionLog,
+            allocate_attempt_directory,
+        )
+        from sora.diagnostics import RuntimeEventCollector
+
+        try:
+            attempt_dir = allocate_attempt_directory(output_dir, entry.key, entry.suite)
+            runtime_events = RuntimeEventCollector()
+            llm_capture = BufferedLLMExchangeCapture()
+            session_log = BufferedSessionLog()
+            if not _arm_live_judge_recording():
+                raise RuntimeError("ARE judge recording could not be armed")
+        except BaseException as error:
+            diagnostic_setup_error = f"{type(error).__name__}: {error}"
+            # An allocated directory may remain as an intentionally discoverable orphan, but a
+            # partially armed collector must not alter how the paid attempt itself is run.
+            attempt_dir = None
     attach_judge(
         scenario,
         model=judge_profile.model,
@@ -479,15 +542,40 @@ def _live_gaia_record(
     )
     charge_sheet = charge_sheet or ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
     charge = None if wall_clock else charge_sheet.charge_for(profile)
-    result = run_scenario(
-        scenario,
-        config=str(config_path),
-        max_wall_seconds=max_wall_seconds,
-        read_stdin=False,
-        charge=charge,
-        charge_model_identity=charge.identity if charge is not None else None,
-        charge_model_digest=charge_sheet.digest if charge is not None else None,
-    )
+    with ExitStack() as diagnostic_context:
+        sora_logger = None
+        previous_level = None
+        if attempt_dir is not None:
+            from sora.diagnostics import collect_runtime_events
+            from sora.llm import capture_llm_exchanges
+
+            diagnostic_context.enter_context(collect_runtime_events(runtime_events))
+            diagnostic_context.enter_context(capture_llm_exchanges(llm_capture))
+            import logging
+
+            sora_logger = logging.getLogger("sora")
+            previous_level = sora_logger.level
+            sora_logger.setLevel(logging.DEBUG)
+            sora_logger.addHandler(session_log)
+        try:
+            result = run_scenario(
+                scenario,
+                config=str(config_path),
+                max_wall_seconds=max_wall_seconds,
+                read_stdin=False,
+                charge=charge,
+                charge_model_identity=charge.identity if charge is not None else None,
+                charge_model_digest=charge_sheet.digest if charge is not None else None,
+                record_judge=attempt_dir is not None,
+                verdict_parse=("case-insensitive" if judge_profile.relax_verdict_case else "stock"),
+                scenario_id=getattr(scenario, "scenario_id", entry.case_id),
+                run_number=entry.repeat,
+            )
+        finally:
+            if sora_logger is not None and session_log is not None:
+                sora_logger.removeHandler(session_log)
+                assert previous_level is not None
+                sora_logger.setLevel(previous_level)
     raw_anomalies = int(getattr(result, "raw_cached_input_anomalies", 0))
     calls, agent_cost, upper_bound = _call_records_and_cost(result.llm_report, profile, sheet)
     missing = surplus = 0
@@ -506,7 +594,7 @@ def _live_gaia_record(
         status = f"invalid: {result.terminal_cause or 'unknown terminal cause'}"
     else:
         status = "complete"
-    return EvaluationRecord(
+    record = EvaluationRecord(
         arm=entry.arm,
         profile=entry.profile,
         suite=entry.suite,
@@ -528,6 +616,9 @@ def _live_gaia_record(
         latency_seconds=(llm_report.latency_seconds if llm_report else 0.0),
         input_tokens=(llm_report.input_tokens if llm_report else 0),
         cached_input_tokens=(llm_report.cached_input_tokens if llm_report else 0),
+        cache_write_input_tokens=(
+            getattr(llm_report, "cache_write_input_tokens", None) if llm_report else None
+        ),
         cache_unknown_input_tokens=(llm_report.cache_unknown_input_tokens if llm_report else 0),
         output_tokens=(llm_report.output_tokens if llm_report else 0),
         reasoning_tokens=(llm_report.thinking_tokens if llm_report else 0),
@@ -565,6 +656,49 @@ def _live_gaia_record(
         llm_max_in_flight=int(getattr(result, "llm_max_in_flight", 0)),
         llm_overlapped_round_trips=int(getattr(result, "llm_overlapped_round_trips", 0)),
     )
+    if attempt_dir is not None:
+        try:
+            from examples.gaia2.evaluation.diagnostics import export_attempt
+
+            diagnostic_ref = export_attempt(
+                attempt_dir,
+                output_dir=output_dir,
+                entry=entry,
+                record=record,
+                result=result,
+                scenario=scenario,
+                config_path=config_path,
+                profile=profile,
+                judge_profile=judge_profile,
+                runtime_events=runtime_events,
+                llm_capture=llm_capture,
+                session_log=session_log,
+                source_revision=source_revision,
+                source_dirty_diff_sha256=source_dirty_diff_sha256,
+            )
+        except BaseException as error:
+            try:
+                artifact_path = attempt_dir.relative_to(output_dir).as_posix()
+            except ValueError:
+                artifact_path = str(attempt_dir)
+            diagnostic_ref = {
+                "schema_version": 1,
+                "path": artifact_path,
+                "index_sha256": None,
+                "error": f"export: {type(error).__name__}: {error}",
+            }
+        record = replace(record, diagnostics=diagnostic_ref)
+    elif diagnostics:
+        record = replace(
+            record,
+            diagnostics={
+                "schema_version": 1,
+                "path": None,
+                "index_sha256": None,
+                "error": diagnostic_setup_error or "diagnostic setup failed",
+            },
+        )
+    return record
 
 
 def _headless_neutral_done(agent: Any) -> bool:
@@ -739,6 +873,8 @@ def _run_command(args: argparse.Namespace) -> int:
         repeats=args.repeats,
         live_neutral=args.live_neutral,
     )
+    source_revision = _source_revision()
+    source_dirty_diff_sha256 = _dirty_diff_hash(excluded={Path(args.output_dir).resolve()})
     policy = BudgetPolicy(
         max_gaia_runs=args.max_gaia_runs,
         max_total_spend=args.max_total_spend,
@@ -868,12 +1004,23 @@ def _run_command(args: argparse.Namespace) -> int:
                 judge_profile=judge_profile,
                 max_wall_seconds=args.max_wall_seconds,
                 max_agent_llm_calls=args.max_agent_llm_calls,
+                output_dir=output_dir,
                 charge_sheet=charge_sheet,
                 wall_clock=args.wall_clock,
+                diagnostics=not args.no_diagnostics,
+                source_revision=source_revision,
+                source_dirty_diff_sha256=source_dirty_diff_sha256,
             )
         _append_checkpoint(checkpoint, entry.key, record)
         records.append(record)
         completed.add(entry.key)
+        diagnostic_error = record.diagnostics and record.diagnostics.get("error")
+        if diagnostic_error:
+            print(
+                f"diagnostics {entry.suite}/{entry.capability}/{entry.case_id}: "
+                f"INCOMPLETE ({diagnostic_error})",
+                file=sys.stderr,
+            )
         if entry.suite in GAIA_SUITES:
             verdict = (
                 "PASS" if record.passed is True else "FAIL" if record.passed is False else "INVALID"
@@ -896,8 +1043,30 @@ def _read_records(paths: list[str]) -> list[EvaluationRecord]:
                 continue
             raw = json.loads(line)
             record = raw.get("record", raw)
-            records.append(record_from_dict(record))
+            parsed = record_from_dict(record)
+            diagnostics = parsed.diagnostics
+            if not parsed.call_records and diagnostics is not None:
+                relative = diagnostics.get("path")
+                if isinstance(relative, str):
+                    calls_path = path.parent / relative / "llm_calls.json"
+                    try:
+                        calls = json.loads(calls_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        pass
+                    else:
+                        if isinstance(calls, list):
+                            parsed = EvaluationRecord(
+                                **(
+                                    parsed.to_dict(detailed_acceptance=True)
+                                    | {"call_records": tuple(calls)}
+                                )
+                            )
+            records.append(parsed)
     return records
+
+
+def _report_diff_exclusions(inputs: list[str], output: str) -> set[Path]:
+    return {*(Path(raw_path).resolve().parent for raw_path in inputs), Path(output).resolve()}
 
 
 def _report_command(args: argparse.Namespace) -> int:
@@ -908,16 +1077,17 @@ def _report_command(args: argparse.Namespace) -> int:
     sheet = PriceSheet.load(Path(args.price_sheet)) if args.price_sheet else None
     snapshot = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
     selected_names = sorted({record.profile for record in records if record.profile in profiles})
+    dirty_diff_sha256 = _dirty_diff_hash(excluded=_report_diff_exclusions(args.input, args.output))
     report = build_report(
         records,
         detailed_acceptance=args.include_acceptance_details,
         prompt_snapshot=snapshot,
         source_revision=_source_revision(),
-        source_dirty_diff_sha256=_dirty_diff_hash(),
+        source_dirty_diff_sha256=dirty_diff_sha256,
         price_sheet_date=sheet.effective_date if sheet else None,
         price_sheet_digest=sheet.digest if sheet else None,
         harness_revision=_source_revision(),
-        harness_dirty_diff_sha256=_dirty_diff_hash(),
+        harness_dirty_diff_sha256=dirty_diff_sha256,
         manifest_digests={name: manifest.digest for name, manifest in manifests.items()},
         selected_profiles=[profiles[name].to_dict() for name in selected_names],
         judge_profile=judge_profile.to_dict(),
@@ -987,6 +1157,11 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument("--max-agent-llm-calls", type=int, default=200)
+    run.add_argument(
+        "--no-diagnostics",
+        action="store_true",
+        help="disable replayable evidence bundles for live Gaia attempts",
+    )
     run.set_defaults(handler=_run_command)
     report = commands.add_parser("report", help="combine baseline/candidate checkpoints")
     report.add_argument("--input", action="append", required=True)

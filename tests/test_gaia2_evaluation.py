@@ -27,12 +27,15 @@ from examples.gaia2.evaluation.campaigns.prompt.synthetic import (
 )
 from examples.gaia2.evaluation.cli import (
     _append_checkpoint,
+    _arm_live_judge_recording,
     _call_records_and_cost,
     _checkpoint_records,
     _headless_neutral_done,
     _live_gaia_record,
     _live_neutral_record,
     _parser,
+    _read_records,
+    _report_diff_exclusions,
     _run_command,
 )
 from examples.gaia2.evaluation.core import (
@@ -420,6 +423,17 @@ def test_cost_calculation_separates_cache_and_applies_long_context_tiers() -> No
     )
     assert unknown_cache.upper_bound is True
     assert unknown_cache.agent_cost == pytest.approx(0.08645)
+    with_cache_write_audit = calculate_call_cost(
+        sheet,
+        gpt,
+        CallUsage(
+            input_tokens=100_000,
+            cached_input_tokens=40_000,
+            output_tokens=10_000,
+            cache_write_input_tokens=20_000,
+        ),
+    )
+    assert with_cache_write_audit == short
 
 
 def test_reasoning_tokens_are_reported_but_never_charged() -> None:
@@ -657,6 +671,25 @@ def test_report_redacts_acceptance_details_and_marks_new_safety_violation_hard()
         oracle="locked oracle",
         trajectory={"private": True},
     )
+    candidate = EvaluationRecord(
+        **(
+            candidate.to_dict(detailed_acceptance=True)
+            | {
+                "call_records": (
+                    {
+                        "call_id": "acceptance-call-secret",
+                        "observed_models": ["acceptance-model-secret"],
+                    },
+                ),
+                "diagnostics": {
+                    "schema_version": 1,
+                    "path": "artifacts/acceptance/secret/attempt-0",
+                    "index_sha256": "abc",
+                    "error": None,
+                },
+            }
+        )
+    )
     report = build_report([baseline, candidate], detailed_acceptance=False)
     assert report["schema_version"] == 1
     assert report["campaign"] == "prompt"
@@ -665,7 +698,187 @@ def test_report_redacts_acceptance_details_and_marks_new_safety_violation_hard()
     assert "locked prompt" not in serialized
     assert "locked oracle" not in serialized
     assert '"private": true' not in serialized
+    assert "acceptance-call-secret" not in serialized
+    assert "acceptance-model-secret" not in serialized
+    assert "artifacts/acceptance" not in serialized
     assert report["provenance"]["statistical_bootstrap_seed"] == 20260831
+
+
+def test_checkpoint_keeps_acceptance_diagnostics_for_explicit_detailed_report(
+    tmp_path: Path,
+) -> None:
+    record = EvaluationRecord(
+        arm="baseline",
+        profile="example",
+        suite="acceptance",
+        capability="search",
+        case_id="secret",
+        repeat=0,
+        score=1.0,
+        passed=True,
+        diagnostics={
+            "schema_version": 1,
+            "path": "artifacts/acceptance/secret/attempt-0",
+            "index_sha256": "abc",
+            "error": None,
+        },
+    )
+
+    checkpoint = tmp_path / "checkpoint.jsonl"
+    _append_checkpoint(checkpoint, "key", record)
+    stored = json.loads(checkpoint.read_text())["record"]
+
+    assert stored["diagnostics"] == record.diagnostics
+    assert "diagnostics" not in record.to_dict()
+    assert record.to_dict(detailed_acceptance=True)["diagnostics"] == record.diagnostics
+
+
+@pytest.mark.parametrize(
+    ("arm_result", "armed_state", "expected"),
+    [(False, False, False), (False, True, True), (True, True, True)],
+)
+def test_live_diagnostics_decide_from_judge_recording_state(
+    monkeypatch: pytest.MonkeyPatch,
+    arm_result: bool,
+    armed_state: bool,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr("sora.adapters.are_judge.arm_judge_recording", lambda: arm_result)
+    monkeypatch.setattr("sora.adapters.are_judge.judge_recording_armed", lambda: armed_state)
+
+    assert _arm_live_judge_recording() is expected
+
+
+def test_checkpoint_externalizes_and_report_loading_hydrates_live_call_rows(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "artifacts" / "entry" / "attempt-0"
+    artifact.mkdir(parents=True)
+    calls = [{"call_id": "c1", "inference_id": "i1", "input_tokens": 12}]
+    (artifact / "llm_calls.json").write_text(json.dumps(calls), encoding="utf-8")
+    record = EvaluationRecord(
+        arm="baseline",
+        profile="example",
+        suite="development",
+        capability="search",
+        case_id="case",
+        repeat=0,
+        score=1.0,
+        passed=True,
+        call_records=tuple(calls),
+        diagnostics={
+            "schema_version": 1,
+            "path": "artifacts/entry/attempt-0",
+            "index_sha256": "abc",
+            "error": None,
+        },
+    )
+    checkpoint = tmp_path / "checkpoint.jsonl"
+
+    _append_checkpoint(checkpoint, "key", record)
+
+    stored = json.loads(checkpoint.read_text())["record"]
+    assert stored["call_records"] == []
+    assert _read_records([str(checkpoint)])[0].call_records == tuple(calls)
+
+
+def test_checkpoint_compares_call_rows_after_json_normalization(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifacts" / "entry" / "attempt-0"
+    artifact.mkdir(parents=True)
+    exported_calls = [{"call_id": "c1", "observed_models": ["m1", "m2"]}]
+    (artifact / "llm_calls.json").write_text(json.dumps(exported_calls), encoding="utf-8")
+    record = EvaluationRecord(
+        arm="baseline",
+        profile="example",
+        suite="development",
+        capability="search",
+        case_id="case",
+        repeat=0,
+        score=1.0,
+        passed=True,
+        call_records=({"call_id": "c1", "observed_models": ("m1", "m2")},),
+        diagnostics={
+            "schema_version": 1,
+            "path": "artifacts/entry/attempt-0",
+            "index_sha256": "abc",
+            "error": None,
+        },
+    )
+    checkpoint = tmp_path / "checkpoint.jsonl"
+
+    _append_checkpoint(checkpoint, "key", record)
+
+    assert json.loads(checkpoint.read_text())["record"]["call_records"] == []
+
+
+@pytest.mark.parametrize("artifact_state", ["missing", "invalid", "mismatched"])
+def test_checkpoint_keeps_call_rows_unless_artifact_can_restore_them(
+    tmp_path: Path, artifact_state: str
+) -> None:
+    artifact = tmp_path / "artifacts" / "entry" / "attempt-0"
+    artifact.mkdir(parents=True)
+    calls = [{"call_id": "c1", "input_tokens": 12}]
+    if artifact_state == "invalid":
+        (artifact / "llm_calls.json").write_text("not json", encoding="utf-8")
+    elif artifact_state == "mismatched":
+        (artifact / "llm_calls.json").write_text("[]", encoding="utf-8")
+    record = EvaluationRecord(
+        arm="baseline",
+        profile="example",
+        suite="development",
+        capability="search",
+        case_id="case",
+        repeat=0,
+        score=1.0,
+        passed=True,
+        call_records=tuple(calls),
+        diagnostics={
+            "schema_version": 1,
+            "path": "artifacts/entry/attempt-0",
+            "index_sha256": None,
+            "error": "export failed",
+        },
+    )
+    checkpoint = tmp_path / "checkpoint.jsonl"
+
+    _append_checkpoint(checkpoint, "key", record)
+
+    assert json.loads(checkpoint.read_text())["record"]["call_records"] == calls
+
+
+def test_report_diff_excludes_checkpoint_roots_and_report_output(tmp_path: Path) -> None:
+    first = tmp_path / "run-a" / "checkpoint.jsonl"
+    second = tmp_path / "run-b" / "checkpoint.jsonl"
+    output = tmp_path / "reports" / "report.json"
+
+    assert _report_diff_exclusions([str(first), str(second)], str(output)) == {
+        first.parent.resolve(),
+        second.parent.resolve(),
+        output.resolve(),
+    }
+
+
+def test_report_counts_incomplete_diagnostic_exports() -> None:
+    record = EvaluationRecord(
+        arm="baseline",
+        profile="example",
+        suite="development",
+        capability="search",
+        case_id="case",
+        repeat=0,
+        score=1.0,
+        passed=True,
+        diagnostics={
+            "schema_version": 1,
+            "path": "artifacts/case/attempt-0",
+            "index_sha256": "abc",
+            "error": "HF trace export failed",
+        },
+    )
+
+    diagnostics = build_report([record])["aggregates"]["diagnostics"]
+
+    assert diagnostics == {"records": 1, "incomplete": 1}
 
 
 def test_report_preserves_pinned_judge_profile_and_checkpoint_coverage() -> None:
@@ -1135,6 +1348,7 @@ def test_live_gaia_attaches_and_records_pinned_judge(
         judge_profile=judge,
         max_wall_seconds=1200.0,
         max_agent_llm_calls=200,
+        output_dir=tmp_path,
     )
 
     assert attached == {
@@ -1200,6 +1414,7 @@ def test_live_gaia_discards_a_judge_score_from_a_timed_out_run(
         judge_profile=judge,
         max_wall_seconds=1200.0,
         max_agent_llm_calls=200,
+        output_dir=tmp_path,
     )
 
     assert record.passed is None
@@ -1568,7 +1783,77 @@ def test_prompt_campaign_defaults_to_200_logical_agent_calls_not_cycles() -> Non
         ]
     )
     assert args.max_agent_llm_calls == 200
+    assert args.no_diagnostics is False
     assert not hasattr(args, "max_steps")
+
+
+def test_live_gaia_export_failure_preserves_the_recorded_score(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    profile = load_profiles(EVAL_ROOT / "profiles.json")["gpt-5.4-medium-prompt"]
+    judge = load_judge_profile(PROMPT_ROOT / "judge.json")
+    entry = next(
+        item
+        for item in build_run_matrix(
+            RunSelection(
+                profiles=(profile.name,),
+                suites=("development",),
+                arm="baseline",
+            ),
+            BudgetPolicy(),
+            load_manifests(PROMPT_ROOT / "manifests"),
+        ).entries
+        if item.suite == "development"
+    )
+    result = SimpleNamespace(
+        outcome=SimpleNamespace(success=True, rationale="matched"),
+        exception=None,
+        terminal_cause="verification_completion",
+        llm_report=None,
+        write_counts=None,
+        replan_count=0,
+        duration=1.0,
+        agent_llm_calls=0,
+        external_actions=0,
+        decision_cycles=1,
+        prop_reads=0,
+        prop_reads_by_property={},
+        judge_recording=None,
+        environment=None,
+    )
+    monkeypatch.setattr(
+        "examples.gaia2.evaluation.cli.resolve_scenario", lambda *_a, **_k: tmp_path
+    )
+    monkeypatch.setattr("sora.adapters.are_sim.load_scenario", lambda _path: SimpleNamespace())
+    monkeypatch.setattr("sora.adapters.are_sim.attach_judge", lambda *_a, **_k: None)
+    monkeypatch.setattr("sora.adapters.are_judge.arm_judge_recording", lambda: None)
+    monkeypatch.setattr("sora.adapters.are_judge.judge_recording_armed", lambda: True)
+    monkeypatch.setattr("examples.gaia2._runner.run_scenario", lambda *_a, **_k: result)
+
+    def fail_export(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        raise OSError("index unavailable")
+
+    monkeypatch.setattr("examples.gaia2.evaluation.diagnostics.export_attempt", fail_export)
+
+    record = _live_gaia_record(
+        entry,
+        scenario_root=tmp_path,
+        ack_locked_acceptance=False,
+        config_path=tmp_path / "agent.yaml",
+        profile=profile,
+        sheet=PriceSheet.load(EVAL_ROOT / "price_sheets" / "2026-09-02.json"),
+        judge_profile=judge,
+        max_wall_seconds=1.0,
+        max_agent_llm_calls=1,
+        output_dir=tmp_path,
+        diagnostics=True,
+    )
+
+    assert record.score == 1.0
+    assert record.passed is True
+    assert record.diagnostics is not None
+    assert record.diagnostics["error"] == "export: OSError: index unavailable"
 
 
 def test_evaluation_record_reports_architecture_units_without_claiming_cycles_are_steps() -> None:

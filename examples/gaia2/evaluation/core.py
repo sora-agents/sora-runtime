@@ -1000,6 +1000,7 @@ class CallUsage:
     cached_input_tokens: int | None
     output_tokens: int
     reasoning_tokens: int | None = None
+    cache_write_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1214,6 +1215,7 @@ class EvaluationRecord:
     latency_seconds: float = 0.0
     input_tokens: int = 0
     cached_input_tokens: int = 0
+    cache_write_input_tokens: int | None = None
     cache_unknown_input_tokens: int = 0
     output_tokens: int = 0
     reasoning_tokens: int = 0
@@ -1250,6 +1252,7 @@ class EvaluationRecord:
     llm_round_trips: int = 0
     llm_max_in_flight: int = 0
     llm_overlapped_round_trips: int = 0
+    diagnostics: dict[str, Any] | None = None
 
     @property
     def accounted_agent_cost(self) -> float:
@@ -1295,6 +1298,8 @@ class EvaluationRecord:
             row.pop("prompt", None)
             row.pop("oracle", None)
             row.pop("trajectory", None)
+            row.pop("call_records", None)
+            row.pop("diagnostics", None)
         return row
 
 

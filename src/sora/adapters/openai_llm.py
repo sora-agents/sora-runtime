@@ -305,10 +305,16 @@ def _usage_of(response: Any, *, answer_chars: int) -> LLMUsage | None:
     reasoning = getattr(completion_details, "reasoning_tokens", None)
     prompt_details = getattr(usage, "prompt_tokens_details", None)
     cached_input = getattr(prompt_details, "cached_tokens", None)
+    cache_write_input = getattr(prompt_details, "cache_creation_tokens", None)
+    if cache_write_input is None:
+        cache_write_input = getattr(prompt_details, "cache_write_tokens", None)
     return LLMUsage(
         input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
         output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
         answer_chars=answer_chars,
         reasoning_tokens=int(reasoning) if reasoning is not None else None,
         cached_input_tokens=int(cached_input) if cached_input is not None else None,
+        cache_write_input_tokens=(
+            int(cache_write_input) if cache_write_input is not None else None
+        ),
     )

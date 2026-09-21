@@ -219,6 +219,9 @@ _SCENARIO = (
     Path(__file__).resolve().parents[1]
     / "examples/gaia2/scenarios/execution/smoke-scenario_universe_25_vetd7u.json"
 )
+_requires_scenario = pytest.mark.skipif(
+    not _SCENARIO.exists(), reason="ignored Gaia smoke scenario is not available"
+)
 # One valid ReAct step: ARE parses the action, finds the tool, and the agent's turn ends. An
 # invalid tool name would loop to the iteration cap instead and turn this into a slow test of
 # ARE's error handling.
@@ -229,6 +232,7 @@ _REPLY = (
 )
 
 
+@_requires_scenario
 def test_a_whole_scenario_run_lands_rows_carrying_its_identity(
     profile: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -546,6 +550,7 @@ def _raise(*_args: Any, **_kwargs: Any) -> None:
 # -- the batch harness's react branch, composed --------------------------------------------------
 
 
+@_requires_scenario
 def test_the_batch_harness_runs_the_react_arm_and_records_it(
     profile: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -619,6 +624,7 @@ def test_the_batch_harness_runs_the_react_arm_and_records_it(
     assert record["metadata"]["raw_cached_input_anomalies"] == 0
 
 
+@_requires_scenario
 def test_the_driver_initializes_the_scenario_itself(
     profile: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

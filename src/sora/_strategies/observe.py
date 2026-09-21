@@ -32,6 +32,7 @@ from sora.action import (
     release,
 )
 from sora.activity import Activity, ActivityState
+from sora.diagnostics import emit_runtime_event
 from sora.memory import (
     PerceptSnapshot,
     percept_snapshot,
@@ -332,6 +333,11 @@ class DefaultObserveStrategy:
         self._derive_property_changes(wm, wm.signals_appended - signals_before)
         just_resolved: list[tuple[Activity, OperationInvocation]] = []
         async for invocation_id, ack in cycle.result_sink.drain():
+            emit_runtime_event(
+                "boundary.operation_ack.received",
+                cause="result_sink",
+                payload={"invocation_id": invocation_id, "ack": ack},
+            )
             # Unambiguous 1:1 match: the invoke's own result resolves its activity automatically to
             # READY — manual-agnostic, no strategy involved. The *second* kind of waiting (block on
             # a declared completion signal) is layered on top below, never fused into this resolve.
@@ -353,6 +359,16 @@ class DefaultObserveStrategy:
                         CompletedOperation(invocation, ack)
                     )  # belief to ground on
                     activity.pending_operation = None
+                    emit_runtime_event(
+                        "pending_operation.resolved" if ack.ok else "pending_operation.failed",
+                        activity_id=activity.id,
+                        cause="operation_ack",
+                        payload={
+                            "invocation_id": invocation_id,
+                            "invocation": invocation,
+                            "ack": ack,
+                        },
+                    )
                     activity.state = ActivityState.READY
                     just_resolved.append((activity, invocation))
                     if ack.ok:
@@ -363,6 +379,12 @@ class DefaultObserveStrategy:
                         # without the error the trace would name neither what failed nor why.
                         log.warning("observe: resolved %s -> FAILED: %s", op, _truncate(ack.result))
                     break
+            else:
+                emit_runtime_event(
+                    "pending_operation.discarded",
+                    cause="late_operation_ack",
+                    payload={"invocation_id": invocation_id, "ack": ack},
+                )
         # Drain first: a provider result may already be queued even though Observe starts after its
         # deadline. It is a real resolution, so do not append a synthetic timeout behind it. Then
         # expire requests that remain pending and drain again so a true absence still resolves in
@@ -390,6 +412,12 @@ class DefaultObserveStrategy:
         received_message = False
         async for message in cycle.communication.receive():
             wm.messages.append(message)
+            emit_runtime_event(
+                "boundary.message.received",
+                cause="transport_receive",
+                payload={"message": message},
+                source_timestamp=message.received_at,
+            )
             received_message = True
             log.info("observe: message from %s: %r", message.sender, _goal_from_message(message))
         if received_message and self._resume_on_input(wm):
@@ -652,4 +680,11 @@ class DefaultObserveStrategy:
         append semantics in their own list, handled in observe()."""
         for tool in wm.focused_tools.values():
             for prop in tool.observe():
-                wm.properties[(tool.id, prop.name)] = Percept(tool.id, prop, time.time())
+                observed_at = time.time()
+                wm.properties[(tool.id, prop.name)] = Percept(tool.id, prop, observed_at)
+                emit_runtime_event(
+                    "boundary.property.received",
+                    cause="property_snapshot",
+                    payload={"source": tool.id, "property": prop},
+                    source_timestamp=observed_at,
+                )

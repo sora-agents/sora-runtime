@@ -105,6 +105,34 @@ async def test_metered_client_logs_one_timed_cue_per_call(_llm_logging_enabled: 
 
 
 @pytest.mark.asyncio
+async def test_metered_latency_excludes_exchange_capture(
+    monkeypatch: pytest.MonkeyPatch, _llm_logging_enabled: None
+) -> None:
+    import sora.llm as llm_module
+
+    moments = iter((10.0, 12.5))
+    monkeypatch.setattr("sora.llm.time.perf_counter", lambda: next(moments))
+    captured: list[float] = []
+
+    def capture(*_args: object, elapsed_seconds: float, **_kwargs: object) -> None:
+        captured.append(elapsed_seconds)
+
+    monkeypatch.setattr(llm_module, "_capture_exchange", capture)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign,assignment]
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(handler)
+    try:
+        await MeteredLLMClient(_StubClient()).complete(_request())
+    finally:
+        logger.removeHandler(handler)
+
+    assert captured == [2.5]
+    assert records[0].__dict__["llm_seconds"] == 2.5
+
+
+@pytest.mark.asyncio
 async def test_metered_client_logs_even_when_inner_raises(_llm_logging_enabled: None) -> None:
     class _Boom(_StubClient):
         async def complete(self, request: CompletionRequest) -> str:
@@ -202,7 +230,9 @@ async def test_llm_meter_tallies_calls_and_seconds(_llm_logging_enabled: None) -
     report = meter.report()
     assert report.section_characters is None
     assert report.dynamic_section_characters is None
+    assert report.cache_write_input_tokens is None
     assert report.inferences[0].dynamic_section_share is None
+    assert report.inferences[0].cache_write_input_tokens is None
 
 
 def test_llm_meter_summary_singular_plural_and_wall() -> None:
@@ -444,6 +474,40 @@ def test_llm_meter_reports_cache_usage_as_unavailable_when_unobserved(
     assert meter.cache_coverage == 0.0
     assert meter.cache_unknown_input_tokens == 42
     assert "cache usage unavailable" in meter.summary()
+
+
+def test_llm_meter_preserves_exact_cache_writes_and_unknown_coverage(
+    _llm_logging_enabled: None,
+) -> None:
+    exact = LLMMeter()
+    logger = logging.getLogger("sora.llm")
+    logger.addHandler(exact)
+    try:
+        with llm_call_scope():
+            log_llm_usage(
+                LLMUsage(
+                    100,
+                    10,
+                    answer_chars=20,
+                    cached_input_tokens=40,
+                    cache_write_input_tokens=25,
+                )
+            )
+    finally:
+        logger.removeHandler(exact)
+
+    exact_report = exact.report()
+    assert exact_report.cache_write_input_tokens == 25
+    assert exact_report.inferences[0].cache_write_input_tokens == 25
+    assert exact_report.inferences[0].usages[0].cache_write_input_tokens == 25
+
+    unknown = LLMMeter()
+    logger.addHandler(unknown)
+    try:
+        log_llm_usage(LLMUsage(100, 10, answer_chars=20))
+    finally:
+        logger.removeHandler(unknown)
+    assert unknown.report().cache_write_input_tokens is None
 
 
 def test_llm_meter_summary_omits_tokens_when_uninstrumented() -> None:

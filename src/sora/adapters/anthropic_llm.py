@@ -136,12 +136,14 @@ def _usage_of(message: Any, *, answer_chars: int) -> LLMUsage | None:
     if usage is None:
         return None
     uncached_input = int(getattr(usage, "input_tokens", 0) or 0)
-    cache_creation_input = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    cache_creation_raw = getattr(usage, "cache_creation_input_tokens", None)
+    cache_creation_input = int(cache_creation_raw) if cache_creation_raw is not None else None
     cache_read_input = getattr(usage, "cache_read_input_tokens", None)
     cached_input = int(cache_read_input) if cache_read_input is not None else None
     return LLMUsage(
-        input_tokens=uncached_input + cache_creation_input + (cached_input or 0),
+        input_tokens=uncached_input + (cache_creation_input or 0) + (cached_input or 0),
         output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
         answer_chars=answer_chars,
         cached_input_tokens=cached_input,
+        cache_write_input_tokens=cache_creation_input,
     )

@@ -52,13 +52,14 @@ development, and acceptance.
 
 Run every command below from the immutable source checkout or worktree that will produce the
 baseline. The ignored Gaia scenario files may live in a different checkout, so set their absolute
-path explicitly. Use a durable output directory that can be archived unchanged; do not use `/tmp`
-for the real run.
+path explicitly. Keep local generated output under the repository's ignored `.sora/` namespace;
+do not use `/tmp` for the real run, and archive the complete output directory before removing its
+checkout or worktree.
 
 ```console
 cd /absolute/path/to/sora-runtime-worktree
 export PROMPT_SCENARIO_ROOT=/absolute/path/to/main-checkout/examples/gaia2/scenarios
-export PROMPT_BASELINE_OUT=/absolute/path/to/baseline-archive/prompt-v2-gpt54-medium
+export PROMPT_BASELINE_OUT="$PWD/.sora/gaia2/evaluations/prompt-v2-gpt54-medium"
 export PROMPT_PRICE_SHEET=examples/gaia2/evaluation/price_sheets/2026-09-12.json
 ```
 
@@ -72,8 +73,7 @@ git status --short
 git rev-parse HEAD
 ```
 
-`git status --short` must print nothing. Then regenerate the seven canonical rendered prompt
-inputs and their hashes:
+`git status --short` must print nothing. Then regenerate the current prompt matrix:
 
 ```console
 uv run python -m examples.gaia2.evaluation prompt snapshot \
@@ -230,6 +230,36 @@ later-discarded calls still consume an admission. Parser repair and provider/SDK
 logical call are billed as additional provider round trips but do not consume another admission.
 External actions and S-ORA decision cycles are recorded separately and are not Gaia steps.
 
+Each live Gaia attempt also records replayable diagnostics by default. Use `--no-diagnostics` only
+when explicitly accepting that the attempt cannot be reconstructed or re-scored from its own
+evidence. Diagnostics are buffered in memory while the scenario runs, then exported after ARE has
+stopped, so filesystem latency cannot move the simulator's wall-clock trajectory. Here, replay
+means auditing the ordered execution and reapplying scoring to the stored judge exchanges; it does
+not mean deterministic re-execution of the agent or simulator.
+
+Ordinary attempts land under `artifacts/<filesystem-safe-entry-key>/attempt-N/`; acceptance
+attempts land under `artifacts/acceptance/<filesystem-safe-entry-key>/attempt-N/`. Attempt numbers
+never overwrite an existing directory, including an orphan left by an interrupted exporter. Each
+bundle contains:
+
+- `run.json`, with outcome, terminal cause, timing, configuration, profile, version, revision, and
+  seed provenance;
+- `trajectory.jsonl`, with ordered cycle/phase context, activity transitions, actions and results,
+  pending work, and environment-boundary observations;
+- `judge_recording.json`, in the existing `examples.gaia2.rescore` schema, plus `verdict.json` and
+  `write_counts.json`;
+- `llm_calls.json`, `llm/exchanges.jsonl`, and deduplicated exact prompts under
+  `llm/prompts/<sha256>.txt`;
+- `session.log` and ARE's Hugging Face trace when available; and
+- `index.json`, with sorted paths, sizes, SHA-256 hashes, and any component export errors.
+
+The checkpoint keeps only a compact artifact reference for live Gaia call details after verifying
+that `llm_calls.json` is readable and exactly matches them. Otherwise it retains the call rows
+inline, so a partial export cannot erase paid-run accounting. Report creation hydrates externalized
+details from `llm_calls.json`; legacy checkpoints with inline calls remain readable. An export
+failure does not change or erase the attempt's score: its checkpoint reference records the failure
+and the report increments `aggregates.diagnostics.incomplete`.
+
 ### 5. Verify completion and produce the report
 
 After the live command finishes, rerun the dry-run command from step 3 against the same output
@@ -259,7 +289,13 @@ Archive these outputs and inputs together:
 - `campaigns/prompt/baseline.json`, `profiles.json`, and `campaigns/prompt/judge.json`;
 - `price_sheets/2026-09-12.json`;
 - all three prompt manifest files and their digests from `report.json`; and
-- any captured process output or external diagnostic artifacts associated with the run.
+- the complete `artifacts/` tree, including every failed, retried, or orphan attempt directory.
+
+Treat the entire `artifacts/acceptance/` subtree as sealed acceptance material, not only the judge
+recording or ARE trace inside it. It is ignored by the repository and must not be copied into an
+ordinary report archive, logs, tickets, or review attachments. Normal reports omit acceptance
+diagnostic references and payloads; `--include-acceptance-details` reveals them only for an
+explicitly authorized detailed report.
 
 Store checksums outside the archive or put the archive in read-only/immutable storage. Candidate
 runs must use the same scenarios, profile, judge, price sheet, harness behavior, limits, reserves,

@@ -46,6 +46,10 @@ scenario.json
 *.scenario.json
 examples/gaia2/scenarios/
 
+# Defense in depth for custom output roots outside .sora/: locked evaluation diagnostics can
+# contain acceptance prompts, traces, and judge payloads.
+**/artifacts/acceptance/
+
 # Environment
 .env
 .env.*

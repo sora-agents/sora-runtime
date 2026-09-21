@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from sora.action import JoinAction
 from sora.activity import ActivityState
+from sora.diagnostics import emit_runtime_event, runtime_event_context, runtime_phase
 from sora.perception import NotificationQueueSink
 from sora.strategies import (
     DefaultInterruptHandler,
@@ -130,8 +131,22 @@ class DecisionCycle:
         constructed once and passed to both — see sora/bootstrap.py. (Dispatch in _act() uses
         self.registry — the mutation-capable handle — not working.registry, which is read-only.)"""
         self._cycle_count += 1
+        cycle_number = self._cycle_count
+        with runtime_event_context(cycle=cycle_number):
+            emit_runtime_event("cycle.entry", payload={"cycle": cycle_number})
+            try:
+                await self._tick_body(cycle_number)
+            except BaseException as error:
+                emit_runtime_event(
+                    "cycle.exit", payload={"cycle": cycle_number, "ok": False, "error": error}
+                )
+                raise
+            emit_runtime_event("cycle.exit", payload={"cycle": cycle_number, "ok": True})
+
+    async def _tick_body(self, cycle_number: int) -> None:
         log.debug("[cycle %d] begin", self._cycle_count)
-        result = await self.strategies.observe.observe(self)
+        with runtime_phase(cycle_number, "observe"):
+            result = await self.strategies.observe.observe(self)
         # Checkpoint after every phase boundary: if a hard interrupt is pending (raised by
         # interrupt() or an InterruptPolicy screening a pushed signal), run the handler and abort
         # rest of this tick. The abandoned TickResult carries no staleness — it never outlives one
@@ -142,15 +157,20 @@ class DecisionCycle:
         # reactive target (ADR-0021).
         if await self._preempted():
             return
-        for activity in list(self.working.activities.values()):
-            result = await self.strategies.reflect.reflect(activity, self.working, self, result)
+        with runtime_phase(cycle_number, "reflect"):
+            for activity in list(self.working.activities.values()):
+                with runtime_event_context(activity_id=activity.id):
+                    result = await self.strategies.reflect.reflect(
+                        activity, self.working, self, result
+                    )
         if await self._preempted():
             return
         # Situate always runs: it re-adjusts wm for the (possibly already-selected) activity every
         # cycle, and selects only if result.activity is still None. Unlike the step/invocation gates
         # below — genuine forward-fusion short-circuits — Situate is not gated on its own field.
         ready = [a for a in self.working.activities.values() if a.state is ActivityState.READY]
-        result = await self.strategies.situate.situate(ready, self.working, self, result)
+        with runtime_phase(cycle_number, "situate"):
+            result = await self.strategies.situate.situate(ready, self.working, self, result)
         if await self._preempted():
             return
         selected = result.activity
@@ -165,13 +185,15 @@ class DecisionCycle:
                 await self.relevance.consider(self)
             return  # nothing selectable this cycle — at most one action, never a mandatory one
         if result.step is None:
-            result = await self.strategies.reason.reason(selected, self.working, self, result)
+            with runtime_phase(cycle_number, "reason", activity_id=selected.id):
+                result = await self.strategies.reason.reason(selected, self.working, self, result)
             if await self._preempted():
                 return
         step = result.step
         if step is None:
             return
-        await self._act(selected, step, result)
+        with runtime_phase(cycle_number, "act", activity_id=selected.id):
+            await self._act(selected, step, result)
 
     async def _preempted(self) -> bool:
         """A phase-boundary checkpoint. If no interrupt is pending, return False and let the tick
@@ -196,6 +218,12 @@ class DecisionCycle:
         an exception here would unwind through the adapter and out of the agent loop. A policy that
         reads the live tool (ADR-0020's pattern) does real I/O and can genuinely fail, and a failed
         screen must degrade to "no interrupt" — the signal still reaches the Observe drain."""
+        emit_runtime_event(
+            "boundary.signal.received",
+            cause="signal_sink",
+            payload={"source": source, "signal": signal},
+            source_timestamp=getattr(signal, "timestamp", None),
+        )
         try:
             request = self.interrupt_policy.decide(source, signal, self.working)
         except Exception:

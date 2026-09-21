@@ -775,6 +775,9 @@ python -m examples.gaia2.run_benchmark --scenario ./amb.json \
 # a whole sweep: walk the artifact tree (files or directories, any mix)
 python -m examples.gaia2.rescore .sora/gaia2/out
 
+# one evaluation attempt, using its self-contained evidence bundle
+python -m examples.gaia2.rescore .sora/gaia2/evaluations/prompt-baseline/artifacts/example/attempt-0
+
 # the acceptance gate on the recording pipeline itself
 python -m examples.gaia2.rescore .sora/gaia2/out --require-divergence
 ```

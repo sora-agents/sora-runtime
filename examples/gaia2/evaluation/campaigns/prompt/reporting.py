@@ -297,9 +297,16 @@ def build_report(
         record.agent_cost_reserve for record in records if record.agent_cost is None
     )
     total_judge_reserve = sum(record.judge_reserve for record in records)
+    diagnostic_records = [record for record in records if record.diagnostics is not None]
+    incomplete_diagnostics = sum(
+        bool(record.diagnostics and record.diagnostics.get("error"))
+        for record in diagnostic_records
+    )
     observations: list[dict[str, Any]] = []
     observed: set[str] = set()
     for record in records:
+        if record.suite == "acceptance" and not detailed_acceptance:
+            continue
         for call in record.call_records:
             for model in call.get("observed_models", []):
                 item = {"kind": "model", "value": str(model)}
@@ -425,6 +432,10 @@ def build_report(
                 ),
             },
             "acceptance_expansion": expansion,
+            "diagnostics": {
+                "records": len(diagnostic_records),
+                "incomplete": incomplete_diagnostics,
+            },
         },
     }
 
