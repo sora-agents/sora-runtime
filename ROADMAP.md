@@ -208,11 +208,13 @@ Small, bounded, and each one currently a silent wrong-answer path rather than a 
 - [ ] **V4.1** Write the real `CHANGELOG.md` entry — it still says *"No code has been released yet"*.
 - [ ] **V4.2** Reconcile `pyproject.toml`'s `version = "0.1.0"` with the tag, and decide the
       post-tag versioning convention.
-- [x] **V4.3** Loose root working documents relocated to an untracked `notes/` directory
+- [x] **V4.3** Loose root working documents relocated to an untracked `.sora/notes/` directory
       (gitignored): the prompt-consolidation lists, the release analysis, the failure write-ups, and
       the documentation-architecture proposals. They churn per session and their conclusions are
       distilled into tracked ADRs, `docs/architecture/notes/`, or this file when they land — so the
-      standing rule is **delete a note once it has been distilled**.
+      standing rule is **delete a note once it has been distilled**. Raw sweep output moved
+      alongside them to `.sora/runs/`, so everything untracked by design sits behind one ignore
+      rule instead of three kept in step.
 - [x] **V4.4** ROADMAP citations removed from durable files. Per AGENTS.md, ADRs, design notes,
       source, and documentation pages must not cite roadmap task IDs or phase labels at all — they
       dangle the moment the roadmap is restructured, which is exactly what happened here. Those

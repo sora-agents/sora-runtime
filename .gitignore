@@ -24,7 +24,15 @@ htmlcov/
 .dmypy.json
 
 # S-ORA runtime state (e.g. file-backed semantic/procedural/episodic memory stores) —
-# namespaced under .sora/ to avoid colliding with unrelated "memory" conventions
+# namespaced under .sora/ to avoid colliding with unrelated "memory" conventions. Also the working
+# tree's two other untracked-by-design areas, moved under this one prefix so that everything a
+# checkpoint must not absorb sits behind a single rule rather than three that have to be kept in
+# step: .sora/notes/ (session-scoped design analysis and in-flight campaign task lists — they churn
+# per session, and their conclusions are distilled into tracked ADRs, design notes under
+# docs/architecture/, or ROADMAP.md when they land) and .sora/runs/ (raw sweep output: per-scenario
+# HF traces, output.jsonl, llm_calls.jsonl, judge responses and driver logs — tens of megabytes of
+# mostly-regenerable bulk, and the only copy of what a paid run actually did). The compact evidence
+# a result is argued from is committed under examples/gaia2/evaluation/ instead.
 .sora/
 my-agent/
 logs/
@@ -55,9 +63,3 @@ examples/gaia2/scenarios/
 
 # Documentation
 site/
-
-# Local working notes: session-scoped design analysis and in-flight campaign task lists
-# (prompt-consolidation, release analyses, failure write-ups). Deliberately untracked — these
-# churn per session and their conclusions are distilled into tracked ADRs, design notes under
-# docs/architecture/, or ROADMAP.md when they land. Delete a note once it has been distilled.
-/notes/
