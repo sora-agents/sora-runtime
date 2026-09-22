@@ -264,10 +264,10 @@ def test_the_serving_tier_is_pinned_only_where_it_is_both_honored_and_verified()
             assert "service_tier" not in profile.request_kwargs()
 
 
-def test_prompt_judge_profile_pins_gpt_5_1_snapshot_and_are_policy() -> None:
+def test_prompt_judge_profile_pins_gpt_5_4_mini_snapshot_and_are_policy() -> None:
     judge = load_judge_profile(PROMPT_ROOT / "judge.json")
 
-    assert judge.model == "gpt-5.1-2025-11-13"
+    assert judge.model == "gpt-5.4-mini-2026-03-17"
     assert judge.provider == "openai"
     assert judge.endpoint is None
     assert judge.credential_env == "OPENAI_API_KEY"
@@ -1720,7 +1720,7 @@ def test_live_gaia_attaches_and_records_pinned_judge(
     )
 
     assert attached == {
-        "model": "gpt-5.1-2025-11-13",
+        "model": "gpt-5.4-mini-2026-03-17",
         "provider": "openai",
         "endpoint": None,
         "offline_validation": False,

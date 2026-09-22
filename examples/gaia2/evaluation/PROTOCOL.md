@@ -349,18 +349,28 @@ The former combined `baseline.json` was also re-cut on 2026-09-21 to add `paper2
 is campaign-membership metadata only — no request parameter, operating point, prompt, judge profile,
 or charge-model figure moved — so it costs no comparability.
 
-## 11. Still open
+## 11. Judge selection
+
+The judge is frozen as [`gpt-5.4-mini-2026-03-17`](campaigns/prompt/judge.json),
+  through the OpenAI ARE graph-per-event judge with every unsupported per-request setting recorded
+  as intentionally omitted and case-insensitive verdict parsing enabled. The selection fixture
+  repeated the `sanity_checker` test six times on ARE's actual `content: <message>` rendering and
+  six times on the identical prefix-stripped control: the selected judge passed all 12 calls, with
+  no false rejection or unparsed verdict. The compact local record is
+  `.sora/runs/judge-selection-gpt-5.4-mini-2026-09-22-rerun.json`, SHA-256
+  `c393ee40c73313f2e90da331ba1620d68b47ad0044a264d62ca3d0b04af8fb0d`. The dated GPT snapshot
+  is selected over the generic alias so the served judge identity cannot drift between cells.
+
+## 12. Still open
 
 Named here so that a reader can see what this protocol does *not* yet fix:
 
 - **Acceptance parameters.** Repeats, decision thresholds, the expansion rule, and the selection rule
   are not yet stated. They must be added here and committed before the locked-acceptance payloads
   are opened, which is what turns this document into a pre-registration.
-- **Judge model.** Selection and configuration are not frozen.
 - **The `gpt-5.4-high-paper` re-audit**, which removes the reasoning-effort confound from the failed
   charge gate.
 - **Freezing the campaign configuration.** Prompts have an immutable-snapshot mechanism;
   `campaigns/prompt/campaign.json` is only a mirror of the live profile, judge, and charge files and
-  therefore records nothing historically. That is correct while the judge is still open, but
-  pre-registration needs the configuration pinned the same way — either a snapshot of it, or its
-  digest recorded here.
+  therefore records nothing historically. Pre-registration needs the configuration pinned the same
+  way — either a snapshot of it, or its digest recorded here.

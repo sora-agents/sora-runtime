@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "judge": {
-    "name": "gpt-5.1-openai-prompt-judge",
+    "name": "gpt-5.4-mini-openai-prompt-judge",
     "implementation": "are.graph_per_event",
     "provider": "openai",
-    "model": "gpt-5.1-2025-11-13",
+    "model": "gpt-5.4-mini-2026-03-17",
     "endpoint": null,
     "credential_env": "OPENAI_API_KEY",
     "settings": {

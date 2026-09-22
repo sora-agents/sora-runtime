@@ -52,7 +52,7 @@ endpoint rather than the model), so re-running replaces the evidence rather than
 
 The current one-repeat baseline uses the `gpt-5.4-medium-prompt` profile
 (`gpt-5.4-2026-03-05`, medium reasoning, 16,384 maximum output tokens) and the pinned
-`gpt-5.1-2025-11-13` ARE graph-per-event judge. Both use `OPENAI_API_KEY`. The run covers the
+`gpt-5.4-mini-2026-03-17` ARE graph-per-event judge. Both use `OPENAI_API_KEY`. The run covers the
 contract suite, all 16 live-neutral cases, and five cases from each Gaia suite: familiar,
 development, and acceptance.
 

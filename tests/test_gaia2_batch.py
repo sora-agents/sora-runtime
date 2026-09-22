@@ -1068,7 +1068,7 @@ def test_paper_manifest_is_the_complete_five_capability_gaia2_mini_selection() -
 def test_pinned_hf_loader_uses_repository_revision_not_builder_parameter(
     monkeypatch: Any,
 ) -> None:
-    import datasets  # type: ignore[import-untyped]
+    import datasets  # type: ignore
     from are.simulation.benchmark import scenario_loader
 
     captured: dict[str, Any] = {}

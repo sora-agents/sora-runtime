@@ -267,7 +267,7 @@ def _pinned_hf_scenarios(
 
     from are.simulation.benchmark.scenario_loader import load_scenario
     from are.simulation.data_handler.models import ExportedHuggingFaceMetadata
-    from datasets import load_dataset  # type: ignore[import-untyped]
+    from datasets import load_dataset  # type: ignore
 
     loaded = load_dataset(
         dataset,
