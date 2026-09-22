@@ -24,6 +24,9 @@ from examples.gaia2._runner import (
     _terminal_cause,
 )
 from examples.gaia2.batch import (
+    ARTIFACT_ATTESTATION,
+    ARTIFACT_CHECKSUMS,
+    CONTAMINATION_MARKER,
     SweepManifest,
     _arm_root,
     _check_operating_point,
@@ -43,6 +46,9 @@ from examples.gaia2.batch import (
     _verify_counterpart_pairing,
     aggregate,
     main,
+    refuse_contaminated_root,
+    verify_artifact_attestation,
+    write_artifact_attestation,
 )
 
 from sora.activity import ActivityState
@@ -1615,6 +1621,10 @@ def test_empty_dataset_refuses_before_truncating_sweep_artifacts(
         num_runs=1,
         judge_model=None,
         no_judge_recording=False,
+        # The point of this test is that the *loader* refuses before truncating. Without this the
+        # attestation guard refuses first, on the deliberately unattested leftovers below, and the
+        # assertion would hold for a reason the test is not about.
+        overwrite_unattested=True,
     )
 
     with pytest.raises(RuntimeError, match="zero scenarios"):
@@ -1657,6 +1667,9 @@ def test_manifest_is_fully_resolved_before_truncating_sweep_artifacts(
         judge_model=None,
         no_judge_recording=False,
         sweep_manifest=manifest,
+        # As above: the assertion is that the *manifest* refuses before truncating, so the
+        # attestation guard must not be the thing that refuses on these unattested leftovers.
+        overwrite_unattested=True,
     )
 
     with pytest.raises(RuntimeError, match="missing"):
@@ -1988,6 +2001,15 @@ def _complete_sweep(tmp_path: Any, clock_mode: str = "generation_free") -> Sweep
             scenario_id=f"scenario-{name}",
             manifest_digest=_SWEEP_DIGEST,
         )
+        # A pinned sweep is attested as it is written, so the fixture for the one shape that earns
+        # a headline has to be attested too — otherwise these tests would assert the headline
+        # against a directory the real gate refuses.
+        batch.write_artifact_attestation(
+            str(Path(tmp_path) / "standard" / name),
+            arm="sora",
+            capability=name,
+            records=[],
+        )
     return SweepManifest(
         name="test-mini",
         dataset="d",
@@ -2296,3 +2318,150 @@ def test_unfrozen_development_mode_cannot_also_ask_for_a_frozen_clock() -> None:
                 "--generation-free",
             ]
         )
+
+
+# --- paid-artifact preservation ---------------------------------------------
+
+
+def _attested_capability(root: Path, capability: str, *, digest: str = "manifest-digest") -> Path:
+    """One scored row plus its attestation, laid out as a finished run would leave them."""
+    cfg_dir = root / "standard" / capability
+    cfg_dir.mkdir(parents=True)
+    record = {
+        "task_id": f"{capability}-0",
+        "score": 1.0,
+        "metadata": {"scenario_manifest_digest": digest, "clock_mode": "generation_free"},
+    }
+    (cfg_dir / "output.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    (cfg_dir / "llm_calls.jsonl").write_text('{"arm": "sora"}\n', encoding="utf-8")
+    write_artifact_attestation(str(cfg_dir), arm="sora", capability=capability, records=[record])
+    return cfg_dir
+
+
+def test_attestation_covers_every_artifact_and_verifies_clean(tmp_path: Path) -> None:
+    cfg_dir = _attested_capability(tmp_path, "time")
+
+    attested = json.loads((cfg_dir / ARTIFACT_ATTESTATION).read_text(encoding="utf-8"))
+    assert [entry["path"] for entry in attested["files"]] == [
+        "llm_calls.jsonl",
+        "output.jsonl",
+    ]
+    # The checksum file is coreutils format so a preserved run can be verified without this repo.
+    lines = (cfg_dir / ARTIFACT_CHECKSUMS).read_text(encoding="utf-8").splitlines()
+    assert lines == [f"{entry['sha256']}  ./{entry['path']}" for entry in attested["files"]]
+    # The rows' own provenance travels with the checksums: this is what ties a compact report to
+    # bytes rather than to a path.
+    assert attested["records"] == {
+        "record_count": 1,
+        "scenario_manifest_digests": ["manifest-digest"],
+        "prompt_snapshot_digests": [None],
+        "charge_model_digests": [None],
+        "clock_modes": ["generation_free"],
+    }
+
+    assert verify_artifact_attestation(str(cfg_dir))[1] == ()
+
+
+def test_attestation_detects_a_changed_added_or_removed_artifact(tmp_path: Path) -> None:
+    cfg_dir = _attested_capability(tmp_path, "time")
+
+    (cfg_dir / "output.jsonl").write_text('{"task_id": "time-0", "score": 0.0}\n', encoding="utf-8")
+    assert "output.jsonl changed since it was attested" in " ".join(
+        verify_artifact_attestation(str(cfg_dir))[1]
+    )
+
+    _attested_capability(tmp_path, "search")
+    (tmp_path / "standard" / "search" / "extra.json").write_text("{}", encoding="utf-8")
+    assert "unattested file present: extra.json" in " ".join(
+        verify_artifact_attestation(str(tmp_path / "standard" / "search"))[1]
+    )
+
+    _attested_capability(tmp_path, "execution")
+    (tmp_path / "standard" / "execution" / "llm_calls.jsonl").unlink()
+    assert "attested file missing: llm_calls.jsonl" in " ".join(
+        verify_artifact_attestation(str(tmp_path / "standard" / "execution"))[1]
+    )
+
+
+def test_attestation_digest_covers_the_file_list_it_was_written_with(tmp_path: Path) -> None:
+    # A rewritten `files` list that agrees with the directory is still caught: the one-value digest
+    # was taken over the list the run wrote, so editing both halves consistently does not restore
+    # agreement with it.
+    cfg_dir = _attested_capability(tmp_path, "time")
+    path = cfg_dir / ARTIFACT_ATTESTATION
+    attested = json.loads(path.read_text(encoding="utf-8"))
+    (cfg_dir / "llm_calls.jsonl").unlink()
+    attested["files"] = [e for e in attested["files"] if e["path"] != "llm_calls.jsonl"]
+    path.write_text(json.dumps(attested), encoding="utf-8")
+
+    assert "artifact set digest does not cover its own file list" in " ".join(
+        verify_artifact_attestation(str(cfg_dir))[1]
+    )
+
+
+def test_a_contamination_marker_above_the_directory_is_never_overridable(tmp_path: Path) -> None:
+    (tmp_path / CONTAMINATION_MARKER).write_text(
+        "react sweep shared an output root\nsecond line\n", encoding="utf-8"
+    )
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+
+    for allow in (False, True):
+        with pytest.raises(SystemExit, match="react sweep shared an output root"):
+            refuse_contaminated_root(str(cfg_dir), allow_unattested=allow)
+
+
+def test_unattested_leftovers_are_refused_but_overridable(tmp_path: Path) -> None:
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "output.jsonl").write_text('{"score": 1.0}\n', encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="unknown provenance"):
+        refuse_contaminated_root(str(cfg_dir))
+
+    refuse_contaminated_root(str(cfg_dir), allow_unattested=True)
+
+
+def test_an_empty_or_attested_directory_is_accepted(tmp_path: Path) -> None:
+    # Nothing to destroy, and a directory whose bytes are exactly what the last run closed: both
+    # are ordinary re-runs, and refusing either would make the guard unusable.
+    refuse_contaminated_root(str(tmp_path / "standard" / "time"))
+    refuse_contaminated_root(str(_attested_capability(tmp_path, "time")))
+
+
+def test_report_carries_the_artifact_set_and_withholds_a_pinned_headline_when_it_moved(
+    tmp_path: Path,
+) -> None:
+    manifest = SweepManifest(
+        name="pinned",
+        dataset="dataset",
+        revision="revision",
+        split="validation",
+        cases=tuple(("time", "time-0") for _ in (0,)),
+        digest="manifest-digest",
+    )
+    cfg_dir = _attested_capability(tmp_path, "time")
+    attested = json.loads((cfg_dir / ARTIFACT_ATTESTATION).read_text(encoding="utf-8"))
+
+    summary = aggregate(str(tmp_path), manifest)
+    assert summary["configs"]["time"]["artifact_set_sha256"] == attested["artifact_set_sha256"]
+    assert summary["configs"]["time"]["artifact_attestation_reasons"] == []
+    assert not any("not attested" in reason for reason in summary["headline_withheld"])
+
+    (cfg_dir / "output.jsonl").write_text(
+        json.dumps({"task_id": "time-0", "score": 0.0, "metadata": {}}) + "\n", encoding="utf-8"
+    )
+    moved = aggregate(str(tmp_path), manifest)
+    assert moved["configs"]["time"]["artifact_set_sha256"] is None
+    assert any("not attested" in reason for reason in moved["headline_withheld"])
+
+
+def test_an_unpinned_sweep_is_not_required_to_be_attested(tmp_path: Path) -> None:
+    # Smoke and report-only runs are the one use where unattested bytes are the point; requiring
+    # attestation everywhere would refuse them. Their headline is already withheld for coverage.
+    _write_config(tmp_path, "time", [1.0])
+
+    summary = aggregate(str(tmp_path))
+
+    assert summary["configs"]["time"]["artifact_set_sha256"] is None
+    assert not any("not attested" in reason for reason in summary["headline_withheld"])

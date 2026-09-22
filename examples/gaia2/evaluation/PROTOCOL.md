@@ -248,6 +248,34 @@ them. Instead:
   still records the digest it rendered, and the headline is withheld when capabilities within one
   sweep disagree about it. The ReAct arm records none, because it does not use these prompts.
 
+**Paid artifacts are checksummed as they are written.** A reusable paid run is evidence only for
+as long as its bytes can be shown to be the bytes the run closed, and a preserved directory is read
+back weeks later, by a different process, often after other sweeps have used the same root.
+
+- When a capability finishes, the run writes `SHA256SUMS` (coreutils format, verifiable with
+  `shasum -c` without this repository) and `artifacts.json` beside its artifacts. Both are written
+  after the last file is closed — a manifest taken mid-sweep would attest bytes still being
+  appended to.
+- `artifacts.json` carries the per-file checksums, a single `artifact_set_sha256` over the ordered
+  list, and the provenance the rows themselves declare: scenario manifest, prompt snapshot, charge
+  model, and clock mode. That second half is the tie. Checksums alone prove a directory has not
+  moved; they do not say which experiment it is. Absent values are carried as nulls rather than
+  dropped, so a run that recorded no provenance cannot read as one that recorded agreement.
+- A report re-checksums each capability directory as it reads it. A capability whose bytes moved,
+  gained a file, lost one, or carries no attestation is named in `headline_withheld` rather than
+  dropped — dropping it would leave the capabilities that did verify looking like a complete sweep.
+  The requirement applies to manifest-pinned sweeps only: a smoke or `--report-only` reading is the
+  one use where unattested bytes are the point, and its headline is already withheld for coverage.
+- A run refuses to open any artifact in a directory holding files of unknown provenance, before
+  `makedirs` and well before either file is truncated. A run that discovers contamination after
+  spending tokens has already lost them; one that discovers it after truncating has destroyed the
+  evidence it was refusing. `--overwrite-unattested` releases this for disposable leftovers.
+- A `CONTAMINATED` file in a run directory or any directory above it disqualifies everything
+  beneath it, and is **not** overridable — a root is marked precisely because its contents must not
+  be reused, and an override would make that a suggestion. `.sora/runs/react-contaminated-do-not-use/`
+  is the root this exists for. A marker is a file rather than a hardcoded path so a contaminated
+  root found later needs no code change to be refused.
+
 **Operating point.** The sweep runs `gpt-5.4-high-paper`. Charge coefficients are keyed by model
 (`gpt-5.4-2026-03-05`) and therefore shared with `gpt-5.4-medium-prompt`; sharing coefficients does
 **not** make a result obtained at `medium` a validation of `high`. Range and drift audits must be run

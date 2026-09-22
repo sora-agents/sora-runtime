@@ -91,8 +91,11 @@ from typing import Any
 
 from examples.gaia2.evaluation.core import (
     LEGACY_CLOCK_MODE,
+    canonical_json,
     resolve_clock_mode,
     resolve_max_wall_seconds,
+    sha256_file,
+    sha256_text,
 )
 from examples.gaia2.llm_calls import LLMCallWriter
 
@@ -104,6 +107,20 @@ _DEFAULT_PROFILES = "examples/gaia2/evaluation/profiles.json"
 # agent as the baseline. The arm names match the `arm` field on every per-call row in
 # llm_calls.jsonl, which is what joins a sweep's records to its cost.
 _ARMS = ("sora", "react")
+
+# Artifact attestation, written into a capability directory once its last file is closed. The
+# checksum file is coreutils format so a reviewer can verify a preserved run with `shasum -c`
+# without this repository; the JSON beside it carries the same list plus the provenance the rows
+# themselves declare, which is what lets a compact report cite bytes rather than a path.
+ARTIFACT_CHECKSUMS = "SHA256SUMS"
+ARTIFACT_ATTESTATION = "artifacts.json"
+
+# Dropped into any directory whose artifacts must never be reused or reported. Checked from the
+# capability directory upward, so marking one run root disqualifies everything beneath it. A
+# marker is deliberately a file rather than a hardcoded path: the root that motivated this one
+# (a react sweep contaminated by a shared output directory) is outside the repository, and a
+# contaminated root discovered later needs no code change to be refused.
+CONTAMINATION_MARKER = "CONTAMINATED"
 
 # Stands in for a missing prompt-snapshot digest on the arm that is supposed to record one, so the
 # absence travels through the same mixing check as a real digest instead of being filtered away.
@@ -791,6 +808,161 @@ def _pass_at_1(records: list[dict[str, Any]]) -> tuple[float | None, int, int]:
     return sum(scores) / len(scores), len(scores), total
 
 
+def _artifact_paths(config_dir: Path) -> list[Path]:
+    """Every artifact in a capability directory, in a stable order.
+
+    The attestation pair excludes itself: a checksum file cannot cover its own bytes, and listing
+    the JSON would make the pair unverifiable the moment either is rewritten."""
+    return sorted(
+        path
+        for path in config_dir.rglob("*")
+        if path.is_file() and path.name not in {ARTIFACT_CHECKSUMS, ARTIFACT_ATTESTATION}
+    )
+
+
+def _artifact_checksums(config_dir: Path) -> list[dict[str, str]]:
+    return [
+        {"path": path.relative_to(config_dir).as_posix(), "sha256": sha256_file(path)}
+        for path in _artifact_paths(config_dir)
+    ]
+
+
+def _record_provenance(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the rows in this directory say produced them.
+
+    This is the half of the attestation that ties bytes to an experiment. The checksums prove the
+    files have not moved since the run closed them; these fields say which scenario selection,
+    prompt suite, charge model and clock the run declared, so a report can cite a checksummed
+    directory instead of trusting a path. Absences are carried as nulls rather than dropped — a
+    run that recorded no provenance must not read as one that recorded agreement."""
+
+    def distinct(field: str) -> list[Any]:
+        return sorted(
+            {row.get("metadata", {}).get(field) for row in records},
+            key=lambda value: (value is not None, str(value)),
+        )
+
+    return {
+        "record_count": len(records),
+        "scenario_manifest_digests": distinct("scenario_manifest_digest"),
+        "prompt_snapshot_digests": distinct("prompt_snapshot_digest"),
+        "charge_model_digests": distinct("charge_model_digest"),
+        "clock_modes": distinct("clock_mode"),
+    }
+
+
+def write_artifact_attestation(
+    config_dir: str, *, arm: str, capability: str, records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Checksum a finished capability directory and record what produced it.
+
+    Called after the last artifact is closed, never before: a manifest written mid-sweep would
+    attest bytes that are still being appended to, and would be wrong for every file written after
+    the one it was taken at."""
+    directory = Path(config_dir)
+    files = _artifact_checksums(directory)
+    attestation = {
+        "arm": arm,
+        "capability": capability,
+        # A digest over the ordered (path, sha256) list, so one value names the whole directory.
+        # Canonical over parsed content rather than the rendered file, for the same reason the
+        # scenario manifest is: reformatting the JSON must not change what the run is.
+        "artifact_set_sha256": sha256_text(canonical_json(files)),
+        "file_count": len(files),
+        "files": files,
+        "records": _record_provenance(records),
+    }
+    (directory / ARTIFACT_CHECKSUMS).write_text(
+        "".join(f"{entry['sha256']}  ./{entry['path']}\n" for entry in files), encoding="utf-8"
+    )
+    (directory / ARTIFACT_ATTESTATION).write_text(canonical_json(attestation), encoding="utf-8")
+    return attestation
+
+
+def verify_artifact_attestation(config_dir: str) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+    """Re-checksum a directory against its stored attestation.
+
+    Returns the attestation (when it parsed) and the reasons it is not trustworthy, empty when the
+    directory is byte-for-byte what the run closed. Reasons are returned rather than raised so a
+    report can name an unverifiable capability beside the ones that verified, instead of becoming
+    unreadable at the first bad directory."""
+    directory = Path(config_dir)
+    path = directory / ARTIFACT_ATTESTATION
+    if not path.is_file():
+        return None, (f"{directory.name}: no {ARTIFACT_ATTESTATION}",)
+    try:
+        attestation = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, (f"{directory.name}: unreadable {ARTIFACT_ATTESTATION} ({exc})",)
+    if not isinstance(attestation, dict) or not isinstance(attestation.get("files"), list):
+        return None, (f"{directory.name}: malformed {ARTIFACT_ATTESTATION}",)
+
+    reasons: list[str] = []
+    stored = {str(entry.get("path")): str(entry.get("sha256")) for entry in attestation["files"]}
+    observed = {entry["path"]: entry["sha256"] for entry in _artifact_checksums(directory)}
+    for name in sorted(set(stored) - set(observed)):
+        reasons.append(f"{directory.name}: attested file missing: {name}")
+    for name in sorted(set(observed) - set(stored)):
+        reasons.append(f"{directory.name}: unattested file present: {name}")
+    for name in sorted(set(stored) & set(observed)):
+        if stored[name] != observed[name]:
+            reasons.append(f"{directory.name}: {name} changed since it was attested")
+    # Checked separately from the per-file comparison above: a rewritten `files` list that is
+    # internally consistent with the directory still fails here, because the one-value digest was
+    # taken over the list the run itself wrote.
+    if not reasons and attestation.get("artifact_set_sha256") != sha256_text(
+        canonical_json(attestation["files"])
+    ):
+        reasons.append(f"{directory.name}: artifact set digest does not cover its own file list")
+    return attestation, tuple(reasons)
+
+
+def _contamination_marker(config_dir: str) -> Path | None:
+    """The nearest CONTAMINATED marker at or above a capability directory, if any."""
+    directory = Path(config_dir).resolve()
+    for candidate in (directory, *directory.parents):
+        marker = candidate / CONTAMINATION_MARKER
+        if marker.is_file():
+            return marker
+    return None
+
+
+def refuse_contaminated_root(config_dir: str, *, allow_unattested: bool = False) -> None:
+    """Fail closed before a paid run opens any artifact in this directory.
+
+    Two separate refusals. A contamination marker disqualifies a root outright and is never
+    overridable — the whole point of marking one is that its contents must not be reused, and an
+    override flag would make that a suggestion. Unattested leftovers are a weaker signal (a
+    previous abort, a hand edit, a run from before attestation existed) and are overridable,
+    because refusing them permanently would leave a directory unusable with no way back."""
+    marker = _contamination_marker(config_dir)
+    if marker is not None:
+        first_line = ""
+        try:
+            first_line = marker.read_text(encoding="utf-8").strip().splitlines()[0]
+        except (OSError, IndexError):
+            pass
+        raise SystemExit(
+            f"refusing to write into a contaminated root: {marker}"
+            + (f" — {first_line}" if first_line else "")
+        )
+    if not Path(config_dir).is_dir() or not _artifact_paths(Path(config_dir)):
+        return
+    attestation, reasons = verify_artifact_attestation(config_dir)
+    if not reasons:
+        digest = str((attestation or {}).get("artifact_set_sha256", ""))[:12]
+        print(f"replacing attested artifacts in {config_dir} (artifact set {digest})")
+        return
+    if allow_unattested:
+        print(f"overwriting unattested artifacts in {config_dir}: {'; '.join(reasons)}")
+        return
+    raise SystemExit(
+        f"refusing to overwrite artifacts of unknown provenance in {config_dir}: "
+        + "; ".join(reasons)
+        + " — move them aside, or pass --overwrite-unattested if they are disposable"
+    )
+
+
 def aggregate(
     output_dir: str,
     manifest: SweepManifest | None = None,
@@ -812,6 +984,13 @@ def aggregate(
             if not os.path.isfile(path):
                 continue
             rows = _read_jsonl(path)
+            # Verified here rather than at write time a second time: this is the only place that
+            # reads a preserved directory back, so it is the only place that can notice the bytes
+            # moved after the run closed them. A capability that fails is named, not dropped —
+            # dropping it would leave the four that verified looking like a complete sweep.
+            attestation, attestation_reasons = verify_artifact_attestation(
+                os.path.join(standard, name)
+            )
             p, scored, total = _pass_at_1(rows)
             # Same rule as the per-record report: a row without a mode is a legacy row and is
             # named as one, so it participates in the mixing check instead of being filtered out
@@ -930,6 +1109,15 @@ def aggregate(
                 "cached_input_clamps": clamps,
                 "raw_cached_input_anomalies": anomalies,
                 "charge_accounting_mismatches": accounting_mismatches,
+                # The tie from a compact report back to checksummed bytes. `artifact_set_sha256`
+                # names the directory these rows were read out of; the reasons say why that name
+                # cannot be trusted, and are empty exactly when it can.
+                "artifact_set_sha256": (
+                    None
+                    if attestation_reasons
+                    else str((attestation or {}).get("artifact_set_sha256"))
+                ),
+                "artifact_attestation_reasons": list(attestation_reasons),
                 "clock_modes": clock_modes,
                 "mixed_clock_modes": mixed_clock_modes,
                 "scenario_manifest_digests": manifest_digests,
@@ -1054,6 +1242,25 @@ def _headline_withheld(
             + ", ".join(digest[:12] for digest in declared_prompt_digests)
         )
 
+    # Gated on a pinned sweep rather than applied everywhere: a manifest-less sweep is already
+    # withheld below for coverage, and requiring attestation of every smoke and report-only
+    # directory would refuse the one use where unattested bytes are the point. A sweep that *is*
+    # pinned is the one whose directory may later be cited as a preserved result, so its bytes
+    # must still be the bytes the run closed.
+    if manifest is not None:
+        unattested = sorted(
+            name
+            for name in _CORE_CAPABILITIES
+            if name in configs and configs[name].get("artifact_attestation_reasons")
+        )
+        if unattested:
+            detail = "; ".join(
+                reason
+                for name in unattested
+                for reason in configs[name]["artifact_attestation_reasons"]
+            )
+            reasons.append(f"capability artifacts not attested as written: {detail}")
+
     digests = _promoted_values(configs, "scenario_manifest_digests")
     if len(digests) > 1:
         reasons.append(
@@ -1170,6 +1377,12 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
 
         args.prompt_snapshot_digest = live_prompts_digest()
     config_dir = os.path.join(_arm_root(args.output_dir, args.arm), "standard", args.capability)
+    # Before os.makedirs, and well before either artifact is opened in truncate mode: a run that
+    # discovers its destination is contaminated after spending tokens has already lost the tokens,
+    # and a run that discovers it after truncating has destroyed the evidence it was refusing.
+    refuse_contaminated_root(
+        config_dir, allow_unattested=getattr(args, "overwrite_unattested", False)
+    )
     os.makedirs(config_dir, exist_ok=True)
     print(f"arm: {args.arm}  ->  {config_dir}")
 
@@ -1269,6 +1482,16 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
                     f"{rec['metadata']['status']} score={rec['score']}",
                     flush=True,
                 )
+    # Outside the `with`, so output.jsonl and llm_calls.jsonl are closed and flushed and the
+    # checksums cover their final bytes. An aborted sweep leaves the partial artifacts readable
+    # but unattested, which is the correct reading of them: they are not a preserved run.
+    attestation = write_artifact_attestation(
+        config_dir, arm=args.arm, capability=args.capability, records=records
+    )
+    print(
+        f"attested {attestation['file_count']} artifacts in {config_dir} "
+        f"(artifact set {attestation['artifact_set_sha256'][:12]})"
+    )
     return records
 
 
@@ -1539,6 +1762,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path(_DEFAULT_PROFILES),
         metavar="JSON",
         help=f"Profile definitions (default: {_DEFAULT_PROFILES}).",
+    )
+    parser.add_argument(
+        "--overwrite-unattested",
+        action="store_true",
+        help=(
+            "Overwrite artifacts that carry no valid attestation. Never overrides a CONTAMINATED "
+            "marker."
+        ),
     )
     parser.add_argument(
         "--output-dir",
