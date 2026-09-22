@@ -23,6 +23,7 @@ from examples.gaia2.evaluation.campaigns.prompt.snapshot import (
     load_campaign_configuration,
     load_prompt_snapshot,
     prompt_rows_digest,
+    verify_live_prompts,
 )
 from examples.gaia2.evaluation.campaigns.prompt.synthetic import (
     SyntheticInvocation,
@@ -723,6 +724,201 @@ def test_prompt_snapshot_loader_rejects_a_row_changed_without_a_new_identity(
         load_prompt_snapshot(path)
 
 
+def _doctored_snapshot(*, rows: int) -> dict[str, Any]:
+    """The control with ``rows`` prompt rows altered, and its digest recomputed to match.
+
+    Recomputing matters: without it the loader's own digest check fires first and nothing
+    downstream of it is ever reached."""
+    snapshot = json.loads(BASELINE_PROMPT_SNAPSHOT.read_text())
+    for row in snapshot["prompts"][:rows]:
+        row["system"] += " changed"
+    snapshot["prompts_digest"] = prompt_rows_digest(snapshot["prompts"])
+    return cast(dict[str, Any], snapshot)
+
+
+def test_verify_live_prompts_names_which_rows_moved() -> None:
+    control = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
+    assert verify_live_prompts(control) == control["prompts_digest"]
+
+    doctored = _doctored_snapshot(rows=2)
+    moved = [
+        f"{row['perception_profile']}/{row['semantic_label']}" for row in doctored["prompts"][:2]
+    ]
+    with pytest.raises(ValueError) as excinfo:
+        verify_live_prompts(doctored)
+    # Naming the rows is the point: a run that says only "prompts moved" sends the operator back
+    # to diffing 28 renderings by hand, which is exactly the state this snapshot replaced.
+    assert "2 of 28 rows moved" in str(excinfo.value)
+    for name in moved:
+        assert name in str(excinfo.value)
+
+
+def test_run_refuses_to_spend_when_the_runtime_prompts_left_the_declared_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    declared = tmp_path / "declared.json"
+    declared.write_text(json.dumps(_doctored_snapshot(rows=1)))
+    monkeypatch.setattr(
+        "examples.gaia2.evaluation.cli._offline_record",
+        lambda entry: pytest.fail("a prompt mismatch must be refused before anything runs"),
+    )
+    args = _parser().parse_args(
+        [
+            "prompt",
+            "run",
+            "--profile",
+            "gpt-5.4-medium-prompt",
+            "--suite",
+            "contract",
+            "--arm",
+            "baseline",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--price-sheet",
+            str(EVAL_ROOT / "price_sheets" / "2026-09-02.json"),
+            "--prompt-snapshot",
+            str(declared),
+            "--confirm-budget",
+            "180",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="no longer match snapshot"):
+        _run_command(args)
+
+
+def test_run_stamps_its_verified_prompt_snapshot_on_every_record(tmp_path: Path) -> None:
+    control = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
+    args = _parser().parse_args(
+        [
+            "prompt",
+            "run",
+            "--profile",
+            "gpt-5.4-medium-prompt",
+            "--suite",
+            "contract",
+            "--arm",
+            "baseline",
+            "--output-dir",
+            str(tmp_path),
+            "--price-sheet",
+            str(EVAL_ROOT / "price_sheets" / "2026-09-02.json"),
+            "--confirm-budget",
+            "180",
+        ]
+    )
+
+    assert _run_command(args) == 0
+    _, records = _checkpoint_records(tmp_path / "checkpoint.jsonl")
+    assert records
+    assert {record.prompt_snapshot_identity for record in records} == {control["identity"]}
+    assert {record.prompt_snapshot_digest for record in records} == {control["prompts_digest"]}
+
+
+def test_run_refuses_to_resume_a_checkpoint_written_under_other_prompts(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint.jsonl"
+    _append_checkpoint(
+        checkpoint,
+        "contract/prior",
+        EvaluationRecord.example(arm="baseline", suite="contract", case_id="prior", score=1.0),
+    )
+    args = _parser().parse_args(
+        [
+            "prompt",
+            "run",
+            "--profile",
+            "gpt-5.4-medium-prompt",
+            "--suite",
+            "contract",
+            "--arm",
+            "baseline",
+            "--output-dir",
+            str(tmp_path),
+            "--price-sheet",
+            str(EVAL_ROOT / "price_sheets" / "2026-09-02.json"),
+            "--confirm-budget",
+            "180",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="run under other prompts"):
+        _run_command(args)
+
+
+def test_report_names_each_arms_own_prompt_snapshot() -> None:
+    records = [
+        EvaluationRecord.example(arm="baseline", suite="development", case_id="a", score=0.0),
+        EvaluationRecord.example(arm="candidate", suite="development", case_id="a", score=1.0),
+    ]
+
+    report = build_report(records)
+    by_arm = report["provenance"]["prompt_snapshots_by_arm"]
+    assert [row["identity"] for row in by_arm["baseline"]] == ["example-control"]
+    assert [row["identity"] for row in by_arm["candidate"]] == ["example-candidate"]
+    assert report["aggregates"]["paired_comparison_withheld"] == ()
+    assert report["aggregates"]["mean_paired_score_delta"] == pytest.approx(1.0)
+
+
+def test_report_withholds_the_delta_when_an_arm_recorded_no_prompt_snapshot() -> None:
+    baseline = EvaluationRecord.example(arm="baseline", suite="development", case_id="a", score=0.0)
+    records = [
+        replace(baseline, prompt_snapshot_identity=None, prompt_snapshot_digest=None),
+        EvaluationRecord.example(arm="candidate", suite="development", case_id="a", score=1.0),
+    ]
+
+    aggregates = build_report(records)["aggregates"]
+    assert aggregates["paired_comparison_withheld"] == (
+        "baseline arm has rows that recorded no prompt snapshot",
+    )
+    assert aggregates["mean_paired_score_delta"] is None
+    assert aggregates["paired_delta_bootstrap_95_interval"] is None
+    # The rows themselves stay readable — withholding the result must not also remove the evidence
+    # an operator needs to work out why it was withheld.
+    assert aggregates["exploratory_mean_paired_score_delta"] == pytest.approx(1.0)
+    assert len(aggregates["paired_deltas"]) == 1
+
+
+def test_report_withholds_the_delta_when_one_arm_mixes_prompt_snapshots() -> None:
+    records = [
+        EvaluationRecord.example(arm="baseline", suite="development", case_id="a", score=0.0),
+        EvaluationRecord.example(arm="candidate", suite="development", case_id="a", score=1.0),
+        replace(
+            EvaluationRecord.example(arm="candidate", suite="development", case_id="b", score=1.0),
+            prompt_snapshot_identity="example-candidate-v2",
+            prompt_snapshot_digest="c" * 64,
+        ),
+    ]
+
+    withheld = build_report(records)["aggregates"]["paired_comparison_withheld"]
+    assert len(withheld) == 1
+    assert withheld[0].startswith("candidate arm mixes prompt snapshots: ")
+    assert "example-candidate" in withheld[0] and "example-candidate-v2" in withheld[0]
+
+
+def test_acceptance_expansion_is_not_evaluable_when_the_prompts_are_unknown() -> None:
+    records: list[EvaluationRecord] = []
+    for case in range(5):
+        for arm, score in (("baseline", 0.0), ("candidate", 1.0)):
+            record = EvaluationRecord(
+                arm=cast(Any, arm),
+                profile="primary",
+                suite="acceptance",
+                capability="search",
+                case_id=f"case-{case}",
+                repeat=0,
+                score=score,
+                passed=bool(score),
+                prompt_snapshot_identity=None if arm == "baseline" else "candidate",
+                prompt_snapshot_digest=None if arm == "baseline" else "b" * 64,
+            )
+            records.append(record)
+
+    expansion = build_report(records)["aggregates"]["acceptance_expansion"]
+    assert expansion["by_profile"]["primary"]["status"] == "not_evaluable"
+    assert expansion["required"] is False
+
+
 def test_prompt_profiles_exhaust_perception_channel_boolean_space() -> None:
     channel_fields = tuple(field.name for field in fields(PerceptionChannels))
     all_channels = {
@@ -1063,6 +1259,8 @@ def test_acceptance_expansion_uses_five_scenario_clusters_not_fifteen_repeats() 
                     repeat=repeat,
                     score=baseline,
                     passed=bool(baseline),
+                    prompt_snapshot_identity="control",
+                    prompt_snapshot_digest="a" * 64,
                 )
             )
             records.append(
@@ -1075,6 +1273,8 @@ def test_acceptance_expansion_uses_five_scenario_clusters_not_fifteen_repeats() 
                     repeat=repeat,
                     score=candidate,
                     passed=bool(candidate),
+                    prompt_snapshot_identity="candidate",
+                    prompt_snapshot_digest="b" * 64,
                 )
             )
 
@@ -1098,6 +1298,8 @@ def test_acceptance_expansion_is_computed_for_each_complete_profile() -> None:
                         repeat=0,
                         score=score,
                         passed=bool(score),
+                        prompt_snapshot_identity=arm,
+                        prompt_snapshot_digest=("a" if arm == "baseline" else "b") * 64,
                     )
                 )
 
@@ -1653,6 +1855,7 @@ def test_completed_checkpoint_resume_needs_no_removed_provider_credential(
 ) -> None:
     profile_name = "gpt-5.4-medium-prompt"
     judge_profile = load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
+    control = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
     manifests = load_manifests(PROMPT_ROOT / "manifests")
     matrix = build_run_matrix(
         RunSelection(
@@ -1678,6 +1881,8 @@ def test_completed_checkpoint_resume_needs_no_removed_provider_credential(
                 score=1.0,
                 passed=True,
                 judge_profile=judge_profile,
+                prompt_snapshot_identity=control["identity"],
+                prompt_snapshot_digest=control["prompts_digest"],
             ),
         )
     monkeypatch.setattr(

@@ -1241,6 +1241,14 @@ class EvaluationRecord:
     charged_seconds: float = 0.0
     charge_model_identity: dict[str, Any] | None = None
     charge_model_digest: str | None = None
+    # Which prompt snapshot this row's agent actually ran, verified against the live renderer
+    # before the run spent anything. Recorded per record rather than once per report because the
+    # comparison this campaign exists to make is between two arms that deliberately run *different*
+    # prompts: a single report-level snapshot can only describe one of them, and silently described
+    # both. A row without these is a row whose prompts are unknown, which is why the paired deltas
+    # are withheld rather than computed when one is missing.
+    prompt_snapshot_identity: str | None = None
+    prompt_snapshot_digest: str | None = None
     cached_input_clamps: int = 0
     raw_cached_input_anomalies: int = 0
     charge_accounting_consistent: bool | None = None
@@ -1276,9 +1284,19 @@ class EvaluationRecord:
         prompt: str | None = None,
         oracle: str | None = None,
         trajectory: dict[str, Any] | None = None,
+        prompt_snapshot_identity: str | None = None,
     ) -> EvaluationRecord:
+        # A real run stamps every row with the snapshot it verified, and a row without one now
+        # withholds the paired comparison. Defaulting the two arms to *different* snapshots is what
+        # a prompt campaign actually looks like, so a fixture built from this helper exercises the
+        # comparable case rather than the degenerate one; a test about the gate names its own.
+        identity = prompt_snapshot_identity or (
+            "example-control" if arm == "baseline" else "example-candidate"
+        )
         return cls(
             arm=arm,
+            prompt_snapshot_identity=identity,
+            prompt_snapshot_digest=sha256_text(identity),
             profile="example",
             suite=suite,
             capability="search",
@@ -1314,6 +1332,8 @@ def record_from_dict(raw: dict[str, Any]) -> EvaluationRecord:
     row.setdefault("charged_seconds", 0.0)
     row.setdefault("charge_model_identity", None)
     row.setdefault("charge_model_digest", None)
+    row.setdefault("prompt_snapshot_identity", None)
+    row.setdefault("prompt_snapshot_digest", None)
     row.setdefault("cached_input_clamps", 0)
     row.setdefault("raw_cached_input_anomalies", 0)
     row.setdefault(

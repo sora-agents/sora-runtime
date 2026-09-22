@@ -221,6 +221,50 @@ def build_prompt_snapshot(
     }
 
 
+def live_prompts_digest() -> str:
+    """The digest of the prompts this process would send, rendered now and pinned to nothing.
+
+    For recording provenance on a run that declares no snapshot — a paper sweep, which is not
+    comparing prompt versions and has no control to verify against, but whose rows still have to
+    say which rendering produced them. Verification is a different question; see
+    :func:`verify_live_prompts`."""
+    return prompt_rows_digest(_prompt_rows())
+
+
+def verify_live_prompts(snapshot: dict[str, Any]) -> str:
+    """Refuse unless the running code renders exactly this snapshot's rows; return its digest.
+
+    Both halves are compared, and neither is redundant: the digest alone detects that something
+    moved but cannot say which of the 28 rows did, and the rows alone would not catch a digest that
+    was never recomputed from them. The mismatch message names the moved rows because the callers
+    are a preflight and a paid run — an operator reading either one needs the failing prompt, not
+    the fact of failure."""
+    rendered = build_prompt_snapshot(
+        identity=snapshot["identity"],
+        source_revision=snapshot["provenance"]["source_revision"],
+        reason=snapshot["provenance"]["reason"],
+        prompt_source_dirty_diff_sha256=snapshot["provenance"]["prompt_source_dirty_diff_sha256"],
+    )
+    if rendered["prompts"] != snapshot["prompts"]:
+        frozen_rows = {
+            (row["perception_profile"], row["semantic_label"]): row for row in snapshot["prompts"]
+        }
+        moved = sorted(
+            f"{row['perception_profile']}/{row['semantic_label']}"
+            for row in rendered["prompts"]
+            if frozen_rows.get((row["perception_profile"], row["semantic_label"])) != row
+        )
+        raise ValueError(
+            f"the runtime prompts no longer match snapshot {snapshot['identity']!r}; "
+            f"{len(moved)} of {len(rendered['prompts'])} rows moved: {', '.join(moved)}"
+        )
+    if rendered["prompts_digest"] != snapshot["prompts_digest"]:
+        raise ValueError(
+            f"the runtime prompt digest no longer matches snapshot {snapshot['identity']!r}"
+        )
+    return str(rendered["prompts_digest"])
+
+
 def build_campaign_configuration(*, root: Path) -> dict[str, Any]:
     profiles = load_profiles(root / "profiles.json")
     configuration: dict[str, Any] = {

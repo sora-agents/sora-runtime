@@ -26,6 +26,7 @@ from examples.gaia2.evaluation.campaigns.prompt.snapshot import (
     build_prompt_snapshot,
     load_campaign_configuration,
     load_prompt_snapshot,
+    verify_live_prompts,
 )
 from examples.gaia2.evaluation.core import (
     GAIA_SUITES,
@@ -217,16 +218,7 @@ def _check_command(args: argparse.Namespace) -> int:
         if not any(profile.endpoint_identity() in sheet.endpoints for sheet in sheets):
             raise ValueError(f"no dated price sheet covers profile endpoint {profile.name}")
     frozen = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
-    rendered = build_prompt_snapshot(
-        identity=frozen["identity"],
-        source_revision=frozen["provenance"]["source_revision"],
-        reason=frozen["provenance"]["reason"],
-        prompt_source_dirty_diff_sha256=frozen["provenance"]["prompt_source_dirty_diff_sha256"],
-    )
-    if rendered["prompts"] != frozen["prompts"]:
-        raise ValueError("the seven runtime prompts no longer match the frozen baseline")
-    if rendered["prompts_digest"] != frozen["prompts_digest"]:
-        raise ValueError("the runtime prompt digest no longer matches the frozen baseline")
+    verify_live_prompts(frozen)
     campaign_configuration = load_campaign_configuration(CAMPAIGN_CONFIGURATION)
     expected_configuration = build_campaign_configuration(root=EVAL_ROOT)
     if campaign_configuration != expected_configuration:
@@ -924,6 +916,14 @@ def _run_command(args: argparse.Namespace) -> int:
     if wrong_campaign:
         raise ValueError(f"profiles are not declared for prompt: {', '.join(wrong_campaign)}")
     manifests = load_manifests(PROMPT_ROOT / "manifests")
+    # Before any credential, provider, or scenario is touched: the prompts this process would send
+    # have to be the ones the declared snapshot recorded. A run that discovers a prompt edit only
+    # afterwards has already paid for rows nothing can retroactively attribute, and the edit is
+    # exactly what a prompt campaign spends money to measure — so this fails closed rather than
+    # recording what it found.
+    prompt_snapshot = load_prompt_snapshot(Path(args.prompt_snapshot))
+    prompt_snapshot_digest = verify_live_prompts(prompt_snapshot)
+    prompt_snapshot_identity = str(prompt_snapshot["identity"])
     sheet = PriceSheet.load(Path(args.price_sheet))
     charge_sheet = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
     for name in args.profile:
@@ -957,6 +957,23 @@ def _run_command(args: argparse.Namespace) -> int:
         raise ValueError(
             "checkpoint contains Gaia records without the pinned judge profile; use a separate "
             "output directory or remove those Gaia rows"
+        )
+    # Resuming into rows produced under other prompts would append this run's rows beside them and
+    # leave one checkpoint describing two prompt versions, which the report can then only withhold.
+    # Refused here instead, while it is still one directory choice rather than spent money.
+    foreign_prompt_digests = sorted(
+        {
+            record.prompt_snapshot_digest or "(none recorded)"
+            for record in records
+            if record.prompt_snapshot_digest != prompt_snapshot_digest
+        }
+    )
+    if foreign_prompt_digests:
+        raise ValueError(
+            f"checkpoint contains records run under other prompts "
+            f"({', '.join(digest[:12] for digest in foreign_prompt_digests)}); this run declares "
+            f"{prompt_snapshot_identity} ({prompt_snapshot_digest[:12]}) — use a separate output "
+            f"directory"
         )
     matrix = build_run_matrix(selection, policy, manifests, prior_records=records)
     projected_campaign_spend = matrix.prior_spend + matrix.total_reserve
@@ -1073,6 +1090,14 @@ def _run_command(args: argparse.Namespace) -> int:
                 source_revision=source_revision,
                 source_dirty_diff_sha256=source_dirty_diff_sha256,
             )
+        # Stamped here rather than threaded through the three record builders: the verified digest
+        # is a property of the whole run, identical on every row it produces, and a builder that
+        # takes it can be called without it.
+        record = replace(
+            record,
+            prompt_snapshot_identity=prompt_snapshot_identity,
+            prompt_snapshot_digest=prompt_snapshot_digest,
+        )
         _append_checkpoint(checkpoint, entry.key, record)
         records.append(record)
         completed.add(entry.key)
@@ -1194,6 +1219,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--arm", required=True, choices=["baseline", "candidate"])
     run.add_argument("--output-dir", required=True)
     run.add_argument("--price-sheet", required=True)
+    run.add_argument(
+        "--prompt-snapshot",
+        default=str(BASELINE_PROMPT_SNAPSHOT),
+        help=(
+            "the prompt snapshot this run declares; the live renderer must match it exactly "
+            "before anything is spent. Defaults to the pre-optimization control, which is what "
+            "a baseline arm runs; a candidate arm names its own snapshot."
+        ),
+    )
     run.add_argument("--confirm-budget", required=True, type=float)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--gaia-repeats", "--repeats", dest="repeats", type=int, default=1)

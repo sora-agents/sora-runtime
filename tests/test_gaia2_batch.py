@@ -1956,6 +1956,7 @@ def _capability(
     *,
     scenario_id: str | None = None,
     manifest_digest: str | None = None,
+    prompt_snapshot_digest: str | None = None,
 ) -> None:
     import os
 
@@ -1966,6 +1967,8 @@ def _capability(
         metadata["scenario_id"] = scenario_id
     if manifest_digest is not None:
         metadata["scenario_manifest_digest"] = manifest_digest
+    if prompt_snapshot_digest is not None:
+        metadata["prompt_snapshot_digest"] = prompt_snapshot_digest
     with open(os.path.join(d, "output.jsonl"), "w") as fh:
         fh.write(json.dumps({"score": score, "metadata": metadata}) + "\n")
 
@@ -2057,6 +2060,46 @@ def test_the_headline_is_withheld_when_capabilities_ran_different_scenario_selec
     summary = batch.aggregate(str(tmp_path), manifest=manifest)
     assert summary["overall"] is None
     assert any("different scenario manifests" in reason for reason in summary["headline_withheld"])
+
+
+def test_the_headline_is_withheld_when_capabilities_ran_different_prompt_snapshots(
+    tmp_path: Any,
+) -> None:
+    """A prompt rewrite between two capabilities of one sweep changes nothing else: same model,
+    same manifest, same clock. Without this gate the mean spans two agents and says so nowhere."""
+    manifest = _complete_sweep(tmp_path)
+    _capability(
+        tmp_path,
+        "time",
+        "generation_free",
+        1.0,
+        scenario_id="scenario-time",
+        manifest_digest=_SWEEP_DIGEST,
+        prompt_snapshot_digest="a" * 64,
+    )
+    _capability(
+        tmp_path,
+        "search",
+        "generation_free",
+        1.0,
+        scenario_id="scenario-search",
+        manifest_digest=_SWEEP_DIGEST,
+        prompt_snapshot_digest="b" * 64,
+    )
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["overall"] is None
+    assert any("different prompt snapshots" in reason for reason in summary["headline_withheld"]), (
+        summary["headline_withheld"]
+    )
+
+
+def test_the_headline_survives_an_arm_that_records_no_prompt_snapshot(tmp_path: Any) -> None:
+    """ARE's own ReAct agent does not read this runtime's prompts, so its rows carry no digest.
+    Requiring one would withhold every baseline-arm headline for a dependency the arm lacks."""
+    manifest = _complete_sweep(tmp_path)
+    summary = batch.aggregate(str(tmp_path), manifest=manifest)
+    assert summary["headline_withheld"] == ()
+    assert summary["overall"] == pytest.approx(1.0)
 
 
 def test_the_headline_is_withheld_when_a_pinned_scenario_never_scored(tmp_path: Any) -> None:

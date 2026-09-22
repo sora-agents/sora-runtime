@@ -574,6 +574,7 @@ def _jsonl_record(
     llm_max_in_flight: int | None = None,
     llm_overlapped_round_trips: int | None = None,
     scenario_manifest_digest: str | None = None,
+    prompt_snapshot_digest: str | None = None,
 ) -> dict[str, Any]:
     """One ``output.jsonl`` line, matching ARE's ``_export_benchmark_result_jsonl`` exactly:
     ``task_id``/``trace_id``/``score`` at top level, and a ``metadata`` dict with all-None values
@@ -646,6 +647,11 @@ def _jsonl_record(
         "llm_max_in_flight": llm_max_in_flight,
         "llm_overlapped_round_trips": llm_overlapped_round_trips,
         "scenario_manifest_digest": scenario_manifest_digest,
+        # Which rendering of this runtime's prompts produced the trajectory above. The one
+        # field that separates two otherwise identical sweeps taken across a prompt rewrite,
+        # and the only place the distinction survives the run. None on the ReAct arm, which
+        # does not use them.
+        "prompt_snapshot_digest": prompt_snapshot_digest,
         # ARE's tool-call-count gate, recomputed offline (no judge model). Recorded only when it
         # FAILS: a failure is conclusive — the judge applies this gate before any per-event
         # matching — so it explains a zero that the rationale otherwise attributes to the
@@ -814,6 +820,15 @@ def aggregate(output_dir: str, manifest: SweepManifest | None = None) -> dict[st
             manifest_digests = sorted(
                 {str(digest) for digest in manifest_markers if digest is not None}
             )
+            # Only the S-ORA arm has these; ARE's own ReAct agent does not read this runtime's
+            # prompts, so its rows carry None and are not evidence of anything to compare.
+            prompt_snapshot_digests = sorted(
+                {
+                    str(row.get("metadata", {}).get("prompt_snapshot_digest"))
+                    for row in rows
+                    if row.get("metadata", {}).get("prompt_snapshot_digest") is not None
+                }
+            )
             clamps = sum(int(row.get("metadata", {}).get("cached_input_clamps", 0)) for row in rows)
             anomalies = sum(
                 int(row.get("metadata", {}).get("raw_cached_input_anomalies", 0)) for row in rows
@@ -904,6 +919,7 @@ def aggregate(output_dir: str, manifest: SweepManifest | None = None) -> dict[st
                 "mixed_clock_modes": mixed_clock_modes,
                 "scenario_manifest_digests": manifest_digests,
                 "mixed_scenario_manifests": mixed_scenario_manifests,
+                "prompt_snapshot_digests": prompt_snapshot_digests,
                 "inference_charge_policies": sorted(
                     {
                         str(row.get("metadata", {}).get("inference_charge_policy"))
@@ -1003,6 +1019,17 @@ def _headline_withheld(
     clock_modes = _promoted_values(configs, "clock_modes")
     if len(clock_modes) > 1:
         reasons.append(f"capabilities ran under different clock modes: {', '.join(clock_modes)}")
+
+    # A prompt edit between two capabilities of one sweep is invisible in every other field: same
+    # model, same manifest, same clock, different agent. Presence is deliberately not required —
+    # the ReAct arm records none and is not running these prompts — so this catches the mixture,
+    # which is the shape a mid-sweep rewrite actually takes.
+    prompt_digests = _promoted_values(configs, "prompt_snapshot_digests")
+    if len(prompt_digests) > 1:
+        reasons.append(
+            "capabilities ran under different prompt snapshots: "
+            + ", ".join(digest[:12] for digest in prompt_digests)
+        )
 
     digests = _promoted_values(configs, "scenario_manifest_digests")
     if len(digests) > 1:
@@ -1111,6 +1138,14 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
     sweep_manifest: SweepManifest | None = getattr(args, "sweep_manifest", None)
     if sweep_manifest is not None:
         _verify_counterpart_pairing(args, sweep_manifest)
+    # Rendered once per sweep, here rather than per scenario: it walks every prompt and perception
+    # channel, and cannot change while the process runs. The ReAct arm leaves it None — it runs
+    # ARE's own agent and never reads these prompts, so a digest on its rows would assert a
+    # dependency that does not exist.
+    if args.arm == "sora":
+        from examples.gaia2.evaluation.campaigns.prompt.snapshot import live_prompts_digest
+
+        args.prompt_snapshot_digest = live_prompts_digest()
     config_dir = os.path.join(_arm_root(args.output_dir, args.arm), "standard", args.capability)
     os.makedirs(config_dir, exist_ok=True)
     print(f"arm: {args.arm}  ->  {config_dir}")
@@ -1245,6 +1280,7 @@ def _run_one_scenario(
     # such identity and leaves both absent.
     charge_identity = profile_charge.identity if profile_charge is not None else None
     charge_digest = charge_model.digest if profile_charge is not None else None
+    prompt_digest: str | None = getattr(args, "prompt_snapshot_digest", None)
 
     try:
         if args.judge_model:
@@ -1327,6 +1363,7 @@ def _run_one_scenario(
             clock_mode=resolve_clock_mode(charge, getattr(args, "generation_free", False)),
             max_wall_seconds=args.max_wall_seconds,
             scenario_manifest_digest=getattr(getattr(args, "sweep_manifest", None), "digest", None),
+            prompt_snapshot_digest=prompt_digest,
         )
 
     trace_id: str | None = None
@@ -1387,6 +1424,7 @@ def _run_one_scenario(
         llm_max_in_flight=int(getattr(result, "llm_max_in_flight", 0)),
         llm_overlapped_round_trips=int(getattr(result, "llm_overlapped_round_trips", 0)),
         scenario_manifest_digest=getattr(getattr(args, "sweep_manifest", None), "digest", None),
+        prompt_snapshot_digest=prompt_digest,
     )
 
 

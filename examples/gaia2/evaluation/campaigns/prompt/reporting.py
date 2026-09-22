@@ -186,6 +186,61 @@ def _familiarity_gap(pairs: list[dict[str, Any]]) -> float | None:
     return familiar_loss - acceptance_loss
 
 
+def _prompt_snapshots_by_arm(
+    records: list[EvaluationRecord],
+) -> dict[str, list[dict[str, str | None]]]:
+    """The distinct prompt snapshots each arm's rows record, as observed rather than as declared.
+
+    Read off the records instead of taken from the report's inputs because the two arms of this
+    campaign run at different times, from different source revisions, under deliberately different
+    prompts. Anything the report is told once can only describe one arm, and describing both with
+    it is how a paired delta between two unknown prompt versions reads as a measurement."""
+    by_arm: dict[str, set[tuple[str | None, str | None]]] = {}
+    for record in records:
+        by_arm.setdefault(record.arm, set()).add(
+            (record.prompt_snapshot_identity, record.prompt_snapshot_digest)
+        )
+    return {
+        arm: [
+            {"identity": identity, "digest": digest}
+            for identity, digest in sorted(
+                observed, key=lambda pair: (pair[0] or "", pair[1] or "")
+            )
+        ]
+        for arm, observed in sorted(by_arm.items())
+    }
+
+
+def _paired_comparison_withheld(
+    snapshots_by_arm: dict[str, list[dict[str, str | None]]],
+) -> tuple[str, ...]:
+    """Every reason these arms cannot be subtracted from one another.
+
+    A prompt campaign's delta means "this prompt change moved the score by this much", which
+    requires each arm to have run one known prompt version throughout. Neither half is checkable
+    from the deltas themselves: rows with no snapshot look exactly like rows with the right one,
+    and an arm that changed prompts mid-run averages two versions into a single column.
+
+    Reasons rather than a bool, matching the headline gate: the operator needs to see which arm is
+    the problem, and a report that only says "withheld" sends them back to the raw rows."""
+    reasons: list[str] = []
+    for arm in ("baseline", "candidate"):
+        snapshots = snapshots_by_arm.get(arm)
+        # An arm that did not run produces no pairs at all, which is its own, already visible
+        # outcome. Naming it here would report a missing arm as a provenance failure.
+        if not snapshots:
+            continue
+        if any(snapshot["digest"] is None for snapshot in snapshots):
+            reasons.append(f"{arm} arm has rows that recorded no prompt snapshot")
+        declared = [snapshot for snapshot in snapshots if snapshot["digest"] is not None]
+        if len(declared) > 1:
+            named = ", ".join(
+                f"{snapshot['identity']} ({str(snapshot['digest'])[:12]})" for snapshot in declared
+            )
+            reasons.append(f"{arm} arm mixes prompt snapshots: {named}")
+    return tuple(reasons)
+
+
 def build_report(
     records: list[EvaluationRecord],
     *,
@@ -235,9 +290,12 @@ def build_report(
         for record in gaia_records
         if judge_profile is not None
     )
+    prompt_snapshots_by_arm = _prompt_snapshots_by_arm(records)
+    paired_comparison_withheld = _paired_comparison_withheld(prompt_snapshots_by_arm)
     run_pairs = _paired_runs(records)
     pairs = _cluster_pairs(run_pairs)
     deltas = [float(pair["score_delta"]) for pair in pairs if pair["score_delta"] is not None]
+    exploratory_mean_delta = sum(deltas) / len(deltas) if deltas else None
     hard_failure_count = sum(
         int(pair["new_safety_violations"] > 0 or pair["new_authorization_violations"] > 0)
         for pair in pairs
@@ -256,10 +314,17 @@ def build_report(
         profile_pairs = [
             pair for pair in pairs if pair["suite"] == "acceptance" and pair["profile"] == profile
         ]
-        complete = len(profile_pairs) == 5 and all(
-            isinstance(pair["baseline_score"], int | float)
-            and isinstance(pair["candidate_score"], int | float)
-            for pair in profile_pairs
+        # The expansion rule subtracts the two arms exactly as the headline delta does, so it is
+        # unsound under the same conditions. Without this it would keep returning a verdict — and
+        # "expansion not required" is the expensive direction to get wrong.
+        complete = (
+            not paired_comparison_withheld
+            and len(profile_pairs) == 5
+            and all(
+                isinstance(pair["baseline_score"], int | float)
+                and isinstance(pair["candidate_score"], int | float)
+                for pair in profile_pairs
+            )
         )
         if not complete:
             by_profile[profile] = {
@@ -336,7 +401,11 @@ def build_report(
             "harness_dirty_diff_sha256": harness_dirty_diff_sha256,
             "source_revision": source_revision,
             "source_dirty_diff_sha256": source_dirty_diff_sha256,
+            # The control this report was generated against — one snapshot, and deliberately not
+            # a claim about what either arm ran. What the arms actually ran is below, read off
+            # their own rows.
             "prompt_snapshot": prompt_snapshot,
+            "prompt_snapshots_by_arm": prompt_snapshots_by_arm,
             "manifest_digests": manifest_digests or {},
             "selected_profiles": selected_profiles or [],
             "judge_profile": judge_profile,
@@ -376,8 +445,20 @@ def build_report(
             "pass_at_1": _pass_at_1(records),
             "paired_run_deltas": run_pairs,
             "paired_deltas": pairs,
-            "mean_paired_score_delta": sum(deltas) / len(deltas) if deltas else None,
-            "paired_delta_bootstrap_95_interval": _bootstrap_interval(deltas),
+            # The campaign's result, or nothing. The per-pair rows above stay readable either way
+            # — they are what an operator needs to diagnose a withheld comparison — but the two
+            # numbers anyone would quote are unavailable rather than approximate when the arms
+            # cannot say which prompts produced them.
+            "mean_paired_score_delta": None
+            if paired_comparison_withheld
+            else exploratory_mean_delta,
+            "paired_delta_bootstrap_95_interval": (
+                None if paired_comparison_withheld else _bootstrap_interval(deltas)
+            ),
+            # The same mean, named for what it is, so a run in progress stays readable. Never
+            # promote this into a result.
+            "exploratory_mean_paired_score_delta": exploratory_mean_delta,
+            "paired_comparison_withheld": paired_comparison_withheld,
             "familiarity_gap": _familiarity_gap(pairs),
             "hard_failure_count": hard_failure_count,
             "budget_usage": {

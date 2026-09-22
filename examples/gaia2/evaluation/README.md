@@ -223,6 +223,12 @@ does not alter scoring, reveal acceptance details in the final report, or bypass
 The pinned judge is attached automatically; the optional `--judge-model`, `--judge-provider`, and
 `--judge-endpoint` arguments are assertions and are rejected if they differ from the pin.
 
+Before any credential or provider is touched, the live renderer is checked against `--prompt-snapshot`
+(the control by default; a candidate arm names its own). A mismatch names the rows that moved and
+refuses the run, and the verified identity and digest are stamped on every record written — which is
+what lets the report tell the two arms apart. Resuming a checkpoint written under other prompts is
+refused for the same reason: use a separate output directory.
+
 The checkpoint is append-only. Re-running the identical command skips completed matrix entries, so
 an interruption between cases resumes safely. A Gaia attempt ending in a timeout, context overflow,
 infrastructure error, LLM-call limit, or unscored completion is checkpointed but remains pending for

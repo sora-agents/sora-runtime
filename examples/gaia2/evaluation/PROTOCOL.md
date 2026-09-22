@@ -216,9 +216,27 @@ Frozen artifacts, verified 2026-09-21:
 | [`charge_model.json`](charge_model.json) | `9065b1dc6bda1aa832b64867b0c0c68885930f7c74bb08b6c48ad140dcbca585` | raw bytes |
 | [`campaigns/prompt/snapshots/pre-optimization-control.json`](campaigns/prompt/snapshots/pre-optimization-control.json) | `56c1cd60b049c73d12f258e03e59b31d3b00ca24cff31f647de38a5038276129` | canonical rendered prompt rows |
 
-The manifest digest is canonical over parsed JSON, so formatting does not change experiment
-identity; the two raw hashes guard their complete files byte for byte. The charge-model identity and
-its semantic digest are also written into every charged or frozen-profile wall-clock result.
+The manifest digest is canonical over parsed JSON, so reformatting does not change experiment
+identity — renaming does, because the name is part of the canonical content. The two raw hashes
+guard their complete files byte for byte. The charge-model identity and its semantic digest are also
+written into every charged or frozen-profile wall-clock result.
+
+**Prompt provenance is per record, not per report.** The two arms of a prompt comparison run
+different prompts by construction, so a single report-level snapshot can only ever describe one of
+them. Instead:
+
+- A run declares a snapshot (`--prompt-snapshot`, defaulting to the control above), and the live
+  renderer is checked against all 28 of its rows *before* any credential, provider, or scenario is
+  opened. A mismatch names the rows that moved and refuses the run.
+- The verified identity and digest are stamped on every record the run writes, and resuming a
+  checkpoint written under other prompts is refused.
+- Reports read those digests back off the rows. An arm with no digest, or an arm that mixes
+  digests, withholds `mean_paired_score_delta`, its bootstrap interval, and the acceptance-expansion
+  verdict, naming the reason in `paired_comparison_withheld`; the per-pair rows and an
+  `exploratory_mean_paired_score_delta` remain for diagnosis.
+- Paper sweeps declare no snapshot — they are not comparing prompt versions — but the S-ORA arm
+  still records the digest it rendered, and the headline is withheld when capabilities within one
+  sweep disagree about it. The ReAct arm records none, because it does not use these prompts.
 
 **Operating point.** The sweep runs `gpt-5.4-high-paper`. Charge coefficients are keyed by model
 (`gpt-5.4-2026-03-05`) and therefore shared with `gpt-5.4-medium-prompt`; sharing coefficients does
@@ -280,6 +298,7 @@ A result is comparable only with results produced on the same side of every line
 | 2026-09-16 | Gaia timing moved from provider wall latency to the frozen token-charged clock. Timing-gated results before and after are not comparable, though the semantic prompts were unchanged. |
 | 2026-09-19 | Commit `65876fc` showed the revalidation judge the armed conditions — a behavioural change that required re-freezing the then-combined `baseline.json`. A sweep run after it is not the same experiment as one before. |
 | 2026-09-21 | `generation_free` adopted as the primary convention; `token_charged` demoted to a blocked sensitivity arm. Timing-gated results are not comparable across conventions. |
+| 2026-09-22 | The scenario manifest was renamed `aamas2027-` to `paper2027-`, moving its canonical digest from `123b92db…` to `cc6ebb08…`. The dataset, revision, split, and every scenario ID are byte-identical, so no result is invalidated — but the digest is the identity key each row records and each paired-arm audit compares, so a row carrying the old one does not pair with a row carrying the new one. No paid rows exist under `123b92db…`. |
 
 The former combined `baseline.json` was also re-cut on 2026-09-21 to add `paper2027` to
 `kimi-k2.5-prompt`'s campaign list. That change survives in the separate `campaign.json` mirror and
@@ -294,9 +313,10 @@ Named here so that a reader can see what this protocol does *not* yet fix:
   are not yet stated. They must be added here and committed before the locked-acceptance payloads
   are opened, which is what turns this document into a pre-registration.
 - **Judge model.** Selection and configuration are not frozen.
-- **Per-record prompt provenance.** Prompt content is now isolated in immutable named snapshots and
-  the campaign configuration has its own mutable mirror. Runs still need to verify their declared
-  snapshot before provider spend, record its digest, and make reports reject missing or mismatched
-  per-arm digests before any paired prompt comparison is paid for.
 - **The `gpt-5.4-high-paper` re-audit**, which removes the reasoning-effort confound from the failed
   charge gate.
+- **Freezing the campaign configuration.** Prompts have an immutable-snapshot mechanism;
+  `campaigns/prompt/campaign.json` is only a mirror of the live profile, judge, and charge files and
+  therefore records nothing historically. That is correct while the judge is still open, but
+  pre-registration needs the configuration pinned the same way — either a snapshot of it, or its
+  digest recorded here.
