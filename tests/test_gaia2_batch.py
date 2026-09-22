@@ -1351,7 +1351,7 @@ def test_scenario_manifest_supplies_pinned_revision_and_digest(
     )
     monkeypatch.setattr(
         "examples.gaia2.batch.aggregate",
-        lambda _path, manifest=None: {"configs": {}, "overall": None},
+        lambda _path, manifest=None, **_: {"configs": {}, "overall": None},
     )
     monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
     monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
@@ -1374,7 +1374,7 @@ def test_wall_clock_sora_still_derives_the_frozen_profile(monkeypatch: Any) -> N
     )
     monkeypatch.setattr(
         "examples.gaia2.batch.aggregate",
-        lambda _path, manifest=None: {"configs": {}, "overall": None},
+        lambda _path, manifest=None, **_: {"configs": {}, "overall": None},
     )
     monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
     monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
@@ -1409,7 +1409,7 @@ def test_allow_unfrozen_config_implies_wall_clock_without_profile_derivation(
     )
     monkeypatch.setattr(
         "examples.gaia2.batch.aggregate",
-        lambda _path, manifest=None: {"configs": {}, "overall": None},
+        lambda _path, manifest=None, **_: {"configs": {}, "overall": None},
     )
     monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
     monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
@@ -1442,7 +1442,7 @@ def test_charge_profile_overrides_automatic_sora_derivation(monkeypatch: Any) ->
     )
     monkeypatch.setattr(
         "examples.gaia2.batch.aggregate",
-        lambda _path, manifest=None: {"configs": {}, "overall": None},
+        lambda _path, manifest=None, **_: {"configs": {}, "overall": None},
     )
     monkeypatch.setattr("examples.gaia2.batch._print_report", lambda _summary: None)
     monkeypatch.setattr("examples.gaia2._local_fs.ensure_local_fallback_fs", lambda: None)
@@ -1929,7 +1929,7 @@ def test_generation_free_raises_the_watchdog_default_and_announces_it(
     under that arithmetic while every ReAct one stays under it, so leaving the cap alone would
     truncate one arm and not the other. Raised explicitly and announced rather than changed
     globally in silence."""
-    monkeypatch.setattr(batch, "aggregate", lambda _root, manifest=None: {})
+    monkeypatch.setattr(batch, "aggregate", lambda _root, manifest=None, **_: {})
     monkeypatch.setattr(batch, "_print_report", lambda _report: None)
 
     batch.main(["--report-only", "out", "--generation-free"])
@@ -2100,6 +2100,42 @@ def test_the_headline_survives_an_arm_that_records_no_prompt_snapshot(tmp_path: 
     summary = batch.aggregate(str(tmp_path), manifest=manifest)
     assert summary["headline_withheld"] == ()
     assert summary["overall"] == pytest.approx(1.0)
+
+
+def test_the_headline_is_withheld_when_the_arm_that_reads_prompts_records_none(
+    tmp_path: Any,
+) -> None:
+    """A sweep that recorded no provenance anywhere is perfectly homogeneous, so the mixture check
+    passes it. It is also the weakest evidence of the two, and missing provenance is not evidence
+    of agreement — the same rule the manifest gate already applies."""
+    manifest = _complete_sweep(tmp_path)
+    summary = batch.aggregate(str(tmp_path), manifest=manifest, expects_prompt_provenance=True)
+    assert summary["overall"] is None
+    assert any(
+        "recorded no prompt snapshot" in reason for reason in summary["headline_withheld"]
+    ), summary["headline_withheld"]
+
+
+def test_the_headline_is_withheld_when_only_some_capabilities_record_prompts(
+    tmp_path: Any,
+) -> None:
+    """The partial case: one capability names its prompts and another does not. Filtering the
+    absences away left a single digest behind, which read as agreement."""
+    manifest = _complete_sweep(tmp_path)
+    _capability(
+        tmp_path,
+        "time",
+        "generation_free",
+        1.0,
+        scenario_id="scenario-time",
+        manifest_digest=_SWEEP_DIGEST,
+        prompt_snapshot_digest="a" * 64,
+    )
+    summary = batch.aggregate(str(tmp_path), manifest=manifest, expects_prompt_provenance=True)
+    assert summary["overall"] is None
+    assert any(
+        "recorded no prompt snapshot" in reason for reason in summary["headline_withheld"]
+    ), summary["headline_withheld"]
 
 
 def test_the_headline_is_withheld_when_a_pinned_scenario_never_scored(tmp_path: Any) -> None:

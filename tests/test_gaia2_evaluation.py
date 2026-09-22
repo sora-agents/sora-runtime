@@ -46,6 +46,7 @@ from examples.gaia2.evaluation.cli import (
     _write_prompt_snapshot,
 )
 from examples.gaia2.evaluation.core import (
+    EXAMPLE_PROMPT_SNAPSHOTS,
     BudgetPolicy,
     CallUsage,
     ChargeModelSheet,
@@ -70,6 +71,14 @@ from sora.memory import PerceptionChannels
 ROOT = Path(__file__).parents[1]
 EVAL_ROOT = ROOT / "examples" / "gaia2" / "evaluation"
 PROMPT_ROOT = EVAL_ROOT / "campaigns" / "prompt"
+
+# The declared snapshots for fixtures that construct records directly rather than through
+# `EvaluationRecord.example()`. Named for what they are, not for the arm that ran them — an arm
+# label is not evidence of a prompt version, which is the whole reason these are checked.
+_DECLARED_SNAPSHOTS = {
+    "baseline": {"identity": "control", "digest": "a" * 64},
+    "candidate": {"identity": "candidate", "digest": "b" * 64},
+}
 
 
 def test_a_profile_maps_onto_one_request_both_direct_callers_send() -> None:
@@ -852,12 +861,18 @@ def test_report_names_each_arms_own_prompt_snapshot() -> None:
         EvaluationRecord.example(arm="candidate", suite="development", case_id="a", score=1.0),
     ]
 
-    report = build_report(records)
+    report = build_report(records, expected_prompt_snapshots=EXAMPLE_PROMPT_SNAPSHOTS)
     by_arm = report["provenance"]["prompt_snapshots_by_arm"]
     assert [row["identity"] for row in by_arm["baseline"]] == ["example-control"]
     assert [row["identity"] for row in by_arm["candidate"]] == ["example-candidate"]
     assert report["aggregates"]["paired_comparison_withheld"] == ()
     assert report["aggregates"]["mean_paired_score_delta"] == pytest.approx(1.0)
+    # Declared and observed, and no third report-level snapshot beside them. One value cannot
+    # describe two arms that run different prompts by construction, and a null one would read as
+    # "unknown" rather than "not applicable" — so its absence here is the guard against it
+    # being reintroduced as a convenience.
+    assert "prompt_snapshot" not in report["provenance"]
+    assert report["provenance"]["expected_prompt_snapshots_by_arm"] == EXAMPLE_PROMPT_SNAPSHOTS
 
 
 def test_report_withholds_the_delta_when_an_arm_recorded_no_prompt_snapshot() -> None:
@@ -867,7 +882,9 @@ def test_report_withholds_the_delta_when_an_arm_recorded_no_prompt_snapshot() ->
         EvaluationRecord.example(arm="candidate", suite="development", case_id="a", score=1.0),
     ]
 
-    aggregates = build_report(records)["aggregates"]
+    aggregates = build_report(records, expected_prompt_snapshots=EXAMPLE_PROMPT_SNAPSHOTS)[
+        "aggregates"
+    ]
     assert aggregates["paired_comparison_withheld"] == (
         "baseline arm has rows that recorded no prompt snapshot",
     )
@@ -890,10 +907,70 @@ def test_report_withholds_the_delta_when_one_arm_mixes_prompt_snapshots() -> Non
         ),
     ]
 
-    withheld = build_report(records)["aggregates"]["paired_comparison_withheld"]
-    assert len(withheld) == 1
+    withheld = build_report(records, expected_prompt_snapshots=EXAMPLE_PROMPT_SNAPSHOTS)[
+        "aggregates"
+    ]["paired_comparison_withheld"]
     assert withheld[0].startswith("candidate arm mixes prompt snapshots: ")
     assert "example-candidate" in withheld[0] and "example-candidate-v2" in withheld[0]
+    # The mixture and the undeclared version are separate findings: one says the arm was not
+    # internally consistent, the other says which half of it was never declared. An operator
+    # shown only the first cannot tell which snapshot to trust.
+    assert withheld[1] == (
+        "candidate arm ran example-candidate-v2 (cccccccccccc) "
+        f"where example-candidate ({EXAMPLE_PROMPT_SNAPSHOTS['candidate']['digest'][:12]}) "
+        "was declared"
+    )
+    assert len(withheld) == 2
+
+
+def test_report_withholds_the_delta_when_an_arm_ran_a_snapshot_it_did_not_declare() -> None:
+    """The failure uniformity cannot see: both arms verified their prompts, both are internally
+    consistent, and one of them ran the wrong file. A candidate arm pointed at the control — one
+    mistyped path — subtracts to approximately zero and reads as "the rewrite changed nothing",
+    which is indistinguishable from the rewrite never having been run."""
+    records = [
+        EvaluationRecord.example(arm="baseline", suite="development", case_id="a", score=0.0),
+        EvaluationRecord.example(
+            arm="candidate",
+            suite="development",
+            case_id="a",
+            score=0.0,
+            prompt_snapshot_identity="example-control",
+        ),
+    ]
+
+    aggregates = build_report(
+        records,
+        expected_prompt_snapshots={
+            "baseline": EXAMPLE_PROMPT_SNAPSHOTS["baseline"],
+            "candidate": {"identity": "example-rewrite", "digest": "d" * 64},
+        },
+    )["aggregates"]
+    assert aggregates["paired_comparison_withheld"] == (
+        "candidate arm ran example-control "
+        f"({EXAMPLE_PROMPT_SNAPSHOTS['baseline']['digest'][:12]}) "
+        "where example-rewrite (dddddddddddd) was declared",
+    )
+    assert aggregates["mean_paired_score_delta"] is None
+
+
+def test_report_withholds_the_delta_when_no_snapshot_was_declared_for_an_arm() -> None:
+    """Rows carrying a digest prove only that *something* was verified at run time. Without the
+    snapshot the comparison was declared over, the report cannot say it was the right one."""
+    records = [
+        EvaluationRecord.example(arm="baseline", suite="development", case_id="a", score=0.0),
+        EvaluationRecord.example(arm="candidate", suite="development", case_id="a", score=1.0),
+    ]
+
+    aggregates = build_report(
+        records, expected_prompt_snapshots={"baseline": EXAMPLE_PROMPT_SNAPSHOTS["baseline"]}
+    )["aggregates"]
+    assert aggregates["paired_comparison_withheld"] == (
+        "candidate arm ran without a declared prompt snapshot to check against",
+    )
+    assert aggregates["mean_paired_score_delta"] is None
+    # Still diagnosable: withholding the result must not remove the evidence behind it.
+    assert aggregates["exploratory_mean_paired_score_delta"] == pytest.approx(1.0)
 
 
 def test_acceptance_expansion_is_not_evaluable_when_the_prompts_are_unknown() -> None:
@@ -1236,7 +1313,7 @@ def test_report_clusters_repeats_by_scenario_for_paired_statistics() -> None:
         ]
     )
 
-    report = build_report(records)
+    report = build_report(records, expected_prompt_snapshots=EXAMPLE_PROMPT_SNAPSHOTS)
     aggregates = report["aggregates"]
     assert len(aggregates["paired_run_deltas"]) == 4
     assert len(aggregates["paired_deltas"]) == 2
@@ -1278,7 +1355,9 @@ def test_acceptance_expansion_uses_five_scenario_clusters_not_fifteen_repeats() 
                 )
             )
 
-    expansion = build_report(records)["aggregates"]["acceptance_expansion"]
+    expansion = build_report(records, expected_prompt_snapshots=_DECLARED_SNAPSHOTS)["aggregates"][
+        "acceptance_expansion"
+    ]
     assert expansion["required"] is True
     assert "mixed paired outcomes" in expansion["reasons"]
 
@@ -1298,12 +1377,14 @@ def test_acceptance_expansion_is_computed_for_each_complete_profile() -> None:
                         repeat=0,
                         score=score,
                         passed=bool(score),
-                        prompt_snapshot_identity=arm,
+                        prompt_snapshot_identity=("control" if arm == "baseline" else "candidate"),
                         prompt_snapshot_digest=("a" if arm == "baseline" else "b") * 64,
                     )
                 )
 
-    expansion = build_report(records)["aggregates"]["acceptance_expansion"]
+    expansion = build_report(records, expected_prompt_snapshots=_DECLARED_SNAPSHOTS)["aggregates"][
+        "acceptance_expansion"
+    ]
     assert set(expansion["by_profile"]) == {"primary", "cross-family"}
     assert all(row["status"] != "not_evaluable" for row in expansion["by_profile"].values())
 
@@ -1322,6 +1403,8 @@ def test_acceptance_expansion_marks_an_incomplete_or_unscored_profile_not_evalua
                     repeat=0,
                     score=1.0,
                     passed=True,
+                    prompt_snapshot_identity="control",
+                    prompt_snapshot_digest="a" * 64,
                 ),
                 EvaluationRecord(
                     arm="candidate",
@@ -1332,11 +1415,18 @@ def test_acceptance_expansion_marks_an_incomplete_or_unscored_profile_not_evalua
                     repeat=0,
                     score=None if case == 4 else 1.0,
                     passed=None if case == 4 else True,
+                    prompt_snapshot_identity="candidate",
+                    prompt_snapshot_digest="b" * 64,
                 ),
             ]
         )
 
-    expansion = build_report(records)["aggregates"]["acceptance_expansion"]
+    # Declared snapshots, so the only thing left that can make this profile unevaluable is the
+    # unscored case. Without them the provenance gate reaches "not_evaluable" first and this test
+    # passes whatever the completeness logic does.
+    expansion = build_report(records, expected_prompt_snapshots=_DECLARED_SNAPSHOTS)["aggregates"][
+        "acceptance_expansion"
+    ]
     assert expansion["by_profile"]["incomplete"]["status"] == "not_evaluable"
 
 

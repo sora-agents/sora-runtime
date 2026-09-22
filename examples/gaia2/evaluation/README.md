@@ -299,6 +299,31 @@ Do not pass `--include-acceptance-details` for a normal baseline report. That fl
 report-time redaction of acceptance prompts, oracles, and trajectories already present in input
 records; it neither unlocks nor reruns acceptance cases.
 
+For a **paired** report — one comparing a candidate prompt suite against the baseline — name both
+arms' snapshots:
+
+```console
+uv run python -m examples.gaia2.evaluation prompt report \
+  --input "$PROMPT_PAIRED_OUT/checkpoint.jsonl" \
+  --output "$PROMPT_PAIRED_OUT/report.json" \
+  --price-sheet "$PROMPT_PRICE_SHEET" \
+  --baseline-snapshot campaigns/prompt/snapshots/pre-optimization-control.json \
+  --candidate-snapshot campaigns/prompt/snapshots/<candidate>.json
+```
+
+`--baseline-snapshot` defaults to the control, so a single-arm baseline report needs neither flag.
+`--candidate-snapshot` has **no default and cannot acquire one**: it is frozen per campaign, and a
+default would be the report guessing which prompts the candidate arm ran — the exact assumption the
+check exists to refuse. Omit it and the paired delta, its bootstrap interval, and the acceptance
+expansion are withheld, with the reason named in `paired_comparison_withheld`; the per-pair rows and
+an exploratory delta stay readable for diagnosis.
+
+Each path is resolved through the snapshot loader, which refuses a file whose rows no longer hash to
+its recorded digest, and every arm's records are then checked against the identity *and* digest
+declared for that arm. Two arms accidentally pointed at the same file are each internally
+consistent and subtract to roughly zero — which reads as "the rewrite changed nothing" — so
+agreement with a declared snapshot is checked rather than mere uniformity across rows.
+
 ### 6. Archive the frozen baseline
 
 Archive these outputs and inputs together:

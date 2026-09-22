@@ -256,8 +256,19 @@ def _check_command(args: argparse.Namespace) -> int:
     missing, available = _check_scenario_availability(Path(args.scenario_root), manifests)
     if missing and args.require_scenarios:
         raise FileNotFoundError("missing ignored scenarios: " + ", ".join(missing))
-    # Exercise report serialization and its schema without any scenario/model content.
-    report = build_report([], prompt_snapshot=frozen, judge_profile=judge_profile.to_dict())
+    # Exercise report serialization and its schema without any scenario/model content. The
+    # frozen snapshot is passed in the shape a real report declares, so this check covers the
+    # same field a paired report is read through rather than a parallel one kept alive for it.
+    report = build_report(
+        [],
+        expected_prompt_snapshots={
+            "baseline": {
+                "identity": str(frozen["identity"]),
+                "digest": str(frozen["prompts_digest"]),
+            }
+        },
+        judge_profile=judge_profile.to_dict(),
+    )
     json.loads(canonical_json(report))
     print(
         f"check passed: {len(profiles)} profiles, {len(manifests)} Gaia manifests, "
@@ -1156,19 +1167,45 @@ def _report_diff_exclusions(inputs: list[str], output: str) -> set[Path]:
     return {*(Path(raw_path).resolve().parent for raw_path in inputs), Path(output).resolve()}
 
 
+def _expected_prompt_snapshots(args: argparse.Namespace) -> dict[str, dict[str, str]]:
+    """Resolve each arm's declared snapshot file to the identity and digest its rows must carry.
+
+    Loading the file rather than trusting a digest passed on the command line: the loader already
+    refuses a snapshot whose rows no longer hash to its recorded digest, so resolving through it
+    means a mutated snapshot cannot certify the rows that were run against its earlier content.
+
+    An arm with no declared snapshot is simply absent from the mapping. The report withholds its
+    delta and names the arm — raising here instead would make a report unreadable in exactly the
+    situation where its per-pair rows are the thing needed for diagnosis."""
+    declared = {
+        "baseline": getattr(args, "baseline_snapshot", None),
+        "candidate": getattr(args, "candidate_snapshot", None),
+    }
+    expected: dict[str, dict[str, str]] = {}
+    for arm, path in declared.items():
+        if not path:
+            continue
+        snapshot = load_prompt_snapshot(Path(path))
+        expected[arm] = {
+            "identity": str(snapshot["identity"]),
+            "digest": str(snapshot["prompts_digest"]),
+        }
+    return expected
+
+
 def _report_command(args: argparse.Namespace) -> int:
     records = _read_records(args.input)
     profiles = load_profiles(EVAL_ROOT / "profiles.json")
     judge_profile = load_judge_profile(PROMPT_ROOT / "judge.json")
     manifests = load_manifests(PROMPT_ROOT / "manifests")
     sheet = PriceSheet.load(Path(args.price_sheet)) if args.price_sheet else None
-    snapshot = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
+    expected_prompt_snapshots = _expected_prompt_snapshots(args)
     selected_names = sorted({record.profile for record in records if record.profile in profiles})
     dirty_diff_sha256 = _dirty_diff_hash(excluded=_report_diff_exclusions(args.input, args.output))
     report = build_report(
         records,
         detailed_acceptance=args.include_acceptance_details,
-        prompt_snapshot=snapshot,
+        expected_prompt_snapshots=expected_prompt_snapshots,
         source_revision=_source_revision(),
         source_dirty_diff_sha256=dirty_diff_sha256,
         price_sheet_date=sheet.effective_date if sheet else None,
@@ -1270,6 +1307,19 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--input", action="append", required=True)
     report.add_argument("--output", required=True)
     report.add_argument("--price-sheet")
+    # Which snapshot each arm is claimed to have run. Checked against what the rows actually
+    # recorded; an arm whose expectation is absent or unmet has its paired delta withheld, because
+    # two arms can each be internally consistent and still have run the same prompts.
+    report.add_argument(
+        "--baseline-snapshot",
+        default=str(BASELINE_PROMPT_SNAPSHOT),
+        help="prompt snapshot the baseline arm was run against",
+    )
+    report.add_argument(
+        "--candidate-snapshot",
+        help="prompt snapshot the candidate arm was run against (no default: it is frozen per "
+        "campaign, and guessing it is the failure this check exists to catch)",
+    )
     report.add_argument("--include-acceptance-details", action="store_true")
     report.add_argument("--safety-sensitive", action="store_true")
     report.add_argument("--reduces-tool-catalog", action="store_true")

@@ -216,10 +216,20 @@ Frozen artifacts, verified 2026-09-21:
 | [`charge_model.json`](charge_model.json) | `9065b1dc6bda1aa832b64867b0c0c68885930f7c74bb08b6c48ad140dcbca585` | raw bytes |
 | [`campaigns/prompt/snapshots/pre-optimization-control.json`](campaigns/prompt/snapshots/pre-optimization-control.json) | `56c1cd60b049c73d12f258e03e59b31d3b00ca24cff31f647de38a5038276129` | canonical rendered prompt rows |
 
-The manifest digest is canonical over parsed JSON, so reformatting does not change experiment
-identity — renaming does, because the name is part of the canonical content. The two raw hashes
-guard their complete files byte for byte. The charge-model identity and its semantic digest are also
-written into every charged or frozen-profile wall-clock result.
+Each of the three is a different kind of hash, and the difference is what each one is able to
+promise:
+
+- The **manifest** digest is canonical over parsed JSON, so reformatting does not change experiment
+  identity — renaming does, because the name is part of the canonical content.
+- The **charge model** digest is over the complete file, byte for byte. It is the only one here that
+  guards a whole file.
+- The **prompt snapshot** digest covers the 28 rendered prompt rows and nothing else — not the
+  provenance block beside them, and not the file. It answers "did the runtime render these
+  prompts", which is the question a run needs answered before it spends; it does not detect an
+  edit elsewhere in the snapshot file.
+
+The charge-model identity and its semantic digest are also written into every charged or
+frozen-profile wall-clock result.
 
 **Prompt provenance is per record, not per report.** The two arms of a prompt comparison run
 different prompts by construction, so a single report-level snapshot can only ever describe one of

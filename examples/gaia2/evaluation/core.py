@@ -1189,6 +1189,16 @@ def resolve_max_wall_seconds(given: float | None, generation_free: bool) -> floa
     return GENERATION_FREE_MAX_WALL_SECONDS if generation_free else DEFAULT_MAX_WALL_SECONDS
 
 
+# What `EvaluationRecord.example()` stamps on each arm, in the shape a report expects to be told
+# an arm was declared to run. Lives beside the helper that produces it so the two cannot drift: a
+# fixture whose declared and recorded snapshots disagree withholds every paired delta, which would
+# read as a broken gate rather than a stale constant.
+EXAMPLE_PROMPT_SNAPSHOTS = {
+    "baseline": {"identity": "example-control", "digest": sha256_text("example-control")},
+    "candidate": {"identity": "example-candidate", "digest": sha256_text("example-candidate")},
+}
+
+
 @dataclass(frozen=True)
 class EvaluationRecord:
     arm: Arm

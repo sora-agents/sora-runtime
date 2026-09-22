@@ -105,6 +105,11 @@ _DEFAULT_PROFILES = "examples/gaia2/evaluation/profiles.json"
 # llm_calls.jsonl, which is what joins a sweep's records to its cost.
 _ARMS = ("sora", "react")
 
+# Stands in for a missing prompt-snapshot digest on the arm that is supposed to record one, so the
+# absence travels through the same mixing check as a real digest instead of being filtered away.
+# Deliberately not a hash-shaped string: it must never compare equal to a snapshot that exists.
+UNRECORDED_PROMPT_SNAPSHOT = "unrecorded"
+
 # The five capabilities Gaia2's headline (equal-weight) score averages over. A run may target any
 # dataset config (incl. `mini`); the report weights only these five when they're present.
 _CORE_CAPABILITIES = ("execution", "search", "adaptability", "time", "ambiguity")
@@ -786,7 +791,12 @@ def _pass_at_1(records: list[dict[str, Any]]) -> tuple[float | None, int, int]:
     return sum(scores) / len(scores), len(scores), total
 
 
-def aggregate(output_dir: str, manifest: SweepManifest | None = None) -> dict[str, Any]:
+def aggregate(
+    output_dir: str,
+    manifest: SweepManifest | None = None,
+    *,
+    expects_prompt_provenance: bool = False,
+) -> dict[str, Any]:
     """Read every ``{output_dir}/standard/{config}/output.jsonl`` and summarize.
 
     ``overall`` is Gaia2's headline metric — the equal-weight mean of pass@1 across the five core
@@ -821,12 +831,17 @@ def aggregate(output_dir: str, manifest: SweepManifest | None = None) -> dict[st
                 {str(digest) for digest in manifest_markers if digest is not None}
             )
             # Only the S-ORA arm has these; ARE's own ReAct agent does not read this runtime's
-            # prompts, so its rows carry None and are not evidence of anything to compare.
+            # prompts, so its rows carry None and are not evidence of anything to compare. On the
+            # arm that does read them, an absent digest is named rather than filtered out — the
+            # same rule as the clock mode above, and for the same reason: dropping the Nones made
+            # a sweep that recorded no provenance at all look exactly like a homogeneous one, so
+            # the mixture check silently passed on the absence it exists to catch.
             prompt_snapshot_digests = sorted(
                 {
-                    str(row.get("metadata", {}).get("prompt_snapshot_digest"))
+                    str(digest) if digest is not None else UNRECORDED_PROMPT_SNAPSHOT
                     for row in rows
-                    if row.get("metadata", {}).get("prompt_snapshot_digest") is not None
+                    if (digest := row.get("metadata", {}).get("prompt_snapshot_digest")) is not None
+                    or expects_prompt_provenance
                 }
             )
             clamps = sum(int(row.get("metadata", {}).get("cached_input_clamps", 0)) for row in rows)
@@ -1021,14 +1036,22 @@ def _headline_withheld(
         reasons.append(f"capabilities ran under different clock modes: {', '.join(clock_modes)}")
 
     # A prompt edit between two capabilities of one sweep is invisible in every other field: same
-    # model, same manifest, same clock, different agent. Presence is deliberately not required —
-    # the ReAct arm records none and is not running these prompts — so this catches the mixture,
-    # which is the shape a mid-sweep rewrite actually takes.
+    # model, same manifest, same clock, different agent. Two distinct failures, not one: a mixture
+    # is a mid-sweep rewrite, while the sentinel means rows that were supposed to name their
+    # prompts did not. The second needs its own arm because a sweep that recorded nothing anywhere
+    # is perfectly homogeneous, and so passes a mixture check while being the weaker evidence of
+    # the two. Absence only reaches here on the arm that reads these prompts; the ReAct arm
+    # records none by design and its digests never enter this set.
     prompt_digests = _promoted_values(configs, "prompt_snapshot_digests")
-    if len(prompt_digests) > 1:
+    if UNRECORDED_PROMPT_SNAPSHOT in prompt_digests:
+        reasons.append("capabilities scored rows that recorded no prompt snapshot")
+    declared_prompt_digests = [
+        digest for digest in prompt_digests if digest != UNRECORDED_PROMPT_SNAPSHOT
+    ]
+    if len(declared_prompt_digests) > 1:
         reasons.append(
             "capabilities ran under different prompt snapshots: "
-            + ", ".join(digest[:12] for digest in prompt_digests)
+            + ", ".join(digest[:12] for digest in declared_prompt_digests)
         )
 
     digests = _promoted_values(configs, "scenario_manifest_digests")
@@ -1639,6 +1662,7 @@ def main(argv: list[str] | None = None) -> None:
                 manifest=(
                     _load_sweep_manifest(args.scenario_manifest) if args.scenario_manifest else None
                 ),
+                expects_prompt_provenance=args.arm == "sora",
             )
         )
         return
@@ -1781,6 +1805,7 @@ def main(argv: list[str] | None = None) -> None:
         aggregate(
             _arm_root(args.output_dir, args.arm),
             manifest=getattr(args, "sweep_manifest", None),
+            expects_prompt_provenance=args.arm == "sora",
         )
     )
 

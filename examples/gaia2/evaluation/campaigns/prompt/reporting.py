@@ -213,13 +213,23 @@ def _prompt_snapshots_by_arm(
 
 def _paired_comparison_withheld(
     snapshots_by_arm: dict[str, list[dict[str, str | None]]],
+    expected_prompt_snapshots: dict[str, dict[str, str]] | None,
 ) -> tuple[str, ...]:
     """Every reason these arms cannot be subtracted from one another.
 
     A prompt campaign's delta means "this prompt change moved the score by this much", which
-    requires each arm to have run one known prompt version throughout. Neither half is checkable
-    from the deltas themselves: rows with no snapshot look exactly like rows with the right one,
-    and an arm that changed prompts mid-run averages two versions into a single column.
+    requires each arm to have run one known prompt version throughout, *and* that version to be
+    the one the comparison was declared over. None of that is checkable from the deltas
+    themselves: rows with no snapshot look exactly like rows with the right one, an arm that
+    changed prompts mid-run averages two versions into a single column, and an arm pointed at the
+    wrong snapshot file produces rows that are internally consistent, genuinely verified, and
+    answer a different question than the one being asked.
+
+    That last case is why observed uniformity is not sufficient. Running the candidate arm against
+    the control snapshot — one mistyped path — yields two arms that agree with themselves, agree
+    with each other, and subtract to approximately zero. Read as a measurement it says the rewrite
+    changed nothing, which is indistinguishable from the rewrite never having been run. So each
+    arm is matched against the snapshot it was *declared* to run, not merely against itself.
 
     Reasons rather than a bool, matching the headline gate: the operator needs to see which arm is
     the problem, and a report that only says "withheld" sends them back to the raw rows."""
@@ -238,6 +248,20 @@ def _paired_comparison_withheld(
                 f"{snapshot['identity']} ({str(snapshot['digest'])[:12]})" for snapshot in declared
             )
             reasons.append(f"{arm} arm mixes prompt snapshots: {named}")
+        expected = (expected_prompt_snapshots or {}).get(arm)
+        if expected is None:
+            reasons.append(f"{arm} arm ran without a declared prompt snapshot to check against")
+            continue
+        for snapshot in declared:
+            if (
+                snapshot["identity"] == expected["identity"]
+                and snapshot["digest"] == expected["digest"]
+            ):
+                continue
+            reasons.append(
+                f"{arm} arm ran {snapshot['identity']} ({str(snapshot['digest'])[:12]}) "
+                f"where {expected['identity']} ({expected['digest'][:12]}) was declared"
+            )
     return tuple(reasons)
 
 
@@ -245,7 +269,7 @@ def build_report(
     records: list[EvaluationRecord],
     *,
     detailed_acceptance: bool = False,
-    prompt_snapshot: dict[str, Any] | None = None,
+    expected_prompt_snapshots: dict[str, dict[str, str]] | None = None,
     source_revision: str | None = None,
     source_dirty_diff_sha256: str | None = None,
     price_sheet_date: str | None = None,
@@ -291,7 +315,9 @@ def build_report(
         if judge_profile is not None
     )
     prompt_snapshots_by_arm = _prompt_snapshots_by_arm(records)
-    paired_comparison_withheld = _paired_comparison_withheld(prompt_snapshots_by_arm)
+    paired_comparison_withheld = _paired_comparison_withheld(
+        prompt_snapshots_by_arm, expected_prompt_snapshots
+    )
     run_pairs = _paired_runs(records)
     pairs = _cluster_pairs(run_pairs)
     deltas = [float(pair["score_delta"]) for pair in pairs if pair["score_delta"] is not None]
@@ -401,10 +427,13 @@ def build_report(
             "harness_dirty_diff_sha256": harness_dirty_diff_sha256,
             "source_revision": source_revision,
             "source_dirty_diff_sha256": source_dirty_diff_sha256,
-            # The control this report was generated against — one snapshot, and deliberately not
-            # a claim about what either arm ran. What the arms actually ran is below, read off
-            # their own rows.
-            "prompt_snapshot": prompt_snapshot,
+            # Two keys, not one, because they answer two different questions: what each arm
+            # was *declared* to run, and what each arm's rows say it *did* run. Collapsing them
+            # is how a report states as fact something it only assumed. A third key once held a
+            # single report-level snapshot; it was removed rather than deprecated because a
+            # report-level value cannot describe two arms that run different prompts by
+            # construction, and a null one reads as "unknown" rather than "not applicable".
+            "expected_prompt_snapshots_by_arm": expected_prompt_snapshots or {},
             "prompt_snapshots_by_arm": prompt_snapshots_by_arm,
             "manifest_digests": manifest_digests or {},
             "selected_profiles": selected_profiles or [],
