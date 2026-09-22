@@ -10,6 +10,7 @@ from typing import Any
 from examples.gaia2.evaluation.core import (
     SCHEMA_VERSION,
     ChargeModelSheet,
+    canonical_json,
     load_judge_profile,
     load_profiles,
     sha256_text,
@@ -195,48 +196,52 @@ def _prompt_rows() -> list[dict[str, Any]]:
     return rows
 
 
-def build_prompt_snapshot(*, source_revision: str) -> dict[str, Any]:
+def prompt_rows_digest(rows: list[dict[str, Any]]) -> str:
+    return sha256_text(canonical_json(rows))
+
+
+def build_prompt_snapshot(
+    *,
+    identity: str,
+    source_revision: str,
+    reason: str,
+    prompt_source_dirty_diff_sha256: str | None = None,
+) -> dict[str, Any]:
+    rows = _prompt_rows()
     return {
         "schema_version": SCHEMA_VERSION,
+        "identity": identity,
         "provenance": {
             "source_revision": source_revision,
-            # The isolated baseline was captured before any prompt source changed. Task-owned
-            # harness or planning-document changes do not make the source prompt dirty.
-            "prompt_source_dirty_diff_sha256": None,
+            "prompt_source_dirty_diff_sha256": prompt_source_dirty_diff_sha256,
+            "reason": reason,
         },
-        "prompts": _prompt_rows(),
+        "prompts_digest": prompt_rows_digest(rows),
+        "prompts": rows,
     }
 
 
-def build_frozen_baseline(
-    *,
-    source_revision: str,
-    root: Path,
-    source_dirty_diff_sha256: str | None = None,
-) -> dict[str, Any]:
-    snapshot = build_prompt_snapshot(source_revision=source_revision)
-    snapshot["provenance"]["source_dirty_diff_sha256"] = source_dirty_diff_sha256
+def build_campaign_configuration(*, root: Path) -> dict[str, Any]:
     profiles = load_profiles(root / "profiles.json")
-    snapshot["pre_task_gaia_agent_settings"] = {
-        "config": "examples/gaia2/agent.yaml",
-        "client": "sora.adapters.anthropic_llm.AnthropicLLMClient",
-        "model": "claude-opus-4-8",
-        "max_output_tokens": 32000,
-        "thinking": "adaptive",
-        "instrument": True,
-        "request_profile_applied_per_semantic_call": False,
+    configuration: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "pre_task_gaia_agent_settings": {
+            "config": "examples/gaia2/agent.yaml",
+            "client": "sora.adapters.anthropic_llm.AnthropicLLMClient",
+            "model": "claude-opus-4-8",
+            "max_output_tokens": 32000,
+            "thinking": "adaptive",
+            "instrument": True,
+            "request_profile_applied_per_semantic_call": False,
+        },
+        "evaluation_profiles": [profiles[name].to_dict() for name in sorted(profiles)],
+        "judge_profile": load_judge_profile(root / "campaigns" / "prompt" / "judge.json").to_dict(),
     }
-    snapshot["evaluation_profiles"] = [profiles[name].to_dict() for name in sorted(profiles)]
-    snapshot["judge_profile"] = load_judge_profile(
-        root / "campaigns" / "prompt" / "judge.json"
-    ).to_dict()
-    # The charge model belongs under the same sha256 gate as the prompts, for the same reason:
-    # editing a coefficient silently invalidates comparison with every number recorded before the
-    # edit, and the failure is not visible in any result. A second, coefficient-specific tripwire
-    # would only be a second thing to forget. ``to_dict`` carries the file's own digest, so a
-    # change to any part of it — a note as much as a number — reddens the baseline test.
-    snapshot["charge_model"] = ChargeModelSheet.load(root / "charge_model.json").to_dict()
-    snapshot["notes"] = {
+    # Keep the live campaign mirror deep rather than reducing it to filenames. ``to_dict`` carries
+    # the charge file's semantic digest, so a coefficient or note cannot move without reddening the
+    # configuration check while the prompt-only control remains immutable.
+    configuration["charge_model"] = ChargeModelSheet.load(root / "charge_model.json").to_dict()
+    configuration["notes"] = {
         "campaigns": ["prompt", "paper2027"],
         "contains_live_model_output": False,
         "contains_gaia_payloads": False,
@@ -274,6 +279,14 @@ def build_frozen_baseline(
             "latency grid depends on, and neither is visible in what a provider declares"
         ),
         "kimi_reasoning": "OpenRouter unified reasoning enabled with provider pinned",
+        "kimi_campaign_membership": (
+            "2026-09-21 re-freeze: kimi-k2.5-prompt gained paper2027 alongside prompt. Campaign "
+            "membership only — no request parameter, operating point, prompt, judge or "
+            "charge-model figure changed, and the diff is the two campaign lists. The profile "
+            "was already named here as the campaign's cross_family_profile, so the omission was "
+            "provisioning, not a decision; the arm cannot run under a campaign it is not "
+            "provisioned for."
+        ),
         "transport": (
             "non-streamed on every profile, so stall_timeout is a total-duration cap rather than "
             "an inter-chunk silence bound. The latency grid reads the same profile field as both "
@@ -285,13 +298,52 @@ def build_frozen_baseline(
             "provider on both endpoints and both clients"
         ),
     }
-    return snapshot
+    return configuration
 
 
-def load_frozen_snapshot(path: Path) -> dict[str, Any]:
+def load_prompt_snapshot(path: Path) -> dict[str, Any]:
     raw = json.loads(path.read_text())
     if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"unsupported prompt snapshot schema in {path}")
+    if not isinstance(raw.get("identity"), str) or not raw["identity"]:
+        raise ValueError(f"prompt snapshot has no identity in {path}")
+    prompts = raw.get("prompts")
+    if not isinstance(prompts, list):
+        raise ValueError(f"prompt snapshot has no prompt rows in {path}")
+    expected_rows = {
+        (perception_profile, semantic_label)
+        for perception_profile, _ in PERCEPTION_PROFILES
+        for semantic_label in PROMPT_LABELS
+    }
+    actual_rows = {
+        (row.get("perception_profile"), row.get("semantic_label"))
+        for row in prompts
+        if isinstance(row, dict)
+    }
+    if len(prompts) != len(expected_rows) or actual_rows != expected_rows:
+        raise ValueError(f"prompt snapshot does not contain the canonical 28 rows in {path}")
+    if raw.get("prompts_digest") != prompt_rows_digest(prompts):
+        raise ValueError(f"prompt snapshot digest does not match its rows in {path}")
+    provenance = raw.get("provenance")
+    if (
+        not isinstance(provenance, dict)
+        or not isinstance(provenance.get("source_revision"), str)
+        or not provenance["source_revision"]
+        or not isinstance(provenance.get("reason"), str)
+        or not provenance["reason"]
+        or "prompt_source_dirty_diff_sha256" not in provenance
+    ):
+        raise ValueError(f"prompt snapshot has no creation reason in {path}")
+    dirty = provenance["prompt_source_dirty_diff_sha256"]
+    if dirty is not None and (not isinstance(dirty, str) or len(dirty) != 64):
+        raise ValueError(f"prompt snapshot has an invalid prompt-source diff digest in {path}")
+    return raw
+
+
+def load_campaign_configuration(path: Path) -> dict[str, Any]:
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"unsupported campaign configuration schema in {path}")
     return raw
 
 

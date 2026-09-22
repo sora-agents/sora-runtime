@@ -18,14 +18,19 @@ from examples.gaia2.evaluation.campaigns.prompt.reporting import build_report
 from examples.gaia2.evaluation.campaigns.prompt.snapshot import (
     PERCEPTION_PROFILES,
     PROMPT_LABELS,
+    build_campaign_configuration,
     build_prompt_snapshot,
-    load_frozen_snapshot,
+    load_campaign_configuration,
+    load_prompt_snapshot,
+    prompt_rows_digest,
 )
 from examples.gaia2.evaluation.campaigns.prompt.synthetic import (
     SyntheticInvocation,
     score_live_case,
 )
 from examples.gaia2.evaluation.cli import (
+    BASELINE_PROMPT_SNAPSHOT,
+    CAMPAIGN_CONFIGURATION,
     _append_checkpoint,
     _arm_live_judge_recording,
     _call_records_and_cost,
@@ -37,6 +42,7 @@ from examples.gaia2.evaluation.cli import (
     _read_records,
     _report_diff_exclusions,
     _run_command,
+    _write_prompt_snapshot,
 )
 from examples.gaia2.evaluation.core import (
     BudgetPolicy,
@@ -588,9 +594,17 @@ def test_the_exclusion_pathspec_is_repo_relative_and_only_built_when_needed(tmp_
     assert _exclude_pathspec(str(root), {(tmp_path / "elsewhere.json").resolve()}) == []
 
 
-def test_frozen_snapshot_has_all_perception_profiles_and_matches_runtime() -> None:
-    frozen = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
-    rendered = build_prompt_snapshot(source_revision=frozen["provenance"]["source_revision"])
+def test_named_baseline_snapshot_has_all_perception_profiles_and_matches_runtime() -> None:
+    # This names the control directly. Re-pointing a movable "current" alias cannot silently move
+    # the guard to a candidate snapshot after the prompt rewrite.
+    assert BASELINE_PROMPT_SNAPSHOT == PROMPT_ROOT / "snapshots" / "pre-optimization-control.json"
+    frozen = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
+    rendered = build_prompt_snapshot(
+        identity=frozen["identity"],
+        source_revision=frozen["provenance"]["source_revision"],
+        reason=frozen["provenance"]["reason"],
+        prompt_source_dirty_diff_sha256=frozen["provenance"]["prompt_source_dirty_diff_sha256"],
+    )
     profile_names = (
         "operations-only",
         "signals-only",
@@ -601,7 +615,29 @@ def test_frozen_snapshot_has_all_perception_profiles_and_matches_runtime() -> No
         (profile, label) for profile in profile_names for label in PROMPT_LABELS
     }
     assert rendered["prompts"] == frozen["prompts"]
-    assert {profile["name"] for profile in frozen["evaluation_profiles"]} == {
+    assert rendered["prompts_digest"] == frozen["prompts_digest"]
+    assert frozen["prompts_digest"] == prompt_rows_digest(frozen["prompts"])
+    assert frozen["identity"] == "pre-optimization-control"
+    assert frozen["provenance"] == {
+        "prompt_source_dirty_diff_sha256": None,
+        "reason": (
+            "Pre-optimization control captured after the byte-identical prompt source cleanup."
+        ),
+        "source_revision": "99ffea0fb37f1e95721c02b92dd2f0540a5c6ad7",
+    }
+    assert set(frozen) == {
+        "identity",
+        "prompts",
+        "prompts_digest",
+        "provenance",
+        "schema_version",
+    }
+
+
+def test_campaign_configuration_mirrors_mutable_inputs_without_entering_prompt_snapshot() -> None:
+    campaign = load_campaign_configuration(CAMPAIGN_CONFIGURATION)
+    assert campaign == build_campaign_configuration(root=EVAL_ROOT)
+    assert {profile["name"] for profile in campaign["evaluation_profiles"]} == {
         "gpt-5.4-medium-prompt",
         "gpt-5.4-high-paper",
         "kimi-k2.5-prompt",
@@ -610,14 +646,23 @@ def test_frozen_snapshot_has_all_perception_profiles_and_matches_runtime() -> No
     # under, so an edit to profiles.json that never reaches the baseline makes it misdescribe the
     # run rather than fail. Same depth as the judge_profile comparison below.
     evaluation_profiles = load_profiles(EVAL_ROOT / "profiles.json")
-    assert frozen["evaluation_profiles"] == [
+    assert campaign["evaluation_profiles"] == [
         evaluation_profiles[name].to_dict() for name in sorted(evaluation_profiles)
     ]
-    assert frozen["notes"]["campaigns"] == ["prompt", "paper2027"]
-    assert frozen["judge_profile"] == load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
+    assert campaign["notes"]["campaigns"] == ["prompt", "paper2027"]
+    assert campaign["judge_profile"] == load_judge_profile(PROMPT_ROOT / "judge.json").to_dict()
     assert (
-        frozen["charge_model"] == ChargeModelSheet.load(EVAL_ROOT / "charge_model.json").to_dict()
+        campaign["charge_model"] == ChargeModelSheet.load(EVAL_ROOT / "charge_model.json").to_dict()
     )
+    serialized = json.dumps(campaign).lower()
+    assert '"prompts"' not in serialized
+    assert "scenario_universe" not in serialized
+    assert '"oracle":' not in serialized
+    assert "sk-" not in serialized
+
+
+def test_prompt_snapshot_rows_are_complete_and_safe() -> None:
+    frozen = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
     for row in frozen["prompts"]:
         assert len(row["system_sha256"]) == len(row["user_sha256"]) == 64
         assert row["system"] and row["user"]
@@ -645,6 +690,37 @@ def test_frozen_snapshot_has_all_perception_profiles_and_matches_runtime() -> No
     assert "scenario_universe" not in serialized
     assert '"oracle":' not in serialized
     assert "sk-" not in serialized
+
+
+def test_prompt_snapshot_identity_is_immutable_and_matches_its_filename(tmp_path: Path) -> None:
+    snapshot = {
+        "schema_version": 1,
+        "identity": "control",
+        "provenance": {"source_revision": "abc", "reason": "control"},
+        "prompts_digest": "digest",
+        "prompts": [],
+    }
+    path = tmp_path / "control.json"
+    _write_prompt_snapshot(path, snapshot)
+    _write_prompt_snapshot(path, snapshot)
+
+    changed = snapshot | {"provenance": {"source_revision": "def", "reason": "replacement"}}
+    with pytest.raises(ValueError, match="already exists and is immutable"):
+        _write_prompt_snapshot(path, changed)
+    with pytest.raises(ValueError, match="filename must equal"):
+        _write_prompt_snapshot(tmp_path / "current.json", snapshot)
+
+
+def test_prompt_snapshot_loader_rejects_a_row_changed_without_a_new_identity(
+    tmp_path: Path,
+) -> None:
+    snapshot = json.loads(BASELINE_PROMPT_SNAPSHOT.read_text())
+    snapshot["prompts"][0]["system"] += " changed"
+    path = tmp_path / "pre-optimization-control.json"
+    path.write_text(json.dumps(snapshot))
+
+    with pytest.raises(ValueError, match="digest does not match"):
+        load_prompt_snapshot(path)
 
 
 def test_prompt_profiles_exhaust_perception_channel_boolean_space() -> None:

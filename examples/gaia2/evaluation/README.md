@@ -19,8 +19,8 @@ pre-registration — the acceptance parameters and the judge are still open, and
 The dated working notes behind it, including the gate report that records running the operational
 gates, stay untracked at `.sora/notes/benchmarks/gaia2/`. What the protocol pins is tracked here:
 the frozen artifacts themselves, including the exact
-[Gaia2 mini manifest](campaigns/paper2027/mini-validation.json), and the hashes
-`campaigns/prompt/baseline.json` holds them to.
+[Gaia2 mini manifest](campaigns/paper2027/mini-validation.json), the immutable prompt snapshots
+under `campaigns/prompt/snapshots/`, and the separately checked campaign configuration.
 
 ## The frozen charge coefficients are failing their audit
 
@@ -83,7 +83,9 @@ git rev-parse HEAD
 
 ```console
 uv run python -m examples.gaia2.evaluation prompt snapshot \
-  --output examples/gaia2/evaluation/campaigns/prompt/baseline.json
+  --identity pre-optimization-control \
+  --reason "Pre-optimization control captured after the byte-identical prompt source cleanup." \
+  --output examples/gaia2/evaluation/campaigns/prompt/snapshots/pre-optimization-control.json
 ```
 
 The snapshot records each of the seven semantic calls across all four perception profiles:
@@ -94,12 +96,17 @@ hashes, declared channels, and per-module character counts from `CompletionReque
 sensitivity control; the default `adaptive` fit removes instructions for channels that the
 environment does not declare.
 
-Review and commit `baseline.json` before making any candidate prompt change or starting the paid
-run. Capturing it from a clean source commit leaves unambiguous revision and dirty-state provenance;
-the subsequent artifact-only commit does not change the runtime prompts represented by the
-snapshot. The snapshot also freezes all evaluation profiles and settings, model identifiers, and
-the pinned judge configuration. The dated price sheet and manifest digests are recorded by the run
-report rather than embedded in the prompt snapshot.
+Review and commit the named snapshot before making any candidate prompt change or starting the paid
+run. Its filename must equal its identity, and the command refuses to overwrite that identity with
+different bytes. Capturing it from a clean prompt-source commit records that revision, a null prompt
+source dirty-diff hash, why the identity was created, and a canonical digest over all 28 rendered
+rows. The test names this file directly; there is no movable `current` pointer to re-point.
+
+Evaluation profiles, settings, judge, and charge coefficients have a different lifecycle. They are
+mirrored in `campaigns/prompt/campaign.json`, regenerated with `prompt configuration`, and checked
+deeply against `profiles.json`, `judge.json`, and `charge_model.json`. That file may move until the
+campaign itself is frozen without rewriting the immutable prompt control. The dated price sheet and
+manifest digests remain report provenance rather than prompt-snapshot content.
 
 ### 2. Run the offline preflight
 
@@ -292,7 +299,8 @@ Archive these outputs and inputs together:
 
 - `checkpoint.jsonl`, `report.json`, and the generated `configs/` directory;
 - the exact source commit ID and any recorded source dirty-diff hash;
-- `campaigns/prompt/baseline.json`, `profiles.json`, and `campaigns/prompt/judge.json`;
+- `campaigns/prompt/snapshots/pre-optimization-control.json`, `campaigns/prompt/campaign.json`,
+  `profiles.json`, and `campaigns/prompt/judge.json`;
 - `price_sheets/2026-09-12.json`;
 - all three prompt manifest files and their digests from `report.json`; and
 - the complete `artifacts/` tree, including every failed, retried, or orphan attempt directory.

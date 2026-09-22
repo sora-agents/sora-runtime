@@ -214,7 +214,7 @@ Frozen artifacts, verified 2026-09-21:
 |---|---|---|
 | [`campaigns/paper2027/mini-validation.json`](campaigns/paper2027/mini-validation.json) | `cc6ebb08d388cc0e4dee635c0a031493c280972c033ba0712577413757515e3b` | canonical (parsed JSON) |
 | [`charge_model.json`](charge_model.json) | `9065b1dc6bda1aa832b64867b0c0c68885930f7c74bb08b6c48ad140dcbca585` | raw bytes |
-| [`campaigns/prompt/baseline.json`](campaigns/prompt/baseline.json) | `7e8d8a7fd0985d6ffd139c07b96cc49585f38f9ac8d2022a45aec0d6412ac8e5` | raw bytes |
+| [`campaigns/prompt/snapshots/pre-optimization-control.json`](campaigns/prompt/snapshots/pre-optimization-control.json) | `56c1cd60b049c73d12f258e03e59b31d3b00ca24cff31f647de38a5038276129` | canonical rendered prompt rows |
 
 The manifest digest is canonical over parsed JSON, so formatting does not change experiment
 identity; the two raw hashes guard their complete files byte for byte. The charge-model identity and
@@ -278,14 +278,13 @@ A result is comparable only with results produced on the same side of every line
 |---|---|
 | 2026-09-12 | Default billing sheet moved from `2026-09-02.json` to `2026-09-12.json` when the Kimi endpoint was repinned from DeepInfra to Venice. Changes cost accounting, not the frozen timing coefficients. |
 | 2026-09-16 | Gaia timing moved from provider wall latency to the frozen token-charged clock. Timing-gated results before and after are not comparable, though the semantic prompts were unchanged. |
-| 2026-09-19 | Commit `65876fc` showed the revalidation judge the armed conditions — a behavioural change that required re-freezing `baseline.json`. A sweep run after it is not the same experiment as one before. |
+| 2026-09-19 | Commit `65876fc` showed the revalidation judge the armed conditions — a behavioural change that required re-freezing the then-combined `baseline.json`. A sweep run after it is not the same experiment as one before. |
 | 2026-09-21 | `generation_free` adopted as the primary convention; `token_charged` demoted to a blocked sensitivity arm. Timing-gated results are not comparable across conventions. |
 
-`baseline.json` was also re-cut on 2026-09-21 to add `paper2027` to `kimi-k2.5-prompt`'s campaign
-list. That re-freeze is campaign-membership metadata only — no request parameter, operating point,
-prompt, judge profile, or charge-model figure moved — and costs no comparability. It is recorded
-inside the artifact at `notes.kimi_campaign_membership`, because a re-freeze that explains itself
-only in a commit message defeats the gate.
+The former combined `baseline.json` was also re-cut on 2026-09-21 to add `paper2027` to
+`kimi-k2.5-prompt`'s campaign list. That change survives in the separate `campaign.json` mirror and
+is campaign-membership metadata only — no request parameter, operating point, prompt, judge profile,
+or charge-model figure moved — so it costs no comparability.
 
 ## 11. Still open
 
@@ -295,10 +294,9 @@ Named here so that a reader can see what this protocol does *not* yet fix:
   are not yet stated. They must be added here and committed before the locked-acceptance payloads
   are opened, which is what turns this document into a pre-registration.
 - **Judge model.** Selection and configuration are not frozen.
-- **Prompt provenance is a single global.** Reports load one prompt snapshot and stamp it onto a
-  report combining both arms, so a behavioural prompt edit would let a combined report assert that
-  the baseline arm ran under prompts it never ran under. Prompt-content snapshots must be split from
-  campaign configuration, and each record must carry its own `prompt_snapshot_digest`, before any
-  paired prompt comparison is paid for.
+- **Per-record prompt provenance.** Prompt content is now isolated in immutable named snapshots and
+  the campaign configuration has its own mutable mirror. Runs still need to verify their declared
+  snapshot before provider spend, record its digest, and make reports reject missing or mismatched
+  per-arm digests before any paired prompt comparison is paid for.
 - **The `gpt-5.4-high-paper` re-audit**, which removes the reasoning-effort confound from the failed
   charge gate.

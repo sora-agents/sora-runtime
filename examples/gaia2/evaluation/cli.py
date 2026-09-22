@@ -21,9 +21,11 @@ from examples.gaia2.evaluation.campaigns.prompt.neutral import (
 )
 from examples.gaia2.evaluation.campaigns.prompt.reporting import build_report
 from examples.gaia2.evaluation.campaigns.prompt.snapshot import (
-    build_frozen_baseline,
+    PROMPT_SOURCES,
+    build_campaign_configuration,
     build_prompt_snapshot,
-    load_frozen_snapshot,
+    load_campaign_configuration,
+    load_prompt_snapshot,
 )
 from examples.gaia2.evaluation.core import (
     GAIA_SUITES,
@@ -51,6 +53,8 @@ from examples.gaia2.evaluation.core import (
 
 EVAL_ROOT = Path(__file__).parent
 PROMPT_ROOT = EVAL_ROOT / "campaigns" / "prompt"
+BASELINE_PROMPT_SNAPSHOT = PROMPT_ROOT / "snapshots" / "pre-optimization-control.json"
+CAMPAIGN_CONFIGURATION = PROMPT_ROOT / "campaign.json"
 DEFAULT_SCENARIO_ROOT = Path("examples/gaia2/scenarios")
 DEFAULT_PRICE_SHEET = EVAL_ROOT / "price_sheets" / "2026-09-12.json"
 
@@ -125,20 +129,67 @@ def _dirty_diff_hash(*, excluded: set[Path] | None = None) -> str | None:
     return sha256_text(canonical_json({"tracked_diff": diff or "", "untracked": additions}))
 
 
+def _prompt_source_dirty_diff_hash() -> str | None:
+    source_paths = sorted(
+        {source[0] for source in PROMPT_SOURCES.values()} | {"src/sora/memory.py"}
+    )
+    root_raw = _git_output("rev-parse", "--show-toplevel")
+    at_root = ("-C", root_raw) if root_raw else ()
+    diff = _git_output(*at_root, "diff", "--binary", "HEAD", "--", *source_paths)
+    untracked_raw = _git_output(
+        *at_root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "--",
+        *source_paths,
+    )
+    additions: list[dict[str, str]] = []
+    if root_raw and untracked_raw:
+        root = Path(root_raw)
+        additions = [
+            {"path": relative, "sha256": sha256_file(root / relative)}
+            for relative in untracked_raw.splitlines()
+        ]
+    if not diff and not additions:
+        return None
+    return sha256_text(canonical_json({"tracked_diff": diff or "", "untracked": additions}))
+
+
 def _snapshot_command(args: argparse.Namespace) -> int:
     output = Path(args.output) if args.output else None
-    baseline = build_frozen_baseline(
+    snapshot = build_prompt_snapshot(
+        identity=args.identity,
         source_revision=_source_revision(),
-        root=EVAL_ROOT,
-        source_dirty_diff_sha256=_dirty_diff_hash(excluded={output} if output else None),
+        reason=args.reason,
+        prompt_source_dirty_diff_sha256=_prompt_source_dirty_diff_hash(),
     )
-    rendered = canonical_json(baseline)
     if args.output:
         assert output is not None
-        output.write_text(rendered)
+        _write_prompt_snapshot(output, snapshot)
         print(f"wrote prompt snapshot: {args.output}")
     else:
-        print(rendered, end="")
+        print(canonical_json(snapshot), end="")
+    return 0
+
+
+def _write_prompt_snapshot(output: Path, snapshot: dict[str, Any]) -> None:
+    identity = snapshot.get("identity")
+    if not isinstance(identity, str) or output.stem != identity:
+        raise ValueError("prompt snapshot filename must equal its immutable identity")
+    rendered = canonical_json(snapshot)
+    if output.exists() and output.read_text() != rendered:
+        raise ValueError(f"prompt snapshot identity {identity!r} already exists and is immutable")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(rendered)
+
+
+def _configuration_command(args: argparse.Namespace) -> int:
+    configuration = canonical_json(build_campaign_configuration(root=EVAL_ROOT))
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(configuration)
+    print(f"wrote campaign configuration: {output}")
     return 0
 
 
@@ -165,18 +216,29 @@ def _check_command(args: argparse.Namespace) -> int:
     for profile in profiles.values():
         if not any(profile.endpoint_identity() in sheet.endpoints for sheet in sheets):
             raise ValueError(f"no dated price sheet covers profile endpoint {profile.name}")
-    frozen = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
-    rendered = build_prompt_snapshot(source_revision=frozen["provenance"]["source_revision"])
+    frozen = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
+    rendered = build_prompt_snapshot(
+        identity=frozen["identity"],
+        source_revision=frozen["provenance"]["source_revision"],
+        reason=frozen["provenance"]["reason"],
+        prompt_source_dirty_diff_sha256=frozen["provenance"]["prompt_source_dirty_diff_sha256"],
+    )
     if rendered["prompts"] != frozen["prompts"]:
         raise ValueError("the seven runtime prompts no longer match the frozen baseline")
+    if rendered["prompts_digest"] != frozen["prompts_digest"]:
+        raise ValueError("the runtime prompt digest no longer matches the frozen baseline")
+    campaign_configuration = load_campaign_configuration(CAMPAIGN_CONFIGURATION)
+    expected_configuration = build_campaign_configuration(root=EVAL_ROOT)
+    if campaign_configuration != expected_configuration:
+        raise ValueError("campaign.json no longer mirrors the live campaign configuration")
     expected_profiles = [profiles[name].to_dict() for name in sorted(profiles)]
-    if frozen.get("evaluation_profiles") != expected_profiles:
-        raise ValueError("the frozen evaluation profiles no longer match profiles.json")
-    if frozen.get("judge_profile") != judge_profile.to_dict():
-        raise ValueError("the frozen judge profile no longer matches judge.json")
+    if campaign_configuration.get("evaluation_profiles") != expected_profiles:
+        raise ValueError("the campaign evaluation profiles no longer match profiles.json")
+    if campaign_configuration.get("judge_profile") != judge_profile.to_dict():
+        raise ValueError("the campaign judge profile no longer matches judge.json")
     charge_model = ChargeModelSheet.load(EVAL_ROOT / "charge_model.json")
-    if frozen.get("charge_model") != charge_model.to_dict():
-        raise ValueError("the frozen charge model no longer matches charge_model.json")
+    if campaign_configuration.get("charge_model") != charge_model.to_dict():
+        raise ValueError("the campaign charge model no longer matches charge_model.json")
     for profile in profiles.values():
         # Every profile a campaign can run has to be chargeable, or the arm silently falls back to
         # measured wall clock and stops being comparable with the arms that were charged.
@@ -1075,7 +1137,7 @@ def _report_command(args: argparse.Namespace) -> int:
     judge_profile = load_judge_profile(PROMPT_ROOT / "judge.json")
     manifests = load_manifests(PROMPT_ROOT / "manifests")
     sheet = PriceSheet.load(Path(args.price_sheet)) if args.price_sheet else None
-    snapshot = load_frozen_snapshot(PROMPT_ROOT / "baseline.json")
+    snapshot = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
     selected_names = sorted({record.profile for record in records if record.profile in profiles})
     dirty_diff_sha256 = _dirty_diff_hash(excluded=_report_diff_exclusions(args.input, args.output))
     report = build_report(
@@ -1109,7 +1171,14 @@ def _parser() -> argparse.ArgumentParser:
     commands = prompt.add_subparsers(dest="command", required=True)
     snapshot = commands.add_parser("snapshot", help="render the seven canonical prompt inputs")
     snapshot.add_argument("--output", help="write JSON here; omit to print to stdout")
+    snapshot.add_argument("--identity", required=True, help="immutable snapshot identity")
+    snapshot.add_argument("--reason", required=True, help="why this prompt identity was captured")
     snapshot.set_defaults(handler=_snapshot_command)
+    configuration = commands.add_parser(
+        "configuration", help="render the mutable campaign-configuration mirror"
+    )
+    configuration.add_argument("--output", default=str(CAMPAIGN_CONFIGURATION))
+    configuration.set_defaults(handler=_configuration_command)
     check = commands.add_parser("check", help="validate all tracked artifacts without network I/O")
     check.add_argument("--scenario-root", default=str(DEFAULT_SCENARIO_ROOT))
     check.add_argument("--require-scenarios", action="store_true")
