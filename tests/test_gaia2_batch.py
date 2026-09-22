@@ -45,6 +45,7 @@ from examples.gaia2.batch import (
     _verdict_parse,
     _verify_counterpart_pairing,
     aggregate,
+    archive_unattested_artifacts,
     main,
     refuse_contaminated_root,
     verify_artifact_attestation,
@@ -2008,7 +2009,7 @@ def _complete_sweep(tmp_path: Any, clock_mode: str = "generation_free") -> Sweep
             str(Path(tmp_path) / "standard" / name),
             arm="sora",
             capability=name,
-            records=[],
+            records=batch._read_jsonl(str(Path(tmp_path) / "standard" / name / "output.jsonl")),
         )
     return SweepManifest(
         name="test-mini",
@@ -2399,6 +2400,59 @@ def test_attestation_digest_covers_the_file_list_it_was_written_with(tmp_path: P
     )
 
 
+def test_attestation_digest_covers_identity_and_record_assertions(tmp_path: Path) -> None:
+    cfg_dir = _attested_capability(tmp_path, "time")
+    path = cfg_dir / ARTIFACT_ATTESTATION
+    attested = json.loads(path.read_text(encoding="utf-8"))
+    attested["arm"] = "react"
+    attested["capability"] = "search"
+    attested["records"] = {"forged": True}
+    path.write_text(json.dumps(attested), encoding="utf-8")
+
+    assert "attestation digest does not cover its own payload" in " ".join(
+        verify_artifact_attestation(str(cfg_dir))[1]
+    )
+
+
+def test_record_provenance_is_recomputed_from_the_checksummed_output(tmp_path: Path) -> None:
+    cfg_dir = _attested_capability(tmp_path, "time")
+    path = cfg_dir / ARTIFACT_ATTESTATION
+    attested = json.loads(path.read_text(encoding="utf-8"))
+    attested["records"] = {"forged": True}
+    attested["attestation_sha256"] = batch._attestation_digest(attested)
+    path.write_text(json.dumps(attested), encoding="utf-8")
+
+    assert "recorded provenance does not match checksummed output.jsonl" in " ".join(
+        verify_artifact_attestation(str(cfg_dir))[1]
+    )
+
+
+@pytest.mark.parametrize("replacement", [None, {}, {"path": "x"}, {"sha256": "0" * 64}])
+def test_malformed_attestation_entries_return_reasons_instead_of_raising(
+    tmp_path: Path, replacement: Any
+) -> None:
+    cfg_dir = _attested_capability(tmp_path, "time")
+    path = cfg_dir / ARTIFACT_ATTESTATION
+    attested = json.loads(path.read_text(encoding="utf-8"))
+    attested["files"] = [replacement]
+    path.write_text(json.dumps(attested), encoding="utf-8")
+
+    assert "malformed artifacts.json" in " ".join(verify_artifact_attestation(str(cfg_dir))[1])
+
+
+@pytest.mark.parametrize("change", ["delete", "corrupt"])
+def test_checksum_manifest_is_part_of_verification(tmp_path: Path, change: str) -> None:
+    cfg_dir = _attested_capability(tmp_path, "time")
+    path = cfg_dir / ARTIFACT_CHECKSUMS
+    if change == "delete":
+        path.unlink()
+    else:
+        path.write_text("not the attested checksums\n", encoding="utf-8")
+
+    reasons = " ".join(verify_artifact_attestation(str(cfg_dir))[1])
+    assert ARTIFACT_CHECKSUMS in reasons
+
+
 def test_a_contamination_marker_above_the_directory_is_never_overridable(tmp_path: Path) -> None:
     (tmp_path / CONTAMINATION_MARKER).write_text(
         "react sweep shared an output root\nsecond line\n", encoding="utf-8"
@@ -2422,11 +2476,54 @@ def test_unattested_leftovers_are_refused_but_overridable(tmp_path: Path) -> Non
     refuse_contaminated_root(str(cfg_dir), allow_unattested=True)
 
 
-def test_an_empty_or_attested_directory_is_accepted(tmp_path: Path) -> None:
-    # Nothing to destroy, and a directory whose bytes are exactly what the last run closed: both
-    # are ordinary re-runs, and refusing either would make the guard unusable.
+def test_an_empty_directory_is_accepted_but_a_completed_run_is_immutable(tmp_path: Path) -> None:
     refuse_contaminated_root(str(tmp_path / "standard" / "time"))
-    refuse_contaminated_root(str(_attested_capability(tmp_path, "time")))
+    cfg_dir = _attested_capability(tmp_path, "time")
+
+    for allow in (False, True):
+        with pytest.raises(SystemExit, match="fresh --output-dir"):
+            refuse_contaminated_root(str(cfg_dir), allow_unattested=allow)
+
+
+def test_disposable_leftovers_are_archived_whole_and_cannot_re_attest_stale_files(
+    tmp_path: Path,
+) -> None:
+    cfg_dir = tmp_path / "standard" / "time"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "output.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": "old",
+                "score": 1.0,
+                "metadata": {
+                    "scenario_manifest_digest": "old",
+                    "clock_mode": "generation_free",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (cfg_dir / "stale-trace.json").write_text('{"paid": true}\n', encoding="utf-8")
+
+    archived = archive_unattested_artifacts(str(cfg_dir), allow_unattested=True)
+
+    assert archived is not None
+    assert (archived / "stale-trace.json").is_file()
+    assert not cfg_dir.exists()
+
+    cfg_dir.mkdir(parents=True)
+    new_record = {
+        "task_id": "new",
+        "score": 1.0,
+        "metadata": {"scenario_manifest_digest": "new", "clock_mode": "generation_free"},
+    }
+    (cfg_dir / "output.jsonl").write_text(json.dumps(new_record) + "\n", encoding="utf-8")
+    write_artifact_attestation(str(cfg_dir), arm="sora", capability="time", records=[new_record])
+
+    attested, reasons = verify_artifact_attestation(str(cfg_dir))
+    assert reasons == ()
+    assert [entry["path"] for entry in (attested or {})["files"]] == ["output.jsonl"]
 
 
 def test_report_carries_the_artifact_set_and_withholds_a_pinned_headline_when_it_moved(

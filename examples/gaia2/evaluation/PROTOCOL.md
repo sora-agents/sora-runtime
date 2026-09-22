@@ -257,19 +257,25 @@ back weeks later, by a different process, often after other sweeps have used the
   after the last file is closed — a manifest taken mid-sweep would attest bytes still being
   appended to.
 - `artifacts.json` carries the per-file checksums, a single `artifact_set_sha256` over the ordered
-  list, and the provenance the rows themselves declare: scenario manifest, prompt snapshot, charge
-  model, and clock mode. That second half is the tie. Checksums alone prove a directory has not
-  moved; they do not say which experiment it is. Absent values are carried as nulls rather than
-  dropped, so a run that recorded no provenance cannot read as one that recorded agreement.
+  list, and the provenance derived from the checksummed `output.jsonl`: scenario manifest, prompt
+  snapshot, charge model, and clock mode. Verification recomputes that provenance from the rows;
+  the adjacent assertion is not trusted on its own. `attestation_sha256` additionally detects an
+  accidental or partial edit anywhere in the JSON payload, but is not a signature. Checksums alone
+  prove a directory has not moved; they do not authenticate who produced it. Absent values are
+  carried as nulls rather than dropped, so a run that recorded no provenance cannot read as one
+  that recorded agreement.
 - A report re-checksums each capability directory as it reads it. A capability whose bytes moved,
   gained a file, lost one, or carries no attestation is named in `headline_withheld` rather than
   dropped — dropping it would leave the capabilities that did verify looking like a complete sweep.
   The requirement applies to manifest-pinned sweeps only: a smoke or `--report-only` reading is the
   one use where unattested bytes are the point, and its headline is already withheld for coverage.
 - A run refuses to open any artifact in a directory holding files of unknown provenance, before
-  `makedirs` and well before either file is truncated. A run that discovers contamination after
-  spending tokens has already lost them; one that discovers it after truncating has destroyed the
-  evidence it was refusing. `--overwrite-unattested` releases this for disposable leftovers.
+  `makedirs` and well before either file is truncated. A completed attested capability is immutable:
+  a new run must use a fresh output root, preserving the old run's absolute trace paths as well as
+  its bytes. `--overwrite-unattested` permits explicitly disposable, incomplete leftovers to be
+  moved whole under `replaced/standard/<capability>/` after scenario selection succeeds and just
+  before writing; it never overrides a completed attested run and never mixes stale artifacts into
+  the replacement.
 - A `CONTAMINATED` file in a run directory or any directory above it disqualifies everything
   beneath it, and is **not** overridable — a root is marked precisely because its contents must not
   be reused, and an override would make that a suggestion. `.sora/runs/react-contaminated-do-not-use/`

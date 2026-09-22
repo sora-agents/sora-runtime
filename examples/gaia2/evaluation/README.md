@@ -304,11 +304,12 @@ arms' snapshots:
 
 ```console
 uv run python -m examples.gaia2.evaluation prompt report \
-  --input "$PROMPT_PAIRED_OUT/checkpoint.jsonl" \
+  --input "$PROMPT_BASELINE_OUT/checkpoint.jsonl" \
+  --input "$PROMPT_CANDIDATE_OUT/checkpoint.jsonl" \
   --output "$PROMPT_PAIRED_OUT/report.json" \
   --price-sheet "$PROMPT_PRICE_SHEET" \
-  --baseline-snapshot campaigns/prompt/snapshots/pre-optimization-control.json \
-  --candidate-snapshot campaigns/prompt/snapshots/<candidate>.json
+  --baseline-snapshot examples/gaia2/evaluation/campaigns/prompt/snapshots/pre-optimization-control.json \
+  --candidate-snapshot examples/gaia2/evaluation/campaigns/prompt/snapshots/<candidate>.json
 ```
 
 `--baseline-snapshot` defaults to the control, so a single-arm baseline report needs neither flag.
