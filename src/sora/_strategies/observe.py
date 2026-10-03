@@ -35,7 +35,12 @@ from sora.action import (
     release,
 )
 from sora.activity import Activity, ActivityState
-from sora.diagnostics import emit_runtime_event, runtime_events_enabled
+from sora.diagnostics import (
+    emit_runtime_event,
+    record_streamed_property_value,
+    runtime_events_enabled,
+    streamed_property_value,
+)
 from sora.memory import (
     PerceptSnapshot,
     percept_snapshot,
@@ -836,6 +841,22 @@ class DefaultObserveStrategy:
         copies every row to export, that was resident RAM and roughly double it at export time —
         so this is a liveness guard on a paid run, not only disk hygiene.
 
+        What "unchanged" is measured against is the *stream*, not the keyed store. Working memory
+        looks like the free answer, since it already holds the previous value, but it is not a
+        record of what the reader has been shown, and it fails as one in two separate ways. It
+        outlives any single collector and is written before a sink exists at all, so a collector
+        armed mid-run — the shape the paid harness actually has, one per attempt against a
+        long-lived agent — would be handed a marker for a property it had never received a value
+        for, and carrying forward from nothing is exactly the unreadable bundle this elision was
+        introduced to avoid. It is also shared across nested collectors, so a value observed while
+        an inner stream was installed would leave the outer one calling its own older value
+        unchanged, sending that reader back to a value that has since moved. So the comparison is
+        against the last value `sora.diagnostics` saw *this* stream receive — the stream being the
+        sink, so several collection contexts appending to one log share one answer — and it is
+        updated only once the sink has taken the row: a dropped `received` has to leave the value
+        still owed, or a sink that recovers is never sent one. The cost is one restated value per
+        property per stream, plus one retained reference per attended property, paid once.
+
         One event per observation is kept rather than none, and the marker is the point: a reader
         shown only changes cannot distinguish an unchanged property from an unattended tool, and
         the per-cycle attended set is precisely what an attention defect has to be read against.
@@ -846,15 +867,12 @@ class DefaultObserveStrategy:
         for tool in wm.focused_tools.values():
             for prop in tool.observe():
                 observed_at = time.time()
-                key = (tool.id, prop.name)
-                # Read before the overwrite: the keyed store *is* the previous value, which is what
-                # makes the comparison below local and free. Skipped entirely when nothing is
-                # listening, so an undiagnosed run pays no comparison at all.
-                previous = wm.properties.get(key) if diagnosing else None
-                wm.properties[key] = Percept(tool.id, prop, observed_at)
+                wm.properties[(tool.id, prop.name)] = Percept(tool.id, prop, observed_at)
                 if not diagnosing:
+                    # Nothing is listening, so an undiagnosed run pays no comparison at all.
                     continue
-                if previous is not None and _same_property(previous.payload, prop):
+                carried = streamed_property_value(tool.id, prop.name)
+                if carried is not None and _same_property(carried, prop):
                     emit_runtime_event(
                         "boundary.property.unchanged",
                         cause="property_snapshot",
@@ -862,9 +880,13 @@ class DefaultObserveStrategy:
                         source_timestamp=observed_at,
                     )
                     continue
-                emit_runtime_event(
+                if emit_runtime_event(
                     "boundary.property.received",
                     cause="property_snapshot",
                     payload={"source": tool.id, "property": prop},
                     source_timestamp=observed_at,
-                )
+                ):
+                    # Only what the sink actually took, and on every path that reaches here, the
+                    # uncomparable-value fallback included: the ledger records what this stream was
+                    # sent, so it follows the delivery rather than the comparison.
+                    record_streamed_property_value(tool.id, prop.name, prop)

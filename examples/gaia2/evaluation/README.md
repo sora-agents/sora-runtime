@@ -267,10 +267,15 @@ bundle contains:
   pending work, and environment-boundary observations. Property observations are recorded once per
   observation, but only a value that *moved* is recorded in full: an unchanged re-observation emits
   a name-only `boundary.property.unchanged`, and a reader carries the value forward from the last
-  `boundary.property.received` for that `(source, name)`. Nothing is dropped — every observation
-  still has its event, so the attended set remains readable per cycle — but the elision is the
-  difference between a greppable bundle and an unusable one: it is worth 247x on a measured
-  read-only scenario (1,270.8 MiB to 5.1 MiB) and more on a longer one, because an ARE app's
+  `boundary.property.received` for that `(source, name)`. What a marker defers to is always in the
+  same bundle and always current, because "unchanged" is measured against what *this* stream was
+  sent rather than against the agent's own memory, which spans attempts and is shared with any
+  nested collector — and a row the sink never took leaves the value owed rather than elided. So a
+  bundle never opens on a valueless marker, and carrying a value forward never runs past a change
+  the stream did not see. Nothing is dropped — every observation still has its event, so the
+  attended set remains readable per cycle — but the elision is the difference between a greppable
+  bundle and an unusable one: it is worth 247x on a measured read-only scenario (1,270.8 MiB to
+  5.1 MiB) and more on a longer one, because an ARE app's
   complete state is ~200 KiB and the whole set is re-observed every cycle;
 - `judge_recording.json`, in the existing `examples.gaia2.rescore` schema, plus `verdict.json` and
   `write_counts.json`;
