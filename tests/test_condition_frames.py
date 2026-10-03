@@ -23,6 +23,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
 from sora._strategies.conditions import (
     _conditions_hold_frame,
@@ -777,6 +779,67 @@ async def test_a_mechanical_sub_goals_step_declared_window_is_lifted(tmp_path: P
     # Attributed to the frame the step lives in — the top-level plan here — so the window holds the
     # activity open rather than belonging to a frame that was never pushed.
     assert state.declared_by == ()
+
+
+async def test_a_mechanical_fan_outs_window_holds_a_maintenance_frame(tmp_path: Path) -> None:
+    """The nested form of the test above, in the arrangement that works: the fan-out splices into a
+    frame whose own `subgoal` step is labelled `maintenance`, so the window it lifted holds that
+    frame and the parent's next step — the report telling the user it is all done — does not run.
+
+    The control for the xfail below: the two differ only in the *enclosing* frame's label, so a
+    failure here means the fan-out stopped lifting its window at all, rather than that the nesting
+    rule moved.
+    """
+    cycle, working = _cycle(tmp_path)
+    plan = Plan(id="sub", goal="clear the conflicts", steps=[_window_step("mechanical")])
+    activity = Activity(id="a1", goal="clear the conflicts", context={}, plan=plan)
+    activity.parent_frames.append(_monitoring_frame("maintenance"))
+    working.activities["a1"] = activity
+
+    result = await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert len(activity.pending_conditions) == 1  # the window was lifted
+    assert result.step is None  # the parent's report step did not run
+    assert len(activity.parent_frames) == 1  # not popped: the window is still open
+    assert activity.state is ActivityState.BLOCKED
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A frame's kind is read off the `subgoal` step that PUSHED it, and a mechanical fan-out "
+        "pushes none — so its own goal_kind is never read, and the window it declares lifts onto "
+        "whatever frame it spliced into without holding it. At the top level the no-parent-frames "
+        "branch of `_body_exhausted` masks this; one level down the frame pops mid-window. Two "
+        "candidate fixes (mark the spliced-into frame, or refuse the shape at plan validation) "
+        "both satisfy the assertion below; the planner-prompt half of either belongs to the "
+        "prompt-rewrite lane. See .sora/notes/w7-w8-defect-briefing.md."
+    ),
+)
+async def test_a_mechanical_fan_outs_window_holds_an_achievement_frame(tmp_path: Path) -> None:
+    """ADR-0027's motivating failure, reachable today one level below the top-level plan.
+
+    Identical to the control above but for the enclosing frame's label. The fan-out step still says
+    `goal_kind: "maintenance"` and still declares the window — nothing reads either — so Reason
+    pops the frame and returns the parent's following step in the same tick, with the condition
+    still live. On the motivating run that step was the message telling the user everything was
+    done, sent while the monitoring window was still open.
+
+    Deliberately asserts only that the parent's step does not run: that is the harm, and it is the
+    one claim both candidate fixes satisfy, so this does not encode a choice between them. The
+    lifting half is asserted by the control test, which is not xfail.
+    """
+    cycle, working = _cycle(tmp_path)
+    plan = Plan(id="sub", goal="clear the conflicts", steps=[_window_step("mechanical")])
+    activity = Activity(id="a1", goal="clear the conflicts", context={}, plan=plan)
+    activity.parent_frames.append(_monitoring_frame("achievement"))
+    working.activities["a1"] = activity
+
+    result = await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    # Today: `wait` — the parent's report-to-user step — with parent_frames already emptied and the
+    # condition still in pending_conditions.
+    assert result.step is None
 
 
 async def test_a_deliberative_sub_goals_step_declared_window_is_lifted(tmp_path: Path) -> None:
