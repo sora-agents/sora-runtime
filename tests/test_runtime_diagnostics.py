@@ -431,3 +431,47 @@ def test_the_snapshot_still_updates_with_no_diagnostic_sink_installed() -> None:
     DefaultObserveStrategy._snapshot_properties(wm)
 
     assert wm.properties[("app", "state")].payload == ObservableProperty("state", 2)
+
+
+def test_stream_yields_exactly_what_snapshot_returns() -> None:
+    collector = RuntimeEventCollector()
+    with collect_runtime_events(collector):
+        for index in range(4):
+            emit_runtime_event("phase.entry", payload={"n": index})
+    assert list(collector.stream()) == list(collector.snapshot())
+
+
+def test_stream_reads_each_row_only_when_it_is_reached() -> None:
+    """`stream` exists so the export holds one row rather than the whole log, and that rests on the
+    per-row read being deferred — not merely on consumption being lazy. `iter(snapshot())` would
+    satisfy every other assertion here while copying everything up front, so this probes the
+    deferral itself: a row reached after the walk started is read at that point, not captured when
+    `stream` was called. The mutation is the probe, not a supported semantic — nothing in the
+    runtime rewrites a committed row."""
+    collector = RuntimeEventCollector()
+    with collect_runtime_events(collector):
+        for index in range(3):
+            emit_runtime_event("phase.entry", payload={"n": index})
+
+    rows = collector.stream()
+    assert next(rows)["payload"]["n"] == 0
+    collector._events[2]["event"] = "read-after-the-walk-began"
+    assert [row["event"] for row in rows] == ["phase.entry", "read-after-the-walk-began"]
+
+
+def test_stream_walks_a_stable_prefix_while_emission_continues() -> None:
+    """A concurrent inference task can emit during the export walk. The event list is append-only,
+    so the walk sees the prefix that existed when it started — the same view a snapshot taken at
+    that moment would have given — rather than a partially-extended or shifting list."""
+    collector = RuntimeEventCollector()
+    with collect_runtime_events(collector):
+        emit_runtime_event("phase.entry", payload={"n": 0})
+        emit_runtime_event("phase.entry", payload={"n": 1})
+        rows = collector.stream()
+        first = next(rows)
+        emit_runtime_event("phase.entry", payload={"n": 2})  # arrives mid-walk
+        remaining = list(rows)
+
+    assert first["payload"]["n"] == 0
+    assert [row["payload"]["n"] for row in remaining] == [1]
+    assert [row["payload"]["n"] for row in collector.snapshot()] == [0, 1, 2]

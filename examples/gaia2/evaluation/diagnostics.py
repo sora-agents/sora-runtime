@@ -7,7 +7,7 @@ import json
 import logging
 import platform
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -42,6 +42,16 @@ class BufferedSessionLog(logging.Handler):
         with self._lock:
             return "".join(line + "\n" for line in self._lines)
 
+    def lines(self) -> Iterator[str]:
+        """The retained lines one at a time, for writing the log out without first joining it into
+        a single string. Append-only like the event collector's, so a length read once under the
+        lock fixes a stable prefix (see ``RuntimeEventCollector.stream``)."""
+        with self._lock:
+            length = len(self._lines)
+        for index in range(length):
+            with self._lock:
+                yield self._lines[index]
+
 
 def allocate_attempt_directory(output_dir: Path, entry_key: str, suite: str) -> Path:
     safe_key = entry_key.replace(":", "--").replace("/", "-")
@@ -61,17 +71,53 @@ def allocate_attempt_directory(output_dir: Path, entry_key: str, suite: str) -> 
         return candidate
 
 
+# Big enough that a multi-GiB artifact is not hashed in a million syscalls, small enough to stay
+# a rounding error against the process that just ran a scenario.
+_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def _write_lines(path: Path, lines: Iterable[str]) -> None:
+    """Write already-formatted lines one at a time, for the reason ``_write_jsonl`` streams."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for line in lines:
+            handle.write(line + "\n")
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(json_safe(value), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _write_jsonl(path: Path, rows: tuple[dict[str, Any], ...]) -> None:
+def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
+    """Write rows as JSON Lines, serializing one row at a time straight into the open file.
+
+    Deliberately NOT ``write_text("".join(...))``: that holds the entire finished file in memory as
+    one string, on top of whatever the caller already materialized to pass in — and the trajectory
+    this writes is the largest artifact in the bundle by orders of magnitude, so the join was the
+    export's peak allocation. Streaming makes the cost one row, whatever the row count. Pair it
+    with an iterator source (``RuntimeEventCollector.stream``) so neither end materializes.
+
+    A row that will not serialize is recorded as a placeholder line and the walk continues, rather
+    than losing the whole file to one bad value. The trajectory is what a failed run is read back
+    from, so 20,000 good rows minus one beats no file at all; the placeholder keeps the loss
+    visible instead of silently shortening the log, and carries the row's sequence number so the
+    gap can be located in the rest of the bundle."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(json_safe(row), sort_keys=True) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            try:
+                line = json.dumps(json_safe(row), sort_keys=True)
+            except BaseException as error:  # noqa: BLE001 — one unserializable row, not the file
+                line = json.dumps(
+                    {
+                        "event": "diagnostic.row_unserializable",
+                        "sequence": row.get("sequence") if isinstance(row, Mapping) else None,
+                        "error": f"{type(error).__name__}: {error}",
+                    },
+                    sort_keys=True,
+                )
+            handle.write(line + "\n")
 
 
 def _write_counts_payload(counts: Any) -> dict[str, Any] | None:
@@ -156,12 +202,19 @@ def _export_trace(
 def _index(attempt_dir: Path, errors: dict[str, str]) -> dict[str, Any]:
     files = []
     for path in sorted(p for p in attempt_dir.rglob("*") if p.is_file() and p.name != "index.json"):
-        data = path.read_bytes()
+        # Size from stat and the digest fed in chunks. `read_bytes()` here was the export's other
+        # whole-file materialization, and the worse one: it ran over every file in the bundle just
+        # to measure and hash it, so the trajectory that had only just been written was pulled back
+        # into memory in a single allocation, after the writer had already held it once.
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(_HASH_CHUNK_BYTES):
+                digest.update(chunk)
         files.append(
             {
                 "path": path.relative_to(attempt_dir).as_posix(),
-                "bytes": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": path.stat().st_size,
+                "sha256": digest.hexdigest(),
             }
         )
     return {
@@ -247,7 +300,7 @@ def export_attempt(
     )
     export(
         "trajectory",
-        lambda: _write_jsonl(attempt_dir / "trajectory.jsonl", runtime_events.snapshot()),
+        lambda: _write_jsonl(attempt_dir / "trajectory.jsonl", runtime_events.stream()),
     )
     export(
         "judge_recording",
@@ -275,7 +328,7 @@ def export_attempt(
     export("llm", lambda: llm_capture.export(attempt_dir / "llm"))
     export(
         "session_log",
-        lambda: (attempt_dir / "session.log").write_text(session_log.text(), encoding="utf-8"),
+        lambda: _write_lines(attempt_dir / "session.log", session_log.lines()),
     )
     export(
         "are_trace",

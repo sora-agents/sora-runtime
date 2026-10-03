@@ -153,8 +153,30 @@ class RuntimeEventCollector:
             self._events.append(row)
 
     def snapshot(self) -> tuple[dict[str, Any], ...]:
+        """Every row collected so far, as one tuple. Convenient for assertions; for export use
+        ``stream`` instead, which yields the same rows without a second copy of the whole log."""
         with self._lock:
             return tuple(dict(row) for row in self._events)
+
+    def stream(self) -> Iterator[dict[str, Any]]:
+        """The same rows ``snapshot`` returns, one at a time, holding only one of them at once.
+
+        Why this is safe to do without the lock held across the whole walk: the event list is
+        append-only — ``emit`` appends and nothing ever removes, reorders, or rewrites a row — so a
+        row's index never changes once assigned. Reading the length once under the lock therefore
+        fixes a prefix that is already complete and will stay so, which is the same point-in-time
+        view ``snapshot`` takes, reached without materializing it. Rows emitted by a concurrent
+        inference task *during* the walk are simply not in that prefix, exactly as they would not be
+        in a snapshot taken at the same moment.
+
+        The per-row copy matches ``snapshot``'s: shallow, so a nested payload is shared either way.
+        """
+        with self._lock:
+            length = len(self._events)
+        for index in range(length):
+            with self._lock:
+                row = self._events[index]
+            yield dict(row)
 
 
 @contextmanager
