@@ -211,9 +211,9 @@ class DefaultReasonStrategy:
             # been a cache write.
             # A fired condition's `then` pushes no frame, so `_active_frame_goal` would answer with
             # the *enclosing* sub-goal and the replacement plan would serve a different commitment
-            # than the discarded one. `pursued_goal` records the `then`'s goal against the depth it
-            # runs at and so takes precedence while that depth still matches; see
-            # `Activity.pursued_goal` for the committed write this cost.
+            # than the discarded one. `pursued_goals` records each `then`'s goal against the depth
+            # it runs at and so takes precedence while that depth still matches; see
+            # `Activity.pursued_goals` for the committed write this cost.
             frame_goal = _pursued_goal(activity) or _active_frame_goal(activity)
             plan = None if frame_goal else await cycle.procedural.retrieve(activity)
             if plan is None:
@@ -254,10 +254,10 @@ class DefaultReasonStrategy:
             if activity.step_index >= len(plan.steps):
                 # The body ran to the end, so a `then`'s commitment is discharged — drop the record
                 # before anything pops, or it would answer for whatever plan next occupies this
-                # depth. Only when the depth still matches: a deeper frame's exhaustion is about to
-                # pop *back into* the `then`, which is still owed.
-                if _pursued_goal(activity) is not None:
-                    activity.pursued_goal = None
+                # depth. Only the entry at *this* depth: a deeper frame's exhaustion is about to pop
+                # *back into* the `then`, which is still owed, and an outer `then`'s entry is owed
+                # for the same reason once this nested one finishes and the stack unwinds to it.
+                activity.pursued_goals.pop(len(activity.parent_frames), None)
                 if activity.parent_frames and not _conditions_hold_frame(activity):
                     # Sub-plan exhausted: pop the frame and resume the parent at the step *after*
                     # its sub-goal, then loop to read it (or pop again if that frame is exhausted).

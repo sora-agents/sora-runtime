@@ -62,23 +62,32 @@ class Activity:
     # its sub-goal (Reason). Empty for a flat plan — generalizes step_index rather than adding a
     # separate intention type (ADR-0002).
     parent_frames: list[tuple[Plan, int, int]] = field(default_factory=list)
-    # `(frame depth, goal)` for a fired condition's `then`: the goal the active plan serves when no
-    # frame records it. A `then` installs without pushing a frame (see the "then" branch in the
-    # inference resolver) precisely so a watch firing repeatedly cannot walk a healthy monitor into
-    # the depth cap. The cost is that nothing remembers the `then`'s own goal, and
-    # `_active_frame_goal` therefore reads the *enclosing* sub-goal — so a discard mid-`then`
+    # `{frame depth: goal}` for every fired condition's `then` still owed: the goal the plan at that
+    # depth serves when no frame records it. A `then` installs without pushing a frame (see the
+    # "then" branch in the inference resolver) precisely so a watch firing repeatedly cannot walk a
+    # healthy monitor into the depth cap. The cost is that nothing remembers the `then`'s own goal,
+    # and `_active_frame_goal` therefore reads the *enclosing* sub-goal — so a discard mid-`then`
     # replanned the enclosing maintenance body, in which the `then`'s unexecuted steps have no
     # legal place, and the planner correctly answered with an empty plan. An observed run lost a
     # committed calendar delete that way: the work was still owed, still correct, and no later
     # firing could re-derive it, since each firing scopes its collection to its own `fired_*_ids`.
     # Kept across `reset_for_replan` so the replacement plan serves the same goal. The depth is
-    # what scopes it rather than an explicit clear, and it is doing real work in three directions:
-    # an authored sub-goal entered from inside the `then` pushes a frame that *does* record its
-    # goal (deeper -> ignored, the frame wins), popping back to the `then` body matches again, and
-    # a discard that pops out past the `then`'s own depth has left the goal behind for good
-    # (shallower -> ignored). Cleared outright once that body is exhausted: the commitment is then
-    # discharged, and a stale entry would answer for some later plan at the same depth.
-    pursued_goal: tuple[int, str] | None = None
+    # what scopes an entry rather than an explicit clear, and it is doing real work in three
+    # directions: an authored sub-goal entered from inside the `then` pushes a frame that *does*
+    # record its goal (deeper -> ignored, the frame wins), popping back to the `then` body matches
+    # again, and a discard that pops out past the `then`'s own depth has left the goal behind for
+    # good (shallower -> ignored). An entry is dropped once its body is exhausted: that commitment
+    # is then discharged, and a stale one would answer for some later plan at the same depth.
+    #
+    # Keyed per depth rather than held in a single slot because `then` bodies nest: an outer `then`
+    # can enter a maintenance sub-goal whose own condition fires a second `then` one frame down. One
+    # slot made that inner install overwrite the outer commitment and its discharge erase the record
+    # outright, so returning to the outer body — steps still unexecuted — left a discard replanning
+    # the enclosing monitor again, which is the very loss this field exists to prevent. Depth is a
+    # sufficient key: a `then` only ever starts once the body at its depth is idle, so two cannot be
+    # owed at one depth at once, and a later firing there is a new commitment replacing a discharged
+    # one. Bounded by the sub-goal depth cap.
+    pursued_goals: dict[int, str] = field(default_factory=dict)
     # Where in `history` the *active* frame's plan began. `history` is flat and frame-agnostic (see
     # reset_for_replan below, which relies on that), which is right for `$from` — it reads the
     # LATEST match, so it stays current, and a sub-plan reading the event its parent created is the
@@ -402,23 +411,24 @@ class Activity:
         # watch would therefore run inside the window rather than after it. Frames below the held
         # prefix are still dropped, and the superseded bundle above recovers what they were doing.
         del self.parent_frames[self.frames_held_by_conditions() :]
-        # `pursued_goal` survives a discard that kept the `then`'s own depth — that is what makes
-        # the replacement plan serve the same commitment the discarded one did, which for a fired
-        # condition's `then` no frame records (see the field).
+        # A `pursued_goals` entry survives a discard that kept its `then`'s own depth — that is what
+        # makes the replacement plan serve the same commitment the discarded one did, which for a
+        # fired condition's `then` no frame records (see the field).
         #
-        # It is dropped when the retained stack ends up SHALLOWER than the depth it records, and
-        # that is not the same as "it stops answering by itself". Both readers do ignore a record
-        # deeper than the stack, so the entry is inert the moment the discard lands — but inert is
-        # not gone, and it is unreachable by the one thing that would clear it: the discharge in
-        # Reason fires only `if _pursued_goal(activity) is not None`, which is the very depth match
-        # the discard just broke. So the record would sit there until some later plan pushed a frame
+        # An entry is dropped when the retained stack ends up SHALLOWER than the depth it records,
+        # and that is not the same as "it stops answering by itself". Both readers do ignore a
+        # record deeper than the stack, so the entry is inert the moment the discard lands — but
+        # inert is not gone, and it is unreachable by the one thing that would clear it: the
+        # discharge in Reason drops the entry *at the current depth*, which is the very match the
+        # discard just broke. So the record would sit there until some later plan pushed a frame
         # back to that depth, and then answer for it: `_pursued_goal` would hand the stale `then`
         # goal to an unrelated sub-goal's replan, and `_within_condition_body` would read that
         # sub-goal's empty fan-out as condition-driven and keep it out of the no-op record. Clearing
         # here changes nothing at the moment of the discard (the entry was already being ignored)
-        # and only stops it coming back.
-        if self.pursued_goal is not None and self.pursued_goal[0] > len(self.parent_frames):
-            self.pursued_goal = None
+        # and only stops it coming back. Entries at or above the retained depth are untouched: a
+        # discard inside a nested `then` leaves every outer commitment still owed.
+        for depth in [depth for depth in self.pursued_goals if depth > len(self.parent_frames)]:
+            del self.pursued_goals[depth]
         # Drop the pipeline's intermediate bindings too: they were produced by (and are only
         # meaningful within) the plan being discarded. The runtime-seeded ones are the exception,
         # and by that same rule rather than against it: no plan produced them, so no plan's

@@ -1042,7 +1042,7 @@ async def test_a_step_with_a_malformed_pending_block_still_runs(tmp_path: Path) 
 async def _entered_then(
     tmp_path: Path, llm: FakeLLMClient
 ) -> tuple[DecisionCycle, WorkingMemory, Activity]:
-    """Drive a real firing all the way into its `then` body, so `pursued_goal` is set by the
+    """Drive a real firing all the way into its `then` body, so `pursued_goals` is written by the
     install path rather than by the test."""
     cycle, working = _cycle(tmp_path, llm)
     # The condition is declared by the monitoring frame's own step, so that frame is one a discard
@@ -1064,7 +1064,7 @@ async def test_a_then_records_the_goal_its_plan_serves(tmp_path: Path) -> None:
     llm = FakeLLMClient(plan_json({"action": "wait"}, {"action": "wait"}))
     _cycle_, _working, activity = await _entered_then(tmp_path, llm)
 
-    assert activity.pursued_goal == (1, _THEN)  # paired with the depth it runs at
+    assert activity.pursued_goals == {1: _THEN}  # keyed by the depth it runs at
     assert len(activity.parent_frames) == 1  # and still no frame of its own
 
 
@@ -1094,7 +1094,7 @@ async def test_the_pursued_goal_survives_the_discard_that_keeps_its_depth(tmp_pa
 
     activity.reset_for_replan()
 
-    assert activity.pursued_goal == (1, _THEN)
+    assert activity.pursued_goals == {1: _THEN}
     assert len(activity.parent_frames) == 1  # held by the live condition
 
 
@@ -1103,12 +1103,12 @@ async def test_an_exhausted_then_stops_answering_for_the_next_plan(tmp_path: Pat
     answer for whatever plan next occupies the same depth."""
     llm = FakeLLMClient(plan_json({"action": "wait"}))
     cycle, working, activity = await _entered_then(tmp_path, llm)
-    assert activity.pursued_goal is not None
+    assert activity.pursued_goals == {1: _THEN}
     activity.step_index = len(activity.plan.steps) if activity.plan else 0  # body exhausted
 
     await cycle.strategies.reason.reason(activity, working, cycle, _tick())
 
-    assert activity.pursued_goal is None
+    assert activity.pursued_goals == {}
 
 
 async def test_a_sub_goal_entered_from_inside_a_then_is_planned_for_itself(tmp_path: Path) -> None:
@@ -1119,7 +1119,7 @@ async def test_a_sub_goal_entered_from_inside_a_then_is_planned_for_itself(tmp_p
     # As a deliberative sub-goal's install would leave it: one frame deeper than the `then`.
     activity.parent_frames.append(_monitoring_frame())
 
-    assert activity.pursued_goal == (1, _THEN)  # still recorded...
+    assert activity.pursued_goals == {1: _THEN}  # still recorded...
     assert _pursued_goal(activity) is None  # ...but not answering at this depth
     assert _active_frame_goal(activity) == _ANCESTOR_GOAL  # the pushed frame does
 
@@ -1141,24 +1141,129 @@ async def test_a_discard_past_the_then_drops_the_record_rather_than_shelving_it(
     being ignored is not the same as being gone.
 
     Both readers skip an entry deeper than the stack, so the previous test's `None` holds the moment
-    the frames go. But the one place that would clear the entry — the discharge in Reason — runs
-    only `if _pursued_goal(activity) is not None`, which is the very depth match the discard broke.
-    So a shelved entry is unreachable by its own cleanup and waits for any later plan to push a
-    frame back to that depth, at which point it answers for work it has nothing to do with: the
+    the frames go. But the one place that would clear the entry — the discharge in Reason — drops
+    only the entry at the *current* depth, which is the very match the discard broke. So a shelved
+    entry is unreachable by its own cleanup and waits for any later plan to push a frame back to
+    that depth, at which point it answers for work it has nothing to do with: the
     stale `then` goal is handed to an unrelated sub-goal's replan, and that sub-goal's empty fan-out
     is read as condition-driven and kept out of the no-op record a report is built from."""
     llm = FakeLLMClient(plan_json({"action": "wait"}, {"action": "wait"}))
     _cycle_, _working, activity = await _entered_then(tmp_path, llm)
-    assert activity.pursued_goal == (1, _THEN)
+    assert activity.pursued_goals == {1: _THEN}
 
     # Nothing holds the monitoring frame once its condition is retired, so the discard pops out
     # past the depth the `then` ran at.
     activity.pending_conditions = []
     activity.reset_for_replan(defect="the plan was invalidated")
     assert activity.parent_frames == []
-    assert activity.pursued_goal is None  # dropped, not shelved
+    assert activity.pursued_goals == {}  # dropped, not shelved
 
     # An unrelated sub-goal later occupies the same depth and inherits nothing.
     activity.parent_frames.append(_monitoring_frame())
     assert _pursued_goal(activity) is None
     assert _within_condition_body(activity) is False
+
+
+# --------------------------------------------------------------------------------------------------
+# `then` bodies nest, and the outer commitment has to survive the inner one
+#
+# An outer `then` can enter an authored sub-goal of its own, and a condition declared inside that
+# sub-goal can fire a second `then` one frame further down. Recorded in a single slot, that inner
+# install overwrote the outer goal and the inner body's exhaustion then erased the record outright —
+# so unwinding back into the outer body, its steps still unexecuted, left the next discard
+# replanning the enclosing monitor. That is the loss the record exists to prevent, one level in.
+# --------------------------------------------------------------------------------------------------
+
+_NESTED_GOAL = "draft the reply to the conservator"
+
+
+def _nested_responses() -> list[str]:
+    """The three planning responses the drive below consumes, in order: the outer `then`'s body (a
+    sub-goal of its own, then a step it has not reached yet), that sub-goal's plan, and the inner
+    `then`'s plan."""
+    return [
+        plan_json(
+            {
+                "action": "subgoal",
+                "goal": _NESTED_GOAL,
+                "mode": "deliberative",
+                "goal_kind": "achievement",
+            },
+            {"action": "wait"},
+        ),
+        plan_json({"action": "wait"}),
+        plan_json({"action": "wait"}),
+    ]
+
+
+async def _nested_then(
+    tmp_path: Path, llm: FakeLLMClient
+) -> tuple[DecisionCycle, WorkingMemory, Activity]:
+    """Both firings through the real install path: the outer `then` at depth 1, an authored sub-goal
+    entered from inside its body at depth 2, and a second `then` fired from inside that one."""
+    cycle, working, activity = await _entered_then(tmp_path, llm)
+
+    # The outer body's first step is a sub-goal of its own, which — unlike a `then` — pushes a
+    # frame.
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+    await cycle.strategies.observe.observe(cycle)
+    assert len(activity.parent_frames) == 2
+    assert _active_frame_goal(activity) == _NESTED_GOAL
+
+    # Its one step has run, so that body is idle when a condition declared inside it fires. Built
+    # directly, as `_fired` does: lifting is not what is under test here, and a condition attributed
+    # to the top-level plan holds no frame, leaving the pop below to turn on the `then` alone.
+    activity.step_index = len(activity.plan.steps) if activity.plan else 0
+    state = PendingConditionState(condition=_other(), evaluated_through=99)
+    activity.pending_conditions.append(state)
+    activity.condition_batch = [state]
+    activity.condition_verdict = ConditionVerdict(fired=(0,))
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+    await cycle.strategies.observe.observe(cycle)
+    return cycle, working, activity
+
+
+async def test_a_then_fired_inside_another_then_keeps_both_commitments(tmp_path: Path) -> None:
+    llm = FakeLLMClient(_nested_responses())
+    _cycle_, _working, activity = await _nested_then(tmp_path, llm)
+
+    assert activity.pursued_goals == {1: _THEN, 2: _OTHER_THEN}
+    assert _pursued_goal(activity) == _OTHER_THEN  # the active plan is the inner `then`'s
+    assert len(activity.parent_frames) == 2  # the sub-goal's frame; neither `then` pushed one
+
+
+async def test_unwinding_out_of_a_nested_then_restores_the_outer_commitment(
+    tmp_path: Path,
+) -> None:
+    """The inner body's exhaustion discharges its own commitment and only its own. The outer `then`
+    still has an unexecuted step, so once the stack unwinds to it, it is again the goal to serve."""
+    llm = FakeLLMClient(_nested_responses())
+    cycle, working, activity = await _nested_then(tmp_path, llm)
+    activity.step_index = len(activity.plan.steps) if activity.plan else 0  # inner body exhausted
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert len(activity.parent_frames) == 1  # popped back into the outer `then`'s body
+    assert activity.pursued_goals == {1: _THEN}  # inner entry discharged, outer one intact
+    assert _pursued_goal(activity) == _THEN
+
+
+async def test_a_discard_after_a_nested_then_replans_the_outer_then(tmp_path: Path) -> None:
+    """What one slot cost, one level in: with the outer entry overwritten and then erased, the only
+    goal left to plan was the enclosing monitor's — in which the outer `then`'s remaining step has
+    no legal place, so the planner rightly answers with an empty plan and the work is lost."""
+    llm = FakeLLMClient([*_nested_responses(), json.dumps({"steps": []})])
+    cycle, working, activity = await _nested_then(tmp_path, llm)
+    activity.step_index = len(activity.plan.steps) if activity.plan else 0
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())  # unwind to the outer
+
+    activity.reset_for_replan()  # no defect: the plan was fine, the world moved
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, user = llm.calls[-1]
+    assert user.startswith(f"Goal: {_THEN}\n")  # the outer `then`, not the monitoring body
+    assert not user.startswith(f"Goal: {_ANCESTOR_GOAL}\n")

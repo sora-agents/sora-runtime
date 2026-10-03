@@ -408,15 +408,22 @@ un-run tail is necessary but not sufficient, because a planner reads the tail *i
 goal it was handed*, and a tail belonging to a different commitment is material it is right to
 discard. The goal, not just the tail, has to survive the discard.
 
-So `Activity.pursued_goal` records a `then`'s goal paired with the **frame depth** it runs at, is
+So `Activity.pursued_goals` records each `then`'s goal keyed by the **frame depth** it runs at, is
 kept across `reset_for_replan()`, and takes precedence over `_active_frame_goal` while that depth
-still matches. Depth is what scopes it, in place of an explicit clear, and it earns its keep in
-three directions: an authored sub-goal entered from inside the `then` pushes a frame that *does*
+still matches. Depth is what scopes an entry, in place of an explicit clear, and it earns its keep
+in three directions: an authored sub-goal entered from inside the `then` pushes a frame that *does*
 record its goal (deeper → the frame wins), popping back into the `then` body matches again, and a
 discard that popped out past the `then` entirely has left that commitment behind for good
-(shallower → ignored). It is cleared outright once the body is exhausted, since the commitment is
+(shallower → ignored). An entry is dropped once its own body is exhausted, since that commitment is
 then discharged and a stale entry would answer for whatever plan next occupies the depth. This
 needs no new frame type and does not relax the no-push rule the depth cap depends on.
+
+Keyed per depth rather than held in one slot, because `then` bodies nest: an outer `then` may enter
+a maintenance sub-goal whose own condition fires a second `then` one frame down. A single slot made
+that inner install overwrite the outer commitment and its discharge erase the record outright, so
+unwinding back into the outer body — steps still unexecuted — left the next discard replanning the
+enclosing monitor, reproducing exactly the loss above one level in. Depth is a sufficient key: a
+`then` starts only once the body at its depth is idle, so two are never owed at one depth at once.
 
 **What recovers the cost instead: the replan sees the plan it replaces.** `reset_for_replan()` parks
 the discard as a `SupersededPlan` (active frame + `step_index` + suspended parents) on

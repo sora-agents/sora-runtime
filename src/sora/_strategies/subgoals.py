@@ -95,15 +95,13 @@ def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
 def _pursued_goal(activity: Activity) -> str | None:
     """The goal a fired condition's ``then`` plan serves, or ``None`` if the active plan is not one.
 
-    ``Activity.pursued_goal`` pairs the goal with the frame depth it was installed at, because a
+    ``Activity.pursued_goals`` keys each goal by the frame depth it was installed at, because a
     ``then`` pushes no frame and so cannot be told apart by the stack alone. Matching on depth is
-    what keeps the record from answering for a plan it does not belong to: deeper means an authored
-    sub-goal was entered from inside the ``then`` and its own frame records its goal, shallower
-    means a discard popped out past the ``then`` entirely."""
-    if activity.pursued_goal is None:
-        return None
-    depth, goal = activity.pursued_goal
-    return goal if depth == len(activity.parent_frames) else None
+    what keeps a record from answering for a plan it does not belong to: a deeper entry means an
+    authored sub-goal was entered from inside the ``then`` and its own frame records its goal, a
+    shallower one means a ``then`` is still owed further out — either beneath an authored sub-goal
+    or beneath a nested ``then`` — and is not what the active plan serves."""
+    return activity.pursued_goals.get(len(activity.parent_frames))
 
 
 def _within_condition_body(activity: Activity) -> bool:
@@ -117,14 +115,12 @@ def _within_condition_body(activity: Activity) -> bool:
     user's work than one sitting directly in it, so the caller that gates on this needs the wider
     question.
 
-    ``<=`` rather than ``==`` is what buys that: deeper means a frame was pushed from inside the
-    ``then`` and the ``then`` is still owed beneath it, shallower means a discard popped out past
-    the ``then`` entirely — which ``pursued_goal`` deliberately does not clear, so this has to
-    exclude it rather than trust the field's mere presence."""
-    if activity.pursued_goal is None:
-        return False
-    depth, _goal = activity.pursued_goal
-    return depth <= len(activity.parent_frames)
+    ``<=`` rather than ``==`` is what buys that: an entry deeper than us was installed at a depth a
+    discard has since popped out past — which ``pursued_goals`` deliberately does not clear, so this
+    has to exclude it rather than trust the field's mere non-emptiness — while one at or above our
+    depth is a ``then`` still owed here or beneath us. Any single such entry answers yes, so a
+    nested ``then`` whose own entry is discharged on exhaustion is still inside its outer one."""
+    return any(depth <= len(activity.parent_frames) for depth in activity.pursued_goals)
 
 
 def _active_frame_goal(activity: Activity) -> str | None:

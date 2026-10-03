@@ -1139,7 +1139,7 @@ async def test_an_empty_fan_out_inside_a_fired_then_records_nothing(tmp_path: Pa
     )
     # What Observe's `then` install leaves behind: a goal recorded against the depth it runs at,
     # because a `then` pushes no frame of its own.
-    activity.pursued_goal = (0, "save the newly added apartments")
+    activity.pursued_goals[0] = "save the newly added apartments"
     working.activities["a"] = activity
 
     await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
@@ -1165,7 +1165,7 @@ async def test_an_empty_fan_out_nested_below_a_then_records_nothing(tmp_path: Pa
         step_index=0,
         history=[_history("search_apartments", [])],
     )
-    activity.pursued_goal = (0, "save the newly added apartments")
+    activity.pursued_goals[0] = "save the newly added apartments"
     activity.parent_frames.append((outer, 0, 0))  # a frame pushed from inside the `then`
     working.activities["a"] = activity
 
@@ -1176,9 +1176,9 @@ async def test_an_empty_fan_out_nested_below_a_then_records_nothing(tmp_path: Pa
 
 async def test_an_empty_fan_out_after_popping_past_the_then_is_recorded(tmp_path: Path) -> None:
     """The other side of the depth comparison, and the reason the gate cannot just test the field
-    for presence. `pursued_goal` is deliberately not cleared by a discard that pops out past the
-    `then` — it stops answering by depth instead — so a stale record must not go on suppressing
-    gaps in whatever plan next occupies the shallower depth."""
+    for non-emptiness. A `pursued_goals` entry is deliberately not cleared by a discard that pops
+    out past the `then` — it stops answering by depth instead — so a stale record must not go on
+    suppressing gaps in whatever plan next occupies the shallower depth."""
     tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
     cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
     await registry.join(_ORIGIN)
@@ -1191,7 +1191,7 @@ async def test_an_empty_fan_out_after_popping_past_the_then_is_recorded(tmp_path
         step_index=0,
         history=[_history("search_apartments", [])],
     )
-    activity.pursued_goal = (2, "save the newly added apartments")  # deeper than the live stack
+    activity.pursued_goals[2] = "save the newly added apartments"  # deeper than the live stack
     working.activities["a"] = activity
 
     await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())

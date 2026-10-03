@@ -357,9 +357,11 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                     elif goal:
                         # Pushing no frame leaves nothing holding this `then`'s goal, so record it
                         # against the depth it runs at: a discard mid-`then` must replan the `then`,
-                        # not the enclosing maintenance body it happens to sit inside. See
-                        # Activity.pursued_goal for the run this cost a committed write.
-                        activity.pursued_goal = (len(activity.parent_frames), goal)
+                        # not the enclosing maintenance body it happens to sit inside. Recorded
+                        # *per depth*, so a `then` fired from inside an outer one does not overwrite
+                        # the commitment the outer body is still owed. See Activity.pursued_goals
+                        # for the run this cost a committed write.
+                        activity.pursued_goals[len(activity.parent_frames)] = goal
                     activity.plan = sub_plan
                     activity.step_index = 0
                     # The sub-plan collects only what it runs itself, not what the parent left
