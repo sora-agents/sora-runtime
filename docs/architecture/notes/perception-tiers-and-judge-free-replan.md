@@ -138,8 +138,15 @@ rule that a spurious replan costs one call and a missed one costs the scenario.
 
 **`replan_on_change` is unsound on an adapter whose signals include the agent's own writes.** Such
 a signal lands on a tool the plan references by construction, so every write would discard the plan
-that issued it, and the agent would never commit to anything. A judge filters that out by reading
-the change; a mechanical trigger cannot.
+that issued it, and the agent would never commit to anything.
+
+The original form of this note added "a judge filters that out by reading the change; a mechanical
+trigger cannot." The first half of that is now known to be false. A measured run handed the
+judgement a self-caused removal signal sitting three lines below the matching delete in its own
+executed history, and it answered *invalid* — because the question it is asked is whether the plan
+is valid against the whole world, not what the change that woke it means, and because the signal log
+it reads is cumulative while the history beside it is windowed. The judge is not the safeguard; it
+was only ever assumed to be.
 
 This is the same reliability problem ADR-0024 cited when it rejected mechanical maintenance
 predicates — it needs per-tool identity scoping or efference tagging to exclude self-writes, "a
@@ -150,8 +157,18 @@ never announce themselves, and with no polling there is no derived property chan
 that guarantee away — an adapter that echoes writes back as signals, or a tier-3 environment where
 polling reports the agent's own effect — and the level must not be used.
 
-An efference mechanism would retire the precondition and make this safe generally. That is the
-principled version and it is not built.
+What *is* now built is narrower than an efference mechanism and does not retire the precondition.
+Observe re-anchors an activity's baseline past the change a **declared** side-effecting operation it
+invoked produced, once that operation is acked (ADR-0024's 2026-10-03 amendment). That removes the
+common case — a self-write announced on a tool the plan references — from both this level and the
+judged one, on the reasoning that a plan is invalidated by *unpredicted* change and its own step is
+the opposite. What it cannot cover is a self-caused change with no ack to attribute it to, or an
+operation whose manual declares no `side_effecting`; on this level there is no judge behind it, so
+the precondition stands for exactly those cases.
+
+A full efference mechanism — read/write tags making *any* self-caused change filterable regardless
+of tool or declaration — would retire the precondition. That is still the principled version and
+still not built.
 
 ## What this costs
 

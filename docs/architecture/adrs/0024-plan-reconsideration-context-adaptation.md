@@ -188,6 +188,83 @@ renders, so each thing the plan's correctness rests on has to be rendered explic
 returning a bare boolean also makes such a gap invisible afterwards, which is why the discard trace
 now names what was armed.
 
+**Tier 2 does not dissolve the self-write problem, and tier 1 now subtracts it (2026-10-03).** The
+"no efference" paragraph above rests on the judgment reasoning *my own reply does not change the
+meeting day*. A measured run refutes that for the default gate, and not for want of rendering: the
+revalidation prompt was recovered from the run's own diagnostics bundle and carried everything this
+ADR asks for, the 2026-09-20 armed conditions included — goal, the three executed deletes, the
+bindings holding both the just-deleted event and the one still to delete, the remaining two steps,
+the armed `watch`, every property, the signal log. The last signal in that log was
+`Change(path='events', added=(), removed=('cc0955…',))`: literally the delete named three lines
+above it under the executed operations. The judgment answered *invalid*.
+
+The reason it could is instructive, and it is not stupidity. The signal log is **cumulative and
+uncorrelated** while the executed history is **windowed**: at that moment the log showed four
+`added` ids against an `added_events` binding holding one, and nothing in the prompt says the other
+three were already answered by earlier firings — each delete is rendered without the add it
+responded to. "Four events added, the plan handles one" reads as incomplete. The judgment is asked
+whether the plan is valid *against the whole world*, never what the change that woke it means, so
+"it can reason the self-write away" was not the question it faced. The cost was not one wasted call:
+the discard took a committed, still-correct delete with it (see the `then`-goal amendment below) and
+the run failed on that one missing write.
+
+The documented escape hatch does not reach this either. A domain gate projects onto *one* external
+surface, and the surface differs per task: the shipped `InboxChangeGate` is INBOX-shaped, so on a
+calendar task it would hide exactly the environment-added events the agent exists to react to. One
+`agent.yaml` serves every task a benchmark split contains, so there is no single projection to pick.
+
+So tier 1 now **subtracts the agent's own acked writes** rather than relying on tier 2 to dismiss
+them: when a *declared* side-effecting operation an activity itself invoked is acked, Observe
+re-anchors that activity's baseline (and its scope cursor) past the change the write produced —
+`DefaultObserveStrategy._absorb_acked_writes`. The principle is that a plan is invalidated by
+*unpredicted* change, and its own write is the opposite: it is the plan's own step, already recorded
+in `history`, so it is information redundant with what the deliberation already had and cannot
+change its answer. If the plan says "delete X, then delete Y", having deleted X is not grounds for
+not deleting Y.
+
+This keeps the decision drivers intact — it is **not** efference tagging on percepts and **not**
+manual-authored relevance. It is the same device `_rebaseline` already uses for attention: re-anchor
+when the signature moved for a reason that is not the world moving independently of the agent. What
+it deliberately is *not* is a blanket "ignore self-caused change" — the subtraction stops at the
+write's own record, which is what preserves the case this ADR was right to worry about:
+
+* A **cascade** — the write cost a quota, triggered an auto-reply, freed a slot something else
+  filled — is a side effect *beyond* the record. It arrives in a later drain and still trips the
+  gate, so an agent's own action that legitimately invalidates its plan is still caught.
+* **Masking** — an environment change landing in the *same* drain as the ack — is the residual
+  cost, and it is the bounded blind spot `_rebaseline` already accepts. It is narrower than it
+  looks: the gate is one of three consumers of a signal, and neither condition evaluation nor a
+  `blocked_on` resume is baselined, so an absorbed signal still arms the watches waiting for it.
+  Only the in-flight plan's revalidation is skipped.
+
+  That bound is **enforced rather than assumed**, and the distinction cost a real defect. Anchoring
+  to the signature of *now* absorbs the whole interval back to the previous anchor, not just the
+  drain carrying the ack: an operation stays in flight across ticks, nothing re-anchors a `running`
+  activity's baseline meanwhile, and a `running` activity cannot reach a checkpoint to spend the
+  change it is owed — so an environment event landing two ticks before the ack was inherited by the
+  new baseline and the next write committed unrevalidated, the entire in-flight window invisible.
+  Observe therefore captures the gate signature *before* the tick's perception lands and absorbs
+  only when the activity's stored baseline still equals it: equal means nothing moved between the
+  anchor and this drain, so what the signature now reflects arrived with the ack; unequal means the
+  world moved first and the guard stays. Unequal also covers a `_rebaseline` that moved the baseline
+  mid-tick, costing at most one revalidation when an attention transition coincides with an ack —
+  the fail-open direction this ADR asks for.
+
+  What the comparison cannot separate is "the world moved" from "my own write became visible before
+  its own ack did": a write whose property effect is snapshotted one tick and acked the next is not
+  absorbed, costing a revalidation. Separating those needs attributing a percept to the write that
+  caused it — efference tagging on percepts, which this ADR declines, and which a gate-side guard
+  must not smuggle in. Observe snapshots properties and drains acks in the same pass, so the two
+  normally arrive together and the common path is unaffected.
+
+Narrow in three further directions, each for its own reason. **Issuer only**: another activity did
+not predict this write, so for it the change is genuinely exogenous. **Declared writes only**: a
+read predicts no change, so there is nothing to justify absorbing what moved alongside it, and an
+operation whose manual declares no `side_effecting` is likewise not absorbed — the claim has to be
+grounded in a declaration, not a guess. **Baselined activities only**: an activity with no baseline
+has nothing to re-anchor, and anchoring one here would pre-empt the entry-time anchor the first
+checkpoint owes it.
+
 ### The change-gate is pluggable (efference on the cooperative path)
 
 Tier 1's *how do I compute the signature* is a per-agent seam — `strategies.change_gate`, a
@@ -200,14 +277,20 @@ value; both the baseline capture and every later comparison route through the sa
 share one signature space.
 
 * **Default — `PerceptionSignatureGate`.** Domain-free: the sorted property reprs plus the
-  signal/message log lengths (the original tier-1 snapshot). It over-fires on the agent's own writes,
-  which is *correct but not free*: tier 2 still returns "still valid," so a self-write costs one
-  revalidation rather than a loop. The right default when an app has authored nothing.
+  signal/message log lengths (the original tier-1 snapshot). It has no way to tell whose write
+  moved it, so a self-caused change does move the signature; what keeps that from costing a
+  revalidation per write is the resolve-time absorption above, not the gate and no longer tier 2
+  (see the 2026-10-03 amendment — relying on tier 2 for it was measured and found wrong). The right
+  default when an app has authored nothing.
 * **Domain gate — the efference filter.** An app that knows its external surface can project
   perception onto just that surface, so a self-caused change collapses to an unchanged signature and
   never even reaches the revalidation. This is the **same efference trick** a stateful `InterruptPolicy`
   applies on the hard-interrupt path (`MailDiffInterruptPolicy` diffs INBOX ids), now available on
-  the *cooperative* path — and it is what removes the one-revalidation-per-self-write cost the default pays.
+  the *cooperative* path. It is still worth authoring where it applies — it suppresses the move
+  *before* the signature is taken, so it also covers a self-caused change an adapter reports with no
+  ack to attribute it to — but it is no longer what stands between the default and a self-write
+  loop, and it is not a general answer: the projection that is correct for one task hides the
+  environment events another task turns on.
 
 The ARE example ships `InboxChangeGate`: the union of INBOX email ids across observable `state`
 properties, sharing the one `state → id-set` projection with `MailDiffInterruptPolicy`. The agent's

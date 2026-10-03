@@ -78,6 +78,7 @@ from sora.types import (
     PendingCondition,
     PendingConditionState,
     PendingInference,
+    PendingOperation,
     Plan,
     PropertyChange,
     Signal,
@@ -1083,8 +1084,20 @@ async def test_answering_the_halt_lets_the_activity_plan_again(tmp_path: Path) -
 
 
 def _append_signal(working: WorkingMemory, source: str) -> None:
+    """Put a signal straight into working memory, as of *before* the tick under test.
+
+    Right for the relevance tests below, which ask what a cursor can see. For the absorption tests
+    it models an announcement that reached working memory in some EARLIER drain, which is a
+    meaningful but different case from an adapter announcing a write as it completes — use
+    ``_announce_signal`` for that one."""
     working.signals.append(Percept(source, Signal("env_notification", {}), 0.0))
     working.signals_appended += 1
+
+
+def _announce_signal(cycle: DecisionCycle, source: str) -> None:
+    """Deliver a signal the way an adapter does: pushed to the sink, drained by the Observe under
+    test, so it lands in the same drain as anything else that tick carries."""
+    cycle.signal_sink.push(source, Signal("env_notification", {}))
 
 
 def test_relevance_sees_a_change_on_a_referenced_tool() -> None:
@@ -1239,3 +1252,192 @@ async def test_the_scope_cursor_is_captured_at_infer_time_not_install_time(tmp_p
 
     assert activity.reconsider_scope == fire_time  # not the drifted install-time cursor
     assert relevant_change_since(working, activity.reconsider_scope, {"t"}) is True
+
+
+# -- Absorbing the agent's own acked writes (the self-write trigger) -----------------------------
+# A plan is invalidated by *unpredicted* change; its own write is the opposite, and its record is
+# already in `history`. A measured run spent a revalidation on a self-caused `state_changed`, got
+# `invalid` back, and lost a committed calendar delete with it.
+
+
+def _running_write(working: WorkingMemory, *, op_id: str, operation: str = "write_op") -> Activity:
+    """An activity mid-plan with its own invoke of `operation` in flight. Two steps, so the second
+    is a sibling a discard would destroy — the shape of the run this came from."""
+    activity = _write_activity(working)
+    activity.plan = Plan(
+        id="p",
+        goal="g",
+        steps=[invoke_step("t", operation), invoke_step("t", "write_op")],
+    )
+    activity.step_index = 1  # step 0 committed; the write below is what the checkpoint guards
+    activity.state = ActivityState.RUNNING
+    activity.pending_operation = PendingOperation(
+        id=op_id, invocation=OperationInvocation("t", operation, {}), invoked_at=0.0
+    )
+    return activity
+
+
+async def _settle_attention(cycle: DecisionCycle) -> None:
+    """One Observe before any baseline is set, so the first attention transition (which re-anchors
+    every activity via `_rebaseline`) cannot be mistaken for the absorption under test."""
+    await DefaultObserveStrategy().observe(cycle)
+
+
+def _baseline(cycle: DecisionCycle, *activities: Activity) -> None:
+    for activity in activities:
+        activity.reconsider_baseline = cycle.change_gate.signature(cycle.working)
+        activity.reconsider_scope = cycle.working.perception_cursor()
+
+
+async def test_an_acked_write_does_not_leave_the_gate_hot(tmp_path: Path) -> None:
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    activity = _running_write(working, op_id="op-1")
+    await _settle_attention(cycle)
+    _baseline(cycle, activity)
+    # The write lands, and the adapter announces it on the very tool the plan references.
+    _announce_signal(cycle, "t")
+    cycle.result_sink.push("op-1", OperationAck(ok=True, result="ok"))
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.pending_operation is None  # resolved normally
+    assert len(activity.history) == 1  # and still recorded as belief to ground on
+    # The gate is cold again, so the next write commits instead of buying a revalidation.
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step == invoke_step("t", "write_op")
+    assert activity.pending_inference is None
+    assert activity.plan is not None  # the sibling step survived
+
+
+async def test_a_change_after_the_ack_still_trips_the_gate(tmp_path: Path) -> None:
+    """The subtraction stops at the write's own record: a cascade or a later environment event
+    arrives in a *different* drain and is not absorbed."""
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    activity = _running_write(working, op_id="op-1")
+    await _settle_attention(cycle)
+    _baseline(cycle, activity)
+    _append_signal(working, "t")
+    cycle.result_sink.push("op-1", OperationAck(ok=True, result="ok"))
+    await DefaultObserveStrategy().observe(cycle)
+
+    _append_signal(working, "t")  # the cascade / the world's own move, one drain later
+    await DefaultObserveStrategy().observe(cycle)
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None  # guarded, exactly as before the fix
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "revalidate"
+
+
+async def test_a_change_from_before_the_ack_drain_is_not_absorbed(tmp_path: Path) -> None:
+    """The absorption's bound is the drain that carries the ack, not "everything since the anchor".
+
+    An operation stays in flight across ticks, nothing re-anchors a RUNNING activity's baseline
+    meanwhile, and a RUNNING activity cannot reach a checkpoint to spend the change it was owed. So
+    re-anchoring to the signature of *now* would inherit an environment event that landed two ticks
+    before the ack and let the next write commit unrevalidated — the whole in-flight window
+    invisible, which is well past the same-drain masking the absorption accepts."""
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    activity = _running_write(working, op_id="op-1")
+    await _settle_attention(cycle)
+    _baseline(cycle, activity)
+
+    # The world moves while the write is still in flight: its own drain, one tick before the ack.
+    _announce_signal(cycle, "t")
+    await DefaultObserveStrategy().observe(cycle)
+    assert activity.pending_operation is not None  # still in flight, so no checkpoint reached it
+
+    # The ack arrives in a later drain, carrying no new perception of its own.
+    cycle.result_sink.push("op-1", OperationAck(ok=True, result="ok"))
+    await DefaultObserveStrategy().observe(cycle)
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None  # the earlier change is still owed a revalidation
+    assert activity.pending_inference is not None
+    assert activity.pending_inference.kind == "revalidate"
+
+
+async def test_an_acked_read_absorbs_nothing(tmp_path: Path) -> None:
+    """A read predicts no change, so there is no record to justify absorbing what moved with it."""
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    activity = _running_write(working, op_id="op-1", operation="read_op")
+    await _settle_attention(cycle)
+    _baseline(cycle, activity)
+    _append_signal(working, "t")
+    cycle.result_sink.push("op-1", OperationAck(ok=True, result="ok"))
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None  # the write ahead is still guarded
+    assert activity.pending_inference is not None
+
+
+async def test_an_undeclared_operation_absorbs_nothing(tmp_path: Path) -> None:
+    """`side_effecting is None` is not absorbed either: the claim "this change is just my own
+    record" cannot be grounded in a declaration, so the guard stays."""
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    activity = _running_write(working, op_id="op-1", operation="mystery")  # not in the manual
+    await _settle_attention(cycle)
+    _baseline(cycle, activity)
+    _append_signal(working, "t")
+    cycle.result_sink.push("op-1", OperationAck(ok=True, result="ok"))
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None
+    assert activity.pending_inference is not None
+
+
+async def test_absorption_is_scoped_to_the_activity_that_issued_the_write(tmp_path: Path) -> None:
+    """Another activity did not predict this write, so for it the change is genuinely exogenous."""
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    writer = _running_write(working, op_id="op-1")
+    bystander = Activity(
+        id="b",
+        goal="g2",
+        context={},
+        plan=Plan(id="p2", goal="g2", steps=[invoke_step("t", "write_op")]),
+    )
+    working.activities["b"] = bystander
+    await _settle_attention(cycle)
+    _baseline(cycle, writer, bystander)
+    _append_signal(working, "t")
+    cycle.result_sink.push("op-1", OperationAck(ok=True, result="ok"))
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    result = await DefaultReasonStrategy().reason(bystander, working, cycle, TickResult())
+    assert result.step is None  # the bystander still revalidates
+    assert bystander.pending_inference is not None
+
+
+async def test_absorption_also_moves_the_scope_cursor(tmp_path: Path) -> None:
+    """The judge-free discard path reads the cursor, so leaving it behind would make
+    `replan_on_change` discard on the very percept the baseline just ruled out."""
+    cycle, working = await _cycle(tmp_path, reconsideration=ReplanOnChange())
+    activity = _running_write(working, op_id="op-1")
+    await _settle_attention(cycle)
+    _baseline(cycle, activity)
+    _announce_signal(cycle, "t")
+    cycle.result_sink.push("op-1", OperationAck(ok=True, result="ok"))
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step == invoke_step("t", "write_op")  # committed, not discarded
+    assert activity.plan is not None
+
+
+async def test_an_unbaselined_activity_is_left_for_its_own_entry_anchor(tmp_path: Path) -> None:
+    """Anchoring here would pre-empt the entry-time baseline the first checkpoint owes it."""
+    cycle, working = await _cycle(tmp_path, reconsideration=BeforeWrites())
+    activity = _running_write(working, op_id="op-1")
+    await _settle_attention(cycle)
+    activity.reconsider_baseline = None
+    cycle.result_sink.push("op-1", OperationAck(ok=True, result="ok"))
+
+    await DefaultObserveStrategy().observe(cycle)
+
+    assert activity.reconsider_baseline is None

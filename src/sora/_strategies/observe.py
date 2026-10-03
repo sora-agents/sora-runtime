@@ -24,6 +24,9 @@ from sora._strategies.interaction import (
     _goal_from_message,
     _truncate,
 )
+from sora._strategies.reconsideration import (
+    _operation_side_effecting,
+)
 from sora.action import (
     ResumeAction,
     SuspendAction,
@@ -314,6 +317,10 @@ class DefaultObserveStrategy:
 
     async def observe(self, cycle: DecisionCycle) -> TickResult:
         wm = cycle.working
+        # Taken before any of this tick's perception lands, and used only by
+        # `_absorb_acked_writes` — see there for why the absorption needs to know what the world
+        # looked like *before* the drain that carries the ack.
+        signature_before_drain = self._signature_before_drain(cycle)
         # Before the snapshot, so a tool a plan just started referencing is perceived on THIS tick
         # rather than the next one.
         attention_moved = await self._reconcile_attention(cycle)
@@ -385,6 +392,11 @@ class DefaultObserveStrategy:
                     cause="late_operation_ack",
                     payload={"invocation_id": invocation_id, "ack": ack},
                 )
+        # Before the inference drain below, not after: a plan install and a revalidation verdict
+        # each re-anchor the baseline to their own fire-time world *deliberately*, and must have
+        # the last word. In practice the two never collide for one activity — pending_operation and
+        # pending_inference are mutually exclusive — so the ordering is belt-and-braces.
+        self._absorb_acked_writes(cycle, just_resolved, signature_before_drain)
         # Drain first: a provider result may already be queued even though Observe starts after its
         # deadline. It is a real resolution, so do not append a synthetic timeout behind it. Then
         # expire requests that remain pending and drain again so a true absence still resolves in
@@ -670,6 +682,109 @@ class DefaultObserveStrategy:
         for activity in cycle.working.activities.values():
             if activity.reconsider_baseline is not None:
                 activity.reconsider_baseline = signature
+
+    @staticmethod
+    def _signature_before_drain(cycle: DecisionCycle) -> object | None:
+        """The gate signature as it stood at the top of this tick, or ``None`` when no absorption
+        could use it.
+
+        Computed here rather than inside ``_absorb_acked_writes`` because by the time that runs the
+        tick's own properties, signals and derived changes are already in working memory — the
+        "before" is gone. Guarded on an in-flight declared write by a baselined activity, which is
+        exactly the absorption's own precondition, so the hash is paid only on the ticks where an
+        absorption is actually possible and not on every observation of a run."""
+        for activity in cycle.working.activities.values():
+            if activity.reconsider_baseline is None or activity.pending_operation is None:
+                continue
+            invocation = activity.pending_operation.invocation
+            if (
+                _operation_side_effecting(
+                    cycle.working, invocation.tool_id, invocation.operation_name
+                )
+                is True
+            ):
+                return cycle.change_gate.signature(cycle.working)
+        return None
+
+    @staticmethod
+    def _absorb_acked_writes(
+        cycle: DecisionCycle,
+        just_resolved: list[tuple[Activity, OperationInvocation]],
+        signature_before_drain: object | None,
+    ) -> None:
+        """Re-anchor the reconsideration gate after the agent's *own* declared write landed, rather
+        than the world moving under it (ADR-0024).
+
+        A plan is invalidated by *unpredicted* change. The agent's own write is the opposite: it is
+        the plan's own step, and its record is already in ``history``, which every deliberation
+        reads. Information redundant with what the deliberation already had cannot change its
+        answer — if the plan says "delete X, then delete Y", having deleted X is not grounds for
+        not deleting Y. So the signature move a self-write produces is noise in the gate, and
+        absorbing it is not a loss of perception.
+
+        Same shape, and the same justification, as ``_rebaseline`` above: the signature moved for a
+        reason that is not the world moving independently of the agent. What it is *not* is a
+        blanket "ignore self-caused change" — the subtraction stops at the write's own record, and
+        anything beyond it still trips the gate:
+
+        * A **cascade** (the write cost a quota, triggered an auto-reply, freed a slot something
+          else filled) lands in a later drain and is not absorbed. That is the case where the side
+          effect is more than the record, and it still earns its reconsideration.
+        * **Masking** — an environment change landing in the *same* drain as the ack — is the
+          residual cost, and it is the bounded blind spot ``_rebaseline`` already accepts for
+          attention. It is narrower than it looks: the gate is only one of three consumers of a
+          signal, and neither condition evaluation nor a ``blocked_on`` resume is baselined, so an
+          absorbed signal still arms the watches that were waiting for it. Only the in-flight
+          plan's revalidation is skipped.
+
+        That same-drain bound is *enforced*, not merely intended, and the enforcement is the
+        ``signature_before_drain`` comparison below. Re-anchoring to the signature of "now" would
+        absorb the whole interval back to the previous anchor, not just this drain: an operation
+        stays in flight across ticks, nothing re-anchors a RUNNING activity's baseline in the
+        meantime, and a RUNNING activity cannot reach a checkpoint to spend the change it was
+        owed. So an environment event that landed two ticks before the ack would be silently
+        inherited by the new baseline and the next write would commit unrevalidated — the entire
+        in-flight window invisible, which is far past "the drain that carried my ack". Comparing
+        the activity's stored baseline against the signature taken at the top of this tick is the
+        exact test: equal means nothing moved between the anchor and this drain, so everything the
+        signature now reflects arrived with the ack and is the write's own; unequal means the world
+        moved first, and the guard stays. Unequal also covers the tick where ``_rebaseline`` moved
+        the baseline mid-tick, which costs at most one revalidation on an attention transition that
+        coincides with an ack — the fail-open direction ADR-0024 asks for.
+
+        Narrow by construction, three ways. **Issuer only**: another activity did not predict this
+        write, so for it the change is genuinely exogenous (falls out of ``pending_operation`` being
+        per-activity). **Declared writes only**: a read predicts no change, so there is no record to
+        justify absorbing anything that moved alongside it — and an operation whose manual declares
+        nothing (``side_effecting is None``) is deliberately *not* absorbed either, keeping the
+        guard wherever the claim cannot be grounded in a declaration. **Baselined activities only**:
+        an activity with no baseline has nothing to re-anchor, and anchoring one here would
+        pre-empt the entry-time anchor the first checkpoint owes it.
+
+        The scope cursor moves with the signature for the reason step 5a's re-baseline moves it:
+        the judge-free discard path reads the cursor, so leaving it behind would have
+        ``replan_on_change`` discard on the very percept this just ruled out.
+        """
+        signature: object | None = None
+        for activity, invocation in just_resolved:
+            if activity.reconsider_baseline is None:
+                continue
+            if (
+                _operation_side_effecting(
+                    cycle.working, invocation.tool_id, invocation.operation_name
+                )
+                is not True
+            ):
+                continue
+            if (
+                signature_before_drain is None
+                or activity.reconsider_baseline != signature_before_drain
+            ):
+                continue  # the world moved before this drain: not this write's to absorb
+            if signature is None:  # one signature for the whole drain; computed only if needed
+                signature = cycle.change_gate.signature(cycle.working)
+            activity.reconsider_baseline = signature
+            activity.reconsider_scope = cycle.working.perception_cursor()
 
     @staticmethod
     def _snapshot_properties(wm: WorkingMemory) -> None:

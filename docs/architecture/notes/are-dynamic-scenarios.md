@@ -121,10 +121,13 @@ on the set of **INBOX email ids**: a follow-up grows the inbox, while the agent'
 so a self-write is structurally invisible to the policy. This is example-level, ARE-email-shaped
 logic (`_inbox_ids_from_state` knows the `folders/INBOX/emails` shape). It is also why the runtime
 default is `NeverInterruptPolicy` — with no general way yet to tell the agent's own writes from
-external events, preempting on a signal is opt-in. The general fix — efference / read-write tags so
-*any* self-caused change is filtered regardless of tool — is deferred alongside BDI-style commitment
-policies and an off-cycle ARE push (which would turn this Observe-cadence preemption into true
-mid-Reason abandonment).
+external events, preempting on a signal is opt-in. The *cooperative* path has since gained a narrow
+version of the same subtraction — a declared side-effecting operation's acked change is absorbed
+into the reconsideration baseline (ADR-0024) — but it does not transfer here: it keys on an
+operation ack, and an interrupt screen runs on `push`, before any ack exists. The general fix —
+efference / read-write tags so *any* self-caused change is filtered regardless of tool or
+declaration — is still deferred, alongside BDI-style commitment policies and an off-cycle ARE push
+(which would turn this Observe-cadence preemption into true mid-Reason abandonment).
 
 **Where the policy gets those ids.** Not from the signal: `state_changed` is a bare event naming the
 app that moved, with no state attached — a signal never duplicates an observable property it

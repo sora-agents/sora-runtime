@@ -102,8 +102,12 @@ class ReplanOnChange:
 
     **Precondition, and the reason this is not the default:** it is unsound on an adapter whose
     signals include the agent's *own* writes. Such a signal lands on a tool the plan references by
-    construction, so every write would discard the plan that issued it. A judge filters that out by
-    reading the change; a mechanical trigger cannot. Use this only where perception is
+    construction, so every write would discard the plan that issued it. Resolve-time absorption
+    (``DefaultObserveStrategy._absorb_acked_writes``) narrows this considerably — a *declared*
+    write the activity itself invoked no longer trips the gate once its ack lands — but it does not
+    retire the precondition: an adapter that reports a self-caused change with no ack to attribute
+    it to, or an operation whose manual declares no ``side_effecting``, still trips it, and here
+    there is no judge to read the change and dismiss it. Use this where perception is
     environment-initiated, or where self-writes are otherwise excluded.
     """
 
@@ -120,14 +124,23 @@ _NON_SIDE_EFFECTING_ACTIONS = frozenset(
 )
 
 
+def _operation_side_effecting(wm: WorkingMemory, tool_id: Any, operation_name: Any) -> bool | None:
+    """An operation's declared ``OperationSpecification.side_effecting``, or None when the manual,
+    the operation, or the declaration itself is missing. Shared by the step-level checkpoint test
+    below and by the resolve-time absorption in Observe, so both read one source of truth."""
+    manual = _manual_for(wm, tool_id)
+    op = manual.operation(operation_name or "") if manual is not None else None
+    return op.side_effecting if op is not None else None
+
+
 def _step_side_effecting(step: Step, wm: WorkingMemory) -> bool | None:
     """Whether committing ``step`` mutates the world: an invoke defers to the operation's
     ``OperationSpecification.side_effecting`` (None = unknown); a WM/attention action or WAIT is a
     definite read (False); any other external action is unknown (None)."""
     if step.next_action == InvokeAction.name:
-        manual = _manual_for(wm, step.params.get(TOOL_ID))
-        op = manual.operation(step.params.get(OPERATION_NAME, "")) if manual is not None else None
-        return op.side_effecting if op is not None else None
+        return _operation_side_effecting(
+            wm, step.params.get(TOOL_ID), step.params.get(OPERATION_NAME, "")
+        )
     if step.next_action in _NON_SIDE_EFFECTING_ACTIONS:
         return False
     return None
@@ -166,11 +179,17 @@ class ChangeGate(Protocol):
 
 class PerceptionSignatureGate:
     """The runtime default ChangeGate: domain-free. The replace-by-key property snapshot (by repr)
-    plus the signal/message append-log lengths. A self-caused write still moves it (a new
-    ``state_changed`` signal, a changed property), so under this default the checkpoint spends one
-    revalidation on the agent's own writes; a domain ChangeGate that projects to only the external
-    surface is how an application removes that (e.g. an INBOX-id gate that self-writes to SENT /
-    read-flags / calendar don't move)."""
+    plus the signal/message append-log lengths.
+
+    A self-caused write *does* move this signature (a new ``state_changed`` signal, a changed
+    property) — the gate has no way to tell whose write it was. What keeps that from costing a
+    revalidation per write is not the gate but the resolve-time absorption in Observe
+    (``DefaultObserveStrategy._absorb_acked_writes``): when a declared write the activity itself
+    invoked is acked, its baseline is re-anchored past the change the write produced. A domain
+    ChangeGate that projects onto only the external surface is still available and still useful —
+    it suppresses the move *before* the signature is taken, so it also covers changes an adapter
+    reports with no ack to hang the absorption on — but it is no longer what stands between the
+    default and a self-write loop."""
 
     def signature(self, wm: WorkingMemory) -> object:
         return _perception_signature(wm)

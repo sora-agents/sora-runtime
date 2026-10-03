@@ -2304,8 +2304,18 @@ class ProceduralMemory:
         nothing, and get replanned into a copy of itself.
         Reuses the same ``LLMClient`` seam as ``infer``; no
         LLM -> raises. A ``False`` verdict re-infers; best-effort, not a guarantee, and
-        deliberately general (no domain-authored predicate) — it reasons about relevance itself, so
-        the agent's own writes don't spuriously invalidate the plan."""
+        deliberately general (no domain-authored predicate) — it reasons about relevance itself
+        rather than against an authored rule.
+
+        It is **not** what keeps the agent's own writes from invalidating its plan, though it was
+        designed on that assumption. A measured run showed why not: this prompt asks whether the
+        plan is still valid against the whole world, never what the change that woke the check
+        means, and it renders a *cumulative* signal log against a *windowed* history — so a
+        self-caused change sits in a log the judgement cannot correlate with the operations that
+        caused it, and a plan handling one of four reported additions reads as incomplete. Shown
+        exactly that, with the matching delete three lines above in the executed history, it
+        answered *invalid*. Self-writes are filtered a tier earlier instead, by the change-gate
+        absorption in Observe (ADR-0024)."""
         if self._llm is None:
             raise RuntimeError(
                 "ProceduralMemory has no LLM configured; cannot revalidate a plan. Pass a client."
