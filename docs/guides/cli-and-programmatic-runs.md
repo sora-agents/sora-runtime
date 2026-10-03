@@ -10,6 +10,14 @@ is a runnable reference for that shape: build the agent, `transport.submit()` an
 the condition you care about (an activity reaching `TERMINATED`, a timeout), then `await agent.stop()`
 and cancel/await the task in a `finally` for teardown.
 
+Awaiting that task is not just tidiness — it is the teardown. `Agent.run()` unwinds its own
+`finally`: it leaves every workspace it joined (closing MCP sessions and their subprocesses) and
+releases the model client's HTTP connection pool. Cancelling without awaiting skips all of it, and
+a pool left open is finalized by the garbage collector after the event loop is gone, which asyncio
+reports as a bare `Task exception was never retrieved ... RuntimeError('Event loop is closed')`
+with no stack into your code. Teardown lives after the loop rather than in `stop()` so that it
+cannot race a tick still in flight.
+
 ## See also
 
 - [Quickstart](../getting-started/quickstart.md) — the `sora run` CLI basics

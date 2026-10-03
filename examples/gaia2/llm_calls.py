@@ -604,6 +604,16 @@ class ClockedSoraLLMClient:
     def logical_call_limit_exceeded(self) -> bool:
         return bool(getattr(self._inner, "logical_call_limit_exceeded", False))
 
+    async def aclose(self) -> None:
+        # Forwarded for the same reason the two properties above are: this wrapper is installed
+        # onto `procedural._llm` for the whole run, so anything it does not pass through is simply
+        # absent from the runtime's view of its client. Teardown is the case where that is silent
+        # -- the agent releases what procedural memory holds, which is this, so without the
+        # forward the real HTTP pool stays open and gets finalized after the loop is gone.
+        aclose = getattr(self._inner, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
     async def complete(self, request: CompletionRequest) -> str:
         # Establishing the scope outside the metering decorator gives this wrapper the same id the
         # usage/done records carry. A parser repair enters an existing scope and therefore charges

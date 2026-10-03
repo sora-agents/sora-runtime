@@ -19,7 +19,7 @@ from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
 from sora.action import default_action_registry
 from sora.cycle import Agent, DecisionCycle
 from sora.environment import EnvironmentRegistry, Workspace, WorkspaceOrigin
-from sora.llm import LLMClient, MeteredLLMClient
+from sora.llm import CompletionRequest, LLMClient, MeteredLLMClient
 from sora.manual import Manual, ToolRecord, WorkspaceRecord
 from sora.memory import (
     EpisodicMemory,
@@ -167,3 +167,129 @@ async def test_run_is_idempotent_on_repeated_start(tmp_path: Path) -> None:
     # The workspace was left; a fresh run() would re-join cleanly (start flag guards double-join
     # within a single run() invocation, which is what the loop relies on).
     assert registry.joined_workspaces() == []
+
+
+class _ClosableLLMClient:
+    """A client that offers the optional ``aclose`` courtesy, so teardown becomes observable.
+
+    Counts rather than flags: closing a connection pool twice is its own defect (the second call
+    lands on an already-released transport), so the count is what the assertions below check.
+    """
+
+    model = "fake-model"
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.closed = 0
+        self._fail = fail
+
+    async def complete(self, request: CompletionRequest) -> str:
+        raise AssertionError("these lifecycle tests never reach a model call")
+
+    async def aclose(self) -> None:
+        self.closed += 1
+        if self._fail:
+            raise RuntimeError("the connection pool refused to close")
+
+
+class _UnclosableWorkspace(FakeWorkspace):
+    """A workspace whose close fails — the other half of run()'s shared teardown going wrong."""
+
+    async def close(self) -> None:
+        raise RuntimeError("workspace close failed")
+
+
+async def test_run_closes_the_model_client_on_teardown(tmp_path: Path) -> None:
+    """A model client holding an HTTP connection pool has to be released while the loop it was
+    created on is still running. Left open, it is finalized by the garbage collector after
+    ``asyncio.run`` has already closed the loop, and asyncio reports that as a bare
+    ``Task exception was never retrieved ... RuntimeError('Event loop is closed')`` — a traceback
+    per run, in exactly the logs a failing run is read back from, plus a leaked pool per run.
+
+    run()'s finally owns it for the same reason it owns leaving workspaces: it is *after* the loop,
+    so it cannot race a tick that is still in flight — which closing from stop() would.
+    """
+    client = _ClosableLLMClient()
+    agent, registry, workspace = _build_agent(tmp_path, llm=client)
+    task = asyncio.create_task(agent.run())
+
+    await _run_until(lambda: bool(registry.all_tools()), task)
+    await agent.stop()
+    await task
+
+    assert client.closed == 1
+    assert workspace.closed is True  # the teardown it shares the finally with still happened
+
+
+async def test_run_closes_the_model_client_when_the_loop_task_is_cancelled(tmp_path: Path) -> None:
+    """The shutdown path every run surface actually takes: ``TerminalSession`` cancels the runner
+    task rather than only setting the stop flag, so the close is reached while the task is already
+    unwinding a CancelledError. If it did not survive that, the close would be dead code on the one
+    path a benchmark run uses.
+    """
+    client = _ClosableLLMClient()
+    agent, registry, workspace = _build_agent(tmp_path, llm=client)
+    task = asyncio.create_task(agent.run())
+
+    await _run_until(lambda: bool(registry.all_tools()), task)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.closed == 1
+    assert workspace.closed is True
+
+
+async def test_run_closes_the_model_client_even_when_leaving_a_workspace_fails(
+    tmp_path: Path,
+) -> None:
+    """The two teardowns are independent, so a workspace whose close raises must not strand the
+    HTTP pool — and the leave failure must still surface rather than being swallowed by the close
+    that follows it."""
+    client = _ClosableLLMClient()
+    agent, registry, _ = _build_agent(tmp_path, llm=client)
+    bad_origin = WorkspaceOrigin(adapter="fake", address="fake://unclosable")
+    registry._adapters[bad_origin] = FakeAdapter(
+        "fake", _UnclosableWorkspace("unclosable", bad_origin, [])
+    )
+
+    task = asyncio.create_task(agent.run())
+    await _run_until(lambda: len(registry.joined_workspaces()) == 2, task)
+    await agent.stop()
+    with pytest.raises(RuntimeError, match="workspace close failed"):
+        await task
+
+    assert client.closed == 1
+
+
+async def test_a_failing_close_does_not_mask_what_the_run_was_unwinding(tmp_path: Path) -> None:
+    """Printing a teardown failure over the real one is the harm being fixed here, so a close that
+    raises must not become the exception that escapes run(). The startup-join failure is what the
+    caller needs to see."""
+    client = _ClosableLLMClient(fail=True)
+    agent, registry, workspace = _build_agent(tmp_path, llm=client)
+    bad_origin = WorkspaceOrigin(adapter="fake", address="fake://bad")
+    registry._adapters[bad_origin] = _FailingAdapter()
+
+    with pytest.raises(RuntimeError, match="second workspace is unavailable"):
+        await agent.run()
+
+    assert client.closed == 1  # attempted, and its own failure absorbed
+    assert workspace.closed is True
+
+
+@pytest.mark.parametrize("llm", [FakeLLMClient(), None], ids=["no-aclose", "no-model-at-all"])
+async def test_a_model_client_offering_no_aclose_is_left_alone(
+    tmp_path: Path, llm: LLMClient | None
+) -> None:
+    """``LLMClient`` is one method wide, so teardown is an optional courtesy a client may offer and
+    not a requirement — the same duck-typing ``ProceduralMemory.model`` already uses. A client
+    without it (and an agent with no model at all) must not turn run()'s teardown into an
+    AttributeError, which would strand the workspace leave sharing that finally."""
+    agent, registry, workspace = _build_agent(tmp_path, llm=llm)
+    task = asyncio.create_task(agent.run())
+
+    await _run_until(lambda: bool(registry.all_tools()), task)
+    await agent.stop()
+    await task
+
+    assert workspace.closed is True

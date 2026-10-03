@@ -2087,6 +2087,19 @@ class ProceduralMemory:
     def logical_call_limit_exceeded(self) -> bool:
         return bool(getattr(self._llm, "logical_call_limit_exceeded", False))
 
+    async def aclose(self) -> None:
+        """Release whatever the model client holds open. Called once by ``Agent.run``'s teardown.
+
+        Duck-typed like ``model`` above, and optional for the same reason: ``LLMClient`` is one
+        method wide, so teardown is a courtesy a client may offer, never a requirement — a client
+        with nothing to release (and a memory configured with no model at all) answers by having no
+        such attribute. Procedural memory is what closes it because it is the only thing holding it:
+        bootstrap builds the client straight into this constructor and hands it nowhere else.
+        """
+        aclose = getattr(self._llm, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
     async def retrieve(self, activity: Activity) -> Plan | None:
         """Looks up a cached Plan matching this activity's goal — e.g. exact match or embedding
         similarity, backend-dependent. The cheap path: skips infer() entirely when it hits."""

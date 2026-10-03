@@ -332,7 +332,15 @@ class Agent:
         (closes MCP sessions/subprocesses) whatever managed to join — even a *partial* startup join
         that then failed (otherwise an already-joined workspace's subprocess would leak). Leaving in
         the finally, after the loop exits, also avoids racing an in-flight tick — unlike leaving
-        from stop()."""
+        from stop().
+
+        The model client is released in the same finally and for the same reason. Its HTTP
+        connection pool has to be closed while the loop it was created on is still running:
+        otherwise the garbage collector finalizes it after ``asyncio.run`` has closed the loop, and
+        asyncio reports that as a bare ``Task exception was never retrieved ... RuntimeError('Event
+        loop is closed')`` — a traceback per run with no stack into any of our code, printed into
+        exactly the logs a failed run is read back from, where it masks the real one. Each run also
+        leaks the pool itself, which a driver running scenarios back to back accumulates."""
         try:
             await self._start()
             while not self._stopped:
@@ -341,8 +349,14 @@ class Agent:
                 # signal a policy elects to preempt on) wakes the loop at once for the next tick.
                 await self.cycle.wait_between_ticks(self._tick_interval)
         finally:
-            for workspace in list(self.registry.joined_workspaces()):
-                await self.registry.leave(workspace.id)
+            # Nested, so the two teardowns can't strand each other: the workspace leaves keep their
+            # existing behaviour exactly (the first failure propagates, the rest are skipped), while
+            # the model client is released whether they succeeded, failed, or never ran.
+            try:
+                for workspace in list(self.registry.joined_workspaces()):
+                    await self.registry.leave(workspace.id)
+            finally:
+                await self._close_model_client()
 
     async def _start(self) -> None:
         if self._started:
@@ -365,6 +379,19 @@ class Agent:
             if origin not in already_joined:
                 log.info("startup: joining workspace %s (%s)", origin.address, origin.adapter)
                 await join.execute(self.registry, self.cycle, activity_id="", origin=origin)
+
+    async def _close_model_client(self) -> None:
+        try:
+            await self.procedural.aclose()
+        except Exception as exc:
+            # Absorbed deliberately. This runs while the loop is already unwinding, so letting it
+            # raise would replace whatever run() was carrying out — a workspace leave failure, or
+            # the body's own exception — with a failure to tidy up after it, which is the masking
+            # this close exists to remove rather than relocate. Debug, matching how the terminal
+            # session treats its own shutdown noise: visible when teardown is what's being read,
+            # absent from the trace of a run that merely ended. `Exception`, so a CancelledError
+            # delivered mid-close still propagates out of an async runtime.
+            log.debug("releasing the model client raised during teardown: %r", exc)
 
     async def stop(self) -> None:
         self._stopped = True

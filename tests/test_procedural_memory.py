@@ -1538,3 +1538,35 @@ def test_ground_system_prompt_separates_what_was_intended_from_what_happened() -
     never learns which operation it is filling in for."""
     assert "EXECUTION RECORD" in GROUND_SYSTEM_PROMPT
     assert "what was INTENDED, never what happened" in GROUND_SYSTEM_PROMPT
+
+
+class _ClosableLLMClient(FakeLLMClient):
+    """A ``FakeLLMClient`` that also offers the optional ``aclose`` courtesy a real client with an
+    HTTP connection pool offers."""
+
+    def __init__(self) -> None:
+        super().__init__("")
+        self.closed = 0
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+async def test_aclose_releases_the_model_client(tmp_path: Path) -> None:
+    """Procedural memory closes the client because it is the only thing holding it — bootstrap
+    builds it straight into this constructor. Left open, its connection pool outlives the event
+    loop and asyncio reports the GC's finalizer as `Event loop is closed`."""
+    llm = _ClosableLLMClient()
+    mem = ProceduralMemory(FileMemoryBackend(tmp_path), llm=llm)
+
+    await mem.aclose()
+
+    assert llm.closed == 1
+
+
+async def test_aclose_tolerates_a_client_that_offers_no_teardown(tmp_path: Path) -> None:
+    """``LLMClient`` is one method wide, so ``aclose`` is duck-typed exactly like ``model``: a
+    client with nothing to release simply has no such attribute, and a memory with no model at all
+    has no client. Neither may raise — this runs in the teardown that also leaves workspaces."""
+    await ProceduralMemory(FileMemoryBackend(tmp_path), llm=FakeLLMClient()).aclose()
+    await ProceduralMemory(FileMemoryBackend(tmp_path)).aclose()  # no model configured at all

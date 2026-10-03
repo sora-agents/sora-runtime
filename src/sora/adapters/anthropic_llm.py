@@ -122,7 +122,10 @@ class AnthropicLLMClient:
         return text
 
     async def aclose(self) -> None:
-        """Release the underlying HTTP client. Optional — the cycle/agent owns lifecycle."""
+        """Release the underlying HTTP client. Called by ``Agent.run``'s teardown, through
+        ``ProceduralMemory.aclose`` — the agent owns lifecycle, the client owns only the
+        round-trip. Not part of the ``LLMClient`` Protocol: it stays a duck-typed courtesy so a
+        client with nothing to release needs no such method."""
         await self._client.close()
 
 

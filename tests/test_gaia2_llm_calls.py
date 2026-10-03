@@ -1389,3 +1389,34 @@ def test_both_frozen_modes_freeze_and_only_the_unfrozen_one_does_not() -> None:
     assert freezes_clock(CLOCK_MODE_TOKEN_CHARGED) is True
     assert freezes_clock(CLOCK_MODE_GENERATION_FREE) is True
     assert freezes_clock(CLOCK_MODE_WALL) is False
+
+
+async def test_the_clocked_client_forwards_teardown_to_the_real_client(tmp_path: Path) -> None:
+    """This wrapper is installed onto ``procedural._llm`` for the whole scenario, so whatever it
+    does not pass through is absent from the runtime's view of its client. For teardown that is
+    silent and costs a connection pool per scenario: the agent releases what procedural memory
+    holds -- this wrapper -- and without the forward the real client's HTTP pool stays open until
+    the garbage collector finalizes it after the event loop is already closed, which asyncio
+    reports as `Task exception was never retrieved ... Event loop is closed`.
+    """
+
+    class _Client:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def complete(self, request: CompletionRequest) -> str:
+            raise AssertionError("this test never completes a round-trip")
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    inner = _Client()
+    writer = LLMCallWriter(tmp_path / "calls.jsonl").open()
+    recorder = SoraCallRecorder(writer, charge=_charge())
+    # Through the metering decorator too, which is how bootstrap builds it -- the forward has to
+    # survive the whole chain, not just one hop.
+    client = ClockedSoraLLMClient(MeteredLLMClient(inner), clock=None, recorder=recorder)
+
+    await client.aclose()
+
+    assert inner.closed == 1
