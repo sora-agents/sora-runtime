@@ -98,7 +98,11 @@ def _matches(element: Any, where: Any) -> bool:
     the element's ``path`` value in ``value`` (a literal list, or — resolved upstream in Reason —
     the projected keys of another collection named by a reference); ``overlaps`` tests the
     element's own interval against a collection of them (see ``_overlaps``). A ``$decide``
-    predicate never gets here (FilterAction escalates it). No predicate keeps everything. A
+    predicate never gets here, and that is now *enforced* rather than assumed: a whole-predicate
+    one is escalated by FilterAction, and a nested one — which FilterAction's top-level escalation
+    test does not see, so it used to arrive here and evaluate False for every element, silently
+    emptying the collection — is refused upstream as a plan defect by
+    ``_resolve_predicate_clause``. No predicate keeps everything. A
     membership set that isn't a list is treated as empty: ``in`` matches nothing, ``not_in`` keeps
     everything (fails open, so a malformed exclusion set never silently drops the whole
     collection).
@@ -735,7 +739,9 @@ def _resolve_predicate_value(
     where = params.get("where")
     if not isinstance(where, dict):
         return params, None  # no predicate
-    resolved, defect = _resolve_predicate_clause(where, history, bindings, properties)
+    resolved, defect = _resolve_predicate_clause(
+        where, history, bindings, properties, top_level=True
+    )
     if defect is not None:
         return params, defect
     return ({**params, "where": resolved} if resolved is not where else params), None
@@ -746,6 +752,8 @@ def _resolve_predicate_clause(
     history: list[CompletedOperation],
     bindings: dict[str, Any],
     properties: dict[tuple[str, str], Percept] | None = None,
+    *,
+    top_level: bool = False,
 ) -> tuple[Any, str | None]:
     """One clause of a predicate, resolved — the recursive worker behind
     ``_resolve_predicate_value``, and where that function's documented shapes are actually applied.
@@ -755,7 +763,12 @@ def _resolve_predicate_clause(
     predicate: a conjunction with one dead clause selects nothing, and a disjunction with one
     silently drops whatever that clause was meant to catch. Composition resolves nothing itself —
     it is structure the evaluator walks — so all that is checked of it here is that it can be
-    walked."""
+    walked.
+
+    ``top_level`` is what separates the predicate's own root from a clause inside it, and only one
+    shape cares: a ``$decide``. As the whole ``where`` it is legal and escalated intact; as a
+    nested clause it is a plan defect, because the escalation test that would catch it only ever
+    reads the root."""
     if not isinstance(where, dict):
         return where, (
             f"a composed predicate contains {_shape_of(where)}, not an object describing a "
@@ -763,7 +776,23 @@ def _resolve_predicate_clause(
             "entry as its own predicate object."
         )
     if _REF_DECIDE in where:
-        return where, None  # a soft clause is escalated whole rather than resolved mechanically
+        if top_level:
+            return where, None  # escalated whole by FilterAction, not resolved mechanically
+        # A soft clause nested under `all`/`any`, which nothing escalates: FilterAction's
+        # escalation test reads the predicate's own top level, so a composed predicate is dispatched
+        # mechanically and the soft clause reaches `_matches` as a clause it cannot evaluate. There
+        # it degenerates to the default `eq` branch -- `path` defaults to "", which plucks the whole
+        # element, against a `value` of None -- so it is False for *every* element. Under `all` that
+        # silently empties the collection; under `any` it silently drops whatever the clause was
+        # meant to catch. Refused here for the same reason an operand-position $decide is: the
+        # filter otherwise does the wrong thing to the whole collection and reports success.
+        return where, (
+            f"a composed predicate's clause cannot be a $decide reference "
+            f"({where[_REF_DECIDE]!r}) — only a whole 'where' can be decided by the model, so a "
+            "soft clause inside 'all'/'any' would be evaluated mechanically and match nothing. "
+            "Split it into two filter steps: keep the mechanical clauses in this one, then filter "
+            "its output with the $decide as the whole 'where'."
+        )
     for key in (_COMPOSE_ALL, _COMPOSE_ANY):
         if key not in where:
             continue

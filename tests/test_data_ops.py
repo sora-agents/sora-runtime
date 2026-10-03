@@ -26,7 +26,7 @@ from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
-from sora.data_ops import _as_collection, _resolve_collection
+from sora.data_ops import _as_collection, _resolve_collection, _resolve_predicate_value
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
 from sora.manual import Manual, ObservablePropertySpecification
 from sora.memory import (
@@ -664,6 +664,47 @@ async def test_filter_empty_or_malformed_composition_is_a_defect_not_a_blanket_k
         assert "kept" not in activity.bindings, where
         assert activity.plan is None, where
         assert activity.replan_trail[-1] is not None, where
+
+
+async def test_filter_nested_decide_clause_is_a_defect_not_an_empty_collection(
+    tmp_path: Path,
+) -> None:
+    """A soft clause inside `all`/`any` is refused, because nothing escalates it.
+
+    FilterAction's escalation test reads the predicate's own top level, so a *composed* predicate
+    holding a `$decide` clause is dispatched mechanically and the soft clause reaches `_matches`,
+    which has no branch for it: `path` defaults to "" (plucking the whole element) and `value` to
+    None, so the clause is False for every element. Under `all` that silently empties the
+    collection while reporting success — observed on a benchmark run as a filter that kept 0 of 108
+    contacts, which left a downstream email fan-out with nothing to send while the agent told the
+    user the task was done. Under `any` it silently drops whatever the clause was meant to catch.
+    """
+    soft = {"$decide": "the room is actually usable"}
+    for where in ({"all": [{"path": "room", "op": "eq", "value": "blue"}, soft]}, {"any": [soft]}):
+        step = Step(
+            next_action="filter",
+            params={"in": BOOKINGS, "out": "kept", "where": where},
+        )
+        activity = await _run_one_dataop(tmp_path, step, [])
+
+        assert "kept" not in activity.bindings, where
+        assert activity.plan is None, where
+        defect = activity.replan_trail[-1]
+        assert defect is not None, where
+        # The brief has to name the shape and say what to write instead, or the planner rewrites
+        # the same predicate: the mechanical clauses stay, the soft one becomes its own step.
+        assert "$decide" in defect and "all" in defect, defect
+
+
+def test_filter_whole_predicate_decide_is_still_escalated_not_refused() -> None:
+    """The counterpart to the clause refusal: as the whole `where`, a `$decide` stays legal.
+
+    Guards the fix's blast radius — the refusal distinguishes the predicate's root from a clause
+    inside it, so a root `$decide` must still pass resolution untouched for FilterAction to
+    escalate.
+    """
+    where = {"$decide": "the interesting ones"}
+    assert _resolve_predicate_value({"where": where}, [], {}) == ({"where": where}, None)
 
 
 async def test_filter_overlaps_is_half_open_by_default(tmp_path: Path) -> None:
