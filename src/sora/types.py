@@ -544,6 +544,11 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     kind: InferenceKind
     requested_at: float
     out: str | None = None  # target binding name for kind=="select"; None for the others
+    # The goal override the call was fired with (a sub-goal's, a `then`'s, or the surviving frame's
+    # on a replan); None when the call is for the activity's own goal. Carried so the resolver can
+    # record it where nothing else does — a `then` installs without pushing a frame, so this is the
+    # only record of the goal its plan serves (see Activity.pursued_goal).
+    goal: str | None = None
     # A compact signature of the perception the pending deliberation was fired against, captured at
     # fire time. For kind "plan"/"subgoal" it is the world the plan is being inferred against; for
     # "revalidate" it is the world the validity check ran against. Observe moves it onto

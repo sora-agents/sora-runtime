@@ -45,6 +45,8 @@ from sora._strategies.subgoals import (
     _ancestor_subgoal_goals,
     _expand_mechanical,
     _goal_token_overlap,
+    _pursued_goal,
+    _within_condition_body,
 )
 from sora.action import (
     CollectAction,
@@ -207,7 +209,12 @@ class DefaultReasonStrategy:
             # goal did not come from the user. Cached retrieval is skipped for the same reason a
             # first-time sub-plan skips it: the store is keyed by goal, and a sub-plan has never
             # been a cache write.
-            frame_goal = _active_frame_goal(activity)
+            # A fired condition's `then` pushes no frame, so `_active_frame_goal` would answer with
+            # the *enclosing* sub-goal and the replacement plan would serve a different commitment
+            # than the discarded one. `pursued_goal` records the `then`'s goal against the depth it
+            # runs at and so takes precedence while that depth still matches; see
+            # `Activity.pursued_goal` for the committed write this cost.
+            frame_goal = _pursued_goal(activity) or _active_frame_goal(activity)
             plan = None if frame_goal else await cycle.procedural.retrieve(activity)
             if plan is None:
                 # Miss -> fire _infer_ off-cycle: it moves the activity to RUNNING and returns at
@@ -245,6 +252,12 @@ class DefaultReasonStrategy:
             plan = activity.plan
             assert plan is not None  # set above, and by every branch that continues this loop
             if activity.step_index >= len(plan.steps):
+                # The body ran to the end, so a `then`'s commitment is discharged — drop the record
+                # before anything pops, or it would answer for whatever plan next occupies this
+                # depth. Only when the depth still matches: a deeper frame's exhaustion is about to
+                # pop *back into* the `then`, which is still owed.
+                if _pursued_goal(activity) is not None:
+                    activity.pursued_goal = None
                 if activity.parent_frames and not _conditions_hold_frame(activity):
                     # Sub-plan exhausted: pop the frame and resume the parent at the step *after*
                     # its sub-goal, then loop to read it (or pop again if that frame is exhausted).
@@ -818,12 +831,24 @@ class DefaultReasonStrategy:
         # on a rejected mechanical step belong to no plan and must not survive its replan.
         _lift_step_conditions(step, activity, wm, mode)
         activity.plan = replace(plan, steps=plan.steps[:i] + expanded + plan.steps[i + 1 :])
-        if not expanded:
+        if not expanded and not _within_condition_body(activity):
             # Zero steps is a legitimate answer (the collection was genuinely empty — an unreadable
             # one already replanned above), but it is one nothing downstream can see: no operation
             # runs, so `history` gains no entry, and a later report phrased against history alone
             # cannot tell "nothing needed doing" from "it was done". Record it as its own kind of
             # outcome so grounding can state the gap instead of inheriting the plan's intent.
+            #
+            # Except inside a fired condition's `then`, where emptiness is the watch working as
+            # asked. The record's premise is "a named piece of work that no operation discharged",
+            # and that does not hold for a monitor: it fires as often as the world moves and most
+            # firings legitimately have nothing to do. Worse, an entry is keyed on the goal string
+            # while the body re-plans the same fan-out on every firing, so barren firings pile up
+            # lines naming the very work the productive ones did. A live run recorded 'Delete each
+            # preexisting calendar event that overlaps...' twice as done-nothing while `history`
+            # held the five deletes it names; the forced report re-grounding then hedged into a
+            # self-contradiction. What would be truthful about repeated firings is an aggregate
+            # over them, which is a reporting feature and does not exist — a per-firing gap note
+            # is not a cheap stand-in for it, it is simply false.
             activity.noop_subgoals.append(str(step.params.get("goal", "")))
         log.info(
             "reason: sub-goal %r fanned out to %d step(s)", step.params.get("goal"), len(expanded)

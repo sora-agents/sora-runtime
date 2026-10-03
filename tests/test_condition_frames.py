@@ -23,14 +23,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
 from sora._strategies.conditions import (
     _conditions_hold_frame,
     _eligible_conditions,
     _frame_key,
     _lift_pending_conditions,
 )
-from sora._strategies.subgoals import _goal_token_overlap
+from sora._strategies.subgoals import (
+    _active_frame_goal,
+    _goal_token_overlap,
+    _pursued_goal,
+    _within_condition_body,
+)
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -957,3 +962,140 @@ async def test_a_step_with_a_malformed_pending_block_still_runs(tmp_path: Path) 
 
     assert activity.pending_conditions == []
     assert activity.plan is not None  # not dropped as a defect
+
+
+# --------------------------------------------------------------------------------------------------
+# A discard mid-`then` must replan the `then`, not the body it sits inside
+#
+# A `then` installs without pushing a frame, so `_active_frame_goal` answers with the ENCLOSING
+# maintenance sub-goal. A measured run was discarded one step into a two-delete fan-out inside a
+# `then`; the replan was therefore asked to plan the monitoring body, in which the remaining delete
+# has no legal place, and the planner correctly returned `{"steps": []}`. The delete was lost for
+# good: each firing scopes its collection to its own `fired_*_ids`, so no later firing re-derived
+# it.
+# --------------------------------------------------------------------------------------------------
+
+
+async def _entered_then(
+    tmp_path: Path, llm: FakeLLMClient
+) -> tuple[DecisionCycle, WorkingMemory, Activity]:
+    """Drive a real firing all the way into its `then` body, so `pursued_goal` is set by the
+    install path rather than by the test."""
+    cycle, working = _cycle(tmp_path, llm)
+    # The condition is declared by the monitoring frame's own step, so that frame is one a discard
+    # will keep (`frames_held_by_conditions`) — the configuration the motivating run was in.
+    activity = _fanned_out(step_index=2, goal_kind="maintenance", pending=(_condition(),))
+    _lift_pending_conditions(activity, working)
+    working.activities[activity.id] = activity
+    activity.condition_batch = list(activity.pending_conditions)
+    activity.condition_verdict = ConditionVerdict(fired=(0,))
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())  # pursues the `then`
+    await _settle()
+    await cycle.strategies.observe.observe(cycle)  # installs the `then`'s plan at this depth
+    assert activity.plan is not None and activity.plan.id != "sub"
+    return cycle, working, activity
+
+
+async def test_a_then_records_the_goal_its_plan_serves(tmp_path: Path) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}, {"action": "wait"}))
+    _cycle_, _working, activity = await _entered_then(tmp_path, llm)
+
+    assert activity.pursued_goal == (1, _THEN)  # paired with the depth it runs at
+    assert len(activity.parent_frames) == 1  # and still no frame of its own
+
+
+async def test_a_discard_mid_then_replans_the_then_not_the_enclosing_body(tmp_path: Path) -> None:
+    llm = FakeLLMClient(
+        [plan_json({"action": "wait"}, {"action": "wait"}), json.dumps({"steps": []})]
+    )
+    cycle, working, activity = await _entered_then(tmp_path, llm)
+    activity.step_index = 1  # one step of the `then` committed; the sibling is still owed
+
+    activity.reset_for_replan()  # no defect: the plan was fine, the world moved
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+    await _settle()
+
+    _system, user = llm.calls[-1]
+    assert user.startswith(f"Goal: {_THEN}\n")  # the `then`, not _ANCESTOR_GOAL
+    assert not user.startswith(f"Goal: {_ANCESTOR_GOAL}\n")
+    # ...and the work still owed is in front of the planner, not merely recoverable in principle.
+    assert "Its remaining, unexecuted steps were" in user
+
+
+async def test_the_pursued_goal_survives_the_discard_that_keeps_its_depth(tmp_path: Path) -> None:
+    """`reset_for_replan` drops frames to the prefix a live condition holds. Here that keeps the
+    monitoring frame, so the `then`'s depth is unchanged and its record still answers."""
+    llm = FakeLLMClient(plan_json({"action": "wait"}, {"action": "wait"}))
+    _cycle_, _working, activity = await _entered_then(tmp_path, llm)
+
+    activity.reset_for_replan()
+
+    assert activity.pursued_goal == (1, _THEN)
+    assert len(activity.parent_frames) == 1  # held by the live condition
+
+
+async def test_an_exhausted_then_stops_answering_for_the_next_plan(tmp_path: Path) -> None:
+    """The commitment is discharged when the body runs out, so the record must not be left to
+    answer for whatever plan next occupies the same depth."""
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    cycle, working, activity = await _entered_then(tmp_path, llm)
+    assert activity.pursued_goal is not None
+    activity.step_index = len(activity.plan.steps) if activity.plan else 0  # body exhausted
+
+    await cycle.strategies.reason.reason(activity, working, cycle, _tick())
+
+    assert activity.pursued_goal is None
+
+
+async def test_a_sub_goal_entered_from_inside_a_then_is_planned_for_itself(tmp_path: Path) -> None:
+    """Depth is what scopes the record. An authored sub-goal pushes a frame that *does* carry its
+    goal, so while it runs the frame wins and the `then` is not consulted."""
+    llm = FakeLLMClient(plan_json({"action": "wait"}, {"action": "wait"}))
+    _cycle_, _working, activity = await _entered_then(tmp_path, llm)
+    # As a deliberative sub-goal's install would leave it: one frame deeper than the `then`.
+    activity.parent_frames.append(_monitoring_frame())
+
+    assert activity.pursued_goal == (1, _THEN)  # still recorded...
+    assert _pursued_goal(activity) is None  # ...but not answering at this depth
+    assert _active_frame_goal(activity) == _ANCESTOR_GOAL  # the pushed frame does
+
+
+async def test_a_discard_that_pops_out_past_the_then_leaves_its_goal_behind(tmp_path: Path) -> None:
+    """The other direction: once the frames the `then` ran under are gone, the goal it served is no
+    longer the question to ask, and the record stops answering by itself."""
+    llm = FakeLLMClient(plan_json({"action": "wait"}, {"action": "wait"}))
+    _cycle_, _working, activity = await _entered_then(tmp_path, llm)
+    activity.parent_frames.clear()  # as a discard with nothing held would leave it
+
+    assert _pursued_goal(activity) is None
+
+
+async def test_a_discard_past_the_then_drops_the_record_rather_than_shelving_it(
+    tmp_path: Path,
+) -> None:
+    """Going through the real discard, not just the reader above: the record is *removed*, because
+    being ignored is not the same as being gone.
+
+    Both readers skip an entry deeper than the stack, so the previous test's `None` holds the moment
+    the frames go. But the one place that would clear the entry — the discharge in Reason — runs
+    only `if _pursued_goal(activity) is not None`, which is the very depth match the discard broke.
+    So a shelved entry is unreachable by its own cleanup and waits for any later plan to push a
+    frame back to that depth, at which point it answers for work it has nothing to do with: the
+    stale `then` goal is handed to an unrelated sub-goal's replan, and that sub-goal's empty fan-out
+    is read as condition-driven and kept out of the no-op record a report is built from."""
+    llm = FakeLLMClient(plan_json({"action": "wait"}, {"action": "wait"}))
+    _cycle_, _working, activity = await _entered_then(tmp_path, llm)
+    assert activity.pursued_goal == (1, _THEN)
+
+    # Nothing holds the monitoring frame once its condition is retired, so the discard pops out
+    # past the depth the `then` ran at.
+    activity.pending_conditions = []
+    activity.reset_for_replan(defect="the plan was invalidated")
+    assert activity.parent_frames == []
+    assert activity.pursued_goal is None  # dropped, not shelved
+
+    # An unrelated sub-goal later occupies the same depth and inherits nothing.
+    activity.parent_frames.append(_monitoring_frame())
+    assert _pursued_goal(activity) is None
+    assert _within_condition_body(activity) is False

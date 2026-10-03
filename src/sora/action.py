@@ -576,7 +576,12 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         scope = cycle.working.perception_cursor() if baseline is not None else None
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind=kind, requested_at=time.time(), baseline=baseline, scope=scope
+            id=inf_id,
+            kind=kind,
+            requested_at=time.time(),
+            baseline=baseline,
+            scope=scope,
+            goal=goal if isinstance(goal, str) and goal else None,
         )
         activity.state = ActivityState.RUNNING  # off-cycle, like _invoke_ — immediate, never blocks
         # `superseded` is dropped on the sub-goal copy (ADR-0024): the bundle is context for

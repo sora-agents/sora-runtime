@@ -384,6 +384,40 @@ bundle, which is why `_infer_` drops it only for a goal that was never planned).
 activity's goal there would put the user's whole request one level inside itself — under the notice
 that tells a sub-plan its goal did not come from the user, which is true only of the sub-goal.
 
+**Following the stack is not enough where the stack records nothing: a fired `then` (2026-10-03).**
+The amendment above makes the replan serve the frame's sub-goal. A fired condition's `then` has no
+frame to serve. It installs at the *current* depth and pushes nothing — deliberately, because a
+watch fires as many times as the world moves and a stack that grew per firing would walk a healthy
+monitor into the depth cap for doing its job. The cost of pushing no frame is that nothing holds the
+`then`'s own goal: the `ConditionFiring` carrying it has already been popped off the queue, so
+`_active_frame_goal` answers with the **enclosing** sub-goal.
+
+A measured run paid for that. Inside an open maintenance window a firing's `then` fanned out to two
+deletes; one landed, the self-write tripped the gate (the amendment above), the judgment said
+*invalid*, and the discard left the monitoring frame standing — correctly — so the replan was asked
+to plan the *monitoring body*, in which a specific pending delete has no legal place. The planner
+answered `{"steps": []}`, which is the right answer to the question it was asked. The delete was
+then unrecoverable: each firing scopes its collection to its own `fired_*_ids`, so the event this
+one conflicted with was gone from the next firing's view and no later firing re-derived it. The run
+failed on that one missing write, and note which half the symptom names — the planner that returned
+an empty plan looks like the fault, while the actual loss is a goal nothing recorded.
+
+Note also what this is *not*: a rendering gap. The `SupersededPlan` worked exactly as the paragraph
+below says — the replan prompt rendered the lost delete verbatim as remaining step 0. Carrying the
+un-run tail is necessary but not sufficient, because a planner reads the tail *in service of the
+goal it was handed*, and a tail belonging to a different commitment is material it is right to
+discard. The goal, not just the tail, has to survive the discard.
+
+So `Activity.pursued_goal` records a `then`'s goal paired with the **frame depth** it runs at, is
+kept across `reset_for_replan()`, and takes precedence over `_active_frame_goal` while that depth
+still matches. Depth is what scopes it, in place of an explicit clear, and it earns its keep in
+three directions: an authored sub-goal entered from inside the `then` pushes a frame that *does*
+record its goal (deeper → the frame wins), popping back into the `then` body matches again, and a
+discard that popped out past the `then` entirely has left that commitment behind for good
+(shallower → ignored). It is cleared outright once the body is exhausted, since the commitment is
+then discharged and a stale entry would answer for whatever plan next occupies the depth. This
+needs no new frame type and does not relax the no-push rule the depth cap depends on.
+
 **What recovers the cost instead: the replan sees the plan it replaces.** `reset_for_replan()` parks
 the discard as a `SupersededPlan` (active frame + `step_index` + suspended parents) on
 `Activity.superseded`, and the planning prompt renders its **un-run tail**, flattened across the stack

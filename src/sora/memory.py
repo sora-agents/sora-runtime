@@ -1556,7 +1556,14 @@ def render_noop_subgoals(goals: list[str], *, budget: int = _NOOP_SUBGOALS_CHAR_
     These read as absence, and absence is what a report gets wrong — a fan-out over an empty
     collection performs nothing, leaves history untouched, and is then indistinguishable from a
     fan-out that did the work. Naming it is the whole fix: the grounder can only decline to claim
-    the work if something tells it the work has a name and did not happen."""
+    the work if something tells it the work has a name and did not happen.
+
+    The rendering states "nothing was done for it" flatly, which is only safe because what reaches
+    it is already narrowed upstream: a fan-out inside a fired condition's ``then`` is never
+    recorded, and the whole record is dropped on replan. Without that, a monitor's barren firings
+    would render this line against the same goal string its productive firings discharged — a
+    direct contradiction of the history rendered beside it, which is how a real run talked itself
+    into a report that denied the five writes it had just made."""
     if not goals:
         return "(none)"
     lines: list[str] = []

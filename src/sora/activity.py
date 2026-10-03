@@ -62,6 +62,23 @@ class Activity:
     # its sub-goal (Reason). Empty for a flat plan — generalizes step_index rather than adding a
     # separate intention type (ADR-0002).
     parent_frames: list[tuple[Plan, int, int]] = field(default_factory=list)
+    # `(frame depth, goal)` for a fired condition's `then`: the goal the active plan serves when no
+    # frame records it. A `then` installs without pushing a frame (see the "then" branch in the
+    # inference resolver) precisely so a watch firing repeatedly cannot walk a healthy monitor into
+    # the depth cap. The cost is that nothing remembers the `then`'s own goal, and
+    # `_active_frame_goal` therefore reads the *enclosing* sub-goal — so a discard mid-`then`
+    # replanned the enclosing maintenance body, in which the `then`'s unexecuted steps have no
+    # legal place, and the planner correctly answered with an empty plan. An observed run lost a
+    # committed calendar delete that way: the work was still owed, still correct, and no later
+    # firing could re-derive it, since each firing scopes its collection to its own `fired_*_ids`.
+    # Kept across `reset_for_replan` so the replacement plan serves the same goal. The depth is
+    # what scopes it rather than an explicit clear, and it is doing real work in three directions:
+    # an authored sub-goal entered from inside the `then` pushes a frame that *does* record its
+    # goal (deeper -> ignored, the frame wins), popping back to the `then` body matches again, and
+    # a discard that pops out past the `then`'s own depth has left the goal behind for good
+    # (shallower -> ignored). Cleared outright once that body is exhausted: the commitment is then
+    # discharged, and a stale entry would answer for some later plan at the same depth.
+    pursued_goal: tuple[int, str] | None = None
     # Where in `history` the *active* frame's plan began. `history` is flat and frame-agnostic (see
     # reset_for_replan below, which relies on that), which is right for `$from` — it reads the
     # LATEST match, so it stays current, and a sub-plan reading the event its parent created is the
@@ -140,9 +157,18 @@ class Activity:
     # that *executed*, so a report phrased against history alone reads that silence as "it
     # happened": the run this comes from told the user it had sent individual emails when the
     # fan-out that would have sent them expanded to nothing. Holds the sub-goal's own goal string.
-    # Append-only for the life of the activity and deliberately NOT cleared on replan, for the same
-    # reason `history` is not — a step that did nothing stays a thing that did nothing, and the
-    # report is written after the replan.
+    # Cleared on replan, reversing an earlier call that kept it for the life of the activity "for
+    # the same reason `history` is not — a step that did nothing stays a thing that did nothing,
+    # and the report is written after the replan". The analogy to `history` is what was wrong: that
+    # records operations which *executed*, physical facts no discard can untrue, while an entry
+    # here records one that did not, which is a fact about a plan rather than about the world. And
+    # "the report is written after the replan" cuts the other way — it is exactly why a stale entry
+    # survives long enough to corrupt it. See `reset_for_replan`.
+    #
+    # Not recorded at all for a fan-out inside a fired condition's `then`: there, an empty
+    # expansion is the watch working rather than work nobody did, and because the entry is keyed on
+    # the goal string a monitor's barren firings accumulate lines naming the work its productive
+    # firings completed. See the record site in the Reason strategy for the run that cost.
     noop_subgoals: list[str] = field(default_factory=list)
     # Named bindings a data-op step writes and a later step reads via {"$bind": "<name>"} (ADR-0023)
     # — the imperative pipeline's intermediate values (a filtered/deduped/sorted collection, a
@@ -376,6 +402,23 @@ class Activity:
         # watch would therefore run inside the window rather than after it. Frames below the held
         # prefix are still dropped, and the superseded bundle above recovers what they were doing.
         del self.parent_frames[self.frames_held_by_conditions() :]
+        # `pursued_goal` survives a discard that kept the `then`'s own depth — that is what makes
+        # the replacement plan serve the same commitment the discarded one did, which for a fired
+        # condition's `then` no frame records (see the field).
+        #
+        # It is dropped when the retained stack ends up SHALLOWER than the depth it records, and
+        # that is not the same as "it stops answering by itself". Both readers do ignore a record
+        # deeper than the stack, so the entry is inert the moment the discard lands — but inert is
+        # not gone, and it is unreachable by the one thing that would clear it: the discharge in
+        # Reason fires only `if _pursued_goal(activity) is not None`, which is the very depth match
+        # the discard just broke. So the record would sit there until some later plan pushed a frame
+        # back to that depth, and then answer for it: `_pursued_goal` would hand the stale `then`
+        # goal to an unrelated sub-goal's replan, and `_within_condition_body` would read that
+        # sub-goal's empty fan-out as condition-driven and keep it out of the no-op record. Clearing
+        # here changes nothing at the moment of the discard (the entry was already being ignored)
+        # and only stops it coming back.
+        if self.pursued_goal is not None and self.pursued_goal[0] > len(self.parent_frames):
+            self.pursued_goal = None
         # Drop the pipeline's intermediate bindings too: they were produced by (and are only
         # meaningful within) the plan being discarded. The runtime-seeded ones are the exception,
         # and by that same rule rather than against it: no plan produced them, so no plan's
@@ -385,6 +428,14 @@ class Activity:
         seeded = {name: self.bindings[name] for name in SEEDED_BINDINGS if name in self.bindings}
         self.bindings.clear()
         self.bindings.update(seeded)
+        # The no-op record goes with them, by the same rule and for a sharper reason. Each entry
+        # says "this plan named this work and no operation did it" — a statement about the plan
+        # being discarded, not about the world. The replacement re-derives the collection that was
+        # empty, and if it is still empty the fan-out records itself again; if it is not, the work
+        # gets done and a surviving entry would have the final report disclose a gap that had since
+        # been filled. Keeping it is the strictly worse error of the two: an unfilled gap re-records
+        # itself a moment later, whereas a filled one is a false admission nothing ever retracts.
+        self.noop_subgoals.clear()
         # Reconsideration baseline/verdict are coupled to the discarded plan (ADR-0024): drop them
         # so the next plan re-baselines against its own starting world rather than a stale one.
         self.reconsider_baseline = None

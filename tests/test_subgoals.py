@@ -1118,6 +1118,107 @@ async def test_a_fan_out_that_expands_records_nothing(tmp_path: Path) -> None:
     assert activity.noop_subgoals == []
 
 
+async def test_an_empty_fan_out_inside_a_fired_then_records_nothing(tmp_path: Path) -> None:
+    """A monitor fires as often as the world moves and most firings have nothing to do, so an empty
+    expansion inside a `then` is the watch working, not work nobody did. Recording it is not merely
+    noisy: the entry is keyed on the goal string and the body re-plans the same fan-out every
+    firing, so barren firings accumulate lines naming the work the productive ones discharged. The
+    run this comes from deleted all five events the oracle wanted and then told the user "no
+    overlapping preexisting events were found, so nothing else was removed"."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    subgoal = _mechanical_subgoal()
+    activity = Activity(
+        id="a",
+        goal="watch the listings",
+        context={},
+        plan=Plan(id="then", goal="save the newly added apartments", steps=[subgoal]),
+        step_index=0,
+        history=[_history("search_apartments", [])],  # nothing to iterate
+    )
+    # What Observe's `then` install leaves behind: a goal recorded against the depth it runs at,
+    # because a `then` pushes no frame of its own.
+    activity.pursued_goal = (0, "save the newly added apartments")
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.noop_subgoals == []
+
+
+async def test_an_empty_fan_out_nested_below_a_then_records_nothing(tmp_path: Path) -> None:
+    """The gate asks "is condition-driven work still on the stack", not "is the active plan the
+    `then`" — the narrower question goes false the moment the body enters a sub-goal of its own,
+    and a fan-out two levels inside a watch body is no more a gap than one sitting directly in
+    it."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    subgoal = _mechanical_subgoal()
+    outer = Plan(id="then", goal="save the newly added apartments", steps=[subgoal])
+    activity = Activity(
+        id="a",
+        goal="watch the listings",
+        context={},
+        plan=Plan(id="inner", goal="save each one", steps=[subgoal]),
+        step_index=0,
+        history=[_history("search_apartments", [])],
+    )
+    activity.pursued_goal = (0, "save the newly added apartments")
+    activity.parent_frames.append((outer, 0, 0))  # a frame pushed from inside the `then`
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.noop_subgoals == []
+
+
+async def test_an_empty_fan_out_after_popping_past_the_then_is_recorded(tmp_path: Path) -> None:
+    """The other side of the depth comparison, and the reason the gate cannot just test the field
+    for presence. `pursued_goal` is deliberately not cleared by a discard that pops out past the
+    `then` — it stops answering by depth instead — so a stale record must not go on suppressing
+    gaps in whatever plan next occupies the shallower depth."""
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    subgoal = _mechanical_subgoal()
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[subgoal]),
+        step_index=0,
+        history=[_history("search_apartments", [])],
+    )
+    activity.pursued_goal = (2, "save the newly added apartments")  # deeper than the live stack
+    working.activities["a"] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.noop_subgoals == [subgoal.params["goal"]]
+
+
+async def test_a_replan_drops_the_no_op_record() -> None:
+    """An entry says "this plan named this work and no operation did it" — a fact about the plan
+    being discarded, not about the world, which is where the earlier analogy to `history` broke
+    down. The replacement re-derives the collection: still empty and the fan-out records itself
+    again, no longer empty and the work gets done, at which point a surviving entry would have the
+    report disclose a gap that had since been filled."""
+    activity = Activity(
+        id="a",
+        goal="shortlist",
+        context={},
+        plan=Plan(id="p", goal="shortlist", steps=[invoke_step("realestate", "save_apartment")]),
+        step_index=0,
+    )
+    activity.noop_subgoals.append("save each apartment")
+
+    activity.reset_for_replan()
+
+    assert activity.noop_subgoals == []
+
+
 async def test_an_unreadable_collection_replans_rather_than_recording_a_no_op(
     tmp_path: Path,
 ) -> None:

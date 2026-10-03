@@ -171,6 +171,7 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                 out = activity.pending_inference.out  # set only for kind=="select"
                 baseline = activity.pending_inference.baseline  # set for plan/subgoal (ADR-0024)
                 scope = activity.pending_inference.scope  # its positional companion
+                goal = activity.pending_inference.goal  # the goal override, if the call had one
                 activity.pending_inference = None
                 with runtime_event_context(activity_id=activity.id):
                     emit_runtime_event(
@@ -353,6 +354,12 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                             break  # this activity claimed the result; it just refused it
                         frame = (activity.plan, activity.step_index, activity.history_mark)
                         activity.parent_frames.append(frame)  # type: ignore[arg-type]  # plan set mid-plan
+                    elif goal:
+                        # Pushing no frame leaves nothing holding this `then`'s goal, so record it
+                        # against the depth it runs at: a discard mid-`then` must replan the `then`,
+                        # not the enclosing maintenance body it happens to sit inside. See
+                        # Activity.pursued_goal for the run this cost a committed write.
+                        activity.pursued_goal = (len(activity.parent_frames), goal)
                     activity.plan = sub_plan
                     activity.step_index = 0
                     # The sub-plan collects only what it runs itself, not what the parent left

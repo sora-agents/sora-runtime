@@ -92,6 +92,41 @@ def _ancestor_subgoal_goals(activity: Activity) -> list[str]:
     return goals
 
 
+def _pursued_goal(activity: Activity) -> str | None:
+    """The goal a fired condition's ``then`` plan serves, or ``None`` if the active plan is not one.
+
+    ``Activity.pursued_goal`` pairs the goal with the frame depth it was installed at, because a
+    ``then`` pushes no frame and so cannot be told apart by the stack alone. Matching on depth is
+    what keeps the record from answering for a plan it does not belong to: deeper means an authored
+    sub-goal was entered from inside the ``then`` and its own frame records its goal, shallower
+    means a discard popped out past the ``then`` entirely."""
+    if activity.pursued_goal is None:
+        return None
+    depth, goal = activity.pursued_goal
+    return goal if depth == len(activity.parent_frames) else None
+
+
+def _within_condition_body(activity: Activity) -> bool:
+    """Whether the activity is executing a fired condition's ``then`` body — either at the depth
+    the ``then`` was installed at, or inside an authored sub-goal entered from within it.
+
+    Deliberately broader than ``_pursued_goal``, and the difference is the whole point: that one
+    answers "is the *active plan* the ``then``", which goes false the moment the body enters a
+    sub-goal of its own, while this answers "is condition-driven work still on the stack at or
+    above us". A zero-step fan-out nested two levels inside a watch body is no more a gap in the
+    user's work than one sitting directly in it, so the caller that gates on this needs the wider
+    question.
+
+    ``<=`` rather than ``==`` is what buys that: deeper means a frame was pushed from inside the
+    ``then`` and the ``then`` is still owed beneath it, shallower means a discard popped out past
+    the ``then`` entirely — which ``pursued_goal`` deliberately does not clear, so this has to
+    exclude it rather than trust the field's mere presence."""
+    if activity.pursued_goal is None:
+        return False
+    depth, _goal = activity.pursued_goal
+    return depth <= len(activity.parent_frames)
+
+
 def _active_frame_goal(activity: Activity) -> str | None:
     """The sub-goal the activity is currently executing *inside*, or ``None`` at the top level.
 
