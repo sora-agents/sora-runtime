@@ -35,7 +35,7 @@ from sora.action import (
     release,
 )
 from sora.activity import Activity, ActivityState
-from sora.diagnostics import emit_runtime_event
+from sora.diagnostics import emit_runtime_event, runtime_events_enabled
 from sora.memory import (
     PerceptSnapshot,
     percept_snapshot,
@@ -282,6 +282,35 @@ def scoped_snapshot(wm: WorkingMemory, activity: Activity) -> PerceptSnapshot:
     if referenced is None:  # unplanned -> the same breadth attention gives it
         return percept_snapshot(wm)
     return percept_snapshot(wm, referenced)
+
+
+def _same_property(previous: Any, current: Any) -> bool:
+    """Whether a re-observed property is identical to the one already recorded — asked for the
+    diagnostic stream only, never for what the agent perceives.
+
+    Defensive about ``__eq__`` because this runs *outside* ``emit_runtime_event``, which swallows
+    everything precisely so that a diagnostic can never alter control flow. A property value is
+    adapter data of arbitrary shape and its comparison is not guaranteed to yield a bool: a numpy
+    array anywhere inside one makes the dataclass's tuple compare raise on truthiness. Reading that
+    as "changed" is the safe direction — the cost of being wrong is one redundant record, never a
+    missing one.
+
+    ``Exception``, not the ``BaseException`` that ``emit_runtime_event`` catches: a cancellation
+    arriving mid-comparison is a real one and has to propagate out of an async runtime, whereas an
+    unusual ``__eq__`` is the case actually being defended against.
+
+    One case this cannot answer: an adapter that returns the *same* value object every time and
+    mutates it in place reads as unchanged however much it moved, because the stored percept aliases
+    the thing it is being compared against. That is a pre-existing constraint rather than one the
+    dedup introduces — such an adapter already defeats its own ``state_changed`` push and the
+    derived-change path, both of which diff against a retained reference the same way, and both of
+    which are *perception* rather than diagnostics. The ARE adapter rebuilds the whole value tree on
+    every ``observe()``, so the comparison there is a real deep one.
+    """
+    try:
+        return bool(previous == current)
+    except Exception:
+        return False
 
 
 class DefaultObserveStrategy:
@@ -792,11 +821,47 @@ class DefaultObserveStrategy:
         property, last value wins. A property is persistent, re-observed state, so re-observing the
         same (source, name) overwrites its entry in the keyed store rather than accumulating — the
         store *is* the snapshot. Signals are the opposite (transient, fire-and-forget) and keep
-        append semantics in their own list, handled in observe()."""
+        append semantics in their own list, handled in observe().
+
+        The store write is unconditional — `observed_at` included, which callers rely on being
+        refreshed on every re-observation — but the *diagnostic* carrying the value is not. An
+        unchanged re-observation emits a name-only `boundary.property.unchanged` in place of the
+        value, which a reader carries forward from the last `received` for that key. This is the
+        same "an unchanged property is not news" rule the reconsideration gate already applies by
+        hashing the property payload rather than the Percept envelope; here it decides whether the
+        diagnostic bundle is readable at all. A live run emitted 21,923 of these events over 11
+        joined tools x 1,993 cycles, each carrying one ARE app's complete unelided state: 4.41 GiB
+        of a 4.31 GiB trajectory (99.9%), against 18 distinct values and ~2.6 MiB of actual
+        information. Another run reached 7.85 GiB. Because the collector accumulates in memory and
+        copies every row to export, that was resident RAM and roughly double it at export time —
+        so this is a liveness guard on a paid run, not only disk hygiene.
+
+        One event per observation is kept rather than none, and the marker is the point: a reader
+        shown only changes cannot distinguish an unchanged property from an unattended tool, and
+        the per-cycle attended set is precisely what an attention defect has to be read against.
+        Only attention *transitions* reach `session.log`, so dropping the marker would leave that
+        record nowhere. The elision is therefore lossless — every observation still has its event,
+        and only a value already in the stream is left out."""
+        diagnosing = runtime_events_enabled()
         for tool in wm.focused_tools.values():
             for prop in tool.observe():
                 observed_at = time.time()
-                wm.properties[(tool.id, prop.name)] = Percept(tool.id, prop, observed_at)
+                key = (tool.id, prop.name)
+                # Read before the overwrite: the keyed store *is* the previous value, which is what
+                # makes the comparison below local and free. Skipped entirely when nothing is
+                # listening, so an undiagnosed run pays no comparison at all.
+                previous = wm.properties.get(key) if diagnosing else None
+                wm.properties[key] = Percept(tool.id, prop, observed_at)
+                if not diagnosing:
+                    continue
+                if previous is not None and _same_property(previous.payload, prop):
+                    emit_runtime_event(
+                        "boundary.property.unchanged",
+                        cause="property_snapshot",
+                        payload={"source": tool.id, "name": prop.name},
+                        source_timestamp=observed_at,
+                    )
+                    continue
                 emit_runtime_event(
                     "boundary.property.received",
                     cause="property_snapshot",

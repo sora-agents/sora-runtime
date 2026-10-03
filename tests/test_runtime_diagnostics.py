@@ -7,6 +7,8 @@ from typing import Any, cast
 
 import pytest
 
+from fakes import FakeTool
+from sora._strategies.observe import DefaultObserveStrategy
 from sora.action import ActionRegistry, CreateActivityAction
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
@@ -17,9 +19,12 @@ from sora.diagnostics import (
     runtime_event_context,
     runtime_phase,
 )
+from sora.environment import EnvironmentRegistry
+from sora.memory import WorkingMemory
 from sora.types import (
     ActionAck,
     InferenceKind,
+    ObservableProperty,
     OperationInvocation,
     PendingInference,
     PendingOperation,
@@ -298,3 +303,131 @@ def test_failing_sink_cannot_change_runtime_behavior() -> None:
         activity = Activity("a1", "goal", {})
         activity.state = ActivityState.TERMINATED
     assert activity.state is ActivityState.TERMINATED
+
+
+# --- property snapshot: an unchanged re-observation must not repeat the value -----------------
+#
+# The trajectory these events land in reached 4.31 GiB (and on another run 7.85 GiB) for a single
+# scenario, 99.9% of it byte-identical repeats of a value already recorded, held in memory for the
+# length of the run. The elision has to stay lossless in both directions, which is what the first
+# two tests pin: an unchanged property still produces an event (so the per-cycle attended set is
+# still readable), and a value that actually moved is still recorded in full.
+
+
+def _wm_with(tool: FakeTool) -> WorkingMemory:
+    wm = WorkingMemory(registry=EnvironmentRegistry())
+    wm.focused_tools[tool.id] = cast(Any, tool)
+    return wm
+
+
+def _property_rows(collector: RuntimeEventCollector) -> list[dict[str, Any]]:
+    return [row for row in collector.snapshot() if row["event"].startswith("boundary.property.")]
+
+
+def test_an_unchanged_property_is_recorded_without_repeating_its_value() -> None:
+    tool = FakeTool("app", properties=[ObservableProperty("state", {"items": [1, 2, 3]})])
+    wm = _wm_with(tool)
+    collector = RuntimeEventCollector()
+
+    with collect_runtime_events(collector):
+        DefaultObserveStrategy._snapshot_properties(wm)  # first sight
+        DefaultObserveStrategy._snapshot_properties(wm)  # unchanged
+        DefaultObserveStrategy._snapshot_properties(wm)  # unchanged
+
+    rows = _property_rows(collector)
+    # One event per observation either way — a reader shown only changes could not tell an
+    # unchanged property from a tool that stopped being attended.
+    assert [row["event"] for row in rows] == [
+        "boundary.property.received",
+        "boundary.property.unchanged",
+        "boundary.property.unchanged",
+    ]
+    assert rows[0]["payload"]["property"]["value"] == {"items": [1, 2, 3]}
+    # The whole point: the repeats carry the key and nothing else.
+    assert rows[1]["payload"] == {"source": "app", "name": "state"}
+    assert "value" not in json.dumps(rows[2]["payload"])
+
+
+def test_a_changed_property_value_is_still_recorded_in_full() -> None:
+    # The regression that would make the bundle useless in the other direction.
+    tool = FakeTool("app", properties=[ObservableProperty("state", {"items": [1]})])
+    wm = _wm_with(tool)
+    collector = RuntimeEventCollector()
+
+    with collect_runtime_events(collector):
+        DefaultObserveStrategy._snapshot_properties(wm)
+        tool.set_properties([ObservableProperty("state", {"items": [1, 2]})])
+        DefaultObserveStrategy._snapshot_properties(wm)
+        DefaultObserveStrategy._snapshot_properties(wm)  # the new value is now the baseline
+
+    rows = _property_rows(collector)
+    assert [row["event"] for row in rows] == [
+        "boundary.property.received",
+        "boundary.property.received",
+        "boundary.property.unchanged",
+    ]
+    assert rows[1]["payload"]["property"]["value"] == {"items": [1, 2]}
+
+
+def test_the_snapshot_store_is_written_on_every_tick_even_when_the_event_is_elided() -> None:
+    # The elision is a diagnostics decision only. `observed_at` is refreshed on every
+    # re-observation and the reconsideration gate relies on that (it hashes the payload rather than
+    # the envelope precisely because of it), so the store write must stay unconditional.
+    tool = FakeTool("app", properties=[ObservableProperty("state", 1)])
+    wm = _wm_with(tool)
+    collector = RuntimeEventCollector()
+
+    with collect_runtime_events(collector):
+        DefaultObserveStrategy._snapshot_properties(wm)
+        first = wm.properties[("app", "state")]
+        DefaultObserveStrategy._snapshot_properties(wm)
+        second = wm.properties[("app", "state")]
+
+    assert second is not first  # re-stored, not skipped
+    assert second.observed_at >= first.observed_at
+    assert second.payload == ObservableProperty("state", 1)
+
+
+def test_an_uncomparable_property_value_is_recorded_rather_than_elided() -> None:
+    # A property value is adapter data of arbitrary shape, and the comparison runs *outside*
+    # emit_runtime_event, which is the thing that swallows failures so a diagnostic can never alter
+    # control flow. A numpy array inside a value is the real-world shape of this: the dataclass's
+    # tuple compare raises on its truthiness. The fallback has to be "changed" — a redundant record
+    # is recoverable, a missing one is not — and it must not propagate.
+    class _Uncomparable:
+        def __eq__(self, other: object) -> bool:
+            raise ValueError("ambiguous truth value")
+
+        __hash__ = None  # type: ignore[assignment]
+
+    tool = FakeTool("app", properties=[ObservableProperty("state", _Uncomparable())])
+    wm = _wm_with(tool)
+    collector = RuntimeEventCollector()
+
+    with collect_runtime_events(collector):
+        DefaultObserveStrategy._snapshot_properties(wm)
+        # A *distinct* instance, which is what a real adapter yields: ARE rebuilds the whole
+        # value tree through `_to_serializable` on every `observe()` (its own
+        # `changed = state != previous` depends on that), so the comparison is a genuine deep one
+        # and actually reaches `__eq__`. Re-observing the identical object instead would be
+        # answered by the tuple compare's identity shortcut before `__eq__` ran, testing nothing.
+        tool.set_properties([ObservableProperty("state", _Uncomparable())])
+        DefaultObserveStrategy._snapshot_properties(wm)
+
+    assert [row["event"] for row in _property_rows(collector)] == [
+        "boundary.property.received",
+        "boundary.property.received",
+    ]
+
+
+def test_the_snapshot_still_updates_with_no_diagnostic_sink_installed() -> None:
+    # No sink means the comparison is skipped entirely, so an undiagnosed run pays nothing for the
+    # dedup. Perception must be identical regardless.
+    tool = FakeTool("app", properties=[ObservableProperty("state", 1)])
+    wm = _wm_with(tool)
+
+    DefaultObserveStrategy._snapshot_properties(wm)
+    tool.set_properties([ObservableProperty("state", 2)])
+    DefaultObserveStrategy._snapshot_properties(wm)
+
+    assert wm.properties[("app", "state")].payload == ObservableProperty("state", 2)

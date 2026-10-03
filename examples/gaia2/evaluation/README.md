@@ -264,7 +264,14 @@ bundle contains:
 - `run.json`, with outcome, terminal cause, timing, configuration, profile, version, revision, and
   seed provenance;
 - `trajectory.jsonl`, with ordered cycle/phase context, activity transitions, actions and results,
-  pending work, and environment-boundary observations;
+  pending work, and environment-boundary observations. Property observations are recorded once per
+  observation, but only a value that *moved* is recorded in full: an unchanged re-observation emits
+  a name-only `boundary.property.unchanged`, and a reader carries the value forward from the last
+  `boundary.property.received` for that `(source, name)`. Nothing is dropped — every observation
+  still has its event, so the attended set remains readable per cycle — but the elision is the
+  difference between a greppable bundle and an unusable one: it is worth 247x on a measured
+  read-only scenario (1,270.8 MiB to 5.1 MiB) and more on a longer one, because an ARE app's
+  complete state is ~200 KiB and the whole set is re-observed every cycle;
 - `judge_recording.json`, in the existing `examples.gaia2.rescore` schema, plus `verdict.json` and
   `write_counts.json`;
 - `llm_calls.json`, `llm/exchanges.jsonl`, and deduplicated exact prompts under
