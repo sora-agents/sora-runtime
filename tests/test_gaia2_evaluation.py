@@ -312,6 +312,26 @@ def test_manifests_are_ids_only_unique_and_stratified() -> None:
     assert ".json" not in manifest_text
 
 
+def test_acceptance_suite_is_disjoint_from_the_reported_sweep_selection() -> None:
+    """A scenario that decides the locked prompt must not also carry the reported score.
+
+    The suites are stratified by universe as well as by capability, and nothing in the manifest
+    format records either property -- so both are asserted here rather than left to a reader.
+    """
+
+    manifests = load_manifests(PROMPT_ROOT / "manifests")
+    sweep = json.loads((EVAL_ROOT / "campaigns" / "paper2027" / "mini-validation.json").read_text())
+    reported = {case["id"] for case in sweep["cases"]}
+    acceptance = {f"scenario_universe_{case.case_id}" for case in manifests["acceptance"].cases}
+    assert acceptance & reported == set()
+    pairs: list[tuple[str, str]] = []
+    for manifest in manifests.values():
+        universes = {case.case_id.split("_", 1)[0] for case in manifest.cases}
+        assert len(universes) == 5
+        pairs.extend((case.case_id.split("_", 1)[0], case.capability) for case in manifest.cases)
+    assert len(pairs) == len(set(pairs))
+
+
 def test_scenario_resolution_recognizes_corrected_smoke_names_and_locks_acceptance(
     tmp_path: Path,
 ) -> None:

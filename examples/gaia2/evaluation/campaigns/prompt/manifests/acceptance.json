@@ -2,10 +2,10 @@
   "schema_version": 1,
   "suite": "acceptance",
   "cases": [
-    {"capability": "search", "id": "21_mq2acb"},
+    {"capability": "search", "id": "21_5bftlu"},
     {"capability": "execution", "id": "23_1hu54e"},
-    {"capability": "adaptability", "id": "27_6u1vo2"},
-    {"capability": "ambiguity", "id": "28_zqomls"},
+    {"capability": "adaptability", "id": "27_b5lnzm"},
+    {"capability": "ambiguity", "id": "28_1qub5h"},
     {"capability": "time", "id": "25_6onsr2"}
   ]
 }

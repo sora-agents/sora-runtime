@@ -208,6 +208,17 @@ corresponding full capability configuration in the same relative order with an i
 payload, so runs load each capability configuration and apply the shared manifest, preserving
 capability labels and the five-way aggregate while evaluating exactly Gaia2 mini.
 
+**The locked suite is drawn from outside that selection.** The prompt campaign's three five-case
+suites ([`campaigns/prompt/manifests/`](campaigns/prompt/manifests)) are stratified twice over: one
+case per capability, five distinct universes per suite, and no (universe, capability) pair reused
+across suites. The `acceptance` suite, whose payloads stay closed until a prompt is locked, is
+additionally disjoint from the reported selection above, so no scenario both decides the prompt and
+carries a reported score. Its cases are selected mechanically, with no judgement left at selection
+time: the lexicographically first `validation` scenario in the same (universe, capability) cell at
+the pinned dataset revision that is absent from the reported selection and unused by another suite.
+The disjointness and both stratification properties are asserted in `tests/test_gaia2_evaluation.py`,
+since the manifest format records neither.
+
 Frozen artifacts, verified 2026-09-21:
 
 | Artifact | Digest | Kind |
@@ -365,9 +376,10 @@ The judge is frozen as [`gpt-5.4-mini-2026-03-17`](campaigns/prompt/judge.json),
 
 Named here so that a reader can see what this protocol does *not* yet fix:
 
-- **Acceptance parameters.** Repeats, decision thresholds, the expansion rule, and the selection rule
-  are not yet stated. They must be added here and committed before the locked-acceptance payloads
-  are opened, which is what turns this document into a pre-registration.
+- **Acceptance parameters.** Repeats, decision thresholds, and the expansion rule are not yet
+  stated. They must be added here and committed before the locked-acceptance payloads are opened,
+  which is what turns this document into a pre-registration. The selection rule is stated in
+  section 7.
 - **The `gpt-5.4-high-paper` re-audit**, which removes the reasoning-effort confound from the failed
   charge gate.
 - **Freezing the campaign configuration.** Prompts have an immutable-snapshot mechanism;
