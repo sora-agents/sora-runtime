@@ -39,6 +39,7 @@ from sora.diagnostics import (
     emit_runtime_event,
     record_streamed_property_value,
     runtime_events_enabled,
+    streamed_property_update,
     streamed_property_value,
 )
 from sora.memory import (
@@ -854,8 +855,16 @@ class DefaultObserveStrategy:
         against the last value `sora.diagnostics` saw *this* stream receive — the stream being the
         sink, so several collection contexts appending to one log share one answer — and it is
         updated only once the sink has taken the row: a dropped `received` has to leave the value
-        still owed, or a sink that recovers is never sent one. The cost is one restated value per
-        property per stream, plus one retained reference per attended property, paid once.
+        still owed, or a sink that recovers is never sent one. Deciding, emitting and recording are
+        one critical section per stream for the same reason, since a ledger write interleaved with
+        another thread's row would describe a log that no longer ends where it claims — and that
+        section cannot close the window the delivery-gated record opens by construction, between a
+        row reaching the sink and its value being noted, which a sink re-entering this snapshot
+        from its own callback runs inside; `sora.diagnostics` keeps both halves of that honest, on
+        the one ordering `RuntimeEventSink` requires of every sink — that a row is committed before
+        anything else happens — without which no row in the log, elided or not, is readable.
+        The cost is one restated value per property per stream, plus one retained reference per
+        attended property, paid once.
 
         One event per observation is kept rather than none, and the marker is the point: a reader
         shown only changes cannot distinguish an unchanged property from an unattended tool, and
@@ -871,22 +880,26 @@ class DefaultObserveStrategy:
                 if not diagnosing:
                     # Nothing is listening, so an undiagnosed run pays no comparison at all.
                     continue
-                carried = streamed_property_value(tool.id, prop.name)
-                if carried is not None and _same_property(carried, prop):
-                    emit_runtime_event(
-                        "boundary.property.unchanged",
+                # Deciding, emitting and recording are one critical section per stream: a
+                # ledger write that landed out of order with its own row would describe a log the
+                # reader does not have. Uncontended unless two threads share a sink.
+                with streamed_property_update():
+                    carried = streamed_property_value(tool.id, prop.name)
+                    if carried is not None and _same_property(carried, prop):
+                        emit_runtime_event(
+                            "boundary.property.unchanged",
+                            cause="property_snapshot",
+                            payload={"source": tool.id, "name": prop.name},
+                            source_timestamp=observed_at,
+                        )
+                        continue
+                    if emit_runtime_event(
+                        "boundary.property.received",
                         cause="property_snapshot",
-                        payload={"source": tool.id, "name": prop.name},
+                        payload={"source": tool.id, "property": prop},
                         source_timestamp=observed_at,
-                    )
-                    continue
-                if emit_runtime_event(
-                    "boundary.property.received",
-                    cause="property_snapshot",
-                    payload={"source": tool.id, "property": prop},
-                    source_timestamp=observed_at,
-                ):
-                    # Only what the sink actually took, and on every path that reaches here, the
-                    # uncomparable-value fallback included: the ledger records what this stream was
-                    # sent, so it follows the delivery rather than the comparison.
-                    record_streamed_property_value(tool.id, prop.name, prop)
+                    ):
+                        # Only what the sink actually took, and on every path that reaches here,
+                        # the uncomparable-value fallback included: the ledger records what this
+                        # stream was sent, so it follows delivery rather than the comparison.
+                        record_streamed_property_value(tool.id, prop.name, prop)

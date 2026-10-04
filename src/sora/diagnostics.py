@@ -15,7 +15,24 @@ from typing import Any, Protocol
 
 
 class RuntimeEventSink(Protocol):
-    """A write-only observer of already-committed runtime events."""
+    """A write-only observer of already-committed runtime events.
+
+    ``emit`` must commit the row — append it, write it, hand it to a queue — before it does
+    anything else, and in particular before any call that could re-enter the runtime. The log is
+    read positionally and by every consumer: a `phase.entry` pairs with the `phase.exit` that
+    follows it, a cycle's rows are the span between its boundaries, a property's current value is
+    the last one in the stream, and an unchanged-property marker defers to the value row before it.
+    A sink that defers its append until after such a call reorders the log against the order the
+    runtime emitted in, and all four of those readings break — a plain value row included, with no
+    elision involved: observations ``1, 2, 3`` arrive as ``1, 3, 2`` and the stream then claims the
+    property ended at 2. Nothing on the emitting side can detect or repair that, since the row is
+    already handed over by the time the reordering happens.
+
+    Committing first is the whole requirement, not "never call back": a sink that re-enters the
+    runtime *after* committing leaves the log in emission order, and the property-value ledger is
+    built to stay consistent across that (see ``_Stream``). It is still a thing a sink has no
+    reason to do, being an observer of events the runtime has already decided on.
+    """
 
     def emit(self, event: dict[str, Any]) -> None: ...
 
@@ -35,6 +52,8 @@ _activity: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _cause: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "sora_runtime_event_cause", default=None
 )
+
+
 # What a stream has already been sent, keyed by (source, name) and holding the last property value
 # *successfully delivered* to it. The elision of an unchanged property's value (see
 # DefaultObserveStrategy._snapshot_properties) is only lossless if the value it defers to is in the
@@ -50,10 +69,48 @@ _cause: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # per-context ledgers would then disagree with the log they share: a value recorded under the inner
 # context is in the stream the outer context's reader walks, so an outer ledger that had not seen
 # it would elide against the wrong row and carry a superseded value forward. Ownership therefore
-# follows the sink, keyed by identity and refcounted by the number of open contexts below.
-_stream_ledgers: dict[int, dict[tuple[str, str], Any]] = {}
-_stream_contexts: dict[int, int] = {}
-_stream_lock = threading.Lock()
+# follows the sink, keyed by identity and refcounted by the number of open contexts.
+class _Stream:
+    """What one sink has been sent, and the lock that keeps that record true.
+
+    ``values`` only describes the log if it is written *in step with* it. Reading it, emitting, and
+    writing it back are three operations, and a thread suspended between the emission and the write
+    lets another thread's row land in between: the first thread then overwrites the ledger with a
+    value the log no longer ends in, and the next re-observation is elided against it, sending the
+    reader forward to a value that was already superseded. So the whole sequence is one critical
+    section per stream (``lock``), which is also why a marker's emission belongs inside it — a
+    marker that lands after another thread's value is read against that value.
+
+    Reentrant because this subsystem may not be the thing that deadlocks a run. A sink is a
+    write-only observer of already-committed events and has no business calling back into
+    perception, but if one did, the same thread re-entering cannot interleave with itself, so
+    reentrancy cannot hang a paid run. It can still *interleave the three operations*, though,
+    which is what ``open`` and ``writers`` are for: an update's row reaches the sink before its
+    value is recorded, so a snapshot taken from inside that sink's own callback runs in a window
+    where the log has a row the ledger does not describe yet. Both directions are wrong there — a
+    nested update eliding against the superseded value, and the enclosing update then overwriting
+    the nested one's record — so a nested update is told nothing (``open``) and a record is dropped
+    rather than allowed to clobber a later one (``writers``).
+
+    ``open`` holds the generation of each update currently open, outermost first; ``updates``
+    issues those generations, so a deeper update always has a higher one. Only one thread's
+    nesting chain is ever on ``open``, since a thread holds ``lock`` for its update's full extent.
+    """
+
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], Any] = {}
+        # Which update last decided each key. Kept for a key whose value was dropped, too: that
+        # tombstone is what makes a further enclosing update drop its own stale record as well.
+        self.writers: dict[tuple[str, str], int] = {}
+        self.open: list[int] = []
+        self.updates = 0
+        self.lock = threading.RLock()
+        self.contexts = 0
+
+
+_streams: dict[int, _Stream] = {}
+# Guards the registry only — which sinks have a stream — never a stream's own contents.
+_streams_lock = threading.Lock()
 
 
 def json_safe(value: Any) -> Any:
@@ -209,6 +266,8 @@ def collect_runtime_events(sink: RuntimeEventSink) -> Iterator[RuntimeEventSink]
     so restates each value once more, which is the recoverable direction — redundancy, never a
     marker deferring to a value the reader cannot find.
 
+    Updates to it are serialized per sink; see ``_Stream`` and ``streamed_property_update``.
+
     ``id(sink)`` is a safe key precisely because of that lifetime: while any context is open it
     holds a strong reference to the sink, so the identity cannot be recycled underneath the entry,
     and once the last one closes the entry is gone rather than left for an unrelated object that
@@ -217,19 +276,16 @@ def collect_runtime_events(sink: RuntimeEventSink) -> Iterator[RuntimeEventSink]
     """
     token = _sink.set(sink)
     key = id(sink)
-    with _stream_lock:
-        _stream_contexts[key] = _stream_contexts.get(key, 0) + 1
-        _stream_ledgers.setdefault(key, {})
+    with _streams_lock:
+        stream = _streams.setdefault(key, _Stream())
+        stream.contexts += 1
     try:
         yield sink
     finally:
-        with _stream_lock:
-            remaining = _stream_contexts.get(key, 1) - 1
-            if remaining > 0:
-                _stream_contexts[key] = remaining
-            else:
-                _stream_contexts.pop(key, None)
-                _stream_ledgers.pop(key, None)
+        with _streams_lock:
+            stream.contexts -= 1
+            if stream.contexts <= 0:
+                _streams.pop(key, None)
         _sink.reset(token)
 
 
@@ -299,17 +355,39 @@ def runtime_events_enabled() -> bool:
     return _sink.get() is not None
 
 
-def _current_ledger() -> dict[tuple[str, str], Any] | None:
-    """The ledger of the installed sink, or ``None`` when nothing is listening.
+def _current_stream() -> _Stream | None:
+    """The installed sink's stream record, or ``None`` when nothing is listening.
 
-    Derived from ``_sink`` rather than tracked separately so that the ledger cannot drift from the
-    stream it describes. Read without ``_stream_lock``: the entry exists for as long as this
-    context is open, and the single-key accesses below are each atomic, so the lock is only needed
-    where entries appear and disappear. Holding it per property would put it on a hot path — the
-    snapshot runs over every attended tool, every cycle.
+    Derived from ``_sink`` rather than tracked separately so that the record cannot drift from the
+    stream it describes. The registry is read without ``_streams_lock``: the entry exists for as
+    long as this context is open, and a single mapping read is atomic, so that lock is only needed
+    where entries appear and disappear.
     """
     sink = _sink.get()
-    return None if sink is None else _stream_ledgers.get(id(sink))
+    return None if sink is None else _streams.get(id(sink))
+
+
+@contextmanager
+def streamed_property_update() -> Iterator[None]:
+    """Hold the installed stream for one property's compare-emit-record sequence.
+
+    The caller decides what counts as unchanged, so the decision cannot be moved in here; what can
+    be is the guarantee that no other thread emits into this stream, or moves its ledger, while
+    that decision is being acted on — and that an update re-entered from inside this one's own
+    emission neither reads nor overwrites a ledger that is mid-flight. A no-op when nothing is
+    listening, which is the common case and must stay free. See ``_Stream`` for both hazards.
+    """
+    stream = _current_stream()
+    if stream is None:
+        yield
+        return
+    with stream.lock:
+        stream.updates += 1
+        stream.open.append(stream.updates)
+        try:
+            yield
+        finally:
+            stream.open.pop()
 
 
 def streamed_property_value(source: str, name: str) -> Any:
@@ -318,11 +396,21 @@ def streamed_property_value(source: str, name: str) -> Any:
     This is the precondition for eliding one: a name-only marker is readable only by someone who
     can carry a value forward from earlier in the same stream, and correct only if the value they
     would carry is the current one. ``None`` covers every case with nothing to defer to — no stream
-    installed, a property this stream has not been sent, a delivery the sink dropped — and all of
-    them want the value emitted, so comparing against ``None`` fails safe by construction.
+    installed, a property this stream has not been sent, a delivery the sink dropped, an update
+    nested inside another one's emission — and all of them want the value emitted, so comparing
+    against ``None`` fails safe by construction.
     """
-    ledger = _current_ledger()
-    return None if ledger is None else ledger.get((source, name))
+    stream = _current_stream()
+    if stream is None:
+        return None
+    with stream.lock:
+        if len(stream.open) > 1:
+            # Re-entered from inside an enclosing update's own emission: that row is in the log
+            # already — ``RuntimeEventSink`` requires it to be committed first — and the ledger
+            # still describes the stream as it was before it. Nothing here can be deferred to
+            # safely, so nothing is offered and every value is restated.
+            return None
+        return stream.values.get((source, name))
 
 
 def record_streamed_property_value(source: str, name: str, value: Any) -> None:
@@ -331,10 +419,25 @@ def record_streamed_property_value(source: str, name: str, value: Any) -> None:
     Call only after a *successful* delivery. Recording one the sink rejected would turn every later
     re-observation into a marker deferring to a row that is not in the bundle, and a sink that
     recovers would never repair it: the ledger would already claim the value had been sent.
+
+    Dropped rather than written when an update nested inside this one's emission has since decided
+    the same property: that update's row is further down the same log, so this value is no longer
+    what the stream carries. Which of the two rows is last is not worth reconstructing from a
+    re-entrant sink's ordering — leaving the key unset restates the value once, which is the
+    recoverable direction, where overwriting would elide against a value the reader never sees.
     """
-    ledger = _current_ledger()
-    if ledger is not None:
-        ledger[(source, name)] = value
+    stream = _current_stream()
+    if stream is None:
+        return
+    with stream.lock:
+        key = (source, name)
+        mine = stream.open[-1] if stream.open else None
+        if mine is not None and stream.writers.get(key, mine) > mine:
+            stream.values.pop(key, None)
+            return
+        stream.values[key] = value
+        if mine is not None:
+            stream.writers[key] = mine
 
 
 @contextmanager

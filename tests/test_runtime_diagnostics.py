@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -14,8 +16,7 @@ from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.diagnostics import (
     RuntimeEventCollector,
-    _stream_contexts,
-    _stream_ledgers,
+    _streams,
     collect_runtime_events,
     emit_runtime_event,
     runtime_event_context,
@@ -640,19 +641,270 @@ def test_a_sinks_ledger_does_not_outlive_the_contexts_open_on_it() -> None:
     per attempt. Nesting therefore refcounts rather than replacing or discarding."""
     collector = RuntimeEventCollector()
     key = id(collector)
-    assert key not in _stream_ledgers
+    assert key not in _streams
 
     with collect_runtime_events(collector):
-        assert _stream_contexts[key] == 1
-        ledger = _stream_ledgers[key]
+        assert _streams[key].contexts == 1
+        stream = _streams[key]
         with collect_runtime_events(collector):
-            assert _stream_contexts[key] == 2
-            assert _stream_ledgers[key] is ledger  # shared, not a second one
-        assert _stream_contexts[key] == 1
-        assert _stream_ledgers[key] is ledger  # kept, not discarded by the inner exit
+            assert _streams[key].contexts == 2
+            assert _streams[key] is stream  # shared, not a second one
+        assert _streams[key].contexts == 1
+        assert _streams[key] is stream  # kept, not discarded by the inner exit
 
-    assert key not in _stream_ledgers
-    assert key not in _stream_contexts
+    assert key not in _streams
+
+
+def _observe_in_own_context(sink: Any, wm: WorkingMemory, *, after: threading.Event | None) -> None:
+    """One thread's whole contribution: install `sink` for itself and take one snapshot.
+
+    Each thread needs its own `collect_runtime_events`, since the installed sink is context-local —
+    which is also the shape that makes this worth guarding, several contexts over one log.
+    """
+    if after is not None:
+        after.wait(2.0)
+    with collect_runtime_events(sink):
+        DefaultObserveStrategy._snapshot_properties(wm)
+
+
+def test_a_stream_is_not_moved_by_another_thread_mid_update() -> None:
+    """Reading the ledger, emitting, and writing it back are three operations. A thread suspended
+    between the emission and the write lets another thread's row land in between, and then
+    overwrites the ledger with a value the log no longer ends in — after which the next
+    re-observation is elided against it and the reader is sent forward to a superseded value.
+
+    Asserted as the property rather than as the symptom: while one thread is mid-update, no other
+    row reaches this stream. Forcing the bad interleaving instead would deadlock against the fix,
+    and the window is the sink's own `emit`, which is the only place a test can stand inside it.
+    """
+
+    class _BlockingSink:
+        def __init__(self) -> None:
+            self.rows: list[dict[str, Any]] = []
+            self.holding = threading.Event()  # the first thread is mid-update
+            self.second_landed = threading.Event()  # the other thread got a row in
+            self.interleaved = True  # pessimistic: only an actual timeout clears it
+
+        def emit(self, event: dict[str, Any]) -> None:
+            if not event["event"].startswith("boundary.property."):
+                return
+            # Roles are read off the row rather than off a call counter, so the sink itself holds
+            # no state the two threads could race on.
+            value = event["payload"].get("property", {}).get("value")
+            if value == 1:
+                self.holding.set()
+                # If anything can interleave, it has this long to prove it.
+                self.interleaved = self.second_landed.wait(0.25)
+            self.rows.append(event)
+            if value == 2:
+                self.second_landed.set()
+
+    sink = _BlockingSink()
+    first = _wm_with(FakeTool("app", properties=[ObservableProperty("state", 1)]))
+    # The same (source, name), so both threads contend for one ledger entry.
+    second = _wm_with(FakeTool("app", properties=[ObservableProperty("state", 2)]))
+
+    threads = [
+        threading.Thread(
+            target=_observe_in_own_context, args=(sink, first), kwargs={"after": None}
+        ),
+        threading.Thread(
+            target=_observe_in_own_context, args=(sink, second), kwargs={"after": sink.holding}
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10.0)
+
+    assert not any(thread.is_alive() for thread in threads), "a thread never finished"
+    assert len(sink.rows) == 2, "both threads must have reached the stream"
+    assert sink.interleaved is False
+
+
+def test_one_stream_being_updated_does_not_hold_up_another() -> None:
+    """The lock is per sink, not one global one. Two agents diagnosed into two collectors share no
+    log and so have nothing to agree about; serializing them would make the cheaper fix — a single
+    module-level lock — silently turn independent streams into a queue."""
+    allowed = threading.Event()
+
+    class _WaitingSink:
+        def __init__(self) -> None:
+            self.rows: list[dict[str, Any]] = []
+            self.holding = threading.Event()
+            self.other_proceeded = False
+
+        def emit(self, event: dict[str, Any]) -> None:
+            if event["event"].startswith("boundary.property."):
+                self.holding.set()
+                self.other_proceeded = allowed.wait(0.5)
+            self.rows.append(event)
+
+    held = _WaitingSink()
+    free = RuntimeEventCollector()
+    first = _wm_with(FakeTool("app", properties=[ObservableProperty("state", 1)]))
+    second = _wm_with(FakeTool("other", properties=[ObservableProperty("mode", "idle")]))
+
+    def observe_other() -> None:
+        _observe_in_own_context(free, second, after=held.holding)
+        allowed.set()
+
+    threads = [
+        threading.Thread(
+            target=_observe_in_own_context, args=(held, first), kwargs={"after": None}
+        ),
+        threading.Thread(target=observe_other),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10.0)
+
+    assert not any(thread.is_alive() for thread in threads), "a thread never finished"
+    assert held.other_proceeded is True, "an unrelated stream was blocked behind this one"
+    assert len(_property_rows(free)) == 1
+
+
+class _ReenteringSink:
+    """Takes one further snapshot from inside its own ``emit``, once, as a sink callback could.
+
+    That is the only place a caller can stand between a row reaching the stream and the stream's
+    ledger being told about it, since the record follows delivery by construction.
+    """
+
+    def __init__(self, observe_again: Callable[[], None]) -> None:
+        self.rows: list[dict[str, Any]] = []
+        self.armed = False
+        self._observe_again = observe_again
+
+    def emit(self, event: dict[str, Any]) -> None:
+        self.rows.append(event)
+        if self.armed and event["event"] == "boundary.property.received":
+            self.armed = False
+            self._observe_again()
+
+    def reconstructed(self) -> list[Any]:
+        """What a reader of this one log recovers, carrying each value forward over the markers."""
+        values: list[Any] = []
+        carried: Any = None
+        for row in self.rows:
+            if row["event"] == "boundary.property.received":
+                carried = row["payload"]["property"]["value"]
+            elif row["event"] != "boundary.property.unchanged":
+                continue
+            values.append(carried)
+        return values
+
+
+def test_a_nested_snapshot_does_not_elide_against_a_row_not_yet_recorded() -> None:
+    """A sink callback that snapshots again runs *between* the enclosing update's row reaching the
+    stream and that row's value being recorded — a window the record cannot close, since it has to
+    follow delivery. The ledger there still describes the stream as it was before that row, so a
+    nested update comparing against it can call its own differing value unchanged, and the reader
+    resolves the marker to the enclosing row instead. Nothing is offered to a nested update at all.
+    """
+    tool = FakeTool("app", properties=[ObservableProperty("state", 2)])
+    wm = _wm_with(tool)
+
+    def observe_again() -> None:
+        tool.set_properties([ObservableProperty("state", 2)])  # equal to what the ledger holds
+        DefaultObserveStrategy._snapshot_properties(wm)
+
+    sink = _ReenteringSink(observe_again)
+    with collect_runtime_events(sink):
+        DefaultObserveStrategy._snapshot_properties(wm)  # ledger := 2
+        tool.set_properties([ObservableProperty("state", 1)])
+        sink.armed = True
+        DefaultObserveStrategy._snapshot_properties(wm)  # emits 1, re-enters while it still says 2
+
+    assert sink.reconstructed() == [2, 1, 2]
+
+
+def test_a_nested_snapshots_record_is_not_overwritten_by_the_enclosing_one() -> None:
+    """The other direction of the same window: the enclosing update returns from its emission and
+    writes its own value over the one the nested update recorded. Its row is no longer what the log
+    ends in, so the next re-observation of it would be elided against a superseded value. Which row
+    is last is not worth reconstructing from a re-entrant sink's ordering, so the key is left unset
+    and the value restated — redundancy a reader can absorb, rather than a marker that misleads.
+    """
+    tool = FakeTool("app", properties=[ObservableProperty("state", 1)])
+    wm = _wm_with(tool)
+
+    def observe_again() -> None:
+        tool.set_properties([ObservableProperty("state", 2)])
+        DefaultObserveStrategy._snapshot_properties(wm)
+
+    sink = _ReenteringSink(observe_again)
+    sink.armed = True
+    with collect_runtime_events(sink):
+        DefaultObserveStrategy._snapshot_properties(wm)  # emits 1, re-enters and records 2
+        tool.set_properties([ObservableProperty("state", 1)])
+        DefaultObserveStrategy._snapshot_properties(wm)  # 1 again: the log last carried 2
+
+    assert sink.reconstructed() == [1, 2, 1]
+
+
+def test_a_sink_that_defers_its_append_misorders_the_log_before_any_elision() -> None:
+    """Why the ordering requirement sits on ``RuntimeEventSink`` rather than on the elision.
+
+    A sink that re-enters the runtime *before* committing its row puts the nested rows in the log
+    first, so the log is no longer in emission order. Shown here with no marker involved at all —
+    every observation differs, so every row carries its full value — and the log still misreads:
+    the reader is told the property ended at 2 when the last observation was 3. The same sink
+    inverts phase nesting, which is read positionally too. So this is not a property of eliding a
+    value; emitting every value in full would not repair either reading, which is why the fix is a
+    requirement on sinks and not a retreat from the elision. A sink that commits its row *first*
+    and only then re-enters is the case the ledger handles, covered by the two tests above.
+    """
+
+    class _DeferringSink:
+        """Commits its row only after one re-entry — the ordering the Protocol rules out."""
+
+        def __init__(self, reenter: Callable[[], None]) -> None:
+            self.rows: list[dict[str, Any]] = []
+            self.armed = False
+            self._reenter = reenter
+
+        def emit(self, event: dict[str, Any]) -> None:
+            if self.armed:
+                self.armed = False
+                self._reenter()
+            self.rows.append(event)
+
+    tool = FakeTool("app", properties=[ObservableProperty("state", 1)])
+    wm = _wm_with(tool)
+
+    def observe_third() -> None:
+        tool.set_properties([ObservableProperty("state", 3)])
+        DefaultObserveStrategy._snapshot_properties(wm)
+
+    sink = _DeferringSink(observe_third)
+    with collect_runtime_events(sink):
+        DefaultObserveStrategy._snapshot_properties(wm)  # 1
+        tool.set_properties([ObservableProperty("state", 2)])
+        sink.armed = True
+        DefaultObserveStrategy._snapshot_properties(wm)  # 2, re-entering at 3 before committing
+
+    values = [row["payload"]["property"]["value"] for row in sink.rows]
+    assert values == [1, 3, 2]  # observed 1, 2, 3 — and the stream's last value is wrong
+
+    def enter_another_phase() -> None:
+        with runtime_phase(2, "reflect"):
+            pass
+
+    phases = _DeferringSink(enter_another_phase)
+    phases.armed = True
+    with collect_runtime_events(phases):
+        with runtime_phase(1, "observe"):
+            pass
+
+    # The inner cycle's phase is complete before the enclosing one has opened.
+    assert [(row["event"], row["payload"]["phase"]) for row in phases.rows] == [
+        ("phase.entry", "reflect"),
+        ("phase.exit", "reflect"),
+        ("phase.entry", "observe"),
+        ("phase.exit", "observe"),
+    ]
 
 
 def test_stream_yields_exactly_what_snapshot_returns() -> None:
