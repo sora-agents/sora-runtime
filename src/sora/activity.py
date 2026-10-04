@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from sora.diagnostics import diagnostic_preview, emit_runtime_event, runtime_events_enabled
 from sora.types import (  # used at run time by reset_for_replan / frames_held_by_conditions
     GOAL_KIND_MAINTENANCE,
+    InferenceKind,
     SupersededPlan,
     goal_kind_of,
 )
@@ -269,6 +271,62 @@ class Activity:
                 payload=diagnostic_preview({"previous": previous, "pending": value}),
             )
 
+    def fail_condition_evaluation(self, judged: Iterable[PendingConditionState]) -> tuple[int, int]:
+        """Resolve a batched condition judgement that was **not an answer**.
+
+        Returns how many waiters stayed re-judgeable and how many were refused outright.
+
+        The single transition for every way a judgement can fail to answer, and deliberately the
+        only one: a seam error, a reply whose `fired` claim could not be read, the stall watchdog's
+        synthetic error, and an evaluation abandoned before it could ever be applied all arrive
+        here. Three of those used to be handled at three sites with two different opinions about
+        the evaluation cursor — one rolled it back, one left it advanced and additionally refunded
+        the retry it had not spent — which is how an unreadable reply came to consume a change
+        permanently. Having one function also makes the ordering constraint statable: it must run
+        *after* retirement has been applied, because liveness is what decides retry against
+        refusal.
+
+        Two outcomes, and which one a waiter gets is not a judgement call:
+
+        * a waiter still **live** and still holding its one retry gets the change back and stays
+          judgeable — the failure is deferred, not resolved, which is the whole point of
+          distinguishing "nobody could read it" from "it did not happen";
+        * a waiter whose retry is spent, or that no longer exists to be re-judged (this very
+          verdict's `retired` half can be perfectly readable while its `fired` half is not), or
+          whose change was **evicted while the judgement was out**, gets a persistent refusal
+          instead. There is nothing left to wait for, and leaving it unresolved would strand a
+          window on a verdict that can never arrive.
+
+        The eviction case is the one that is not about liveness, and it is why the retry is not
+        simply offered to every live waiter. The rewind gives a change back by moving the cursor;
+        it cannot give back a log entry retention has dropped, so a waiter rewound over an evicted
+        change is re-judgeable in form only. What it does have is an acceptance mark above its
+        cursor, which keeps its gate reading open — until some later matching change is judged and
+        the single scalar cursor advances past both, at which point nothing records that anything
+        was ever lost and the window expires into its negative branch. So the loss is converted
+        here into the one thing a later judgement cannot erase.
+
+        Only the negative branch is ever lost. A refused waiter stays on watch and can still FIRE on
+        a later change — an *absence* is the one claim an unreadable judgement has made unavailable
+        for good.
+        """
+        live = {id(state) for state in self.pending_conditions}
+        retried = refused = 0
+        for state in judged:
+            if state.dispatched_evidence_lost:
+                # Deliberately ahead of the liveness test: a retry here would re-open a gate over
+                # a change that no longer exists (see above).
+                state.refuse_expiry()
+                refused += 1
+            elif id(state) in live and not state.retried_after_failure:
+                state.retried_after_failure = True
+                state.rewind_to_fire_point()
+                retried += 1
+            else:
+                state.refuse_expiry()
+                refused += 1
+        return retried, refused
+
     def discard_inference(self) -> None:
         """Invalidate an off-cycle infer/ground in flight (and any params it already parked): the
         late result is discarded on resolve because its id no longer matches the (now-cleared)
@@ -282,6 +340,21 @@ class Activity:
                 cause="runtime_discard",
                 payload=diagnostic_preview({"pending": self.pending_inference}),
             )
+        # Abandoning a condition judgement is not the same as discarding a late one, and only the
+        # late case is a free no-op. A late result lands on a batch some other path has already
+        # resolved; this one removes the only evaluation that was ever going to resolve it, and
+        # `condition_batch` is cleared by nothing but the verdict being applied. Left alone, those
+        # waiters sit unresolved forever on a verdict that can never arrive: an expiry over one of
+        # them defers rather than decides, and — worse — the next dispatch overwrites the batch, at
+        # which point the stranded waiter is outstanding nowhere, its cursor still advanced past the
+        # change nobody read, and the next sweep reads that advance as the absence that authorizes
+        # the negative branch. So it takes the ordinary failure transition: retry if it can still be
+        # judged, persistent refusal if it cannot.
+        if self.pending_inference is not None and self.pending_inference.kind is (
+            InferenceKind.CONDITION
+        ):
+            self.fail_condition_evaluation(self.condition_batch)
+            self.condition_batch = []
         self.pending_inference = None
         self.grounded_params = None
 

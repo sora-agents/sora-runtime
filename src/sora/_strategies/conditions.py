@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -23,6 +24,7 @@ from sora.perception import Percept
 from sora.types import (
     GOAL_KIND_MAINTENANCE,
     SUBGOAL,
+    ConditionFiring,
     ConditionWait,
     PendingCondition,
     PendingConditionState,
@@ -41,6 +43,112 @@ if TYPE_CHECKING:
     from sora.types import Plan
 
 log = logging.getLogger("sora.strategies")
+
+
+def queue_expiry_branches(
+    activity: Activity, wm: WorkingMemory, retiring: Iterable[PendingConditionState]
+) -> list[ConditionFiring]:
+    """Queue the `otherwise` of every condition retiring without ever having fired.
+
+    Called by **both** retirement paths — the clock's sweep here in Observe and the batched
+    verdict's `retired` half in Reason — which is why it is a free function rather than a method on
+    either. A hook in only one of them is the shape of a half-applied fix: the two paths answer
+    different kinds of `until` (a declared duration versus an event-shaped clause the judge reads),
+    so whichever one went unhooked would drop the branch for a whole category of plan while the
+    other worked, and the symptom would be an agent that acts on a timeout only sometimes.
+
+    Queueing onto `condition_fired` is what makes the rest free: that queue already counts as
+    committed work holding the declaring frame open, already keeps Reflect from terminating an
+    activity whose body is finished, and is already drained one at a time only once the body is
+    idle. An expiry needs every one of those and needs them to behave identically to a firing.
+
+    Two things make it safe to call from more than one place, both of which are races that were
+    reproduced against this code rather than imagined. `expiry_settled` makes the *decision*
+    idempotent per waiter: three sites retire, two of them from a list of states captured before the
+    call they were waiting on resolved, and the identity-based drop those sites perform is a silent
+    no-op for a state another site already removed — so the removal deduplicates itself and deciding
+    would not. Note what the mark has to record, which the first version of it got wrong: not "this
+    branch was queued" but "this branch was decided", either way. A branch one site deliberately
+    *rejected* leaves `ever_fired` false and the evaluation mark advanced, so a later sweep finds
+    every reason to queue it and none to stop — the rejection is invisible unless it is written
+    down, and that holds for a waiter still live at the time of the rejection just as much as for
+    one already retired: by the time its own window closes, the advanced cursor is the only trace
+    of the change it never managed to read. `expiry_owed` handles the opposite error: a window that
+    closes while a judgement over it is outstanding is not yet known to have never fired, and
+    committing the branch there runs it beside the `then` that verdict is about to earn. Deferral is
+    the one outcome that is *not* settled, because it is the one that is still pending.
+
+    Checked against the state rather than against the activity's live `pending_conditions`, which
+    looks equivalent and is not: these waiters are being retired off exactly that list, and the two
+    callers sit on opposite sides of the removal — the clock decides before dropping, the verdict
+    after — so a liveness filter would silently reject every state arriving from the verdict.
+
+    The decline is permanent, and that is why it is settled rather than re-derived: a window that
+    closes while a matching change sits in memory *unjudged* loses the branch outright. The gate
+    opened, so "nothing arrived" is the one reading now demonstrably unavailable — and unlike an
+    outstanding judgement there is nothing to wait for, since no evaluation is ever dispatched for a
+    condition that has stopped existing. The change itself is lost, which is the behaviour that
+    preceded this branch and is deliberately not widened into here: making a retired condition still
+    judgeable is a second lifecycle state for a condition, and the race between retirement and
+    eligibility predates the branch. Narrow in practice — an open gate makes the activity READY and
+    Reason judges it at the head of its next pass, so the state lasts about a tick.
+
+    `fired_changes` is deliberately left empty: nothing moved — that is the entire point of this
+    branch — and the pursuit path reads an absence of precise changes as "seed no ids", which clears
+    `SEEDED_BINDINGS` rather than handing the `otherwise` plan an authoritative empty set to filter
+    against.
+    """
+    queued: list[ConditionFiring] = []
+    deferred = 0
+    declined = 0
+    for state in retiring:
+        if state.condition.otherwise is None or state.ever_fired or state.expiry_settled:
+            continue
+        if _gate_open(wm, state):
+            # A change matched this watch and nothing has judged it. It may be the awaited reply,
+            # landing in the last tick before the deadline — the near-miss this construct is most
+            # likely to meet — so the negative branch is not available: its premise is an absence
+            # this condition can no longer claim. Refused, not just skipped: the answer is permanent
+            # (see below), and a later sweep must not reach a different one — which it could, since
+            # half of what `_gate_open` reads is retained memory and the signal that closed the gate
+            # may be evicted by then. Through the one rejecting writer, so that "a decision is a
+            # decision whichever way it went" stays checkable in a single place.
+            state.refuse_expiry()
+            declined += 1
+            continue
+        if any(outstanding is state for outstanding in activity.condition_batch):
+            # A judgement over this very state has been dispatched and not yet applied, so
+            # `ever_fired` cannot be read yet: it only becomes true when Reason applies a verdict,
+            # and the verdict in flight may be about to fire this condition. Committing the
+            # negative branch here would run it alongside the `then` the same verdict earns.
+            # Defer to that verdict instead of guessing — it is already paid for, it lands within a
+            # tick or two, and `_apply_condition_verdict` re-offers what is marked here *after*
+            # marking firings. Identity, not equality: equal conditions can be distinct waiters.
+            state.expiry_owed = True
+            deferred += 1
+            continue
+        state.expiry_settled = True
+        queued.append(ConditionFiring(condition=state.condition, on_expiry=True))
+    if declined:
+        log.info(
+            "condition: %d window(s) on %s closed over an unjudged change -> `otherwise` declined",
+            declined,
+            activity.id,
+        )
+    if deferred:
+        log.info(
+            "condition: %d window(s) on %s closed under judgement -> `otherwise` deferred",
+            deferred,
+            activity.id,
+        )
+    if queued:
+        activity.condition_fired.extend(queued)
+        log.info(
+            "condition: %d window(s) on %s closed unfired -> queued `otherwise`",
+            len(queued),
+            activity.id,
+        )
+    return queued
 
 
 def _lift_pending_conditions(activity: Activity, wm: WorkingMemory) -> None:
@@ -119,6 +227,11 @@ def _lifted(
         ),
         evaluated_through=wm.signals_appended,
         derived_through=wm.property_changes_appended,
+        # Nothing accepted yet, stated in the same coordinates rather than left at a bare 0: the
+        # acceptance marks are compared against the two cursors above, so "no evidence" has to mean
+        # "level with where this window started reading", not "the beginning of the log".
+        accepted_signals=wm.signals_appended,
+        accepted_derived=wm.property_changes_appended,
     )
 
 
@@ -319,8 +432,10 @@ def _conditions_hold_frame(activity: Activity) -> bool:
     Two independent reasons, and only the second is a goal-kind question:
 
     * **Committed work** — a queued `condition_fired` or a verdict nothing has applied yet. Both
-      kinds of goal owe it: the judgement is already paid for and the `then` runs at this depth, so
-      the parent must not run ahead of them.
+      kinds of goal owe it: the judgement is already paid for and the goal runs at this depth, so
+      the parent must not run ahead of them. Either branch counts, a firing's `then` or an expiry's
+      `otherwise` (ADR-0028) — they share the queue precisely so this rule covers both without
+      being restated.
     * **A maintenance goal's own live conditions** — its steps were the first iteration, so it is
       finished only when every condition it declared has retired. On the motivating run, popping
       resumed the parent at the message telling the user everything was done, sent while the
@@ -427,6 +542,177 @@ def _match_derived(wm: WorkingMemory, wait: SignalWait, *, since: int = 0) -> _M
     return None
 
 
+def _accepted_match(wm: WorkingMemory, state: PendingConditionState) -> _Match | None:
+    """The first unjudged change matching this watch, recording that this window accepted it.
+
+    A query that writes, and the write is why it exists rather than two call sites each doing their
+    own scan. Both callers ask "has something matched?" of retained memory, and retention is capped:
+    the answer was true while the change sat in `WorkingMemory.signals` and false once unrelated
+    traffic pushed it out, with nothing in between to notice the difference. Recognizing a match is
+    the one moment the runtime holds that fact, so it is also the moment to make it durable
+    (`PendingConditionState.accept_evidence`) — any later re-derivation is a guess about what
+    retention happened to keep. The marks are what make a window's unresolved evidence outlive the
+    log entry that carried it.
+    """
+    match = _match_signal(wm, state.condition.watch, since=state.evaluated_through)
+    if match is None:
+        match = _match_derived(wm, state.condition.watch, since=state.derived_through)
+    if match is not None:
+        state.accept_evidence(match.sequence, derived=match.derived)
+    return match
+
+
+def _matching_signals(wm: WorkingMemory, wait: SignalWait, *, since: int) -> Iterator[int]:
+    """Sequence numbers of every retained signal at or after `since` satisfying this watch."""
+    first_seq = wm.signals_appended - len(wm.signals)
+    for offset, percept in enumerate(wm.signals):
+        sequence = first_seq + offset
+        if sequence < since:
+            continue
+        if (
+            percept.payload.name == wait.signal_name
+            and (wait.source is None or percept.source == wait.source)
+            and watch_matches(wait.path, wait.kind, changes_of(percept.payload))
+        ):
+            yield sequence
+
+
+def _matching_derived(wm: WorkingMemory, wait: SignalWait, *, since: int) -> Iterator[int]:
+    """Sequence numbers of every retained derived change at or after `since` satisfying a watch."""
+    first_seq = wm.property_changes_appended - len(wm.property_changes)
+    for offset, percept in enumerate(wm.property_changes):
+        sequence = first_seq + offset
+        if sequence < since:
+            continue
+        if wait.source is not None and percept.source != wait.source:
+            continue
+        if watch_matches(wait.path, wait.kind, list(percept.payload.changes)):
+            yield sequence
+
+
+def reconcile_retained_evidence(wm: WorkingMemory, *, signal_floor: int, derived_floor: int) -> int:
+    """Record what every live window has accepted, and refuse the branch of any window losing it.
+
+    Returns how many expiry branches were refused. Called from Observe immediately before the
+    retention trim, with the first sequence each log will still hold afterwards — so the entries
+    about to be dropped are examined while they are still in hand, which is the only moment they
+    can be.
+
+    Over **every** waiter on every activity, deliberately, rather than the ones a gate check
+    happens to reach. Acceptance used to be recorded only where a gate was checked: the eligibility
+    sweep, which looks at activities BLOCKED on a `ConditionWait`, or the per-state check an expiry
+    sweep makes. An activity that is READY with body work left is neither, so a reply that landed
+    while the agent was busy was never recognized at all and the trim removed the only trace of it.
+    Recognition cannot be conditional on scheduling: what a window accepted is a fact about the
+    window, not about which activity the runtime got round to looking at.
+
+    Refusing here, rather than recording the loss and deciding later, is the other half. A
+    high-water mark cannot carry "this was lost": the evaluation cursor is a single scalar, so
+    judging a *later* matching change advances it past the evicted one, and the acceptance mark it
+    then meets reads as "everything accepted has been answered". One reply, one eviction, and one
+    later change judged negative was enough to reach the negative branch that way. The refusal is
+    the same decision `_apply_condition_verdict` makes over an unreadable answer, for the same
+    reason and with the same early timing: a window that accepted a change nobody could read can no
+    longer claim the absence its negative branch asserts, and that is true from the moment the
+    change is lost rather than from the moment the window closes. Nothing clears it, which is the
+    point — a later judgement about later evidence says nothing about the change that went missing.
+
+    A waiter with a judgement **in flight** is the one case that is recorded rather than decided,
+    and it needed its own handling because the fire-time cursor advance hides it: the change a call
+    was asked about sits below the cursor from the moment the call goes out, so scanning from the
+    cursor skips exactly the entry whose loss a failed verdict cannot undo. That loss is not a
+    refusal yet, because the judgement may still answer — and an answer resolves its own evidence,
+    whichever way it goes. It becomes a refusal only where the failure is resolved
+    (`Activity.fail_condition_evaluation`), which is also the only site that can tell a failure from
+    an answer.
+
+    Live waiters only, and that is complete rather than a gap: a waiter already retired while its
+    judgement was out is refused by `Activity.fail_condition_evaluation` on liveness alone, whatever
+    retention did to its evidence, and resolved by a usable verdict the same as any other.
+
+    Only the negative branch is affected. The condition stays on watch and can still fire.
+
+    Deliberately scanning from each waiter's evaluation cursor (or fire point) rather than from its
+    acceptance mark, and therefore re-examining retained entries every tick: an entry accepted on an
+    earlier tick is still unjudged, and this tick may be the one that drops it, so the narrower
+    bound would record acceptance correctly and then miss the loss. The cost is bounded by (entries
+    held in the two logs) x (live waiters), per tick, each entry costing an integer compare and —
+    for a candidate that gets that far — the name/source/path match a gate check performs. The logs
+    are capped at 256 and 1024, though this runs *before* the trim and so sees one tick's arrivals
+    above the cap. That bound is stated rather than measured: no benchmark has been run against it.
+    """
+    refused = 0
+    for activity in wm.activities.values():
+        for state in activity.pending_conditions:
+            wait = state.condition.watch
+            # Identity, not equality: equal conditions can be distinct waiters. A state in the
+            # batch has a judgement out over it, so the span between its fire point and its cursor
+            # is dispatched-but-unanswered — evidence, and losable, even though the cursor has
+            # formally passed it.
+            in_flight = any(outstanding is state for outstanding in activity.condition_batch)
+            unjudged_loss = False
+            dispatched_loss = False
+            # From the evaluation cursor, not from the acceptance mark: an entry already accepted
+            # on an earlier tick is still unjudged, and this tick may be the one that drops it.
+            # From the FIRE point while a judgement is out, for the same reason one step earlier:
+            # the fire-time advance moved the cursor past the change being judged, so the cursor
+            # alone would hide precisely the entry whose loss a failed verdict cannot recover.
+            since = state.fired_from_signals if in_flight else state.evaluated_through
+            for sequence in _matching_signals(wm, wait, since=since):
+                state.accept_evidence(sequence, derived=False)
+                if sequence >= signal_floor:
+                    continue
+                if sequence < state.evaluated_through:
+                    dispatched_loss = True
+                else:
+                    unjudged_loss = True
+            since = state.fired_from_derived if in_flight else state.derived_through
+            for sequence in _matching_derived(wm, wait, since=since):
+                state.accept_evidence(sequence, derived=True)
+                if sequence >= derived_floor:
+                    continue
+                if sequence < state.derived_through:
+                    dispatched_loss = True
+                else:
+                    unjudged_loss = True
+            if dispatched_loss:
+                # Not decided here: the call is already paid for and may come back readable, in
+                # which case it resolves its own evidence and nothing was lost that mattered.
+                # Recorded so that a verdict which does NOT answer cannot quietly rewind into a
+                # gate over a change that is gone.
+                state.lose_dispatched_evidence()
+                log.info(
+                    "condition: evidence under judgement on %s lost to retention -> "
+                    "`otherwise` refused unless that judgement answers",
+                    activity.id,
+                )
+            if unjudged_loss and not state.expiry_settled:
+                state.refuse_expiry()
+                refused += 1
+                log.info(
+                    "condition: evidence on %s lost to retention before judgement -> "
+                    "`otherwise` refused",
+                    activity.id,
+                )
+    return refused
+
+
+def _gate_open(wm: WorkingMemory, state: PendingConditionState) -> bool:
+    """Has a change this one condition has not yet judged matched its watch?
+
+    The per-state half of `_eligible_conditions`, which cannot be reused directly: it iterates
+    `pending_conditions`, and the waiters this answers for are being retired off exactly that list
+    — one caller asks before the drop, the other after.
+
+    Two sources, OR-ed, and the second is the load-bearing one: a matching change still in memory,
+    or one this window accepted at any point since it opened. Only the first used to be consulted,
+    which made the answer a function of the retention cap — see
+    `PendingConditionState.accepted_signals` for the wrong action that bought. An evicted change is
+    still evidence; what it is not any more is judgeable, and those are different facts.
+    """
+    return _accepted_match(wm, state) is not None or state.has_unresolved_evidence
+
+
 def _eligible_conditions(
     activity: Activity, wm: WorkingMemory
 ) -> list[tuple[PendingConditionState, _Match]]:
@@ -446,9 +732,7 @@ def _eligible_conditions(
     """
     eligible: list[tuple[PendingConditionState, _Match]] = []
     for state in activity.pending_conditions:
-        match = _match_signal(wm, state.condition.watch, since=state.evaluated_through)
-        if match is None:
-            match = _match_derived(wm, state.condition.watch, since=state.derived_through)
+        match = _accepted_match(wm, state)
         if match is not None:
             eligible.append((state, match))
     return eligible
@@ -697,6 +981,10 @@ class ConditionRetirement:
         work the frame already accepted and paid a judgement for, and ADR-0027 holds both kinds of
         frame open for it. Retirement ends the *watching*, not a firing that already happened.
         """
+        # Before anything is dropped, because the expiry branch is owed BY the conditions that are
+        # about to stop existing — and because the resume at the bottom of this method is what lets
+        # Reason reach the queue at all.
+        queued = queue_expiry_branches(activity, cycle.working, retiring)
         # Identity, not equality: PendingConditionState is mutable (its marks advance), so it is
         # unhashable, and two conditions can compare equal while being distinct waiters. A state the
         # eligibility gate retired while a judgement was in flight is simply no longer found.
@@ -722,10 +1010,18 @@ class ConditionRetirement:
         if not isinstance(activity.blocked_on, ConditionWait):
             return
         freed_frame = bool(activity.parent_frames) and not _conditions_hold_frame(activity)
-        if activity.pending_conditions and not freed_frame:
+        if activity.pending_conditions and not freed_frame and not queued:
             # Still waiting, on less. Re-derive the wait so `blocked_on` keeps describing what the
             # activity is actually waiting for — what a diagnostic renders and a harness inspects.
             activity.blocked_on = ConditionWait(watches=_condition_watches(activity))
             return
+        # `not queued` is load-bearing in the guard above, and its absence is invisible in any
+        # test that retires an activity's *only* condition. An expiry branch is reached by Reason
+        # and Situate only ever selects a READY activity, so nothing else will wake this one: the
+        # signal that could have has already been and gone, which is precisely why the branch is
+        # owed. A window closing unfired while a sibling condition is still watched would therefore
+        # queue its `otherwise` and then sit BLOCKED holding it for good. Resuming there is safe as
+        # well as necessary — once the branch is pursued and the body runs out, Reason re-blocks on
+        # whatever conditions remain, declining only while something is still owed.
         resume = cycle.actions.internal(ResumeAction.name)
         await resume.execute(cycle, activity_id=activity.id)

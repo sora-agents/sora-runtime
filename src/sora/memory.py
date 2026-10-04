@@ -1168,6 +1168,16 @@ def pending_from_raw(
         if kind is not None and record_malformed:
             log_llm_malformed(dropped=1)
         kind = None
+    # An unusable `otherwise` degrades to None rather than dropping the whole condition, unlike
+    # `when`/`then` above. The asymmetry is deliberate: a condition with no `then` has nothing to do
+    # at all, while one with a mis-shaped `otherwise` still has a working watch and positive branch,
+    # and dropping it outright would take the branch that *is* well-formed down with the one that
+    # is not.
+    otherwise = raw.get("otherwise")
+    if not isinstance(otherwise, str) or not otherwise.strip():
+        if otherwise is not None and record_malformed:
+            log_llm_malformed(dropped=1)
+        otherwise = None
     return PendingCondition(
         watch=SignalWait(
             signal_name=signal_name,
@@ -1178,6 +1188,7 @@ def pending_from_raw(
         when=when,
         then=then,
         until=until,
+        otherwise=otherwise,
     )
 
 
@@ -1896,36 +1907,52 @@ def _parse_condition_verdict(
     waiting, which is the same state it was already in. The opposite default would let a flaky call
     invent follow-up work — the expensive, user-visible failure. Out-of-range indices are dropped
     for the same reason, so a hallucinated index cannot retire a condition that is still live.
+
+    The degraded value additionally has to carry that it is **not an answer**, because one consumer
+    reads an empty `fired` as an authorization rather than a no-op: `PendingCondition.otherwise`
+    commits precisely on "nothing fired". Degrading silently there turns every way of failing to
+    read the field — unparseable text, a non-object, a missing or non-list `fired`, or a list left
+    empty only because its entries were discarded — into a way of acting, which is how malformed
+    output came to order a cab. So `ConditionVerdict.failed` records an incomplete reading of
+    `fired`, and the caller decides; a `fired` the judge answered and left empty stays an answer.
+
+    Scoped to the `fired` claim on purpose. A malformed `retired` needs no such mark, because it
+    degrades to retiring nothing, and retiring nothing authorizes nothing — the asymmetry is in the
+    consumers, not in the two fields. The retirement-only call therefore never sets it.
     """
     try:
         obj = _load_json_object(text)
     except (ValueError, TypeError, AttributeError):
         log_llm_malformed(dropped=2 if expect_fired else 1)
-        return ConditionVerdict()
+        return ConditionVerdict(failed=expect_fired)
 
-    def _indices(key: str, *, required: bool = True) -> tuple[int, ...]:
+    def _indices(key: str, *, required: bool = True) -> tuple[tuple[int, ...], bool]:
+        """The indices, and whether they are a *complete* reading of the field."""
         raw = obj.get(key) if isinstance(obj, dict) else None
         if not isinstance(raw, list):
             if required or raw is not None:
                 log_llm_malformed(dropped=1)
-            return ()
+            return (), False
         out: list[int] = []
+        intact = True
         for entry in raw:
             if isinstance(entry, bool) or not isinstance(entry, int):
                 log_llm_malformed(dropped=1)
+                intact = False
                 continue  # bool is an int subclass; a `true` here is not index 1
             if not 0 <= entry < count:
                 log_llm_malformed(dropped=1)
+                intact = False
                 continue
             if entry in out:
                 log_llm_malformed(repaired=1)
-                continue
+                continue  # a dedup does not change the claim
             out.append(entry)
-        return tuple(out)
+        return tuple(out), intact
 
-    return ConditionVerdict(
-        fired=_indices("fired", required=expect_fired), retired=_indices("retired")
-    )
+    fired, fired_intact = _indices("fired", required=expect_fired)
+    retired, _ = _indices("retired")
+    return ConditionVerdict(fired=fired, retired=retired, failed=expect_fired and not fired_intact)
 
 
 # --- undeclared relevance: does a change bear on work that already finished? — ADR-0026 ---------
@@ -2612,6 +2639,9 @@ class ProceduralMemory:
                     when=cond["when"],
                     then=cond["then"],
                     until=_until_from_raw(cond.get("until")),
+                    # Absent for any plan stored before the expiry branch existed, which is the
+                    # same "none declared" a plan that simply does not use one reports.
+                    otherwise=cond.get("otherwise"),
                 )
                 for cond in (data.get("pending") or ())
             ),

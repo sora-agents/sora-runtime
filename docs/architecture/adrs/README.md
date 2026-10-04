@@ -42,7 +42,8 @@ This folder records the S-ORA runtime's architectural decisions using [MADR](htt
 | [0025](0025-deliberation-breakers.md) | Deliberation breakers: bounding replanning, recursion, and acting on a dead plan | proposed | Decision cycle |
 | [0026](0026-undeclared-relevance-recovery.md) | Undeclared-relevance recovery: an idle-scheduled judge over unclaimed signals, user-gated, amending rather than reopening | proposed | Decision cycle |
 | [0027](0027-achievement-and-maintenance-goals.md) | Achievement and maintenance sub-goals: completion criterion, frame lifetime, and the environment clock | proposed | Decision cycle |
+| [0028](0028-expiry-branch-for-pending-conditions.md) | An expiry branch for pending conditions: the `otherwise` a window owes when nothing fires | proposed | Decision cycle |
 
 ## Planned
 
-None currently pending — 27 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).
+None currently pending — 28 architectural decisions written up above, all `proposed` during README-driven design (see the lifecycle note in Conventions; each is promoted to `accepted` once realized in code).

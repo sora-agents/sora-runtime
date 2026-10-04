@@ -249,15 +249,17 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                     # quiet afterwards never makes the condition eligible again — so a failure
                     # here silently loses the wake rather than deferring it. That is reachable
                     # on a HEALTHY call, since the client retries a stalled request twice at its
-                    # own stall timeout each, which can outlast this deadline. Give the change
-                    # back, once per condition (see `retried_after_failure`).
-                    for state in activity.condition_batch:
-                        if state.retried_after_failure:
-                            continue
-                        state.retried_after_failure = True
-                        state.evaluated_through = state.fired_from_signals
-                        state.derived_through = state.fired_from_derived
-                    activity.condition_verdict = ConditionVerdict()
+                    # own stall timeout each, which can outlast this deadline.
+                    #
+                    # Giving the change back is therefore right, but it is NOT done here. This
+                    # branch only records that the judgement was not an answer; the retry-or-refuse
+                    # transition is `Activity.fail_condition_evaluation`, applied by Reason once
+                    # retirement has been applied — which is what decides whether a waiter can
+                    # still be re-judged at all. Rolling back here as well would spend the one
+                    # permitted retry on a waiter the same verdict is about to retire, and would
+                    # put a second opinion about the cursor in a second place, which is how the
+                    # two failure producers came to disagree.
+                    activity.condition_verdict = ConditionVerdict(failed=True)
                     activity.state = ActivityState.READY
                     log.warning(
                         "observe: condition evaluation for %s failed (%s) -> nothing fired",
@@ -412,10 +414,12 @@ async def _resolve_inferences(cycle: DecisionCycle) -> None:
                     activity.condition_verdict = (
                         verdict if isinstance(verdict, ConditionVerdict) else ConditionVerdict()
                     )
-                    # The seam answered, so the retry this condition is owed on a failure is
-                    # restored — the bound is one retry per failure, not one per activity life.
-                    for state in activity.condition_batch:
-                        state.retried_after_failure = False
+                    # The retry allowance is NOT restored here. The seam answering is not this
+                    # question being answered: a reply whose `fired` claim could not be read parks
+                    # `failed=True` over a working seam, and refunding the allowance on that basis
+                    # gave back a retry the waiter had never spent while its cursor stayed advanced
+                    # past the change nobody read. Restored by the applier instead, against a
+                    # *usable* answer (see `PendingConditionState.restore_retry_allowance`).
                     activity.state = ActivityState.READY
                     log.info(
                         "observe: condition verdict fired=%s retired=%s for activity %s",

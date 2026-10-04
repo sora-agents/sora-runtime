@@ -13,6 +13,7 @@ from sora._strategies.conditions import (
     _conditions_hold_frame,
     _eligible_conditions,
     _lift_step_conditions,
+    queue_expiry_branches,
 )
 from sora._strategies.contracts import (
     TickResult,
@@ -645,6 +646,15 @@ class DefaultReasonStrategy:
         activity.condition_verdict = None
         judged = activity.condition_batch
         activity.condition_batch = []
+        # Mark firings BEFORE retirement is applied, because an `otherwise` is owed only to a window
+        # that closed having NEVER fired, and one verdict may legitimately do both: `{"fired": [0],
+        # "retired": [0]}` is the ordinary one-shot answer, not a contradiction (see above). Marking
+        # afterwards would read that shape as a window that expired unfired and queue the
+        # alternative branch alongside the `then` it just earned — running both branches of one
+        # condition, in the case that is most common rather than in an exotic one.
+        for i in verdict.fired:
+            if i < len(judged):
+                judged[i].ever_fired = True
         # A window the clock owns is not this judge's to close (ADR-0027 §5): it is answered every
         # tick by comparison in `retire_expired`, and the judge is never told what domain time it
         # is. Dropped before anything is applied, so the retirement record cannot pick it up either.
@@ -677,6 +687,77 @@ class DefaultReasonStrategy:
         # discard judgements already paid for and unrecoverable: the marks advanced at fire time, so
         # the signal that opened the other gates can no longer make them eligible.
         activity.condition_fired.extend(fired)
+        # Expiry branches after the firings, so a verdict that both fires one condition and closes
+        # another unfired pursues the awaited event first. Queued here rather than next to the
+        # retirement above for that ordering alone — and before the pursuit check below, since an
+        # `otherwise` with nothing else owed is reason enough to run.
+        # Two groups, and the second is the one that matters. The first is what this verdict just
+        # retired. The second is every state whose expiry branch was *deferred* because this very
+        # judgement was outstanding when its window closed: the clock retired and dropped those
+        # already, so they appear in no `retired` list here, and this is the first moment
+        # `ever_fired` is settled for them — which is why the marking loop above runs before this.
+        # Duplicates across the two groups are harmless, since each decision sets `expiry_settled`.
+        # Safe from re-deferring, too: `condition_batch` was emptied at the top of this method, so
+        # the outstanding-judgement check inside sees nothing in flight.
+        # A verdict that FAILED is not a negative one, and that governs every waiter it judged, not
+        # only the two groups being offered a branch right now. The empty verdict a seam error or an
+        # unreadable answer parks is fail-soft for everything else here — an absent fire does
+        # nothing — but for the expiry branch "nothing fired" is precisely the authorization, so a
+        # network error or a `"fired": "unknown"` would order the cab.
+        # The retirement group is the trap, because half of a failed answer can be perfectly
+        # readable: `{"fired": "unknown", "retired": [0]}` legitimately stops the watching, and the
+        # retirement above is applied on exactly that basis. What it cannot also establish is that
+        # the awaited event never happened — that was the half this answer failed to say — and the
+        # branch needs both. So a valid `retired` still retires, and no waiter is offered its
+        # branch. A non-answer decides nothing.
+        # This is the ONLY site that resolves a failure, and it sits after the retirement above
+        # rather than at either producer, because liveness is what separates the two outcomes: a
+        # waiter still on watch gets its change back and stays judgeable, one this verdict just
+        # retired can never be re-judged and gets a persistent refusal instead. Both are recorded,
+        # which is the part a review keeps finding missing — judging a state advances its evaluation
+        # cursor past the change that opened its gate, and that advance is indistinguishable from a
+        # watch that nothing ever matched. So a waiter whose answer was unreadable and whose window
+        # closes two ticks later meets a clock sweep that finds no open gate and no judgement in
+        # flight, and reads the cursor this call moved as evidence that the reply never came. Both
+        # halves were reproduced against this code: a still-live waiter whose
+        # `{"fired": "unknown", "retired": []}` landed before the deadline, and a quiet retirement
+        # judgement returning `{"retired": [0]}` after this path had dropped the branch. Each
+        # ordered the cab.
+        if verdict.failed:
+            # Only the claims this verdict left UNRESOLVED. A failed reading is not an empty one:
+            # `{"fired": [0, 7], "retired": []}` fails on the index that does not exist while saying
+            # something perfectly usable about the one that does, and the firing loop above has
+            # already consumed it. Handing that waiter to the failure transition as well gave its
+            # change back for a retry it did not need — and the retry, asked the same question about
+            # the same change, fired the same condition again: one reply, two `then` sub-goals, two
+            # external operations. A partial answer is retried only where it was silent.
+            answered = {id(judged[i]) for i in verdict.fired if i < len(judged)}
+            for state in judged:
+                if id(state) in answered:
+                    # This waiter's question WAS answered readably, so by the same rule as the
+                    # branch below it earns its allowance back.
+                    state.restore_retry_allowance()
+            unresolved = [state for state in judged if id(state) not in answered]
+            retried, refused = activity.fail_condition_evaluation(unresolved)
+            if unresolved:
+                log.info(
+                    "reason: condition judgement on %s was not an answer -> "
+                    "%d re-judgeable, %d expiry branch(es) refused",
+                    activity.id,
+                    retried,
+                    refused,
+                )
+        else:
+            # Only a usable answer earns the allowance back (one retry per failure, not one per
+            # activity life). Restored here rather than where the verdict is parked, so that the
+            # answer being readable is what pays for it.
+            for state in judged:
+                state.restore_retry_allowance()
+            queue_expiry_branches(
+                activity,
+                wm,
+                [judged[i] for i in retiring] + [s for s in judged if s.expiry_owed],
+            )
         if activity.condition_fired and _body_exhausted(activity):
             return await self._pursue_fired_condition(activity, wm, cycle, result)
         # Nothing fired. If the body is finished, go back to waiting rather than falling through to
@@ -690,7 +771,15 @@ class DefaultReasonStrategy:
     async def _pursue_fired_condition(
         self, activity: Activity, wm: WorkingMemory, cycle: DecisionCycle, result: TickResult
     ) -> TickResult:
-        """Take the oldest queued fire and pursue its `then` as a deliberative sub-goal.
+        """Take the oldest queued item and pursue the goal it owes as a deliberative sub-goal.
+
+        Usually a firing's `then`. An expiry queues its condition's `otherwise` here instead, and
+        everything below applies to it unchanged — that identical treatment is the reason the two
+        share one queue. The one place they differ is the seeding: an expiry reports no changes,
+        because nothing moved, so the `changes_are_precise` test below is false and the seeded
+        bindings are cleared rather than filled. That is the correct answer for this branch, not a
+        degradation of it — the `otherwise` plan is about an event that did *not* happen, so there
+        are no ids for it to name.
 
         One at a time, in the order the verdict listed them: each `then` is a goal in its own right,
         and pursuing a second while the first one's sub-plan is still running would nest it inside
@@ -712,7 +801,12 @@ class DefaultReasonStrategy:
         about a third of the entire run's input tokens, for set membership.
         """
         state = activity.condition_fired.pop(0)
-        log.info("reason: pending condition fired on %s -> %r", activity.id, state.condition.then)
+        log.info(
+            "reason: pending condition %s on %s -> %r",
+            "closed unfired" if state.on_expiry else "fired",
+            activity.id,
+            state.goal,
+        )
         # Replace the previous firing's ids even when this firing cannot supply new ones. A coarse
         # Change means "something moved, ids and direction unknown", so turning its three empty
         # tuples into authoritative empty sets would silently make `in` select nothing and
@@ -736,7 +830,7 @@ class DefaultReasonStrategy:
         step = Step(
             next_action=SUBGOAL,
             params={
-                "goal": state.condition.then,
+                "goal": state.goal,
                 "mode": SubgoalMode.DELIBERATIVE,
                 "from_condition": True,
             },

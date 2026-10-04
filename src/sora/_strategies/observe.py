@@ -10,6 +10,7 @@ from sora._strategies.conditions import (
     ConditionRetirement,
     _eligible_conditions,
     _match_signal,
+    reconcile_retained_evidence,
 )
 from sora._strategies.contracts import (
     FocusPolicy,
@@ -452,6 +453,19 @@ class DefaultObserveStrategy:
         await self._retirement.retire_quiet(cycle)
         # Trim last: a signal that just arrived this tick must survive to be matched by the two
         # passes above before it's ever subject to eviction (bound orphan growth; newest win).
+        # Immediately before it, every live condition window reconciles against what the trim is
+        # about to leave behind. This has to happen here and nowhere else: the passes above only
+        # look at activities they have business with, so a window belonging to a READY activity
+        # with body work left got no look at all, and the entry that would have told it something
+        # arrived is gone one line later. An absence is the one claim this runtime reads as an
+        # authorization, so the fact that evidence existed must outlive the log that carried it.
+        reconcile_retained_evidence(
+            wm,
+            signal_floor=wm.signals_appended - min(len(wm.signals), _SIGNAL_RETENTION),
+            derived_floor=(
+                wm.property_changes_appended - min(len(wm.property_changes), _DERIVED_RETENTION)
+            ),
+        )
         if len(wm.signals) > _SIGNAL_RETENTION:
             del wm.signals[:-_SIGNAL_RETENTION]
         if len(wm.property_changes) > _DERIVED_RETENTION:

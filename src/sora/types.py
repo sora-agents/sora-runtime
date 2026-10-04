@@ -301,6 +301,29 @@ class PendingCondition:  # what would make an exhausted plan relevant again — 
     when: str
     then: str
     until: Until | None = None
+    # The branch owed when this condition stops waiting WITHOUT ever having fired — "if after three
+    # minutes nobody has replied, order a default cab". Prose, and pursued exactly as `then` is, for
+    # exactly the same reason: its consumer is `_infer_`, so this adds no branch language to the
+    # plan beyond a second string.
+    #
+    # `then` is reachable only by a FIRING, so before this field a window's negative branch had no
+    # representable form at all: `until` ends the watching and attaches nothing to the ending. A
+    # planner asked for the ordinary reactive pattern "act if no response arrives in time" could
+    # only restate the goal, which is what it did — five restatements across a replan on one
+    # observed run, searching for a construct that did not exist rather than failing fast.
+    #
+    # Owed on retirement with ZERO firings, which is the whole reason
+    # `PendingConditionState.ever_fired` exists: a firing does not consume a condition (`until` is
+    # what ends it), so without that mark "the window closed" and "the awaited thing never happened"
+    # are the same observation.
+    #
+    # Reached from BOTH retirement paths, the clock's and the judge's. Restricting it to the clock
+    # reads safer — a false retire would then only stop watching instead of acting — but it silently
+    # drops the branch whenever the planner writes an event-shaped `until`, which reproduces the
+    # original defect invisibly. The retirement judge is instructed to default to KEEPING, so its
+    # error direction is an `otherwise` that fails to fire (the pre-existing behaviour) rather than
+    # one that fires wrongly, which is the direction worth erring in when the branch can act.
+    otherwise: str | None = None
 
 
 @dataclass(frozen=True)
@@ -391,6 +414,31 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # number could not say how far this condition has read in each without one silently skipping
     # entries in the other.
     derived_through: int = 0
+    # How far EVIDENCE has been recognized in each log, in the same coordinate space as the two
+    # cursors above. "Is there an unjudged change matching this watch?" used to be answered only by
+    # re-scanning working memory at the moment the question was asked, and that answer is a function
+    # of the retention cap rather than of the window: `WorkingMemory.signals` is capped, so a reply
+    # that matched a watch and was then pushed out by unrelated traffic before any judgement ran
+    # made the gate read CLOSED -- and a closed gate over an expiring window is precisely the
+    # authorization for `otherwise`. One matching reply plus enough unrelated signals therefore
+    # dispatched the negative branch having bought no judgement at all: not a decision lost, a wrong
+    # external action taken. These marks make acceptance durable, so evidence the runtime recognized
+    # stays unresolved until something answers for it, whatever retention does in the meantime.
+    accepted_signals: int = 0
+    accepted_derived: int = 0
+    # Whether evidence this condition had already DISPATCHED for judgement was lost to retention
+    # before an answer arrived. The two marks above cannot express it, and the gap is narrow and
+    # real: the evaluation cursor advances at fire time, so the change under judgement sits *below*
+    # the cursor the moment the call goes out, which is exactly where the pre-trim reconciliation
+    # stops looking. Evict it there and the loss is recorded nowhere; a verdict that then FAILS
+    # rewinds the cursor, re-opening a gate over a change that no longer exists, and the next
+    # matching change to be judged advances the scalar cursor past both — at which point the
+    # acceptance mark reads as fully answered and the window expires into its negative branch.
+    # Not folded into the refusal the reconciliation makes for an unjudged loss, because a
+    # judgement is already paid for and may still answer readably: a usable verdict resolves its
+    # own evidence, so this is cleared by `restore_retry_allowance`, and only a failure or an
+    # abandonment turns it into the permanent refusal (`Activity.fail_condition_evaluation`).
+    dispatched_evidence_lost: bool = False
     # Where both marks stood before the in-flight judgement advanced them, so a judgement that
     # ERRORS can give the change back. Advancing at fire time is right for a call that answers (a
     # signal landing mid-flight earns its own evaluation rather than re-judging this one), but on a
@@ -424,14 +472,147 @@ class PendingConditionState:  # one PendingCondition's per-run state — on Acti
     # a judge instructed to default to keeping, i.e. never. The runtime knows the instant the
     # planner cannot re-derive, so it carries it rather than asking.
     inherited_deadline: datetime | None = None
+    # Whether any verdict has EVER fired this condition — what `PendingCondition.otherwise` is owed
+    # against, and something nothing else here records. `fired_from_signals`/`fired_from_derived`
+    # are rollback marks for the judgement currently in flight and are overwritten by the next one,
+    # so neither survives as "this happened at least once". Set when a verdict fires and never
+    # cleared: a window that fired and later expired has already had its awaited event, so its
+    # expiry owes no alternative.
+    ever_fired: bool = False
+    # Whether this condition's expiry branch has been DECIDED — committed to the queue, declined
+    # over an unjudged change, or dropped because the verdict that owed it was not an answer. All
+    # three are terminal, and the mark is set-once like `ever_fired`, for a reason the identity
+    # removal in `_drop_retired` does not cover: three sites retire (the clock sweep, the retirement
+    # judge's parked verdict, and the batched eligibility verdict), two of them carry a list of
+    # states captured BEFORE the call they were waiting on resolved, and a state another site has
+    # already retired is "simply no longer found" by that removal — a silent no-op. Deciding has no
+    # such natural no-op. Recording only the *commit* was the first version of this field and was
+    # not enough: a branch another site had deliberately REJECTED left `ever_fired` and this mark
+    # both false with the evaluation mark advanced, so a stale sweep found nothing to stop it and
+    # resurrected the rejected branch. A decision is a decision whichever way it went. It is also
+    # decidable BEFORE this condition's window closes, which is why a rejection is written here on
+    # every state an unreadable verdict judged and not only on the ones being retired: judging a
+    # state advances its evaluation cursor, and once advanced, a cursor past an unread change is
+    # indistinguishable from a watch nothing ever matched. Keyed on the state rather than checked
+    # against `pending_conditions`, so it holds whether the caller decides before dropping (the
+    # clock) or after (the verdict), and whether or not the state is still live. Deferral is
+    # deliberately NOT settled — that is the one outcome that is still pending, and `expiry_owed`
+    # carries it.
+    expiry_settled: bool = False
+    # Whether the expiry branch is owed but could not yet be decided, because a condition
+    # judgement over this very state was outstanding when the window closed. `ever_fired` is only
+    # true once a verdict has been APPLIED, so a window closing while its verdict sits parked or
+    # in flight reads as "never fired" and would commit the negative branch next to the `then` the
+    # same verdict is about to earn — both branches of one condition, in the near-deadline case
+    # that is the construct's whole point. The decision is therefore deferred to the verdict that
+    # is already paid for: `_apply_condition_verdict` marks `ever_fired` first, then re-offers the
+    # states marked here. A verdict that never lands (the stale-id discard) drops the branch, which
+    # is the behaviour that preceded the branch existing, rather than hanging anything.
+    expiry_owed: bool = False
+
+    def accept_evidence(self, sequence: int, *, derived: bool) -> None:
+        """Record that a change matching this watch was recognized as evidence for this window.
+
+        The single writer of both acceptance marks, and monotone by construction, because
+        recognition is opportunistic: whichever of the eligibility sweep or the per-state gate check
+        looks first does the recognizing, and either may be re-offered a change the mark already
+        covers. Moving backwards there would hand back the only durable trace that something arrived
+        (see `accepted_signals`).
+        """
+        if derived:
+            self.accepted_derived = max(self.accepted_derived, sequence + 1)
+        else:
+            self.accepted_signals = max(self.accepted_signals, sequence + 1)
+
+    @property
+    def has_unresolved_evidence(self) -> bool:
+        """Is a change this window accepted still waiting for a usable answer?
+
+        Deliberately independent of what memory still holds, which is the whole reason the marks
+        exist. Resolution is the evaluation cursor reaching the acceptance mark, so a rollback that
+        gives a change back re-opens this for free -- including when that change has since been
+        evicted, which would otherwise be a second route to the same wrong action.
+        """
+        return (
+            self.accepted_signals > self.evaluated_through
+            or self.accepted_derived > self.derived_through
+        )
+
+    def lose_dispatched_evidence(self) -> None:
+        """Record that the change this waiter's in-flight judgement was asked about is gone.
+
+        Set, never cleared here: the clear belongs to the one event that makes the loss harmless,
+        which is the judgement coming back readable (see `restore_retry_allowance`).
+        """
+        self.dispatched_evidence_lost = True
+
+    def rewind_to_fire_point(self) -> None:
+        """Give back the change a judgement that will never answer had advanced past.
+
+        The single writer of a *backwards* cursor move, so the one thing a rollback must not do —
+        disagree with the fire-time advance another site performed — is impossible by construction
+        rather than by review. Paired with `retried_after_failure`, which is what keeps a seam that
+        fails every time from re-opening its own gate forever.
+        """
+        self.evaluated_through = self.fired_from_signals
+        self.derived_through = self.fired_from_derived
+
+    def refuse_expiry(self) -> None:
+        """Terminal: this waiter's negative branch is unavailable, and that has been recorded.
+
+        The only way `expiry_settled` is set to reject rather than to commit, which is what makes
+        "a decision is a decision whichever way it went" checkable in one place. It says nothing
+        against the condition FIRING later — an absence is the single claim an unreadable judgement
+        has made unavailable for good (see `ConditionVerdict.failed`).
+        """
+        self.expiry_settled = True
+
+    def restore_retry_allowance(self) -> None:
+        """A judgement answered this waiter's question readably, so its one retry is earned back.
+
+        Gated on a *usable* answer on purpose. The allowance used to be cleared for the whole batch
+        as soon as the seam returned anything at all, on the reading that "the seam answered" — but
+        a seam answering is not this question being answered, so an unreadable reply refunded a
+        retry it had never spent while permanently consuming the change it could not read. The
+        bound is one retry per *failure*, not one per activity life, and only an answer moves it.
+
+        Also the single place a dispatched loss is forgiven, for the same reason and on the same
+        evidence: a judgement that answered this waiter's question answered it *about* the change
+        it was given, so whether memory still holds that change no longer decides anything. Only a
+        verdict that fails to answer leaves the loss standing (see `dispatched_evidence_lost`).
+        """
+        self.retried_after_failure = False
+        self.dispatched_evidence_lost = False
 
 
 @dataclass(frozen=True)
 class ConditionFiring:
-    """One immutable firing queued for pursuit, detached from its live waiter's mutable marks."""
+    """One immutable prose goal a condition now owes, queued for pursuit and detached from its live
+    waiter's mutable marks — either a firing's `then` or an expiry's `otherwise`."""
 
     condition: PendingCondition
     fired_changes: tuple[tuple[str, Change], ...] = ()
+    # Which branch is owed: the `then` of something that fired, or the `otherwise` of a window that
+    # closed having never fired. One queue carries both on purpose — it is the same commitment, "a
+    # prose goal this activity owes", and the queue is what holds the declaring frame open as
+    # committed work, keeps the activity off Reflect's termination path, orders pursuit one at a
+    # time, and defers it until the body is idle instead of preempting a live plan. A parallel queue
+    # would have to re-derive all four, and three of them have been defects here already.
+    on_expiry: bool = False
+
+    @property
+    def goal(self) -> str:
+        """The prose goal this queued item owes: `otherwise` for an expiry, `then` for a firing.
+
+        Resolved here rather than at queue time so the queue keeps naming the *condition* it came
+        from, which is what a log line and a diagnostic read. The fallback is unreachable by
+        construction — an expiry is only ever queued for a condition that declared an `otherwise` —
+        and is written as a fallback rather than an assertion because this resolves inside Reason,
+        where a raise ends the run outright.
+        """
+        if self.on_expiry and self.condition.otherwise is not None:
+            return self.condition.otherwise
+        return self.condition.then
 
 
 @dataclass(frozen=True)
@@ -450,6 +631,19 @@ class ConditionVerdict:
 
     fired: tuple[int, ...] = ()
     retired: tuple[int, ...] = ()  # `until` is now satisfied; the condition stops waiting
+    # Whether this is an ANSWER at all. A judgement that errors parks an empty verdict — the
+    # runtime's fail-soft for a flaky seam, sound on its own terms because an activity that was
+    # waiting simply keeps waiting. What it cannot carry implicitly is the difference between "the
+    # change was not the awaited thing" and "nobody could tell": both read as no indices. That
+    # difference is inert for the positive branch (an absent fire does nothing either way) and
+    # decisive for the negative one, where "nothing fired" is exactly the authorization
+    # `PendingCondition.otherwise` needs — so a seam failure would act, which is the one outcome a
+    # failure must never buy. Set by the failure path and by a parse that could not read the
+    # `fired` claim at all, which is the same non-answer arriving over a working seam: unparseable
+    # text, a missing or non-list `fired`, or a list left empty only because its entries were
+    # discarded. A `fired` the judge answered and left empty is an answer, and the only one of
+    # these that authorizes anything.
+    failed: bool = False
 
 
 @dataclass(frozen=True)
