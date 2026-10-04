@@ -224,7 +224,11 @@ reported reproduction is fixed:
   committed.
 * **I4** An unresolved waiter never reaches a committed branch without an intervening usable answer.
 * **I5** Only a usable answer restores the retry allowance.
-* **I6** A valid reply and a genuine timeout each produce their intended action.
+* **I6** A valid reply and a genuine timeout each produce their intended action. **I1-I5 hold; I6
+  does not, and that is accepted rather than outstanding** — a reply lost before anything could
+  judge it (retired with its window, or evicted by retention) produces neither branch. A genuine
+  timeout always produces its action; a valid reply does so unless it is lost. See the negative
+  consequence below for the decision and what bounds it.
 
 Every supported transition:
 
@@ -325,9 +329,9 @@ I6 failure in the opposite direction.
   this machinery refuses at plan time. So the clock keeps closing on time and the branch declines.
   Retention is a second route to the same outcome and is disclosed with it: a reply accepted into an
   open window whose log entry is evicted before the activity is free to judge it can no longer be
-  judged at all, so its window is refused the moment that entry is dropped. Both are **known violations of I6**, and
-  they are the only ones left outstanding: a reply that arrives inside its window — the case the
-  construct most needs to get right — can produce neither branch. It is
+  judged at all, so its window is refused the moment that entry is dropped. Both are **known
+  violations of I6**, and they are the only two: a reply that arrives inside its window — the case
+  the construct most needs to get right — can produce neither branch. It is
   severable because it costs a no-op and never a wrong external action — which is the line the
   retention case crossed before acceptance was made durable, and the reason that one was a defect
   rather than a disclosed limitation — and they are named here rather than left implicit because
@@ -335,8 +339,32 @@ I6 failure in the opposite direction.
   **finite-evidence closure**: closing a window freezes the evidence it has already accepted while that judgement
   finishes, without holding the window open to new traffic — which is the second lifecycle state
   this bullet declines, scoped to evidence rather than to the condition. That is a separate decision
-  and needs its own record. Until one way or the other is chosen, the honest statement of this
-  decision's guarantee is I1-I5 plus a timeout that fires whenever the window was quiet.
+  and needs its own record.
+
+  **That pair is accepted rather than closed, and this is the decision, not a deferral.** The
+  guarantee this ADR makes is therefore I1-I5 plus a timeout that fires whenever the window was
+  quiet — stated positively because it is what the construct is relied on for, and because the
+  alternative reading ("I6 pending") invites a later reader to treat the gap as an unfinished
+  task rather than a known shape. Three things decided it. The harm is bounded to the safe
+  direction: both routes cost the branch and never a wrong external action, so the failure mode is
+  the behaviour that preceded this construct. The reachability is measured rather than assumed —
+  across a five-scenario benchmark suite the observed per-scenario volumes were 0-8 retained
+  signals against a cap of 256, and 11-19 changed property receipts against a cap of 1024, so the
+  retention route is one to two orders of magnitude out of reach at those volumes, leaving only the
+  one-tick race between a change arriving and its window closing. And the cost of closing it falls
+  on the shared condition lifecycle every `pending` condition runs through, including the ones that
+  never declare a branch — a change whose defects in this family were found by review rather than
+  by tests, eleven times.
+
+  Accepted does not mean untested. Both routes are pinned as *intended* behaviour, so a later change
+  cannot quietly convert them into the unsafe direction, and the two claims the acceptance itself
+  makes are pinned alongside them: that unrelated traffic alone never suppresses a quiet window's
+  timeout (the guarantee — an over-broad match in the retention reconciliation would silence every
+  timeout in a busy environment, and passes every loss test), and that a refused window still
+  releases its activity (the bound — a refusal that stranded a waiter would be a hang, which is
+  strictly worse than the no-op this accepts, and is invisible to any test asserting only what was
+  *not* dispatched). Reopening is a new ADR, and the evidence that would justify it is a run where
+  a reply actually arrives inside a window and is lost — not the argument that it could.
 
   One qualification on what an unchanged prompt baseline means, since it is easy to over-read: no
   built-in prompt teaches `otherwise`, and the frozen prompt baseline is unchanged by this work —

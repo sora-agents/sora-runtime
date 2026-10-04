@@ -746,3 +746,71 @@ async def test_a_usable_answer_still_resolves_its_own_evicted_evidence(tmp_path:
 
     assert seam.planned == [_OTHERWISE]
     assert [op for op, _ in tool.invocations] == ["order_cab"]
+
+
+# --------------------------------------------------------------------------------------------------
+# The accepted contract. A reply lost before anything could judge it produces neither branch — the
+# disclosed I6 violation, accepted for this release rather than closed (see ADR-0028). These two
+# rows pin what that acceptance actually promises, from both sides, because neither is implied by
+# the rows above: every one of those asserts what a LOST reply does, and the risk in accepting the
+# weaker contract is in the other direction — a refusal that spreads too far, or that costs more
+# than the branch.
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_unrelated_traffic_alone_never_suppresses_a_quiet_window(tmp_path: Path) -> None:
+    """Heavy non-matching traffic, no reply: the timeout still fires.
+
+    This is the half of the accepted contract that is a *guarantee* rather than a limitation — "a
+    timeout fires whenever the window was quiet" — and it is the one a future change to the
+    retention reconciliation would break silently. Every refusal in this file is triggered by
+    evidence being lost, so the cheapest possible over-reach is to key the refusal on eviction
+    rather than on the eviction of something that MATCHED: that passes every row above and kills the
+    construct outright in exactly the busy environment it exists for, since a long-running agent
+    overruns a 256-entry log as a matter of course.
+
+    `_unrelated_traffic` shares the reply's signal name and source and differs only in path, so what
+    has to decline it is the watch itself. A refusal here would mean the matching test is too loose,
+    not that the log is too short.
+    """
+    cycle, activity, tool, seam, clock = _waiting_agent(tmp_path, [_NOTHING_FIRED])
+    await cycle.registry.join(_ORIGIN)
+    _unrelated_traffic(cycle, _SIGNAL_RETENTION + 32)
+
+    await _turns(cycle, 9, clock, each=40.0)
+
+    assert not activity.pending_conditions, "the clock-owned window should have retired"
+    assert seam.planned == [_OTHERWISE], "a quiet window must still reach its branch under traffic"
+    assert [op for op, _ in tool.invocations] == ["order_cab"]
+
+
+async def test_a_window_refused_over_a_lost_reply_still_releases_its_activity(
+    tmp_path: Path,
+) -> None:
+    """The reply is evicted, the branch is refused — and the agent carries on.
+
+    The other half of the acceptance, and the one that makes "costs a no-op" true rather than
+    merely intended. The refusal is reached with the activity BLOCKED on a `ConditionWait` over a
+    condition that is then retired, so the failure mode this excludes is not a wrong action but a
+    hang: an activity left waiting on a wait nothing can ever satisfy would be strictly worse than
+    the lost branch the disposition accepted, and no other row notices it — they all assert what was
+    *not* dispatched, which a deadlocked agent satisfies perfectly.
+
+    So the bound is asserted as a release: the window closes, the branch is refused, and the
+    activity is free to pursue the rest of its goal.
+    """
+    cycle, activity, tool, seam, clock = _waiting_agent(tmp_path, [_NOTHING_FIRED])
+    await cycle.registry.join(_ORIGIN)
+    _reply(cycle)
+    _unrelated_traffic(cycle, _SIGNAL_RETENTION + 32)
+
+    await _turns(cycle, 9, clock, each=40.0)
+
+    assert not _reply_retained(cycle), "the reply was not evicted — the test proves nothing"
+    assert seam.planned == [], "a lost reply authorizes neither branch"
+    assert [op for op, _ in tool.invocations] == []
+
+    # The cost is the branch, and only the branch.
+    assert activity.state is not ActivityState.BLOCKED, "a refusal must not strand the activity"
+    assert activity.blocked_on is None, "the wait outlived the condition it was waiting on"
+    assert not activity.pending_conditions
