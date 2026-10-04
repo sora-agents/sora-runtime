@@ -90,13 +90,21 @@ def _expire_stalled_inferences(cycle: DecisionCycle, deadline: float | None) -> 
     `pending_inference` and the existing guard drops it, exactly as it drops any other stale
     result.
 
-    This is *infrastructure* time, so the host wall-clock is the right one and
-    `requested_at`'s `time.time()` needs no domain clock: it measures how long a request has
-    been outstanding on this machine, never how far a simulated world has moved.
+    This is *infrastructure* time, so it needs no domain clock: it measures how long a request
+    has been outstanding on this machine, never how far a simulated world has moved. But it is
+    an elapsed *duration*, which makes `time.monotonic()` the only correct host clock on BOTH
+    sides of the subtraction — here and at every `requested_at` stamp. `time.time()` is not
+    monotonic: an NTP step or a host sleep/wake moves it independently of elapsed time, so the
+    difference between two readings can diverge from the real wait by any amount. That is not
+    theoretical — reading it that way fired on a healthy plan call whose own measured latency
+    was 167s, reported as a 1063s wait, inside a session that lasted 279s end to end. It costs
+    the agent either way it breaks: a forward step abandons a call that was about to answer,
+    and a backward step makes `waited` negative, so the guard never fires and the absent-result
+    stall it exists to catch goes uncaught.
     """
     if deadline is None:
         return
-    now = time.time()
+    now = time.monotonic()
     for activity in cycle.working.activities.values():
         pending = activity.pending_inference
         if pending is None or activity.state is not ActivityState.RUNNING:

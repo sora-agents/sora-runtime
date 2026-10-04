@@ -542,6 +542,12 @@ class PendingInference:  # tracks one in-flight infer()/ground() — lives on Ac
     # batched pending-condition judgement, landing a ConditionVerdict onto
     # Activity.condition_verdict.
     kind: InferenceKind
+    # A `time.monotonic()` reading, NOT a wall-clock timestamp: its only consumer subtracts it from
+    # a later reading to decide whether the call has stalled, and `time.time()` can step (NTP, host
+    # sleep/wake) so that difference diverges from the real wait by any amount. The cost of that is
+    # a replan in both directions — see `_expire_stalled_inferences`. Consequence worth knowing
+    # before using this field for anything else: it is meaningless on its own and correlates with no
+    # log line or diagnostics timestamp. Compare it only against another `time.monotonic()`.
     requested_at: float
     out: str | None = None  # target binding name for kind=="select"; None for the others
     # The goal override the call was fired with (a sub-goal's, a `then`'s, or the surviving frame's

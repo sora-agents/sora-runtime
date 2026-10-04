@@ -578,7 +578,7 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
         activity.pending_inference = PendingInference(
             id=inf_id,
             kind=kind,
-            requested_at=time.time(),
+            requested_at=time.monotonic(),
             baseline=baseline,
             scope=scope,
             goal=goal if isinstance(goal, str) and goal else None,
@@ -661,7 +661,7 @@ class GroundAction:  # predefined internal action: _ground_ — the async param-
         activity = cycle.working.activities[kwargs["activity_id"]]
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind=InferenceKind.GROUND, requested_at=time.time()
+            id=inf_id, kind=InferenceKind.GROUND, requested_at=time.monotonic()
         )
         activity.state = ActivityState.RUNNING
         log.info("reason: grounding %s params via the model", kwargs["operation_name"])
@@ -739,7 +739,7 @@ class RevalidateAction:  # predefined internal action: _revalidate_ — the plan
         activity.pending_inference = PendingInference(
             id=inf_id,
             kind=InferenceKind.REVALIDATE,
-            requested_at=time.time(),
+            requested_at=time.monotonic(),
             baseline=baseline,
         )
         activity.state = ActivityState.RUNNING  # off-cycle, like _infer_ — immediate, never blocks
@@ -784,7 +784,7 @@ class EvaluateConditionsAction:  # predefined internal action: _evaluate_conditi
         observed = kwargs.get("observed")
         inf_id = uuid.uuid4().hex
         activity.pending_inference = PendingInference(
-            id=inf_id, kind=InferenceKind.CONDITION, requested_at=time.time()
+            id=inf_id, kind=InferenceKind.CONDITION, requested_at=time.monotonic()
         )
         activity.state = ActivityState.RUNNING
         log.info(
@@ -855,7 +855,7 @@ class FilterAction:  # predefined data-op: _filter_
             # _ground_ — park RUNNING, resolve into bindings[out] a later cycle (via Observe).
             inf_id = uuid.uuid4().hex
             activity.pending_inference = PendingInference(
-                id=inf_id, kind=InferenceKind.SELECT, requested_at=time.time(), out=out
+                id=inf_id, kind=InferenceKind.SELECT, requested_at=time.monotonic(), out=out
             )
             activity.state = ActivityState.RUNNING
             log.info("data-op: filter %r via the model (%d items)", out, len(collection))

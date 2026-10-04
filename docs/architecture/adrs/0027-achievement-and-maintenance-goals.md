@@ -150,9 +150,13 @@ frame lives exactly as long as its `until`.
 
 ### 5. The clock
 
-An `until` is a question about **domain** time. Every `time.time()` in the runtime today
-(`Percept.observed_at`, `invoked_at`, `requested_at`, an episode's `ended_at`) is **host wall-clock**
-and correct as infrastructure timing. Under a simulation these are different clocks — ARE's starts
+An `until` is a question about **domain** time. Every clock reading in the runtime today is a
+**host** one and correct as infrastructure timing: `Percept.observed_at`, `invoked_at` and an
+episode's `ended_at` are `time.time()` wall-clock instants, while `PendingInference.requested_at` is
+a `time.monotonic()` reading — the stall watchdog subtracts it from a later one to measure how long
+a call has been outstanding, and a *duration* cannot be taken from a clock that steps. The
+distinction this section draws is unaffected by which of the two it is: both are the machine's
+clock, neither is the simulated world's. Under a simulation these are different clocks — ARE's starts
 at the scenario's `start_time` *and can run at a different rate* — so the two must never be merged
 into one "now". `are_sim.py` already carries a comment recording the silent wrong-answer bug from
 exactly that confusion (an agent told it was 1 Jan 1970 during a 2024-10-15 scenario).

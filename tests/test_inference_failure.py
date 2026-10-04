@@ -9,10 +9,13 @@ end reaches episodic memory, and the user hears about it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from fakes import ScriptedTransport
 from sora._strategies.inference import _inference_defect
@@ -326,6 +329,80 @@ async def test_an_already_queued_result_wins_over_the_watchdog(tmp_path: Path) -
     (inference,) = meter.report().inferences
     assert inference.outcome == "success"
     assert inference.discarded is False
+
+
+# --------------------------------------------------------------------------------------------------
+# ...and the deadline measures a DURATION, so both sides of it read the monotonic clock
+# --------------------------------------------------------------------------------------------------
+# `time.time()` is not monotonic: an NTP step or a host sleep/wake moves it independently of elapsed
+# time, and the watchdog subtracts two readings. Both directions were reachable and both cost the
+# agent — the forward one was observed in a benchmark run, where a plan call whose own measured
+# latency was 167s was reported as having waited 1063s inside a 279s session, and was abandoned.
+# The stamp and the read have to move together, so each is pinned here: the two wall-clock tests
+# catch a regression in the guard, and the third catches one at a `requested_at` stamp site (which
+# would leave `waited` hugely negative, hiding every stall instead of inventing one).
+
+
+async def test_a_wall_clock_jump_forward_does_not_expire_a_healthy_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direction that was observed firing: the call is seconds old, the wall clock has moved
+    an hour, and expiring it buys a replan nobody needed (and, in flight, loses the plan)."""
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring(InferenceKind.PLAN)
+    activity.pending_inference = PendingInference(
+        id="inf-1", kind=InferenceKind.PLAN, requested_at=time.monotonic()
+    )
+    working.activities["a1"] = activity
+    monkeypatch.setattr(time, "time", lambda: time.monotonic() + 3600.0)
+
+    await DefaultObserveStrategy(inference_deadline=300.0).observe(cycle)
+
+    assert activity.pending_inference is not None  # still in flight, as it should be
+    assert activity.state is ActivityState.RUNNING
+
+
+async def test_a_wall_clock_step_backwards_does_not_hide_a_real_stall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quieter direction, and the worse one: a backwards step makes a `time.time()` delta
+    negative, so the watchdog never fires and the absent-result stall it exists to catch strands
+    the activity RUNNING for as long as the run lasts."""
+    cycle, working, _ = _cycle(tmp_path)
+    activity = _inferring(InferenceKind.PLAN)
+    activity.pending_inference = PendingInference(
+        id="inf-1", kind=InferenceKind.PLAN, requested_at=time.monotonic() - 600.0
+    )
+    working.activities["a1"] = activity
+    monkeypatch.setattr(time, "time", lambda: time.monotonic() - 3600.0)
+
+    await DefaultObserveStrategy(inference_deadline=300.0).observe(cycle)
+
+    assert activity.pending_inference is None
+    assert activity.state is ActivityState.READY  # degraded to a replan, the way it was designed to
+
+
+async def test_the_stamp_is_on_the_same_clock_the_watchdog_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through a real action rather than a hand-built `PendingInference`, because the defect was a
+    mismatch between the two sides and either side alone looks fine. `_ground_` stands in for all
+    five stamp sites; a wall clock pinned far away from the monotonic one makes a stamp taken from
+    it unmistakable."""
+    cycle, working, _ = _cycle(tmp_path)
+    activity = Activity(id="a1", goal="book the day", context={}, state=ActivityState.READY)
+    working.activities["a1"] = activity
+    monkeypatch.setattr(time, "time", lambda: 1.0e9)
+
+    await cycle.actions.internal("ground").execute(
+        cycle, activity_id="a1", operation_name="book", partial_params={}
+    )
+    pending = activity.pending_inference
+    assert pending is not None
+    assert abs(pending.requested_at - time.monotonic()) < 60.0  # monotonic, not 1e9
+
+    for _ in range(3):  # let the spawned call finish (it fails: no model is configured)
+        await asyncio.sleep(0)
 
 
 async def test_a_failed_then_inference_replans_rather_than_killing_the_activity(
