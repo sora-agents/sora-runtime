@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "name": "debug-10-not-evidence",
+  "dataset": "meta-agents-research-environments/gaia2",
+  "revision": "78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99",
+  "split": "validation",
+  "cases": [
+    {
+      "capability": "adaptability",
+      "id": "scenario_universe_22_0421h2"
+    },
+    {
+      "capability": "adaptability",
+      "id": "scenario_universe_23_0ekokg"
+    },
+    {
+      "capability": "ambiguity",
+      "id": "scenario_universe_21_1juxxq"
+    },
+    {
+      "capability": "ambiguity",
+      "id": "scenario_universe_24_098n1q"
+    },
+    {
+      "capability": "execution",
+      "id": "scenario_universe_26_1ok8eo"
+    },
+    {
+      "capability": "execution",
+      "id": "scenario_universe_27_0zl6k5"
+    },
+    {
+      "capability": "search",
+      "id": "scenario_universe_25_0teplz"
+    },
+    {
+      "capability": "search",
+      "id": "scenario_universe_30_48xm0t"
+    },
+    {
+      "capability": "time",
+      "id": "scenario_universe_28_ev6kjl"
+    },
+    {
+      "capability": "time",
+      "id": "scenario_universe_29_4cn3h4"
+    }
+  ]
+}

@@ -332,6 +332,50 @@ def test_acceptance_suite_is_disjoint_from_the_reported_sweep_selection() -> Non
     assert len(pairs) == len(set(pairs))
 
 
+def test_debug_selection_is_disjoint_from_every_other_selection_and_fully_stratified() -> None:
+    """The debugging set has to stay re-runnable byte-for-byte after the prompts are rewritten.
+
+    Its whole purpose is to be replayed once the prompt consolidation lands, so a drifted
+    selection would silently compare two different scenario sets. Disjointness from the reported
+    sweep, from the three prompt suites, and from every scenario already run is what keeps the
+    debugging spend off the reported numbers; the universe spread is the same double
+    stratification the suites use, extended to ten cells.
+    """
+
+    campaigns = EVAL_ROOT / "campaigns"
+    debug = json.loads((campaigns / "paper2027" / "debug-10-not-evidence.json").read_text())
+    reported = {
+        case["id"]
+        for case in json.loads((campaigns / "paper2027" / "mini-validation.json").read_text())[
+            "cases"
+        ]
+    }
+    manifests = load_manifests(PROMPT_ROOT / "manifests")
+    suite_ids = {
+        f"scenario_universe_{case.case_id}"
+        for manifest in manifests.values()
+        for case in manifest.cases
+    }
+    suite_cells = {
+        (case.case_id.split("_", 1)[0], case.capability)
+        for manifest in manifests.values()
+        for case in manifest.cases
+    }
+    capabilities = {case.capability for manifest in manifests.values() for case in manifest.cases}
+
+    ids = {case["id"] for case in debug["cases"]}
+    assert len(ids) == 10
+    assert ids & reported == set()
+    assert ids & suite_ids == set()
+
+    cells = [(case["id"].split("_")[2], case["capability"]) for case in debug["cases"]]
+    assert sorted(universe for universe, _ in cells) == [str(u) for u in range(21, 31)]
+    assert set(cells) & suite_cells == set()
+    per_capability = Counter(capability for _, capability in cells)
+    assert set(per_capability) == capabilities
+    assert set(per_capability.values()) == {2}
+
+
 def test_scenario_resolution_recognizes_corrected_smoke_names_and_locks_acceptance(
     tmp_path: Path,
 ) -> None:
