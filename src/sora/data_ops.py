@@ -427,10 +427,87 @@ def _resolve_collection(
             return None, _collection_defect(ref, value, history, properties)
     else:
         value = ref  # a literal (already a list, mapping, or a plan author's mistake)
+        # A step's input collection is ONE collection. A literal list whose *elements* are
+        # references is the planner reaching past that for an addition — `"in": [{"$bind": "a"},
+        # {"$bind": "b"}]` to mean "a and b together" — and element references are never resolved
+        # here, so the list stays two reference dicts and the consuming op reads them as data: a
+        # `flatten` iterates each mapping's values and binds the literal strings ["a", "b"], which a
+        # downstream `in` then matches against nothing. Observed end to end: a 109-contact match
+        # returned 0 and the agent reported that no such person exists. Empty is an answer and
+        # unreadable is a question, so this is a question — and the legal form now exists, which is
+        # why this names `concat` rather than a workaround.
+        if isinstance(value, list) and any(_is_reference(element) for element in value):
+            named = ", ".join(
+                json.dumps(element, sort_keys=True) for element in value if _is_reference(element)
+            )
+            return None, (
+                "a step's input collection cannot be a list of references "
+                f"(this one holds {named}) — `in` always names a single collection. To add "
+                "collections together, write a `concat` step whose `of` is that list of references "
+                "and read its `out` binding here instead"
+            )
     collection = _as_collection(value)
     if collection is None:
         return None, _collection_defect(ref, value, history, properties)
     return collection, None
+
+
+def _resolve_sources(
+    refs: Any,
+    history: list[CompletedOperation],
+    bindings: dict[str, Any] | None = None,
+    properties: dict[tuple[str, str], Percept] | None = None,
+    meter: PropertyReadMeter | None = None,
+) -> tuple[list[Any] | None, str | None]:
+    """The collections a ``concat`` adds together: a list of references, each resolved against the
+    same tiers as a single ``in`` and appended in order. Returns ``(concatenated, defect)`` on
+    ``_resolve_collection``'s contract.
+
+    This is the only op whose input is not one collection, and that is the whole reason it exists.
+    Every other op is unary, and ``flatten`` concatenates only *within* a single reference (a
+    paginated sweep's pages, a ``collect``'s per-call results — both produced by one earlier step),
+    so two collections produced by two *independent* steps had no legal way to become one. A plan
+    needing a single candidate pool drawn from two different apps, or one ordering over two
+    disjoint result sets, could not be written at all; the planner reached for ``"in": [{"$bind":
+    "a"}, {"$bind": "b"}]`` instead, which bound the *names* of the bindings and matched nothing.
+
+    A defect in ANY source is a defect for the whole step, on the same reasoning as a ``between``
+    pair with one unreadable end: a concatenation missing one of its inputs is not a short answer,
+    it is a confident answer to a different question, and downstream it reads as "those records do
+    not exist".
+
+    ``concat`` deliberately does **not** deduplicate. ``distinct`` already does, with an explicit
+    ``by``, and folding dedup in here would both duplicate it and silently drop records that differ
+    outside the chosen key. Set union is ``concat`` followed by ``distinct``."""
+    if not isinstance(refs, (list, tuple)):
+        return None, (
+            f"a concat step's `of` must be a list of references naming the collections to add "
+            f"together (got {_shape_of(refs)}) — e.g. "
+            '`"of": [{"$bind": "<one>"}, {"$bind": "<other>"}]`'
+        )
+    if not refs:
+        return None, (
+            "a concat step's `of` is empty, so it names nothing to add together — list the "
+            "references whose collections should be combined, or drop the step and read the one "
+            "collection directly"
+        )
+    concatenated: list[Any] = []
+    for ref in refs:
+        if _is_reference(ref) and _REF_DECIDE in ref:
+            # Soft resolution has no home here. A `$decide` collection is resolved off-cycle by the
+            # filter escalation; concat is mechanical and has no such path, so a soft source would
+            # silently contribute nothing rather than park.
+            return None, (
+                "a concat source cannot be a $decide reference "
+                f"({ref[_REF_DECIDE]!r}) — concat is mechanical, so every collection it adds has "
+                "to be in hand already. Produce that collection in an earlier step and name its "
+                "binding here"
+            )
+        collection, defect = _resolve_collection(ref, history, bindings, properties, meter)
+        if defect is not None:
+            return None, f"one of the concat sources could not be read: {defect}"
+        concatenated.extend(collection or [])
+    return concatenated, None
 
 
 def _flatten(collection: list[Any], path: str | None = None) -> tuple[list[Any] | None, str | None]:
@@ -564,7 +641,9 @@ def _operand_defect(where: dict[str, Any], written: Any, operand: Any) -> str | 
     ``eq``/``ne`` are deliberately excluded. An operand of any shape can genuinely match there — a
     field that really is null, an object compared whole — so refusing one would refuse a
     legitimate predicate to guard against a mistake that isn't provable from the shape alone.
-    ``in``/``not_in`` are excluded too: their operand is a collection, already checked as one."""
+    Membership is also excluded: fields can themselves be lists or records, so a nested operand
+    can be valid. Its shape alone cannot prove a malformed comparison.
+    """
     op = where.get("op", "eq")
     if op == "between":
         if not (isinstance(operand, (list, tuple)) and len(operand) == 2):
@@ -790,8 +869,12 @@ def _resolve_predicate_clause(
             f"a composed predicate's clause cannot be a $decide reference "
             f"({where[_REF_DECIDE]!r}) — only a whole 'where' can be decided by the model, so a "
             "soft clause inside 'all'/'any' would be evaluated mechanically and match nothing. "
-            "Split it into two filter steps: keep the mechanical clauses in this one, then filter "
-            "its output with the $decide as the whole 'where'."
+            "Preserve the whole rule's boolean logic: only for AND (conjunction), filter the "
+            "mechanical clauses first, then filter that output with $decide as the whole 'where'. "
+            "For OR (disjunction), filter separate branches from the same input collection, then "
+            "concat their outputs and distinct by stable record identity (or whole-item equality). "
+            "Alternatively use one whole 'where' $decide for the whole rule over the original "
+            "collection, especially for nested mixed logic."
         )
     for key in (_COMPOSE_ALL, _COMPOSE_ANY):
         if key not in where:
@@ -846,25 +929,25 @@ def _resolve_predicate_clause(
     if defect is not None:
         return where, defect
     members = resolved_members or []
-    projected = [pluck(m, where.get("value_path", "")) for m in members]
-    # A membership set is compared element-by-element against a scalar key, so only scalar members
-    # can ever match. A non-scalar (dict/list) or ``None`` projection is dead weight: `in` silently
-    # drops it, `not_in` silently keeps it. The usual cause is a `value_path` that's missing (the
-    # referenced collection is records, not bare keys), wrong (names a field the records don't
-    # carry -> None), or points at a nested object — surface any such member rather than let the
-    # filter fail open invisibly (an all-None projection is exactly the duplicate-action trap:
-    # "not already saved" keeps everything). An empty set (nothing resolved) stays silent here —
-    # _resolve_collection already logged *why*, and a genuinely empty exclusion list is benign.
-    if members and any(p is None or isinstance(p, (dict, list)) for p in projected):
-        bad = sum(1 for p in projected if p is None or isinstance(p, (dict, list)))
+    value_path = where.get("value_path") or ""
+    projected: list[Any] = []
+    missing_paths = 0
+    for member in members:
+        try:
+            projected.append(walk_path(member, value_path))
+        except (KeyError, IndexError, TypeError, ValueError):
+            missing_paths += 1
+            projected.append(None)
+    # Missing projection paths are demonstrable mistakes. Lists, records and explicit null values
+    # can legitimately match a field of the same shape, so they are not diagnosed as malformed.
+    if missing_paths:
         log.warning(
-            "filter: membership set for %r has %d/%d member(s) that projected to a non-scalar or "
-            "None key (value_path=%r); those can never match — `in` drops them, `not_in` keeps "
-            "them — check `value_path`",
+            "filter: membership set for %r has %d/%d member(s) missing value_path=%r; "
+            "those project to None — check `value_path`",
             where.get("path"),
-            bad,
-            len(projected),
-            where.get("value_path"),
+            missing_paths,
+            len(members),
+            value_path,
         )
     resolved_where = {k: v for k, v in where.items() if k != "value_path"}
     resolved_where["value"] = projected

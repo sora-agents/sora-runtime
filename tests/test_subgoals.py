@@ -136,6 +136,40 @@ def _mechanical_subgoal(collection_path: str = "") -> Step:
     )
 
 
+async def test_prompt_dependent_call_example_preserves_each_lookup_identity(tmp_path: Path) -> None:
+    marker = "Dependent-call example (items carry code; lookup returns a bare id):\n"
+    example = PLAN_SYSTEM_PROMPT.split(marker, 1)[1].splitlines()[0]
+    steps = _parse_plan_steps(example)
+    cycle, working, _ = _cycle(tmp_path, _no_llm_procedural(tmp_path), FakeTool("catalog"))
+    activity = Activity(
+        id="a",
+        goal="apply each item",
+        context={},
+        plan=Plan(id="p", goal="apply each item", steps=steps),
+        bindings={"items": [{"code": "first"}, {"code": "second"}]},
+    )
+    working.activities[activity.id] = activity
+
+    for code, record_id in (("first", "record-one"), ("second", "record-two")):
+        result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+        assert result.step == invoke_step("catalog", "lookup", code=code)
+        activity.history.append(
+            CompletedOperation(
+                OperationInvocation("catalog", "lookup", {"code": code}),
+                OperationAck(ok=True, result=record_id),
+            )
+        )
+    # Both lookups precede collection; the follow-ups read their own collected entry, not the
+    # latest $from result, which would incorrectly reuse record-two for the first item.
+    for code, record_id in (("first", "record-one"), ("second", "record-two")):
+        result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+        assert result.step == invoke_step("catalog", "apply", record_id=record_id, code=code)
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert result.step is None
+    assert activity.plan is not None
+    assert not activity.replan_trail
+
+
 # --------------------------------------------------------------------------------------------------
 # Mechanical fan-out — len(collection) concrete steps, no model call
 # --------------------------------------------------------------------------------------------------

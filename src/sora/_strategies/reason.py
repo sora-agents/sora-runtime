@@ -51,6 +51,7 @@ from sora._strategies.subgoals import (
 )
 from sora.action import (
     CollectAction,
+    ConcatAction,
     EvaluateConditionsAction,
     FilterAction,
     FlattenAction,
@@ -66,6 +67,7 @@ from sora.data_ops import (
     _flatten,
     _resolve_collection,
     _resolve_predicate_value,
+    _resolve_sources,
 )
 from sora.memory import (
     percept_snapshot,
@@ -515,6 +517,24 @@ class DefaultReasonStrategy:
                 activity.reset_for_replan(defect=defect)
                 return True  # no step this cycle; Reason re-infers against the current world
             passthrough = {k: v for k, v in step.params.items() if k != "from"}
+        elif step.next_action == ConcatAction.name:
+            # The one op whose input is a LIST of references rather than a single collection, so it
+            # reads `of` and not `in`. Resolved here, like a `collect`'s gather and a `flatten`'s
+            # concatenation, because an unreadable source has to drop the plan.
+            resolved, defect = _resolve_sources(
+                step.params.get("of"),
+                activity.history,
+                activity.bindings,
+                cycle.working.properties,
+                cycle.working.prop_reads,
+            )
+            passthrough = {k: v for k, v in step.params.items() if k != "of"}
+            if defect is not None:
+                defect = f"data-op {step.next_action!r} could not read its input: {defect}"
+                log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
+                activity.reset_for_replan(defect=defect)
+                return True  # no step this cycle; Reason re-infers against the current world
+            collection = resolved if resolved is not None else []
         else:
             resolved, defect = _resolve_collection(
                 step.params.get("in"),

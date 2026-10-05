@@ -1,7 +1,8 @@
 """Structured-value data-ops — the plan's composable data-processing layer (ADR-0023).
 
 A data-op is a ``Step`` whose ``next_action`` names a registered data-op (``filter``, ``distinct``,
-``sort``, ``take``, ``collect``, ``reduce``). Reason dispatches it from ``ActionRegistry``'s
+``sort``, ``take``, ``collect``, ``flatten``, ``concat``, ``reduce``). Reason dispatches it
+from ``ActionRegistry``'s
 dedicated data-op bucket, transforming a run-time collection (read from history via ``$from`` or a
 prior binding via ``$bind``) and writing a **named binding** (``Activity.bindings[out]``) that a
 later step reads via ``{"$bind": "<name>"}``. Mechanical ops run inline and advance the plan; a
@@ -16,6 +17,7 @@ actually implemented.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -23,10 +25,16 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
+from sora._prompts.plan import PLAN_SYSTEM_PROMPT
 from sora.action import default_action_registry
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
-from sora.data_ops import _as_collection, _resolve_collection, _resolve_predicate_value
+from sora.data_ops import (
+    _as_collection,
+    _resolve_collection,
+    _resolve_predicate_value,
+    _resolve_sources,
+)
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
 from sora.manual import Manual, ObservablePropertySpecification
 from sora.memory import (
@@ -36,6 +44,7 @@ from sora.memory import (
     ProceduralMemory,
     SemanticMemory,
     WorkingMemory,
+    _parse_plan_steps,
 )
 from sora.perception import Message, Percept
 from sora.references import _MISSING, _latest_result
@@ -341,7 +350,7 @@ async def test_filter_membership_wrong_value_path_warns_before_failing_open(
     # Fails open (the documented never-raise contract) — but now it is no longer silent.
     assert [e["id"] for e in activity.bindings["kept"]] == ["a1", "a2"]
     assert any(
-        "value_path" in r.getMessage() and "never match" in r.getMessage() for r in caplog.records
+        "value_path" in r.getMessage() and "missing" in r.getMessage() for r in caplog.records
     )
 
 
@@ -691,9 +700,11 @@ async def test_filter_nested_decide_clause_is_a_defect_not_an_empty_collection(
         assert activity.plan is None, where
         defect = activity.replan_trail[-1]
         assert defect is not None, where
-        # The brief has to name the shape and say what to write instead, or the planner rewrites
-        # the same predicate: the mechanical clauses stay, the soft one becomes its own step.
+        # Recovery must preserve the connective: sequential filters are AND, not OR.
         assert "$decide" in defect and "all" in defect, defect
+        assert "AND" in defect and "OR" in defect, defect
+        assert "same input" in defect and "concat" in defect and "distinct" in defect, defect
+        assert "whole rule" in defect, defect
 
 
 def test_filter_whole_predicate_decide_is_still_escalated_not_refused() -> None:
@@ -894,6 +905,43 @@ async def test_composed_overlaps_semi_join_needs_no_model_call(tmp_path: Path) -
 # --------------------------------------------------------------------------------------------------
 # filter — $decide predicate escalates to one off-cycle model call
 # --------------------------------------------------------------------------------------------------
+
+
+async def test_prompt_mixed_or_example_preserves_both_branches(tmp_path: Path) -> None:
+    marker = "Mixed OR example (records carry id and flagged; urgency needs judgement):\n"
+    example = PLAN_SYSTEM_PROMPT.split(marker, 1)[1].splitlines()[0]
+    steps = _parse_plan_steps(example)
+    records = [
+        {"id": "flagged-only", "flagged": True, "text": "routine"},
+        {"id": "urgent-only", "flagged": False, "text": "urgent"},
+        {"id": "both", "flagged": True, "text": "urgent"},
+        {"id": "neither", "flagged": False, "text": "routine"},
+    ]
+    llm = FakeLLMClient('{"keep": [1, 2]}')
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    cycle, working, _ = _cycle(tmp_path, procedural, FakeTool("realestate"))
+    activity = _activity_with_plan(steps, [])
+    activity.bindings["records"] = records
+    working.activities[activity.id] = activity
+
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    assert activity.bindings["flagged"] == [records[0], records[2]]
+    assert activity.pending_inference is not None
+    await asyncio.sleep(0)
+    # Check actual select input, not bindings rendered elsewhere in the model's context.
+    items = llm.calls[0][1].split("Items:\n", 1)[1].splitlines()
+    assert [json.loads(item.split(": ", 1)[1]) for item in items] == records
+    await DefaultObserveStrategy().observe(cycle)
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert activity.bindings["urgent"] == [records[1], records[2]]
+    assert [record["id"] for record in activity.bindings["selected"]] == [
+        "flagged-only",
+        "both",
+        "urgent-only",
+    ]
+    assert len(llm.calls) == 1
+    assert not activity.replan_trail
 
 
 async def test_filter_decide_escalates_and_lands_in_binding(tmp_path: Path) -> None:
@@ -1362,6 +1410,34 @@ def test_resolve_collection_separates_empty_from_unreadable() -> None:
     # replan, or every legitimately-empty fan-out would burn a planning inference.
     assert _resolve_collection({}, [], {}) == ([], None)
     assert _resolve_collection([], [], {}) == ([], None)
+
+
+def test_a_collection_cannot_be_a_list_of_references() -> None:
+    """A step's input collection is ONE collection; the addition goes in a ``concat``.
+
+    ``in: [{"$bind": "a"}, {"$bind": "b"}]`` reads as "a and b together", but element references are
+    never resolved there: the list stays two reference dicts, and the consuming op reads them as
+    data. A ``flatten`` over it iterates each mapping's values and binds the literal strings
+    ``["a", "b"]``, which a downstream ``in`` matches against nothing. Observed end to end on a
+    109-contact match that returned 0 and had the agent report that no such person exists — a silent
+    wrong answer, so the refusal has to point at the step that *does* add collections together."""
+    collection, defect = _resolve_collection(
+        [{"$bind": "sent_recipients"}, {"$bind": "sent_cc"}],
+        [],
+        {"sent_recipients": ["a@x"], "sent_cc": ["b@x"]},
+    )
+    assert collection is None
+    assert defect is not None
+    # Both sides are named, so the retry knows which two collections it was trying to add.
+    assert "sent_recipients" in defect and "sent_cc" in defect
+    # And the legal form is named, or the replan re-guesses from the same nothing.
+    assert "concat" in defect and "`of`" in defect
+
+    # A literal list of plain values stays a perfectly good collection — the refusal is scoped to
+    # reference *elements*, not to literals.
+    assert _resolve_collection(["a@x", "b@x"], [], {}) == (["a@x", "b@x"], None)
+    # Records are values too: only a reference element is refused.
+    assert _resolve_collection([{"email": "a@x"}], [], {}) == ([{"email": "a@x"}], None)
 
 
 def test_a_bad_path_on_a_present_source_is_not_reported_as_a_missing_source() -> None:
@@ -1842,3 +1918,156 @@ def test_a_record_with_a_nested_dict_field_is_still_not_a_collection() -> None:
     payload."""
     assert _as_collection({"contacts": [{"id": "c1"}], "address": {"city": "Stockholm"}}) is None
     assert _as_collection({"event_id": "e1", "attendees": ["a"], "organizer": {"id": "u"}}) is None
+
+
+# --------------------------------------------------------------------------------------------------
+# concat — add independently produced collections together (the only op with more than one input)
+# --------------------------------------------------------------------------------------------------
+
+
+async def test_concat_adds_independently_produced_collections(tmp_path: Path) -> None:
+    """The gap every other op leaves open. Each of the other seven is unary, and `flatten`
+    concatenates only *within* one reference (a sweep's pages, a `collect`'s per-call results), so
+    two collections produced by two independent steps had no legal way to become one — a single
+    candidate pool drawn from two different apps, or one ordering over two disjoint result sets,
+    could not be written at all."""
+    step = Step(
+        next_action="concat",
+        params={
+            "of": [
+                [{"id": "c1"}, {"id": "c2"}],
+                {"$from": "list_email_contacts", "path": ""},
+            ],
+            "out": "pool",
+        },
+    )
+    activity = await _run_one_dataop(
+        tmp_path, step, [_history("list_email_contacts", [{"id": "c3"}])]
+    )
+    # Order is the order the sources were named, so a downstream `take` is predictable.
+    assert [e["id"] for e in activity.bindings["pool"]] == ["c1", "c2", "c3"]
+
+
+def test_concat_does_not_deduplicate() -> None:
+    """`distinct` already dedups, with an explicit `by`. Folding it in here would both duplicate
+    that op and silently drop records differing outside the chosen key — so set union is `concat`
+    then `distinct`, two steps, each doing one thing."""
+    collection, defect = _resolve_sources(
+        [{"$bind": "a"}, {"$bind": "b"}],
+        [],
+        {"a": ["x@h", "y@h"], "b": ["y@h", "z@h"]},
+    )
+    assert defect is None
+    assert collection == ["x@h", "y@h", "y@h", "z@h"]
+
+
+def test_concat_refuses_a_source_it_cannot_read() -> None:
+    """A defect in ANY source is a defect for the whole step, on the same reasoning as a `between`
+    pair with one unreadable end: a concatenation missing one of its inputs is not a short answer,
+    it is a confident answer to a different question, and downstream it reads as "those records do
+    not exist"."""
+    collection, defect = _resolve_sources(
+        [{"$bind": "present"}, {"$bind": "never_written"}], [], {"present": ["x@h"]}
+    )
+    assert collection is None
+    assert defect is not None
+    # The unreadable side is named: the half that read fine would send the replan to the
+    # wrong step.
+    assert "never_written" in defect
+
+
+def test_concat_refuses_an_of_that_is_not_a_list_of_references() -> None:
+    """A single reference in `of` is the planner writing an ordinary unary op's `in` by another
+    name; it has nothing to add together, and silently treating it as one source would make the
+    step a no-op that reads as success."""
+    collection, defect = _resolve_sources({"$bind": "just_one"}, [], {"just_one": ["x@h"]})
+    assert collection is None
+    assert defect is not None and "`of`" in defect
+
+    # An empty `of` names nothing at all: unreadable, not an empty answer.
+    collection, defect = _resolve_sources([], [], {})
+    assert collection is None
+    assert defect is not None
+
+
+def test_concat_refuses_a_decide_source() -> None:
+    """Soft resolution has no home here. A `$decide` collection is resolved off-cycle by the filter
+    escalation; concat is mechanical and has no such path, so a soft source would contribute
+    nothing and the step would look like it had added it."""
+    collection, defect = _resolve_sources(
+        [{"$bind": "a"}, {"$decide": "the contacts who might plausibly be meant"}],
+        [],
+        {"a": ["x@h"]},
+    )
+    assert collection is None
+    assert defect is not None and "$decide" in defect
+
+
+async def test_concat_source_it_cannot_read_drops_the_plan(tmp_path: Path) -> None:
+    """End to end through Reason: the defect has to drop the plan rather than write a short
+    binding, which is why the sources are resolved in Reason and not in the action."""
+    step = Step(
+        next_action="concat",
+        params={"of": [[{"id": "c1"}], {"$bind": "never_written"}], "out": "pool"},
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert "pool" not in activity.bindings
+    assert activity.plan is None
+    assert activity.replan_trail[-1] is not None
+
+
+def test_membership_resolution_does_not_assume_the_compared_field_is_scalar() -> None:
+    resolved, defect = _resolve_predicate_value(
+        {"where": {"path": "email", "op": "in", "value": [{"$bind": "a"}, {"$bind": "b"}]}},
+        [],
+        {"a": ["x@h"], "b": ["y@h"]},
+    )
+    assert defect is None
+    assert resolved["where"]["value"] == [["x@h"], ["y@h"]]
+
+    # A flat membership set — including one assembled from references — stays perfectly good.
+    resolved, defect = _resolve_predicate_value(
+        {"where": {"path": "email", "op": "in", "value": [{"$bind": "one"}, "y@h"]}},
+        [],
+        {"one": "x@h"},
+    )
+    assert defect is None
+    assert resolved["where"]["value"] == ["x@h", "y@h"]
+
+
+@pytest.mark.parametrize("op", ["in", "not_in"])
+@pytest.mark.parametrize(
+    "form", ["literal", "element_references", "collection_reference", "projected_collection"]
+)
+async def test_filter_membership_accepts_list_valued_fields(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, op: str, form: str
+) -> None:
+    records = [{"coordinates": [1, 2]}, {"coordinates": [8, 9]}]
+    value: object = [[1, 2], [3, 4]]
+    if form == "element_references":
+        value = [{"$from": "first"}, {"$from": "second"}]
+    elif form == "collection_reference":
+        value = {"$from": "allowed"}
+    elif form == "projected_collection":
+        value = {"$from": "allowed_records"}
+    where = {"path": "coordinates", "op": op, "value": value}
+    if form == "projected_collection":
+        where["value_path"] = "coordinates"
+    step = Step(
+        next_action="filter",
+        params={
+            "in": records,
+            "out": "selected",
+            "where": {"all": [where]},
+        },
+    )
+    history = [
+        _history("first", [1, 2]),
+        _history("second", [3, 4]),
+        _history("allowed", [[1, 2], [3, 4]]),
+        _history("allowed_records", [{"coordinates": [1, 2]}, {"coordinates": [3, 4]}]),
+    ]
+    activity = await _run_one_dataop(tmp_path, step, history)
+    assert activity.plan is not None
+    assert activity.bindings["selected"] == [records[0] if op == "in" else records[1]]
+    assert not caplog.records

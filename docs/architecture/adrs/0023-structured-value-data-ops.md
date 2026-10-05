@@ -59,9 +59,10 @@ computation *visible as ordinary plan steps* and the concurrency model intact.
 
 Concretely:
 
-* **Seven built-in ops**: `filter`, `distinct`, `sort`, `take`, `collect`, `flatten`, `reduce`. Each reads an
-  `in` collection — a `$from` reference (history), a `$bind` reference (a prior binding), or a
-  literal — and writes a named result into a new **`Activity.bindings[out]`**, which a later step
+* **Eight built-in ops**: `filter`, `distinct`, `sort`, `take`, `collect`, `flatten`, `concat`,
+  `reduce`. All but `collect` (which names an operation in `from`) and `concat` (which names a
+  *list* of references in `of`) read an `in` collection — a `$from` reference (history), a
+  `$bind` reference (a prior binding), or a literal — and each writes a named result into a new **`Activity.bindings[out]`**, which a later step
   reads via `{"$bind": "<name>", "path": …}`. `$bind` is thereby **generalized** from ADR-0022's
   eager loop-element substitution to also read this binding store at ground time; the two coexist
   because the loop element is substituted at fan-out, before grounding runs.
@@ -108,6 +109,23 @@ Concretely:
   off. The same gap widened `_as_collection`'s paginated-envelope tier to accept a **nested**
   metadata block (`{"contacts": [...], "metadata": {"range": …, "total": …}}`) beside the flat
   sibling form it already took, under the same closed-vocabulary check.
+* **`concat` is the only op with more than one input, and the only way to ADD collections.** Every
+  other op is unary, and `flatten` concatenates only *within* a single reference — a sweep's pages,
+  a `collect`'s per-call results, both produced by one earlier step. Two collections produced by two
+  *independent* steps therefore had no legal way to become one, so a plan needing a single candidate
+  pool drawn from two different apps, or one ordering over two disjoint result sets, could not be
+  written at all. Observed: the planner reached for `"in": [{"$bind": "a"}, {"$bind": "b"}]`, whose
+  element references are never resolved, so a 109-contact match returned zero and the agent reported
+  that no such person exists. `concat` takes `of` — a *list* of references — rather than overloading
+  `in`, because a literal list of plain values is already a valid `in` (the offsets sweep above), so
+  `"in": [...]` would mean "these items" for scalars and "add these" for references, with a mixed
+  list undecidable. A defect in any one source is a defect for the whole step, on the `between`-pair
+  reasoning: a concatenation missing an input is a confident answer to a different question. It
+  deliberately does **not** deduplicate — `distinct` already does, with an explicit `by`, and
+  folding dedup in here would both duplicate that op and silently drop records differing outside the
+  chosen key; set union is `concat` then `distinct`. Only the *additive* direction was missing:
+  intersection and difference are already `filter where {op: in}` / `{op: not_in}` against the other
+  collection, which is why this closes the set algebra with exactly one op rather than three.
 
 Named bindings are transient run state (a sibling of `history`/`grounded_params`, **not** a new
 memory module) and are cleared on replan, since they are coupled to the plan that produced them.
@@ -236,6 +254,12 @@ everything (fails open, so a missing exclusion list never silently drops the who
 lets a plan split a formerly-bundled `$decide` ("in 5..10 **and** not already saved") into its
 mechanical half (`not_in` the saved list) and only the genuinely judgemental remainder.
 
+Sequential filters preserve such a split only for conjunctions (AND). For a mixed disjunction
+(OR), filter separate branches from the same original collection, then `concat` their outputs
+and `distinct` by stable record identity (or whole-item equality). Judging the entire rule with
+one whole-predicate `$decide` over the original collection is also supported, especially for
+nested mixed logic. Neither prompt guidance nor the replan diagnostic should turn OR into AND.
+
 **A reference-valued predicate is not only a membership set (2026-08-24).** The paragraph above was
 written for `in`/`not_in`, and so was the code: resolution was gated on those two ops. But the need
 it describes — an operand known only at run time — is not specific to membership. The canonical
@@ -284,6 +308,19 @@ invocation's params (the return wins on key collision; a non-dict result is wrap
 pipeline is fully mechanical: `collect` → `filter between 5 10` on the rate → membership `in` join
 on `zip_code`, with no `$decide`. Without it, correlating each rate back to its zip would force the
 judgement escalation — which, being blind to other ops' history, cannot see the rates anyway.
+
+A per-item lookup followed by a dependent operation uses **two mechanical fan-outs** with
+`collect` between them. Each template is one step, not a step list. The second fan-out reads each
+collected entry's original input arguments and its returned fields (or `result` for a scalar
+return), preserving which result belongs to which item. An unqualified `$from` in that second
+fan-out would instead reuse the latest lookup result for every item.
+
+Membership compares the whole field against each member using equality. A list-valued field can
+therefore match a list member, and a record-valued field can match a record member; nested operands
+are not inherently defective. Use `concat` when combining collections into one membership set for
+scalar fields. Without the compared field's type, operand shape alone cannot prove that flattening
+was intended. Projection diagnostics report missing `value_path` paths, not legitimate list,
+record, or null values.
 
 **`collect` is scoped to the frame that ran the operations (2026-08-24).** "Gathers them" was
 written with a single fan-out in mind and implemented literally, as *every* history entry matching

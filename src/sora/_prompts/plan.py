@@ -75,7 +75,22 @@ _NARROWING_WITHOUT_PROPERTIES = (
 _CURRENT_STATE_PREDICATES_WITHOUT_PROPERTIES = (
     "A `$decide` predicate is judged only against the execution "
     "context provided; it cannot reconstruct state from before a "
-    "change. "
+    "change. That context is its own `in` collection and the "
+    "named data-op bindings, supplied in full — and nothing "
+    "else, so a clause that has to read ANOTHER collection "
+    "cannot be answered where it stands. An unanswerable clause "
+    "rejects EVERY item, and the empty result is "
+    "indistinguishable from nothing qualifying: the agent goes "
+    "on to tell the user it found no match. STAGE the join — an "
+    "earlier step pulls that collection into its own binding, "
+    "and the predicate names THAT binding. Stage NARROW: a "
+    "binding reaches the predicate only while it is small "
+    "enough, and one that is too wide is replaced wholesale by a "
+    "placeholder naming its size, leaving the predicate no "
+    "values to compare against and rejecting every item again. "
+    "Reduce the staged collection to the bare keys the clause "
+    "matches on before naming it, and join two large collections "
+    "with the mechanical `in` form rather than by judgement. "
 )
 
 PLAN_PROMPT = PromptManifest(
@@ -230,6 +245,32 @@ PLAN_PROMPT = PromptManifest(
                 "that operation's result>\"}, or\n"
                 '  {"$decide": "<what value is needed>"} when picking the '
                 "value needs judgement.\n"
+                "`$from` resolves the MOST RECENT matching operation, not a "
+                "particular earlier step. Before calling the same operation "
+                "again for a different collection, save the first collection "
+                "with a data-op binding. A one-source `concat` does this "
+                'without a model call: {"action": "concat", "of": '
+                '[{"$from": "<operation_name>", "path": "<collection>"}], '
+                '"out": "<first_collection>"}. Later use that `$bind`. Two '
+                "identical `$from` references after two calls BOTH read the "
+                "second call; they do not recover the two different results. "
+                "When planning a continuation, reuse results already in the "
+                "execution record if the observed state does not contradict "
+                "them. Do not repeat a read just because this continuation "
+                "is being planned now; fetch again for changed or missing data.\n"
+                "A $decide that picks ONE item out of a collection is the "
+                "case to be careful with: it is judged as prose, and prose "
+                "loses clauses. Give it only the part that genuinely needs "
+                "judgement, and never fold a mechanically-checkable "
+                "qualifier into its wording. 'The lightest available "
+                "acid-free wooden crate' names two exact stored field values "
+                "and one superlative, and what comes back is reliably the "
+                "lightest item with the QUALIFIERS DROPPED — a different "
+                "crate, ordered and paid for. Narrow on the exact fields "
+                "FIRST with mechanical `filter` clauses, then `sort` on the "
+                "superlative's field and `take` 1: that is exact, needs no "
+                "judgement, and costs no call. Keep the $decide for what no "
+                "field encodes.\n"
             ),
         ),
         PromptModule(
@@ -536,6 +577,35 @@ PLAN_PROMPT = PromptManifest(
                 "NOW: a $prop snapshot is current state, never a history, so a "
                 "predicate that asks how things were BEFORE something happened "
                 "cannot be answered and will silently get the wrong items. "
+                "It is also judged against a LIMITED view: the items of its "
+                "own `in` collection and the named data-op bindings, and "
+                "nothing else is. Observed properties "
+                "reach it only as a shape sketch with a count — not records — "
+                "so a clause that has to read ANOTHER collection ('is among "
+                "the people she messaged this month', 'appears in the chat "
+                "roster') cannot be answered where it stands. An unanswerable "
+                "clause rejects EVERY item, and the empty result is "
+                "indistinguishable from nothing qualifying: the agent goes on "
+                "to tell the user it found no match. STAGE the join instead — "
+                "an earlier step pulls that other collection into its own "
+                "binding ($prop or an operation, then the data-ops that "
+                "reduce it to the keys you need), and the predicate names "
+                "THAT binding. Once staged, the mechanical `in`/`not_in` form "
+                "below is usually the whole join — and when the staged binding "
+                "came from a `collect`, its items are RECORDS, so name "
+                "`value_path` to say which field of each to match against "
+                "rather than falling back to a $decide. "
+                "Stage NARROW, though: a binding reaches the predicate only "
+                "while it is small enough, and one that is too wide is "
+                "replaced wholesale by a placeholder naming its size. The "
+                "predicate then has NO values to compare against and rejects "
+                "every item — the same silent empty result, one step later and "
+                "harder to see. So reduce a staged collection to the bare keys "
+                "the clause matches on (`flatten` to that field, then "
+                "`distinct`) BEFORE naming it, and never name a binding that "
+                "still holds the whole records you pulled a moment ago. Two "
+                "large collections are never joined by judgement at all: "
+                "reduce both sides to keys and use the mechanical `in` form. "
             ),
             variants=(
                 PromptVariant(
@@ -583,7 +653,32 @@ PLAN_PROMPT = PromptManifest(
                 'must hold) or {"any": [<clause>, ...]} (at least one must), '
                 "nesting freely. Most real rules have two or three parts, and "
                 "one awkward part is NOT a reason to make the WHOLE predicate "
-                "a $decide — compose the mechanical clauses instead. An empty "
+                "a $decide — compose the mechanical clauses instead. But every "
+                "clause INSIDE an `all`/`any` must be mechanical: a $decide is "
+                "only ever a whole `where`, never one clause of a composition "
+                "and never inside a `value`. The runtime refuses both rather "
+                "than let them quietly match nothing, and the refusal costs a "
+                "replan. Preserve the rule's boolean logic when splitting it: "
+                "only for an AND (conjunction), compose the mechanical "
+                "clauses in a first filter, then filter ITS output with "
+                "$decide as the entire `where`. Sequential filters implement "
+                "AND. For an OR (disjunction), filter separate branches from "
+                "the SAME input collection, then `concat` their outputs and "
+                "`distinct` by the record's stable identity (or omit `by` for "
+                "whole-item equality). That preserves items satisfying either "
+                "branch and acts once on items satisfying both. Alternatively "
+                "judge the whole rule with one $decide over the original "
+                "collection; use that when nested mixed logic cannot be "
+                "decomposed while preserving its meaning.\n"
+                "Mixed OR example (records carry id and flagged; urgency needs judgement):\n"
+                '{"steps": [{"action": "filter", "in": {"$bind": "records"}, '
+                '"out": "flagged", "where": {"path": "flagged", "op": "eq", '
+                '"value": true}}, {"action": "filter", "in": {"$bind": "records"}, '
+                '"out": "urgent", "where": {"$decide": "keep records judged urgent"}}, '
+                '{"action": "concat", "of": [{"$bind": "flagged"}, {"$bind": "urgent"}], '
+                '"out": "either"}, {"action": "distinct", "in": {"$bind": "either"}, '
+                '"out": "selected", "by": "id"}]}\n'
+                "An empty "
                 "clause list is rejected as a defect rather than quietly "
                 "keeping everything. There is one further op, for ranges "
                 'rather than points: {"op": "overlaps", "start_path": '
@@ -613,7 +708,15 @@ PLAN_PROMPT = PromptManifest(
                 "executed' that a PREVIOUS, replaced plan produced are NOT "
                 "collectible, and collecting them yields an empty list — if "
                 "this plan needs those values, run the operation again. Each "
-                "collected item also carries that call's INPUT arguments, so "
+                "collected item also carries that call's INPUT arguments. "
+                "When the call has input arguments, a scalar return, including "
+                "null, is stored under `result`: "
+                'a lookup called with {"user_name": "A"} that returns "id-A" '
+                'collects as {"user_name": "A", "result": "id-A"}. Filter '
+                "on `result` and bind `result` for that identifier; it is NOT "
+                "stored under `value`. A mapping return keeps its actual "
+                "fields, with input arguments added, so use its documented "
+                "fields instead of assuming it has a `result` wrapper. Thus "
                 "you can filter/join on them even when the result doesn't echo "
                 "them back — e.g. after get_condition_score per gallery, "
                 "`collect` yields items with both the returned score AND the "
@@ -629,7 +732,26 @@ PLAN_PROMPT = PromptManifest(
                 "when each element is already a list or a recognisable page "
                 "envelope; give `path` to name the payload field when you know "
                 "it. Flattening an already-flat collection changes nothing, so "
-                "it is safe to include whenever the elements might be pages,\n"
+                "it is safe to include whenever the elements might be pages. "
+                "`flatten` works WITHIN one reference, so it cannot add two "
+                "separately produced bindings together — that is `concat`,\n"
+                '  {"action": "concat", "of": [<reference>, <reference>, '
+                '...], "out": "<name>"}  add independently produced '
+                "collections together, in the order named. Every other "
+                "action takes ONE collection in `in` — one reference, or a "
+                "literal list of plain values — so a list of REFERENCES is "
+                "never how you combine two of them: "
+                '`"in": [{"$bind": "a"}, {"$bind": "b"}]` is rejected as a '
+                "plan defect. For membership against SCALAR fields, a list "
+                "of collection references in `value` compares that scalar "
+                "against each entire collection, rather than their elements. "
+                "Use `concat` to combine those membership collections: name "
+                "the collections in `of`, then read its single `out` binding "
+                "as the `in` or as the membership value. `concat` does NOT "
+                "remove duplicates — follow it with `distinct` when the "
+                "sources can overlap and duplicates would matter. A membership "
+                "set CAN contain lists or records when the compared field itself "
+                "has that shape; that is equality membership, not concatenation,\n"
                 '  {"action": "reduce", "in": ..., "out": "<name>", "op": '
                 '"<sum|min|max|count|mean>", "by": "<field>"}  aggregate to a '
                 "single value.\n"
@@ -639,6 +761,28 @@ PLAN_PROMPT = PromptManifest(
                 "act on values a tool produced per item (e.g. a condition "
                 "score per gallery), map with a mechanical sub-goal, then "
                 "`collect` its results before filtering or reducing them.\n"
+                "`collect` gathers successful results into one list for the current "
+                "plan, carrying each call's input arguments but no implicit "
+                "CURRENT element. Each mechanical template contains ONE step. "
+                "For dependent calls, first fan out the lookup, then `collect` "
+                "its results, then fan out the follow-up over that collected "
+                "binding. Bind both the result and the original input arguments "
+                "from each collected record to preserve item identity. For a "
+                "scalar lookup result, read `result`; for a dict result, use its "
+                "actual returned fields. Do not put a list of steps in a template "
+                "or use an unqualified $from lookup result in the second fan-out: "
+                "it would read only the latest call for every item.\n"
+                "Dependent-call example (items carry code; lookup returns a bare id):\n"
+                '{"steps": [{"action": "subgoal", "goal": "look up each item", '
+                '"mode": "mechanical", "in": {"$bind": "items"}, "as": "item", '
+                '"template": {"action": "invoke", "tool_id": "catalog", '
+                '"operation_name": "lookup", "params": {"code": {"$bind": "item", '
+                '"path": "code"}}}}, {"action": "collect", "from": "lookup", '
+                '"out": "looked_up"}, {"action": "subgoal", "goal": "apply each lookup", '
+                '"mode": "mechanical", "in": {"$bind": "looked_up"}, "as": "entry", '
+                '"template": {"action": "invoke", "tool_id": "catalog", '
+                '"operation_name": "apply", "params": {"record_id": {"$bind": "entry", '
+                '"path": "result"}, "code": {"$bind": "entry", "path": "code"}}}}]}\n'
             ),
         ),
         PromptModule(

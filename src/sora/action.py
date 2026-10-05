@@ -990,6 +990,19 @@ class FlattenAction:  # predefined data-op: _flatten_ — the paginated sweep's 
         log.info("data-op: flatten %r -> %d items", kwargs["out"], len(collection))
 
 
+class ConcatAction:  # predefined data-op: _concat_ — the only op with more than one input
+    name = "concat"
+
+    async def execute(self, cycle: DecisionCycle, **kwargs: Any) -> None:
+        # Reason has already resolved every `of` reference and concatenated them, for the same
+        # reason it pre-gathers a `collect` and pre-concatenates a `flatten`: a source that cannot
+        # be read has to drop the plan, and only Reason may do that.
+        activity = cycle.working.activities[kwargs["activity_id"]]
+        collection = list(kwargs["collection"])
+        activity.bindings[kwargs["out"]] = collection
+        log.info("data-op: concat %r -> %d items", kwargs["out"], len(collection))
+
+
 class ReduceAction:  # predefined data-op: _reduce_
     name = "reduce"
 
@@ -1021,7 +1034,7 @@ class ReduceAction:  # predefined data-op: _reduce_
 
 def default_action_registry() -> ActionRegistry:
     """The predefined action space, assembled once: the six external actions, the eight internal
-    working-memory levers/model calls, plus the seven plan-composable data-ops (ADR-0023). bootstrap
+    working-memory levers/model calls, plus the eight plan-composable data-ops (ADR-0023). bootstrap
     and test harnesses register everything through this rather than naming each action inline."""
     registry = ActionRegistry()
     for external in (
@@ -1053,6 +1066,7 @@ def default_action_registry() -> ActionRegistry:
         TakeAction(),
         CollectAction(),
         FlattenAction(),
+        ConcatAction(),
         ReduceAction(),
     ):
         registry.register_data_op(data_op)
