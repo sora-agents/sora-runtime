@@ -14,7 +14,20 @@ carries its **own** high-water mark over a monotonic counter that the retention 
 
 from __future__ import annotations
 
-from sora.types import Change, Signal, changes_of, path_matches, watch_matches
+import pytest
+
+from sora.memory import render_changes
+from sora.perception import Percept
+from sora.types import (
+    Change,
+    ObservableProperty,
+    Signal,
+    changes_of,
+    diff_values,
+    identities,
+    path_matches,
+    watch_matches,
+)
 
 # --------------------------------------------------------------------------------------------------
 # path_matches — the bidirectional prefix
@@ -155,3 +168,146 @@ def test_an_unscoped_watch_is_unchanged_by_the_new_field() -> None:
     changes = [Change(path="events", removed=("e1",))]
     assert watch_matches("events", None, changes)
     assert watch_matches(None, None, changes)
+
+
+# --------------------------------------------------------------------------------------------------
+# identities — which field identifies a record, and what a wrong answer costs
+# --------------------------------------------------------------------------------------------------
+
+
+def test_a_record_keyed_on_message_id_is_identified() -> None:
+    """Message records need their own recognized identity field. Records keyed on `message_id` fell
+    through `id`/`uid`/`event_id`/`email_id`, so a conversation that gained a reply reported the
+    coarse form, the dereference had no id to look up, and a judgement asking whether anyone
+    declined an invitation was handed a path with no values at all."""
+    before = [{"message_id": "m1", "sender_id": "+1", "content": "are you coming?"}]
+    after = before + [{"message_id": "m2", "sender_id": "+2", "content": "Sorry, I can't join."}]
+    assert identities(after) is not None
+    assert diff_values(before, after) == [Change(path="", added=("m2",), updated=())]
+
+
+def test_a_foreign_key_does_not_identify_a_record() -> None:
+    """`sender_id` sits next to `message_id` and sorts before it, so name order alone picks the
+    wrong field. Keying on it collapses two messages from one sender onto a single entry — turning
+    an appended reply into an `updated` of the earlier one, which reads as "he changed his mind"
+    rather than "a second person answered"."""
+    items = [
+        {"message_id": "m1", "sender_id": "+1", "content": "first"},
+        {"message_id": "m2", "sender_id": "+1", "content": "second"},
+    ]
+    assert identities(items) == {"m1": items[0], "m2": items[1]}
+
+
+def test_a_non_unique_identity_degrades_to_coarse_rather_than_collapsing() -> None:
+    # Keying on a duplicated field silently drops a record. Reporting "something under here moved"
+    # is the honest answer, and `Change`'s contract already requires consumers to accept it.
+    assert identities([{"id": "dup", "v": 1}, {"id": "dup", "v": 2}]) is None
+
+
+@pytest.mark.parametrize("calendar_id", ["calendar-one", "calendar-two"])
+def test_event_identity_is_stable_when_appending_across_or_within_calendars(
+    calendar_id: str,
+) -> None:
+    before = [{"calendar_id": "calendar-one", "event_id": "event-one"}]
+    after = before + [{"calendar_id": calendar_id, "event_id": "event-two"}]
+    assert identities(before) == {"event-one": before[0]}
+    assert identities(after) == {"event-one": before[0], "event-two": after[1]}
+    assert diff_values(before, after) == [Change(added=("event-two",))]
+
+
+def test_a_unique_foreign_key_without_a_record_id_degrades_to_coarse() -> None:
+    before = [{"sender_id": "sender-one", "content": "first"}]
+    after = before + [{"sender_id": "sender-two", "content": "second"}]
+    assert identities(after) is None
+    assert diff_values(before, after) == [Change()]
+
+
+def test_a_duplicate_record_id_does_not_fall_back_to_a_unique_foreign_key() -> None:
+    items = [
+        {"event_id": "event-one", "calendar_id": "calendar-one"},
+        {"event_id": "event-one", "calendar_id": "calendar-two"},
+    ]
+    assert identities(items) is None
+
+
+def test_a_list_of_scalars_still_has_no_identity() -> None:
+    # Scalars have no stable record key: invented positional ids change meaning on every insert.
+    assert identities(["a", "b"]) is None
+
+
+# --------------------------------------------------------------------------------------------------
+# render_changes — the dereference, including where the change could not name its items
+# --------------------------------------------------------------------------------------------------
+
+
+def _property(source: str, name: str, value: object) -> Percept:
+    return Percept(source=source, payload=ObservableProperty(name=name, value=value), observed_at=0)
+
+
+def test_a_coarse_change_on_a_list_shows_its_tail() -> None:
+    """The structural backstop. An adapter that cannot identify its items (an MCP
+    `resources/updated` carries only a URI) must still leave the judgement something to read, and
+    for a list an append is what a coarse change overwhelmingly is."""
+    value = {
+        "conversations": {
+            "c1": {
+                "messages": [{"content": "are you coming?"}, {"content": "Sorry, I can't join."}]
+            }
+        }
+    }
+    rendered = render_changes(
+        [("insim:are/Messages", Change(path="conversations.c1.messages"))],
+        [_property("insim:are/Messages", "state", value)],
+    )
+    assert "Sorry, I can't join." in rendered
+    assert "could not identify which items moved" in rendered
+    assert "(most recent)" in rendered
+
+
+def test_a_coarse_change_on_a_dict_renders_no_records() -> None:
+    """Deliberately the one shape left unanswered: with no key added or removed there is no tail to
+    point at, and dumping the map is the shape sketch this dereference exists to replace."""
+    value = {"conversations": {f"c{i}": {"topic": f"t{i}"} for i in range(50)}}
+    rendered = render_changes(
+        [("insim:are/Messages", Change(path="conversations"))],
+        [_property("insim:are/Messages", "state", value)],
+    )
+    assert "read from the current snapshot" not in rendered
+    assert "could not identify which items moved" in rendered
+
+
+def test_a_coarse_change_on_a_leaf_shows_its_value() -> None:
+    # A leaf that moved has no sub-structure to name, and its value is both the whole answer and
+    # cheap to render.
+    rendered = render_changes(
+        [("insim:are/City", Change(path="crime_rate"))],
+        [_property("insim:are/City", "state", {"crime_rate": 0.42})],
+    )
+    assert "0.42" in rendered
+
+
+@pytest.mark.parametrize(
+    "survivors", [[{"message_id": "kept", "content": "unchanged"}], "unchanged"]
+)
+def test_precise_removal_does_not_render_surviving_records_as_changed(survivors: object) -> None:
+    rendered = render_changes(
+        [("tool", Change(path="messages", removed=("gone",)))],
+        [_property("tool", "state", {"messages": survivors})],
+    )
+    assert "removed=['gone']" in rendered
+    assert "unchanged" not in rendered
+    assert "read from the current snapshot" not in rendered
+    assert "most recent" not in rendered
+
+
+def test_an_identified_change_is_unaffected_by_the_coarse_fallback() -> None:
+    # The precise path stays precise: named ids are looked up, and the tail is not appended to them.
+    value = {
+        "messages": [{"message_id": "m1", "content": "old"}, {"message_id": "m2", "content": "new"}]
+    }
+    rendered = render_changes(
+        [("tool", Change(path="messages", added=("m2",)))],
+        [_property("tool", "state", value)],
+    )
+    assert "new" in rendered and "old" not in rendered
+    assert "most recent" not in rendered

@@ -697,6 +697,10 @@ def render_properties(properties: list[Percept]) -> str:
 # Smaller than the history budget — this is a delta (what just moved), not an execution trace.
 _CHANGED_RECORD_BUDGET = 12_000
 
+# How many of a list's most recent entries stand in for a coarse change on it. Small on purpose: it
+# is a fallback for a change that could not name its items, not a second way to dump a collection.
+_COARSE_TAIL = 5
+
 
 def _identifies(item: Any, wanted: set[str]) -> bool:
     """Whether a record is one of the ones a ``Change`` named. An adapter reports *which* ids moved
@@ -714,16 +718,29 @@ def _records_for_change(value: Any, change: Change) -> list[Any]:
     Handles both container shapes an adapter publishes: an ``{id -> record}`` map (indexed straight)
     and a list of records (scanned for the id). ``removed`` ids are deliberately not looked up —
     they are gone from the snapshot by definition, so naming them is all that can be done.
+
+    The **coarse** form — "something under here moved", every id tuple empty — is still answerable
+    where the path lands on something bounded, and answering it is the difference between a
+    judgement that can read what arrived and one handed a path with no values, which can only say
+    "nothing fired". A list gets its tail: an append is what a coarse list change overwhelmingly is,
+    and the tail is where one lands. A leaf gets its value. A **dict** gets nothing, deliberately —
+    a coarse dict change means some value moved somewhere inside it without any key being added or
+    removed, so there is no tail to point at and rendering the whole map is the shape-sketch problem
+    this dereference exists to avoid. Adapters must degrade to the coarse form (an MCP
+    ``resources/updated`` carries only a URI), so this path is reached by correct inputs, not just
+    by the identity rule failing.
     """
     ids = change.added + change.updated
-    if not ids:  # the coarse form: "something under here moved", nothing to dereference
-        return []
     try:
         container = walk_path(value, change.path)
     except (KeyError, IndexError, TypeError, ValueError):
         # The snapshot is read at judgement time, not at change time, so a path can have gone away
         # between the two. Skip it: the change line still says where to look.
         return []
+    if not (ids or change.removed):
+        if isinstance(container, list):
+            return list(container[-_COARSE_TAIL:])
+        return [] if isinstance(container, dict) else [container]
     if isinstance(container, dict):
         return [container[key] for key in ids if key in container]
     if isinstance(container, list):
@@ -769,7 +786,12 @@ def render_changes(changes: Sequence[tuple[str, Change]], properties: list[Perce
             )
             if ids
         )
-        located.append(f"- {where}{detail}")
+        coarse = not detail
+        located.append(
+            f"- {where}{detail}"
+            + (" (the source could not identify which items moved)" if coarse else "")
+        )
+        label = f"{where} (most recent)" if coarse else where
         for percept in properties:
             if percept.source != source:
                 continue
@@ -778,12 +800,12 @@ def render_changes(changes: Sequence[tuple[str, Change]], properties: list[Perce
                 body = _one_line(_render_json(record))
                 if body not in rendered_records:
                     rendered_records.add(body)
-                    records.append((where, None, body))
+                    records.append((label, None, body))
             if found:
                 break  # a Change names a path, not a property; the first that resolves is it
     block = "\n".join(located)
     if records:
-        block += "\n\nThe records behind those ids, read from the current snapshot:\n" + "\n".join(
+        block += "\n\nThe records at those paths, read from the current snapshot:\n" + "\n".join(
             _fit_to_budget(records, _CHANGED_RECORD_BUDGET)
         )
     return block

@@ -62,28 +62,49 @@ class Change:  # WHERE an observable property moved — see Signal.payload["chan
 _DIFF_MAX_DEPTH = 6
 
 
+# Preserve established record-ID precedence; a unique foreign key is not a record identity.
+# Unrecognized record shapes degrade to a coarse Change rather than guessing from `*_id` names.
+_IDENTITY_KEYS = ("id", "uid", "event_id", "email_id", "message_id")
+
+
+def _identity_key(items: list[dict[str, Any]]) -> str | None:
+    """Choose a recognized record ID, requiring a scalar, unique value on every item.
+
+    Select by field precedence before checking values: a duplicated or incomplete record ID must
+    degrade to a coarse change, not fall back to a different field as the collection grows.
+    Without a declared record schema, uniqueness alone cannot distinguish an ID from a foreign key.
+    """
+    for key in _IDENTITY_KEYS:
+        if not any(key in item for item in items):
+            continue
+        values = [item.get(key) for item in items]
+        if not all(isinstance(v, str | int) and not isinstance(v, bool) for v in values):
+            return None
+        identified = [str(v) for v in values]
+        return key if len(set(identified)) == len(identified) else None
+    return None
+
+
 def identities(value: Any) -> dict[str, Any] | None:
     """Read a container as {identity: item}, or None if it isn't one we can identify items in.
 
-    A dict is already keyed. A list of dicts is keyed by each item's own id-ish field — which is
-    what makes "this email appeared" expressible at all. A list of scalars has no identity to
-    report, so it degrades to the coarse form rather than inventing positional ids that would
-    change meaning whenever anything is inserted.
+    A dict is already keyed. A list of records is keyed by whichever of their own fields identifies
+    them (`_identity_key`) — which is what makes "this email appeared" expressible at all. A list of
+    scalars, or of records with no usable identity, has no identity to report, so it degrades to the
+    coarse form rather than inventing positional ids that would change meaning whenever anything is
+    inserted.
     """
     if isinstance(value, dict):
         return value
     if isinstance(value, list):
-        keyed: dict[str, Any] = {}
-        for item in value:
-            if not isinstance(item, dict):
-                return None
-            ident = (
-                item.get("id") or item.get("uid") or item.get("event_id") or item.get("email_id")
-            )
-            if not isinstance(ident, str | int):
-                return None
-            keyed[str(ident)] = item
-        return keyed
+        if not value:
+            return {}
+        if not all(isinstance(item, dict) for item in value):
+            return None
+        key = _identity_key(value)
+        if key is None:
+            return None
+        return {str(item[key]): item for item in value}
     return None
 
 
