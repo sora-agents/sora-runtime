@@ -86,6 +86,7 @@ from sora.types import (
     SEND_MESSAGE_TO_USER,
     SUBGOAL,
     TOOL_ID,
+    WAIT,
     Change,
     ConditionFiring,
     ConditionVerdict,
@@ -306,6 +307,20 @@ class DefaultReasonStrategy:
                 if parked:
                     return result  # RUNNING on the select escalation; binding lands a later cycle
                 continue
+            # Validate against the live registry, not a built-in allowlist: developers can add
+            # external actions. WAIT is the cycle's no-op sentinel and has no registry entry.
+            if step.next_action != WAIT:
+                try:
+                    cycle.actions.external(step.next_action)
+                except KeyError:
+                    defect = (
+                        f"Unregistered plan action {step.next_action!r}. Tool operations use "
+                        "action 'invoke' with tool_id and operation_name; otherwise choose a "
+                        "registered external action."
+                    )
+                    log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
+                    activity.reset_for_replan(defect=defect)
+                    return result
             # A write is the last moment the runtime can still decline to act, so before one it
             # asks whether the plan can still finish at all (_unsatisfiable_reference). Ahead of
             # grounding, unlike the reconsideration checkpoint below: this reads only settled state,
@@ -881,6 +896,23 @@ class DefaultReasonStrategy:
             # the child inference needs its step-owned conditions in the prompt, but a rejected
             # step must not leave a condition behind for a replacement plan to inherit.
             goal = step.params["goal"]
+            if not isinstance(goal, str):
+                # A sub-goal's `goal` is literal text, and nothing resolves it as a reference: the
+                # reference grammar covers step *params*, not the goal a child deliberation is
+                # handed. A planner that writes {"$decide": "a goal string that says to ..."} —
+                # observed, three times in one plan, inside a mechanical sub-goal's `template` —
+                # therefore hands the recursion guard a dict, which used to raise out of `tick()`
+                # and abort the whole scenario on an AttributeError. Unreadable is a question, so
+                # name the illegal form and replan instead of crashing or silently stringifying it
+                # (a goal reading `{'$decide': ...}` would brief the child on the wrong task).
+                goal_defect = (
+                    "a sub-goal's `goal` must be literal text, not a reference "
+                    f"(got {type(goal).__name__}: {goal!r}) — write the goal out, "
+                    "deciding its wording at planning time"
+                )
+                log.warning("reason: plan defect for activity %s — %s", activity.id, goal_defect)
+                activity.reset_for_replan(defect=goal_defect)
+                return _SUBGOAL_DEFECT
             # A `then` (see `_pursue_fired_condition`) restates the goal that declared it — the
             # planner is told to phrase it "like the original goal" — so containment in an ancestor
             # is its shape, not a failure to reduce, and the overlap check reads it as recursion

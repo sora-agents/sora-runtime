@@ -27,7 +27,7 @@ import pytest
 
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
 from sora._strategies.subgoals import _DEFAULT_MAX_SUBGOAL_DEPTH
-from sora.action import InferAction, default_action_registry, invoke_step
+from sora.action import InferAction, SendAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
@@ -116,6 +116,64 @@ def _no_llm_procedural(tmp_path: Path) -> ProceduralMemory:
     # Mechanical fan-out makes no model call, so a procedural with no LLM is enough (and would raise
     # if the fan-out ever escalated, proving it didn't).
     return ProceduralMemory(FileMemoryBackend(tmp_path / "proc"))
+
+
+async def test_unregistered_plan_action_replans_before_dispatch(tmp_path: Path) -> None:
+    tool = FakeTool("calendar")
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="find the appointment",
+        context={},
+        plan=Plan(
+            id="p",
+            goal="find the appointment",
+            steps=[
+                Step(
+                    next_action="search_events",
+                    params={"tool_id": "calendar", "operation_name": "search_events"},
+                )
+            ],
+        ),
+    )
+    working.activities[activity.id] = activity
+
+    await cycle.tick()
+
+    assert activity.plan is None
+    assert activity.step_index == 0
+    assert activity.state == ActivityState.READY
+    assert activity.superseded is not None
+    assert "search_events" in (activity.superseded.defect or "")
+    assert "invoke" in (activity.superseded.defect or "")
+    assert not tool.invocations
+
+
+@pytest.mark.parametrize("action_name", ["wait", "notify"])
+async def test_plan_action_guard_preserves_wait_and_registered_extensions(
+    tmp_path: Path, action_name: str
+) -> None:
+    tool = FakeTool("calendar")
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    custom = SendAction()
+    custom.name = "notify"
+    cycle.actions.register_external(custom)
+    step = Step(next_action=action_name, params={"to": "user", "content": {"text": "ready"}})
+    activity = Activity(
+        id="a",
+        goal="notify the user",
+        context={},
+        plan=Plan(id="p", goal="notify the user", steps=[step]),
+    )
+    working.activities[activity.id] = activity
+
+    await cycle.tick()
+
+    assert activity.plan is not None
+    assert activity.step_index == 1
+    assert not activity.replan_trail
 
 
 def _mechanical_subgoal(collection_path: str = "") -> Step:
@@ -999,6 +1057,49 @@ async def test_a_hand_built_subgoal_with_an_unknown_mode_replans(tmp_path: Path)
     assert result.step is None
     assert activity.plan is None
     assert "sub-goal mode" in (activity.replan_trail[-1] or "")
+
+
+async def test_a_deliberative_subgoal_with_a_reference_goal_replans(tmp_path: Path) -> None:
+    """A `$decide` goal is not a legal form, and it must not be a crash.
+
+    Nothing resolves `params["goal"]` as a reference — the grammar covers step params, not the goal
+    a child deliberation is handed. A planner wrote `{"$decide": "a goal string that says to ..."}`
+    three times in one plan, inside a mechanical sub-goal's `template`; the recursion guard then
+    called `.lower()` on a dict, and the AttributeError raised out of `tick()` and aborted the whole
+    scenario. Two paid benchmark scenarios were lost to it before the traceback was logged at all.
+    Stringifying instead would be worse than the crash in one way: the child would be briefed on
+    a goal reading `{'$decide': ...}`, which reads as success and spends real actions."""
+    tool = FakeTool("realestate")
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    # _no_llm_procedural raises if _infer_ fires, so reaching the child inference fails the test.
+    activity = Activity(
+        id="a",
+        goal="invite the attendees",
+        context={},
+        plan=Plan(
+            id="p",
+            goal="invite the attendees",
+            steps=[
+                Step(
+                    next_action="subgoal",
+                    params={
+                        "goal": {"$decide": "a goal string that says to send the invitation"},
+                        "mode": "deliberative",
+                    },
+                )
+            ],
+        ),
+    )
+    working.activities["a"] = activity
+
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+
+    assert result.step is None
+    assert activity.plan is None  # reset_for_replan
+    trail = activity.replan_trail[-1] or ""
+    # The defect names the illegal form and the fix, or the retry re-guesses from the same nothing.
+    assert "literal text" in trail and "$decide" in trail
 
 
 def test_step_from_raw_defaults_missing_action_to_invoke() -> None:

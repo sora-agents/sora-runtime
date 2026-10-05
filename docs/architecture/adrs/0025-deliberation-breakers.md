@@ -191,6 +191,14 @@ entry is **normalized to the error's cause** rather than carrying `repr(exc)` wh
 failures quote different model output, would never compare equal, and would defeat the precise check
 that makes a hopeless call cost two attempts instead of five. The full message is logged.
 
+A syntactically valid plan can still name an unregistered action — for example, putting a tool's
+operation name in the `action` field instead of using `invoke`. Default Reason detects this before
+grounding or dispatch and resets the plan with a defect explaining the action/operation distinction.
+It checks the live external-action registry, so registered developer extensions remain valid;
+the cycle's `wait` sentinel, sub-goals, and registered data-ops retain their separate paths.
+This recovery uses the same replan trail and breaker rather than allowing dispatch to raise
+`KeyError` and end the entire run.
+
 An inference kind with no degradation of its own still terminates — but no longer *silently*, which
 is the second defect this fixes. The old branch wrote **no episode** (so the failure never reached
 memory, and `DefaultReflectStrategy`'s "TERMINATED was already recorded" was untrue for this path)
