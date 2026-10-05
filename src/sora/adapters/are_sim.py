@@ -109,7 +109,8 @@ def _internal_app_names() -> frozenset[str]:
 # Hand-authored per key, not derived: deciding whether an operation *can* return a field means
 # reading operations that need arguments, which no probe can enumerate. Each entry names what was
 # checked. `tests/fixtures/are_app_state_census.json` pins every app's key set so a new upstream
-# key is a red test rather than a silently reopened hole.
+# key is a red test rather than a silently reopened hole. Policies identify app implementations;
+# scenario-assigned labels such as "Messages" are not stable type identities.
 _UNREACHABLE_STATE_KEYS: dict[str, frozenset[str]] = {
     # `get_crime_rate(zip_code)` is deliberately rate-limited (100 calls / 30 min; its
     # `_enforce_rate_limit` raises past that). The metering is a designed scenario constraint, and
@@ -138,6 +139,20 @@ def _publishable_state(app_name: str, state: Any) -> Any:
     if not withheld or not isinstance(state, dict):
         return state
     return {k: v for k, v in state.items() if k not in withheld}
+
+
+def _state_policy_name(app: Any) -> str:
+    """Scenario-assigned labels must not weaken an implementation's state policy.
+
+    ARE's ``app_name()`` returns a mutable instance name (``Messages`` rather than
+    ``MessagingAppV2`` in benchmark scenarios). The implementation, including an inherited
+    policy for a specialized app, identifies the keys to withhold. The name fallback keeps
+    protocol fakes and apps without a classified implementation on their existing path.
+    """
+    return next(
+        (cls.__name__ for cls in type(app).__mro__ if cls.__name__ in _UNREACHABLE_STATE_KEYS),
+        app.app_name(),
+    )
 
 
 # ARE mutates app state on its own event-loop thread with no lock we can share (see AreSimulation),
@@ -1210,7 +1225,8 @@ class _AreTool:
                 # snapshot. Narrowing at observe()'s return instead would leak every withheld key
                 # straight back out through the signal payload.
                 return _publishable_state(
-                    self._app.app_name(), _to_serializable(self._sim.run(self._app.get_state))
+                    _state_policy_name(self._app),
+                    _to_serializable(self._sim.run(self._app.get_state)),
                 )
             except RuntimeError as exc:  # concurrent modification by the ARE event-loop thread
                 last = exc

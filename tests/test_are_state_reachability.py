@@ -125,15 +125,52 @@ async def test_the_withheld_key_does_not_leak_back_out_through_the_change_signal
     assert "crime_data" not in repr(sink.pushed[0].payload)  # Change objects; repr, not json
 
 
+@pytest.mark.parametrize(
+    ("implementation", "label", "withheld"),
+    [
+        ("CityApp", "City", {"crime_data": {"94110": 7}}),
+        ("CabApp", "Cabs", {"d_service_config": {}, "quotation_history": []}),
+        ("MessagingAppV2", "Messages", {"id_to_name": {}, "name_to_id": {}}),
+    ],
+)
+async def test_scenario_labels_cannot_bypass_state_withholding(
+    implementation: str, label: str, withheld: dict[str, Any]
+) -> None:
+    # ARE's app_name() is the scenario-assigned name, not the implementation's type identity.
+    app_type = type(implementation, (_FakeCity,), {"app_name": lambda self: label})
+    app = app_type()
+    app.state = {**withheld, "public_value": 1}
+    tool = _city_tool(app)
+    sink = _Sink()
+    await tool.focus(sink)
+    assert tool.observe()[0].value == {"public_value": 1}
+    for key in withheld:
+        app.state[key] = "private change"
+    tool.observe()
+    assert sink.pushed == []
+    app.state["public_value"] = 2
+    tool.observe()
+    assert len(sink.pushed) == 1
+    assert not any(key in repr(sink.pushed[0].payload) for key in withheld)
+
+
+async def test_an_app_subclass_keeps_its_state_withholding_policy() -> None:
+    city_type = type("CityApp", (_FakeCity,), {})
+    specialized_type = type("SpecializedCity", (city_type,), {"app_name": lambda self: "Town"})
+    tool = _city_tool(specialized_type())
+    await tool.focus(_Sink())
+    assert tool.observe()[0].value == {"api_call_count": 0}
+
+
 # ------------------------------------------------------------------------------------------------
 # The upstream key set the table was authored against (needs ARE: `uv sync --group are`)
 # ------------------------------------------------------------------------------------------------
 
 
 def _live_census() -> dict[str, list[str]]:
-    """Every ARE app's `get_state()` keys, keyed by `app_name()` — the same identity the filter is
-    keyed by, so an alias class (`Calendar` vs `CalendarApp` vs `CalendarV2`) is its own row and
-    cannot be classified in one place and forgotten in another."""
+    """Every ARE app's state keys under its canonical default name. Scenarios can rename these
+    instances, so the live policy lookup uses their implementation rather than that label.
+    Each distinct implementation still needs its own census row."""
     import importlib
     import inspect
     import pkgutil
