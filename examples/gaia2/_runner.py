@@ -557,6 +557,12 @@ def run_scenario(
             asyncio.run(session.run())
         except Exception as e:  # a run-time crash: record it, sweep continues (KI still propagates)
             exc = e
+            # The traceback, not just `str(exc)`. Only the message reaches `RunResult.status`, and a
+            # bare message names neither the frame nor the library: a crash recorded as `'dict'
+            # object has no attribute 'lower'` cost two separate paid scenarios before anyone could
+            # say which `.lower()` it was, and the session log simply stops at the last cycle. The
+            # scenario is already lost at this point, so logging cannot cost it anything further.
+            log.error("scenario run crashed", exc_info=True)
         duration = time.monotonic() - started
         # Sampled here, immediately after the session's teardown, rather than in the
         # RunResult below: everything between is scoring work (a judge pass over the oracle
@@ -579,6 +585,7 @@ def run_scenario(
             # A judge/oracle failure surfaces here, not as a silent unscored run.
             except Exception as e:
                 exc = e
+                log.error("scenario validate() crashed", exc_info=True)
 
         # Deliberately outside the judge guard and after validate(): it needs no judge and no
         # tokens, so an unscored dev run — where it is the only pass/fail signal there is —

@@ -1008,13 +1008,15 @@ class _StubChecker:
     tallies votes with a case-SENSITIVE membership test and returns None when nothing parsed."""
 
     def __init__(
-        self, response: str, success: str = "[[True]]", failure: str = "[[False]]"
+        self, response: object, success: str = "[[True]]", failure: str = "[[False]]"
     ) -> None:
         self.success_str = success
         self.failure_str = failure
         self.num_votes = 1
 
-        def judge(_args: dict[str, str]) -> str:
+        # Deliberately `object`: ARE types this `str`, but the engine does sometimes hand back a
+        # structured response, and that is the case the patch has to survive rather than crash on.
+        def judge(_args: dict[str, str]) -> object:
             return response
 
         self.judge = judge
@@ -1022,7 +1024,9 @@ class _StubChecker:
     def __call__(self, user_prompt_args: dict[str, str]) -> bool | None:
         votes: list[bool] = []
         for _ in range(self.num_votes):
-            response = self.judge(user_prompt_args)
+            # `Any`, not `str`: ARE's annotation says str, and the point of the stub is to behave
+            # the way ARE actually does when the engine hands back something else.
+            response: Any = self.judge(user_prompt_args)
             if response is None:
                 continue
             if self.success_str in response:
@@ -1049,6 +1053,25 @@ def test_are_discards_a_lowercase_verdict_before_the_patch(monkeypatch: pytest.M
     # The defect itself, stated as a test: the judge signed off, and ARE records no vote at all.
     checker = _stub_are(monkeypatch)("The tone is polite and suitable. Evaluation: [[true]]")
     assert checker({}) is None  # not False — the verdict was discarded, not disagreed with
+
+
+def test_relax_judge_verdict_case_survives_a_non_string_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dict response must cast no vote, exactly as stock ARE does — never raise.
+
+    ARE's own parse is `self.success_str in response`, which on a dict tests its KEYS: no match, no
+    vote, scenario unaffected. The replacement lowercases instead, and `dict.lower` does not exist,
+    so an engine that returns a structured response turned a silent no-vote into
+    `'dict' object has no attribute 'lower'` — recorded as `infrastructure_error`, which discards a
+    whole paid scenario rather than one checker's opinion. Relaxing the marker comparison must not
+    narrow the set of response types the checker tolerates."""
+    cls = _stub_are(monkeypatch)
+    assert relax_judge_verdict_case() is True
+    # Stock ARE's behavior on this input is None (no vote), and that is what must survive.
+    assert cls({"text": "Evaluation: [[true]]"})({}) is None
+    # A string still parses case-insensitively, i.e. the patch's actual purpose is intact.
+    assert cls("Evaluation: [[true]]")({}) is True
 
 
 def test_relax_judge_verdict_case_reads_a_lowercase_pass(monkeypatch: pytest.MonkeyPatch) -> None:

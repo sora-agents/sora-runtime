@@ -552,6 +552,21 @@ def relax_judge_verdict_case() -> bool:
             response = self.judge(user_prompt_args)
             if response is None:
                 continue
+            if not isinstance(response, str):
+                # ARE's own parse is `success_str in response`, which on the structured response
+                # the engine sometimes returns tests its KEYS: no match, no vote, scenario
+                # untouched. Lowercasing raises there instead, and the runner records the
+                # AttributeError as `infrastructure_error` — discarding a whole paid scenario over
+                # one checker's opinion. Relaxing the marker comparison must not narrow the
+                # response types tolerated, so every non-string keeps the stock expression.
+                try:
+                    if self.success_str in response:
+                        votes.append(True)
+                    elif self.failure_str in response:
+                        votes.append(False)
+                except TypeError:
+                    pass
+                continue
             lowered = response.lower()
             if success in lowered:
                 votes.append(True)
