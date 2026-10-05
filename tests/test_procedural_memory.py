@@ -13,6 +13,7 @@ serialization round-trip the module owns.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -52,11 +53,14 @@ from sora.memory import (
 from sora.perception import Message, Percept
 from sora.types import (
     CompletedOperation,
+    ConditionFiring,
+    InferenceKind,
     ObservableProperty,
     OperationAck,
     OperationInvocation,
     PendingCondition,
     PendingConditionState,
+    PendingInference,
     Plan,
     Signal,
     SignalWait,
@@ -1084,18 +1088,28 @@ def test_plan_prompt_examples_stay_off_any_evaluated_domain() -> None:
     structural rules these examples teach are domain-free, so keeping the nouns off any evaluated
     domain costs nothing. The natural way to reintroduce the bias is to reach for whatever scenario
     is being debugged when adding an example, which is exactly what this catches."""
-    lowered = PLAN_SYSTEM_PROMPT.lower()
-    for noun in (
-        "apartment",
-        "crime_rate",
-        "zip_code",
-        "laundry",
-        "amenities",
-        "relative",
-        "cheapest",
-        "rentaflat",
+    # The grounding prompt carries worked examples of its own, and had no such guard until an
+    # edit re-anchoring a $decide example put a scored domain's superlative straight into it.
+    for label, prompt in (
+        ("PLAN_SYSTEM_PROMPT", PLAN_SYSTEM_PROMPT),
+        ("GROUND", GROUND_SYSTEM_PROMPT),
     ):
-        assert noun not in lowered, f"benchmark-domain noun {noun!r} is back in PLAN_SYSTEM_PROMPT"
+        lowered_prompt = prompt.lower()
+        for noun in (
+            "apartment",
+            "crime_rate",
+            "zip_code",
+            "laundry",
+            "amenities",
+            "relative",
+            "cheapest",
+            "rentaflat",
+        ):
+            assert noun not in lowered_prompt, f"benchmark-domain noun {noun!r} is back in {label}"
+        assert re.search(r"\bcab\b", lowered_prompt) is None, (
+            f"benchmark transport example in {label}"
+        )
+    lowered = PLAN_SYSTEM_PROMPT.lower()
     # ...and the structure those examples carry is still taught (guards against deleting rather
     # than re-anchoring them): a per-item fan-out, a membership exclusion, and an input-arg join.
     assert "per item" in lowered
@@ -1496,7 +1510,24 @@ def test_plan_prompt_tells_a_subgoal_plan_not_to_report_to_the_user() -> None:
     activity.parent_frames = [(Plan(id="p", goal="reconcile the shortlist", steps=[]), 0, 0)]
     _, user = default_plan_prompt(activity, {}, PerceptSnapshot(), [])
     assert "NOT a request from the user" in user
-    assert "do NOT end this plan by invoking `send_message_to_user`" in user
+    assert "do not append another signoff here" in user
+    assert "Report to the user only if this goal explicitly asks" in user
+
+
+async def test_delegated_user_question_is_not_forbidden_by_subgoal_provenance(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+    activity = _activity("Ask the user which available reservation to choose.")
+    activity.parent_frames = [(Plan(id="p", goal="arrange the visit", steps=[]), 0, 0)]
+
+    await mem.infer(activity, {})
+
+    _system, user = llm.calls[-1]
+    assert "Ask the user which available reservation to choose." in user
+    assert "Report to the user only if this goal explicitly asks" in user
+    assert "do NOT end this plan by invoking `send_message_to_user`" not in user
 
 
 def test_plan_prompt_says_nothing_about_provenance_for_a_top_level_goal() -> None:
@@ -1505,6 +1536,93 @@ def test_plan_prompt_says_nothing_about_provenance_for_a_top_level_goal() -> Non
     _, user = default_plan_prompt(_activity("reconcile the shortlist"), {}, PerceptSnapshot(), [])
     assert "NOT a request from the user" not in user
     assert "send_message_to_user" not in user
+
+
+@pytest.mark.parametrize("replanning", [False, True])
+async def test_condition_branch_has_provenance_without_a_parent_frame(
+    tmp_path: Path, replanning: bool
+) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+    activity = _activity("notify the participants who declined")
+    activity.condition_fired.append(
+        ConditionFiring(
+            condition=PendingCondition(
+                watch=SignalWait(signal_name="reply", source="messenger"),
+                when="a participant replies",
+                then="record their reply",
+            )
+        )
+    )
+    activity.pending_inference = PendingInference(
+        id="in-flight",
+        kind=InferenceKind.PLAN if replanning else InferenceKind.CONDITION_FOLLOWUP,
+        requested_at=0.0,
+        goal=activity.goal,
+    )
+    if replanning:
+        activity.pursued_goals[0] = activity.goal
+
+    await mem.infer(activity, {})
+
+    _system, user = llm.calls[-1]
+    assert "This goal is a condition branch" in user
+    assert "NOT a new request from the user" in user
+    assert "Report to the user only if this goal explicitly asks" in user
+
+
+async def test_condition_branch_singular_goal_keeps_all_matching_changed_records(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+    activity = _activity("Notify that person about the change.")
+    activity.pending_inference = PendingInference(
+        id="followup", kind=InferenceKind.CONDITION_FOLLOWUP, requested_at=0.0
+    )
+    activity.bindings["fired_added_ids"] = ["record-one", "record-two"]
+
+    await mem.infer(activity, {})
+
+    _system, user = llm.calls[-1]
+    assert "record-one" in user and "record-two" in user
+    assert "ALL records that satisfy the triggering condition" in user
+    assert "not just the latest record" in user
+
+
+@pytest.mark.parametrize("queued,nested", [(False, False), (True, False), (False, True)])
+async def test_only_last_top_level_condition_branch_closes_followup_batch(
+    tmp_path: Path, queued: bool, nested: bool
+) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+    activity = _activity("record the participant reply")
+    activity.pending_inference = PendingInference(
+        id="followup", kind=InferenceKind.CONDITION_FOLLOWUP, requested_at=0.0
+    )
+    if nested:
+        activity.parent_frames = [(Plan(id="parent", goal="handle the request", steps=[]), 0, 0)]
+    if queued:
+        activity.condition_fired.append(
+            ConditionFiring(
+                condition=PendingCondition(
+                    watch=SignalWait(signal_name="reply", source="messenger"),
+                    when="a participant replies",
+                    then="record the other reply",
+                )
+            )
+        )
+
+    await mem.infer(activity, {})
+
+    _system, user = llm.calls[-1]
+    if queued or nested:
+        assert "without appending an automatic completion report" in user
+        assert "send ONE closing user reply" not in user
+    else:
+        assert "send ONE closing user reply" in user
+        assert "ALL completed follow-up work" in user
+        assert "without appending an automatic completion report" not in user
 
 
 # --------------------------------------------------------------------------------------------------

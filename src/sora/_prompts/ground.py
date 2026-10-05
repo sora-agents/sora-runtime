@@ -117,6 +117,22 @@ GROUND_PROMPT = PromptManifest(
             ),
         ),
         PromptModule(
+            name="selection-integrity",
+            text=(
+                "A $decide that SELECTS something has to satisfy EVERY clause "
+                "in its wording, not the easiest one. 'The lightest available "
+                "acid-free wooden crate' is a conjunction: the treatment, the "
+                "material and the weight all bind, and the lightest candidate "
+                "made of the WRONG material does not answer it. Check the "
+                "candidates against each clause in turn, and if none "
+                "satisfies all of them, report that as a gap exactly as you "
+                "would a missing value — a near miss is not an answer. "
+                "Quietly relaxing one clause reads as success and spends a "
+                "real action on the wrong thing, which is worse than the "
+                "step not running.\n"
+            ),
+        ),
+        PromptModule(
             name="resolvable-values",
             text=(
                 "That is only for missing DATA. A value you can compute or "
@@ -143,7 +159,15 @@ GROUND_PROMPT = PromptManifest(
                 "which work it was, rather than omitting it or reporting the "
                 "intent as achieved. The user has no other view of what the "
                 "agent did, so a report that overstates it is not something "
-                "they can catch or recover from."
+                "they can catch or recover from. Preserve the concrete facts "
+                "that make the outcome clear: name the channel on which a "
+                "message was sent, and report a resolved calendar date as an "
+                "absolute date rather than repeating the user's context-dependent "
+                "phrase. Use the executed operation and its parameters for "
+                "these facts; do not invent a channel or date absent from the "
+                "record. When giving event or booking details with a start and end "
+                "time, explicitly state the duration computed from those bounds "
+                "as well as the bounds themselves; do not leave it implicit."
             ),
         ),
     ),

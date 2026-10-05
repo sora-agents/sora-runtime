@@ -83,6 +83,7 @@ from sora.types import (
     Change,
     CompletedOperation,
     ConditionVerdict,
+    InferenceKind,
     PendingCondition,
     PendingConditionState,
     Plan,
@@ -880,17 +881,51 @@ def _render_goal_provenance(activity: Activity) -> str:
     from the user* — a condition the model cannot evaluate, because a sub-goal is inferred against
     its own goal string with the parent nowhere in the prompt. Every plan therefore read as the
     user's and ended with a report, so one user turn produced a report per plan in the tree instead
-    of one for the turn. A non-empty intention stack is the mechanical answer (see
+    of one for the turn. An explicitly delegated user question is still work the child owes;
+    suppressing automatic signoffs must not suppress that operation. A non-empty intention stack
+    is the mechanical answer (see
     ``InferAction.execute``): it means this plan is a sub-plan, and the reply belongs to whatever
     plan the user's goal is on. Empty stack renders nothing, leaving the system prompt's condition
-    to apply as before."""
+    to apply as before.
+
+    A condition branch deliberately pushes no frame. Its in-flight kind identifies the first
+    inference; the existing per-depth pursued goal identifies a replan of that commitment. Without
+    those markers a branch reads as a fresh user request and signs off while another queued branch
+    still owes work. Only the last queued top-level follow-up owns the closing report for the
+    batch; a nested branch leaves that automatic report to its parent."""
+    pending = activity.pending_inference
+    if (
+        pending is not None and pending.kind is InferenceKind.CONDITION_FOLLOWUP
+    ) or activity.pursued_goals.get(len(activity.parent_frames)) == activity.goal:
+        matching_scope = (
+            " One firing can contain several changed records. If this goal owes an action to "
+            "'that person' or 'that record', handle ALL records that satisfy the triggering "
+            "condition, not just the latest record. Filter the triggering changes to the "
+            "qualifying matches, then fulfill the goal for the whole matching set; do not take "
+            "only one unless the user's instruction actually limits the target to one."
+        )
+        if not activity.condition_fired and not activity.parent_frames:
+            return (
+                "This goal is the last currently queued condition branch (`then` or `otherwise`) "
+                "at the top level, NOT a new request from the user. After completing its work, "
+                "send ONE closing user reply summarizing ALL completed follow-up work in the "
+                "execution record. Do not report halfway through this plan. If this goal already "
+                "requests a user message that supplies that closing reply, it is sufficient; "
+                "do not append a second report."
+            ) + matching_scope
+        return (
+            "This goal is a condition branch (`then` or `otherwise`), NOT a new request from the "
+            "user. Fulfill the branch's goal without appending an automatic completion report: "
+            "other queued branches may still owe work. Report to the user only if this goal "
+            "explicitly asks for it; that requested message remains part of the branch."
+        ) + matching_scope
     if not activity.parent_frames:
         return ""
     return (
-        "This goal is one step of a larger plan — it is NOT a request from the user, and the user "
-        "is not waiting on its result. The plan that owns the user's goal reports back when the "
-        "whole task is done, so do NOT end this plan by invoking `send_message_to_user`: a report "
-        "here reaches the user as a second, partial answer to a question they asked once."
+        "This goal is one step of a larger plan — it is NOT a request from the user. "
+        "The plan that owns the user's goal supplies the automatic completion report, so do not "
+        "append another signoff here. Report to the user only if this goal explicitly asks for "
+        "it; a requested question or message remains part of this subgoal and must be performed."
     )
 
 
