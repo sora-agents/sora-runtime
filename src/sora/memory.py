@@ -973,8 +973,9 @@ def _render_armed_conditions_section(activity: Activity) -> str:
     return (
         f"Conditions already armed and watching:\n{render_armed_conditions(states)}\n"
         "These watches are already registered and are part of the work in progress, not a gap in "
-        "it. Each one runs its `then` by itself when its `when` comes true, so do NOT plan the "
-        "work a `then` describes and do NOT add steps to watch for, poll for, or wait on a change "
+        "it. Each one runs its `then` when its `when` comes true, or its `otherwise`, if present, "
+        "when it expires without firing. Do NOT plan either branch's work inline and do NOT add "
+        "steps to watch for, poll for, or wait on a change "
         "one of them is already watching for. Do not declare a `pending` condition equivalent to "
         "one of these either: a second waiter on the same change does the same work twice. Plan "
         "only what is left to do besides them — waiting is itself work being done, so a short "
@@ -1663,6 +1664,8 @@ def _condition_block(index: int, condition: PendingCondition) -> list[str]:
     ]
     if condition.until is not None:
         lines.append(f"   until {condition.until.text}")
+    if condition.otherwise is not None:
+        lines.append(f"   otherwise {condition.otherwise}")
     return lines
 
 

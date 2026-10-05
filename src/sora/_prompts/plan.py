@@ -209,6 +209,22 @@ PLAN_PROMPT = PromptManifest(
                 "not yet available, use `$decide` to phrase the report from "
                 "those results at execution time rather than guessing during "
                 "planning.\n"
+                "One exception, and it decides whether a deferred task counts "
+                "at all: when the activity has a `pending` condition carrying "
+                "BOTH a `then` and an `otherwise`, one of those two branches "
+                "is certain to run, and the closing report belongs in THEM, "
+                "not in this body. This applies both to a condition declared "
+                "here and to an already-armed condition shown in the context "
+                "while replanning. A reply to the user is read as this task's "
+                "FINAL answer, so everything done after it is attributed to a "
+                "follow-up the task does not have and counts for nothing — "
+                "however correctly it was performed. A body that signs off "
+                "with 'I asked them and will order one if nobody replies' "
+                "therefore throws away the whole branch that follows. So arm "
+                "the condition and stay SILENT here, and let each branch end "
+                "with its own report. (With only a `then` and no `otherwise`, "
+                "nothing is guaranteed to run, so this body does still report "
+                "before it waits.)\n"
                 "`send_message_to_user` is the agent's OWN reply channel — the "
                 "recipient is always the user, so it is NEVER how you message "
                 "anyone else. When the goal asks to email/message/notify some "
@@ -955,7 +971,8 @@ PLAN_PROMPT = PromptManifest(
                 '"updated"}, "when": "<what must have happened>", "then": '
                 '"<what to do about it>", "until": "<when to stop waiting>" | '
                 '{"text": "<when to stop waiting>", "seconds": <how long the '
-                "window lasts>}}\n"
+                'window lasts>}, "otherwise": "<what to do if it never '
+                'happens>"}\n'
             ),
             variants=(
                 PromptVariant(
@@ -1060,7 +1077,32 @@ PLAN_PROMPT = PromptManifest(
                 "so write it as a plain string and let it be judged as an "
                 "event. Never guess a `seconds` you were not given; a wrong "
                 "one stops the agent watching while the thing it is watching "
-                "for can still happen.\n"
+                "for can still happen. A stretch the goal DID give you, "
+                "though, is not a guess and you MUST declare it: 'if after 3 "
+                'minutes there is no response\' is {"text": "three minutes '
+                'have passed", "seconds": 180}. Leaving a stated duration as '
+                "prose does not keep the window honest, it unmoors it — an "
+                "event-shaped `until` is only reconsidered when the runtime "
+                "next sweeps, which is idle-scheduled with backoff, so "
+                "'after 3 minutes' silently becomes 'some time after "
+                "something looks'.\n"
+                '"otherwise" is the OTHER branch of the same wait: the goal '
+                "to pursue if the window closes having NEVER been satisfied. "
+                "'...and if nobody replies within 3 minutes, reserve a default "
+                "display case' is ONE pending entry — `when`/`then` for the reply, "
+                "`until.seconds` for the three minutes, `otherwise` for the "
+                "default display case. Like `then` it is a goal in prose, planned "
+                "fresh if the moment comes. Omit it when a quiet window "
+                "genuinely calls for nothing; a condition that fired at "
+                "least once is owed nothing, because the thing it waited for "
+                "happened.\n"
+                "Do NOT express a timeout as a sub-goal that waits. 'Wait up "
+                "to 3 minutes for a reply, and stop early if one arrives' is "
+                "the shape to avoid: it has no exit that ACTS, so the agent "
+                "waits and then does nothing — exactly the outcome the goal "
+                "was guarding against. There is no step that waits. The "
+                "window is `until.seconds`, the reply branch is `then`, and "
+                "the timeout branch is `otherwise`.\n"
             ),
             variants=(
                 PromptVariant(
@@ -1086,6 +1128,17 @@ PLAN_PROMPT = PromptManifest(
                 '     "then": "Rebook the Rembrandt restoration slot for the '
                 'day she proposes, clearing whatever is already booked then",\n'
                 '     "until": "the restoration slot has taken place"}]}\n'
+                'Example — a timeout branch, goal: "Ask the curator which '
+                "display case to use; if after 2 minutes nobody has answered, "
+                'reserve the default display case for the loaned vase."\n'
+                '  "pending": [{"watch": {"signal": "state_changed", '
+                '"source": "<messaging tool id>", "path": "conversations", '
+                '"kind": "added"},\n'
+                '     "when": "the curator names a display case",\n'
+                '     "then": "Reserve the display case the curator names",\n'
+                '     "until": {"text": "two minutes have passed", '
+                '"seconds": 120},\n'
+                '     "otherwise": "Reserve the default display case for the loaned vase"}]\n'
             ),
             variants=(
                 PromptVariant(

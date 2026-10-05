@@ -538,7 +538,7 @@ async def test_a_replan_beside_an_open_window_is_shown_what_is_armed(tmp_path: P
     _system, user = llm.calls[-1]
     assert "Conditions already armed and watching:" in user
     assert _THEN in user  # the `then` it will run, so the plan need not run it
-    assert "do NOT plan the work a `then` describes" in user
+    assert "Do NOT plan either branch's work inline" in user
 
 
 async def test_a_plan_with_nothing_armed_renders_no_such_section(tmp_path: Path) -> None:

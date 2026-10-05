@@ -55,10 +55,14 @@ from sora.types import (
     ObservableProperty,
     OperationAck,
     OperationInvocation,
+    PendingCondition,
+    PendingConditionState,
     Plan,
     Signal,
+    SignalWait,
     Step,
     SupersededPlan,
+    Until,
 )
 
 
@@ -238,6 +242,30 @@ async def test_infer_defaults_missing_action_to_invoke(tmp_path: Path) -> None:
     plan = await mem.infer(_activity("what time"), {})
 
     assert plan.steps == [invoke_step("clock", "get_time", tz="UTC")]
+
+
+async def test_replan_preserves_an_armed_conditions_expiry_work(tmp_path: Path) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+    activity = _activity("arrange transport after asking colleagues")
+    activity.pending_conditions.append(
+        PendingConditionState(
+            condition=PendingCondition(
+                watch=SignalWait(signal_name="state_changed", source="messenger"),
+                when="a colleague volunteers",
+                then="report who volunteered",
+                until=Until(text="the response window closes", seconds=180),
+                otherwise="book transport, notify the colleagues, and report the outcome",
+            )
+        )
+    )
+
+    await mem.infer(activity, {})
+
+    _system, user = llm.calls[-1]
+    assert "Conditions already armed and watching:" in user
+    assert "then  report who volunteered" in user
+    assert "otherwise book transport, notify the colleagues, and report the outcome" in user
 
 
 async def test_infer_prompt_carries_goal_and_tool_operations(tmp_path: Path) -> None:

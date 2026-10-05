@@ -169,6 +169,7 @@ class _StopController:
             or (
                 activity.state is ActivityState.BLOCKED
                 and isinstance(activity.blocked_on, InputWait | ConditionWait)
+                and not _owes_a_timeout_branch(activity)
             )
             for activity in activities
         )
@@ -220,6 +221,35 @@ def _timeline_expired(simulation: Any) -> bool:
     except Exception:  # a diagnostic must never cost the run its real result
         log.warning("timeline-expiry probe failed", exc_info=True)
         return False
+
+
+def _owes_a_timeout_branch(activity: Any) -> bool:
+    """Whether this activity is waiting out a declared window that still owes its ``otherwise``.
+
+    A ``ConditionWait`` otherwise counts as finished, which is right for an open-ended condition:
+    waiting indefinitely on a reply that may never arrive would hang the scenario past its own
+    timeline. It is wrong for a window carrying BOTH a clock bound and an ``otherwise``, because
+    that pair is a promise of future work — the branch is owed the instant the window closes
+    unfired. Treating it as finished tears the run down in the same breath as the block, so the
+    branch can never run and the scenario records the branch's writes as missing, which reads as a
+    planning failure rather than the harness one it is.
+
+    Idle waiting is not free of environment time — the clock freeze removes GENERATION from the
+    scenario clock, not the waiting — so the window does close if the run is allowed to sit there,
+    and ``deadline`` still bounds how long that can take.
+
+    The three exclusions mirror the authorization in ``_queue_expiry_branches`` exactly, so this
+    cannot hold a run open on a branch that site would decline: a condition that ever fired owes
+    nothing (the awaited event happened), a settled expiry has already had its branch dispatched,
+    and an event-shaped ``until`` has no clock bound to wait out in the first place."""
+    for state in getattr(activity, "pending_conditions", ()) or ():
+        condition = state.condition
+        if condition.otherwise is None or state.ever_fired or state.expiry_settled:
+            continue
+        until = condition.until
+        if until is not None and until.seconds is not None:
+            return True
+    return False
 
 
 def _make_stop_when(

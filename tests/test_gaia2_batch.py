@@ -469,13 +469,17 @@ def _agent_with(
     states: list[ActivityState],
     blocked_on: list[Any] | None = None,
     *,
+    pending_conditions: list[list[Any]] | None = None,
     cycle_count: int = 0,
     logical_call_limit_exceeded: bool = False,
 ) -> SimpleNamespace:
     waits: list[Any] = blocked_on if blocked_on is not None else [None] * len(states)
+    conditions: list[list[Any]] = (
+        pending_conditions if pending_conditions is not None else [[] for _ in states]
+    )
     activities = {
-        i: SimpleNamespace(state=st, blocked_on=w)
-        for i, (st, w) in enumerate(zip(states, waits, strict=True))
+        i: SimpleNamespace(state=st, blocked_on=w, pending_conditions=c)
+        for i, (st, w, c) in enumerate(zip(states, waits, conditions, strict=True))
     }
     return SimpleNamespace(
         working=SimpleNamespace(activities=activities),
@@ -658,6 +662,83 @@ def test_stop_when_rides_through_a_judge_pause() -> None:
     predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
     assert predicate is not None
     assert predicate() is False
+
+
+def _timeout_condition(
+    *, otherwise: str | None = "Order a default cab", seconds: float | None = 180.0, **marks: bool
+) -> SimpleNamespace:
+    """One `pending_conditions` entry, in the shape `_StopController` reads it."""
+    return SimpleNamespace(
+        condition=SimpleNamespace(
+            otherwise=otherwise,
+            until=None if seconds is None else SimpleNamespace(seconds=seconds),
+        ),
+        ever_fired=marks.get("ever_fired", False),
+        expiry_settled=marks.get("expiry_settled", False),
+    )
+
+
+def test_stop_when_waits_out_a_window_that_still_owes_its_otherwise() -> None:
+    """An agent waiting out a declared timeout has definite future work, and must not be torn down.
+
+    A `ConditionWait` normally counts as finished, which is right for an open-ended condition —
+    waiting forever on a reply that may never come would hang the scenario. It is wrong for a
+    window with a clock bound AND an `otherwise`: the branch is owed the moment the window closes
+    unfired, so stopping here is what makes the timeout unreachable. Observed on a real run: the
+    planner emitted `until.seconds` and `otherwise` exactly as intended, blocked, and was cancelled
+    in the same instant — scoring 0 with the branch's writes missing, which reads as a planning
+    failure rather than a harness one. Environment time advances over the idle wait (it is the
+    GENERATION that the clock freeze removes, not the waiting), so the window does close if the run
+    is allowed to sit there, and the wall cap still bounds it."""
+    sim = _sim(running=False)
+    agent = _agent_with(
+        [ActivityState.BLOCKED],
+        [ConditionWait()],
+        pending_conditions=[[_timeout_condition()]],
+    )
+    predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
+    assert predicate is not None
+    assert predicate() is False
+    assert predicate.reason is None
+
+
+def test_stop_when_stops_once_the_owed_branch_is_settled_or_moot() -> None:
+    """The three ways nothing is owed any more, each of which must still stop the run.
+
+    Without these the fix trades an unreachable branch for a run that never ends: a condition that
+    already fired owes nothing (the awaited event happened), a settled expiry has had its branch
+    dispatched, and an event-shaped `until` has no clock bound to wait for in the first place."""
+    for label, condition in (
+        ("fired", _timeout_condition(ever_fired=True)),
+        ("settled", _timeout_condition(expiry_settled=True)),
+        ("event-shaped", _timeout_condition(seconds=None)),
+        ("no branch owed", _timeout_condition(otherwise=None)),
+    ):
+        sim = _sim(running=False)
+        agent = _agent_with(
+            [ActivityState.BLOCKED],
+            [ConditionWait()],
+            pending_conditions=[[condition]],
+        )
+        predicate = _make_stop_when(sim, agent, None, _FAR_DEADLINE)
+        assert predicate is not None
+        assert predicate() is True, label
+        assert predicate.reason == "verification_completion", label
+
+
+def test_stop_when_an_owed_window_still_yields_to_the_wall_cap() -> None:
+    # The wait is bounded by the same cap as everything else -- an owed branch cannot hold a run
+    # open past its deadline.
+    sim = _sim(running=False)
+    agent = _agent_with(
+        [ActivityState.BLOCKED],
+        [ConditionWait()],
+        pending_conditions=[[_timeout_condition()]],
+    )
+    predicate = _make_stop_when(sim, agent, None, -1.0)
+    assert predicate is not None
+    assert predicate() is True
+    assert predicate.reason == "timeout"
 
 
 def test_stop_when_a_pause_that_never_ends_is_a_stall(monkeypatch: pytest.MonkeyPatch) -> None:
