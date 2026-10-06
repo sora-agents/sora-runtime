@@ -88,6 +88,18 @@ SELECT_PROMPT = PromptManifest(
             ),
         ),
         PromptModule(
+            name="predicate-scope",
+            text=(
+                "Test exactly the predicate's stated clauses; do not add an "
+                "extra membership or co-occurrence requirement. A list that "
+                "contains at least one value OTHER THAN X need not contain X "
+                "itself: [A, B] satisfies that rule when neither value is X, "
+                "just as [X, A] does. Require X to occur only when the predicate "
+                "also asks for its presence. Evaluate every item against the "
+                "whole rule and return all items that satisfy it.\n"
+            ),
+        ),
+        PromptModule(
             name="missing-context",
             text=(
                 "There is a second legal answer, for one specific case: the "

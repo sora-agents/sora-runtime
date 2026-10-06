@@ -1,13 +1,14 @@
 """``examples/gaia2/batch.py`` + ``_runner.py`` — pure formatting/aggregation and the turn-aware
-stop predicate, tested directly (no ARE, no model tokens). The parts that touch ARE or spend tokens
-(scenario iteration, judge, trace export) are exercised by the operator-run correctness gate, not
-here.
+stop predicate, tested directly (no ARE, no model tokens). Optional loader/exporter imports are
+stubbed for orchestration tests; live scenario loading, judging and trace export are exercised by
+the operator-run correctness gate.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import threading
 import time
 from argparse import Namespace
@@ -421,6 +422,18 @@ def test_charge_accounting_mismatch_is_recorded_without_aborting_scenario(
         llm_round_trips=2,
         llm_max_in_flight=2,
         llm_overlapped_round_trips=2,
+    )
+    # No environment was returned, so neither exporter nor status is used; only the lazy imports
+    # need to resolve. Keep this accounting test runnable without the optional ARE group.
+    monkeypatch.setitem(
+        sys.modules,
+        "are.simulation.data_handler.exporter",
+        SimpleNamespace(JsonScenarioExporter=object),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "are.simulation.scenarios.scenario",
+        SimpleNamespace(ScenarioStatus=object),
     )
     monkeypatch.setattr("examples.gaia2._runner.run_scenario", lambda *_a, **_k: result)
     monkeypatch.setattr("sora.adapters.are_sim.populate_oracle_events", lambda _scenario: None)
@@ -1149,9 +1162,6 @@ def test_paper_manifest_is_the_complete_five_capability_gaia2_mini_selection() -
 def test_pinned_hf_loader_uses_repository_revision_not_builder_parameter(
     monkeypatch: Any,
 ) -> None:
-    import datasets  # type: ignore
-    from are.simulation.benchmark import scenario_loader
-
     captured: dict[str, Any] = {}
 
     def fake_load_dataset(dataset: str, **kwargs: Any) -> dict[str, list[dict[str, Any]]]:
@@ -1160,11 +1170,16 @@ def test_pinned_hf_loader_uses_repository_revision_not_builder_parameter(
         return {"validation": [{"scenario_id": "scenario-a", "data": "{}", "run_number": 7}]}
 
     scenario = SimpleNamespace(scenario_id="scenario-a", run_number=None)
-    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
-    monkeypatch.setattr(
-        scenario_loader,
-        "load_scenario",
-        lambda *_args, **_kwargs: (scenario, []),
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
+    monkeypatch.setitem(
+        sys.modules,
+        "are.simulation.benchmark.scenario_loader",
+        SimpleNamespace(load_scenario=lambda *_args, **_kwargs: (scenario, [])),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "are.simulation.data_handler.models",
+        SimpleNamespace(ExportedHuggingFaceMetadata=SimpleNamespace),
     )
 
     rows = list(
@@ -1684,15 +1699,17 @@ def test_aggregate_suppresses_pass_at_1_for_mixed_scenario_manifests(tmp_path: P
 def test_empty_dataset_refuses_before_truncating_sweep_artifacts(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    from are.simulation.benchmark import scenario_loader
-
     config_dir = tmp_path / "standard" / "mini"
     config_dir.mkdir(parents=True)
     output = config_dir / "output.jsonl"
     calls = config_dir / "llm_calls.jsonl"
     output.write_text("paid output\n")
     calls.write_text("paid calls\n")
-    monkeypatch.setattr(scenario_loader, "setup_scenarios_iterator", lambda **_kwargs: iter(()))
+    monkeypatch.setitem(
+        sys.modules,
+        "are.simulation.benchmark.scenario_loader",
+        SimpleNamespace(setup_scenarios_iterator=lambda **_kwargs: iter(())),
+    )
     args = Namespace(
         output_dir=str(tmp_path),
         arm="sora",
@@ -1719,6 +1736,11 @@ def test_empty_dataset_refuses_before_truncating_sweep_artifacts(
 def test_manifest_is_fully_resolved_before_truncating_sweep_artifacts(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "are.simulation.benchmark.scenario_loader",
+        SimpleNamespace(setup_scenarios_iterator=lambda **_kwargs: iter(())),
+    )
     config_dir = tmp_path / "standard" / "time"
     config_dir.mkdir(parents=True)
     output = config_dir / "output.jsonl"

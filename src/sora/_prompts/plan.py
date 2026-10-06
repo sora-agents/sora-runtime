@@ -22,6 +22,19 @@ from sora._prompts.core import (
 
 _NO_PROPERTY_REFERENCES = ""
 
+_SEARCH_QUERY_RECOVERY = (
+    "Separate retrieval names from selection criteria. A name search may match "
+    "a literal substring, so adding a medium, size, availability or other "
+    "qualifier to the query can hide the named record. Search using a short "
+    "distinctive name fragment, then check EVERY requested qualifier against "
+    "the returned records and their variants. An empty result proves only "
+    "that this query matched nothing. Before declaring the item absent or "
+    "asking for a substitute, try a shorter name fragment or another suitable "
+    "read operation; on replan, do not repeat the same failed query unchanged. "
+    "Keep those retrieval attempts bounded and never relax the selection "
+    "criteria to make a match.\n"
+)
+
 _NAME_MATCHING_WITHOUT_PROPERTIES = (
     "When the value you match on is a NAME the USER phrased, `eq` "
     "matches only the stored string in full, and people name "
@@ -61,7 +74,7 @@ _NAME_SEARCH_WITHOUT_PROPERTIES = (
     "user which one they meant. Do not re-tighten to an `eq` on "
     "the name to cut the list down: that is the same mistake one "
     "step later.\n"
-)
+) + _SEARCH_QUERY_RECOVERY
 
 _NARROWING_WITHOUT_PROPERTIES = (
     "Where data is reachable through operations, narrow it before "
@@ -265,6 +278,11 @@ PLAN_PROMPT = PromptManifest(
                 "When sharing event or booking details with a start and end time, "
                 "include both bounds AND the duration computed from them explicitly. "
                 "Do not leave the recipient to calculate the duration.\n"
+                "One unresolved item does not cancel independent work in the "
+                "same goal. Complete the remaining authorized steps that do not "
+                "depend on it before asking the user about that item, and report "
+                "the completed work and the precise unresolved part. Do not "
+                "replace the whole remaining plan with a substitution question.\n"
                 "One exception, and it decides whether a deferred task counts "
                 "at all: when the activity has a `pending` condition carrying "
                 "BOTH a `then` and an `otherwise`, one of those two branches "
@@ -443,7 +461,8 @@ PLAN_PROMPT = PromptManifest(
                 "user which one they meant. Do not re-tighten to an `eq` on "
                 "the name to cut the list down: that is the same mistake one "
                 "step later.\n"
-            ),
+            )
+            + _SEARCH_QUERY_RECOVERY,
             variants=(
                 PromptVariant(
                     channels=OPERATIONS_ONLY,
