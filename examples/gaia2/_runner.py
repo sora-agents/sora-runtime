@@ -83,6 +83,7 @@ class RunResult:
     llm_report: Any = None
     replan_count: int = 0
     terminal_cause: str | None = None
+    terminal_inference_errors: tuple[str, ...] = ()
     agent_llm_calls: int = 0
     external_actions: int = 0
     decision_cycles: int = 0
@@ -639,12 +640,13 @@ def run_scenario(
         if truncation is None and wall_expired():
             truncation = "wall_clock"
 
+        inference_errors = _terminal_inference_errors(session.llm_report)
         terminal_cause = _terminal_cause(
             exc,
             expired,
             stop_reason,
             outcome.success if isinstance(outcome.success, bool) else None,
-            inference_errors=_terminal_inference_errors(session.llm_report),
+            inference_errors=inference_errors,
         )
 
         return RunResult(
@@ -669,6 +671,7 @@ def run_scenario(
                 for activity in agent.working.activities.values()
             ),
             terminal_cause=terminal_cause,
+            terminal_inference_errors=inference_errors,
             agent_llm_calls=agent.procedural.logical_calls_admitted,
             external_actions=agent.cycle.external_action_count,
             decision_cycles=agent.cycle.cycle_count,

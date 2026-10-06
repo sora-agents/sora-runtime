@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Iterable
@@ -261,9 +262,10 @@ class LLMCallWriter:
     twice. The default appends, which is what a driver aimed at an operator-chosen path wants.
     """
 
-    def __init__(self, path: str | Path, *, reset: bool = False) -> None:
+    def __init__(self, path: str | Path, *, reset: bool = False, durable: bool = False) -> None:
         self.path = Path(path)
         self._reset = reset
+        self._durable = durable
         self._truncated = False
         self._lock = threading.Lock()
         self._handle: Any = None
@@ -285,6 +287,8 @@ class LLMCallWriter:
                 self.open()
             self._handle.write(json.dumps(asdict(record), sort_keys=True) + "\n")
             self._handle.flush()
+            if self._durable:
+                os.fsync(self._handle.fileno())
             self.written += 1
 
     def close(self) -> None:

@@ -577,6 +577,7 @@ def _jsonl_record(
     awaiting_input: list[str] | None = None,
     harness_truncation: str | None = None,
     terminal_cause: str | None = None,
+    terminal_inference_errors: tuple[str, ...] = (),
     max_wall_seconds: float | None = None,
     write_counts: Any = None,
     timeline_expired: bool = False,
@@ -639,6 +640,7 @@ def _jsonl_record(
         # now, dropped on the way into this record — which left a watchdog-truncated run looking
         # exactly like one that finished.
         "terminal_cause": terminal_cause,
+        "terminal_inference_errors": list(terminal_inference_errors) or None,
         # The watchdog value this run was given. Part of the timing configuration, not a harness
         # detail: under a frozen clock the cap is the only bound on a trajectory's length, so a row
         # that does not carry it cannot say whether its own truncation was plausible.
@@ -818,7 +820,14 @@ def _artifact_paths(config_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in config_dir.rglob("*")
-        if path.is_file() and path.name not in {ARTIFACT_CHECKSUMS, ARTIFACT_ATTESTATION}
+        if path.is_file()
+        and path
+        not in {
+            config_dir / ARTIFACT_CHECKSUMS,
+            config_dir / ARTIFACT_ATTESTATION,
+            config_dir / (ARTIFACT_CHECKSUMS + ".tmp"),
+            config_dir / (ARTIFACT_ATTESTATION + ".tmp"),
+        }
     )
 
 
@@ -867,6 +876,20 @@ def _record_provenance(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _atomic_artifact_text(path: Path, value: str) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        file.write(value)
+        file.flush()
+        os.fsync(file.fileno())
+    temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def write_artifact_attestation(
     config_dir: str, *, arm: str, capability: str, records: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -889,8 +912,8 @@ def write_artifact_attestation(
         "records": _record_provenance(records),
     }
     attestation["attestation_sha256"] = _attestation_digest(attestation)
-    (directory / ARTIFACT_CHECKSUMS).write_text(_render_checksum_manifest(files), encoding="utf-8")
-    (directory / ARTIFACT_ATTESTATION).write_text(canonical_json(attestation), encoding="utf-8")
+    _atomic_artifact_text(directory / ARTIFACT_CHECKSUMS, _render_checksum_manifest(files))
+    _atomic_artifact_text(directory / ARTIFACT_ATTESTATION, canonical_json(attestation))
     return attestation
 
 
@@ -1494,16 +1517,39 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
     # ARE's own agent and never reads these prompts, so a digest on its rows would assert a
     # dependency that does not exist.
     if args.arm == "sora":
-        from examples.gaia2.evaluation.campaigns.prompt.snapshot import live_prompts_digest
+        from examples.gaia2.evaluation.campaigns.prompt.snapshot import (
+            live_prompts_digest,
+            load_prompt_snapshot,
+            verify_live_prompts,
+        )
 
-        args.prompt_snapshot_digest = live_prompts_digest()
+        snapshot_path = getattr(args, "prompt_snapshot", None)
+        args.prompt_snapshot_digest = (
+            verify_live_prompts(load_prompt_snapshot(snapshot_path))
+            if snapshot_path is not None
+            else live_prompts_digest()
+        )
     config_dir = os.path.join(_arm_root(args.output_dir, args.arm), "standard", args.capability)
     # Before os.makedirs, and well before either artifact is opened in truncate mode: a run that
     # discovers its destination is contaminated after spending tokens has already lost the tokens,
     # and a run that discovers it after truncating has destroyed the evidence it was refusing.
-    refuse_contaminated_root(
-        config_dir, allow_unattested=getattr(args, "overwrite_unattested", False)
-    )
+    checkpoint_plan = getattr(args, "checkpoint_plan", None)
+    if checkpoint_plan is not None:
+        from examples.gaia2.checkpoints import ScenarioCheckpoints
+
+        if (
+            sweep_manifest is None
+            or not args.judge_model
+            or getattr(args, "pause_file", None) is None
+        ):
+            raise ValueError("scenario checkpoints require a manifest, judge, and pause file")
+        ScenarioCheckpoints(
+            Path(config_dir), checkpoint_plan, arm=args.arm, capability=args.capability
+        ).verify()
+    else:
+        refuse_contaminated_root(
+            config_dir, allow_unattested=getattr(args, "overwrite_unattested", False)
+        )
 
     if args.judge_model:
         # Said once at the top of the sweep as well as per record: an operator watching the run
@@ -1556,6 +1602,16 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
     # Probe before opening either artifact in truncate mode. A cache/revision miss in ARE's loader
     # can otherwise replace a paid capability with empty files and print a deceptively clean 0/0.
     first_run_scenarios = scenarios_for_run()
+    if checkpoint_plan is not None:
+        from examples.gaia2.checkpoints import run_checkpointed
+
+        return run_checkpointed(
+            args,
+            Path(config_dir),
+            first_run_scenarios,
+            scenarios_for_run,
+            record_judge=record_judge,
+        )
 
     # The destination passed the early provenance guard and the scenario selection is usable. Move
     # explicitly disposable, unattested leftovers aside only now, at the last responsible moment
@@ -1622,6 +1678,24 @@ def _run_capability(args: argparse.Namespace) -> list[dict[str, Any]]:
         f"(artifact set {attestation['artifact_set_sha256'][:12]})"
     )
     return records
+
+
+def _isolated_scenario_config(
+    config: str, config_dir: str, scenario_id: str, run_number: int
+) -> str:
+    """Reserve fresh durable memory before building an agent; never reuse a previous attempt."""
+    import yaml
+
+    source = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
+    key = f"{sha256_text(scenario_id)[:16]}.run{run_number}"
+    state_root = (Path(config_dir) / "state" / key).resolve()
+    state_root.mkdir(parents=True, exist_ok=False)
+    source["agent"]["memory"] = {
+        kind: f"file://{state_root / kind}" for kind in ("semantic", "procedural", "episodic")
+    }
+    config_path = state_root / "agent.yaml"
+    config_path.write_text(yaml.safe_dump(source, sort_keys=False), encoding="utf-8")
+    return str(config_path)
 
 
 def _run_one_scenario(
@@ -1703,9 +1777,14 @@ def _run_one_scenario(
                 charge_model_digest=charge_digest,
             )
         else:
+            config = args.config
+            if getattr(args, "isolate_memory", False):
+                config = _isolated_scenario_config(
+                    config, config_dir, str(scenario.scenario_id), run_number
+                )
             result = run_scenario(
                 scenario,
-                config=args.config,
+                config=config,
                 verbose=args.verbose,
                 max_wall_seconds=args.max_wall_seconds,
                 read_stdin=False,
@@ -1781,6 +1860,7 @@ def _run_one_scenario(
         timeline_expired=result.timeline_expired,
         harness_truncation=result.harness_truncation,
         terminal_cause=result.terminal_cause,
+        terminal_inference_errors=getattr(result, "terminal_inference_errors", ()),
         max_wall_seconds=args.max_wall_seconds,
         verdict_parse=_verdict_parse(args),
         charged_seconds=result.charged_seconds,
@@ -1857,6 +1937,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_DEFAULT_CONFIG,
         metavar="AGENT_YAML",
         help=f"Agent config for --arm sora (default: {_DEFAULT_CONFIG}).",
+    )
+    parser.add_argument("--supervisor-pid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--checkpoint-plan", type=Path, help="Launcher plan for resumable scenario checkpoints."
+    )
+    parser.add_argument(
+        "--pause-file",
+        type=Path,
+        help="Stop between scenarios when this launcher drain marker exists.",
+    )
+    parser.add_argument(
+        "--isolate-memory",
+        action="store_true",
+        help="Give each scenario/repeat fresh file-backed memory inside its artifact directory.",
+    )
+    parser.add_argument(
+        "--prompt-snapshot",
+        type=Path,
+        help="Verify S-ORA's live prompts against this named snapshot before any paid calls.",
     )
     parser.add_argument(
         "--profile",

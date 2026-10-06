@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "paper2027-infrastructure-canary-not-evidence",
+  "dataset": "meta-agents-research-environments/gaia2",
+  "revision": "78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99",
+  "split": "validation",
+  "cases": [
+    {"capability": "search", "id": "scenario_universe_28_4sn4lc"},
+    {"capability": "time", "id": "scenario_universe_27_daamy9"}
+  ]
+}

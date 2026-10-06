@@ -22,6 +22,9 @@ the frozen artifacts themselves, including the exact
 [Gaia2 mini manifest](campaigns/paper2027/mini-validation.json), the immutable prompt snapshots
 under `campaigns/prompt/snapshots/`, and the separately checked campaign configuration.
 
+For bounded subprocess sweeps and the eight-run infrastructure canary, see
+[Concurrent Gaia2 runs](CONCURRENT.md). The launcher defaults to a dry run.
+
 ## The frozen charge coefficients are failing their audit
 
 The compact evidence for the 2026-09-21 charge audit is preserved in [`gates/2026-09-21/`](gates/2026-09-21/)
