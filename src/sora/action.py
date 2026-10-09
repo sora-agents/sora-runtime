@@ -282,6 +282,7 @@ class InvokeAction:  # predefined external action: _invoke_
         )
         activity.state = ActivityState.RUNNING  # implicit, unconditional — see Activities
         log.info("act: invoke %s.%s%s", tool_id, operation_name, f" {params}" if params else "")
+        _flag_possible_repeated_write(activity, invocation, tool)
         _spawn_tracked(self._tasks, self._call(cycle, tool, operation_name, params, invocation_id))
         return ActionAck(ok=True)  # immediate — the round-trip runs off-cycle, cycle never blocks
 
@@ -295,6 +296,56 @@ class InvokeAction:  # predefined external action: _invoke_
     ) -> None:
         ack = await tool.invoke(operation_name, **params)
         cycle.result_sink.push(invocation_id, ack)  # keyed by invocation_id, not tool_id
+
+
+def _flag_possible_repeated_write(
+    activity: Activity, invocation: OperationInvocation, tool: Tool
+) -> None:
+    """Log-only tripwire: a write identical to one that already succeeded in this activity.
+
+    Diagnostic, never a guard: an identical write can be legitimate, and the event cannot say why
+    the planner repeated it. It exists so runs can show whether context that restates the root
+    request (sub-goal and then-branch planning) leads a child plan to redo its parent's work. The
+    history is shared by every frame and ``history_mark`` moves on replan, so the payload records
+    the raw position facts rather than inferring which frame owned the earlier call. Only
+    operations declared ``side_effecting=True`` are checked; unknown metadata is a coverage gap."""
+    spec = tool.manual.operation(invocation.operation_name)
+    if spec is None or spec.side_effecting is not True:
+        return
+    earlier = [
+        index
+        for index, completed in enumerate(activity.history)
+        if completed.ack.ok and completed.invocation == invocation
+    ]
+    if not earlier:
+        return
+    frame_goal = None
+    if activity.parent_frames:
+        parent_plan, parent_index, _mark = activity.parent_frames[-1]
+        if 0 <= parent_index < len(parent_plan.steps):
+            frame_goal = parent_plan.steps[parent_index].params.get("goal")
+    log.warning(
+        "act: possible repeated write %s.%s in activity %s (earlier success at history %s)",
+        invocation.tool_id,
+        invocation.operation_name,
+        activity.id,
+        earlier,
+    )
+    emit_runtime_event(
+        "action.possible_repeated_write",
+        activity_id=activity.id,
+        payload={
+            "tool_id": invocation.tool_id,
+            "operation_name": invocation.operation_name,
+            "arguments": diagnostic_preview(invocation.params),
+            "earlier_history_indexes": earlier,
+            "history_length": len(activity.history),
+            "history_mark": activity.history_mark,
+            "frame_depth": len(activity.parent_frames),
+            "frame_goal": diagnostic_preview(frame_goal),
+            "step_index": activity.step_index,
+        },
+    )
 
 
 def invoke_step(tool_id: str, operation_name: str, **op_args: Any) -> Step:
@@ -622,6 +673,7 @@ class InferAction:  # predefined internal action: _infer_ — the async plan mod
             else replace(
                 activity,
                 goal=goal,
+                originating_goal=activity.originating_goal or activity.goal,
                 superseded=activity.superseded if replanning else None,
                 parent_frames=frames,
             )

@@ -50,7 +50,9 @@ from sora.action import (
 )
 from sora.activity import Activity, ActivityState
 from sora.cycle import DecisionCycle
+from sora.diagnostics import RuntimeEventCollector, collect_runtime_events
 from sora.environment import EnvironmentRegistry, Tool, WorkspaceOrigin
+from sora.manual import Manual, OperationSpecification
 from sora.memory import (
     EpisodicMemory,
     FileMemoryBackend,
@@ -70,11 +72,16 @@ from sora.strategies import (
 from sora.types import (
     OPERATION_NAME,
     TOOL_ID,
+    CompletedOperation,
     InferenceKind,
     ObservableProperty,
+    OperationAck,
+    OperationInvocation,
     PendingInference,
+    Plan,
     Signal,
     SignalWait,
+    Step,
 )
 
 # --------------------------------------------------------------------------------------------------
@@ -283,6 +290,136 @@ async def test_concurrent_invokes_get_distinct_ids_and_both_land(tmp_path: Path)
     drained = dict([item async for item in cycle.result_sink.drain()])
     assert set(drained) == {a1.pending_operation.id, a2.pending_operation.id}
     assert all(ack.ok for ack in drained.values())
+
+
+def _write_manual(side_effecting: bool | None) -> Manual:
+    return Manual(
+        id="EmailClientApp",
+        metadata={},
+        description="email",
+        observable_properties=[],
+        signals=[],
+        operations=[
+            OperationSpecification(
+                name="send_email", description="", parameters={}, side_effecting=side_effecting
+            )
+        ],
+    )
+
+
+def _sent(to: str) -> CompletedOperation:
+    return CompletedOperation(
+        OperationInvocation(
+            tool_id="EmailClientApp", operation_name="send_email", params={"to": to}
+        ),
+        OperationAck(ok=True),
+    )
+
+
+async def _invoke_send(
+    tmp_path: Path, side_effecting: bool | None, history: list[CompletedOperation], to: str
+) -> tuple[Activity, FakeTool, tuple[dict[str, Any], ...]]:
+    tool = FakeTool(
+        "EmailClientApp",
+        manual=_write_manual(side_effecting),
+        invoke_results={"send_email": {"sent": True}},
+    )
+    registry, _ = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, _, _ = _cycle(registry, tmp_path)
+    activity = _add_activity(cycle, "a1")
+    activity.history.extend(history)
+    events = RuntimeEventCollector()
+    with collect_runtime_events(events):
+        ack = await InvokeAction().execute(
+            registry,
+            cycle,
+            activity_id="a1",
+            tool_id="EmailClientApp",
+            operation_name="send_email",
+            to=to,
+        )
+    assert ack.ok is True  # the tripwire never blocks dispatch
+    await asyncio.sleep(0)
+    return (
+        activity,
+        tool,
+        tuple(e for e in events.snapshot() if e["event"] == "action.possible_repeated_write"),
+    )
+
+
+async def test_invoke_flags_a_write_identical_to_an_earlier_success_without_blocking_it(
+    tmp_path: Path,
+) -> None:
+    failed = CompletedOperation(_sent("bo@x.com").invocation, OperationAck(ok=False))
+    _, tool, flagged = await _invoke_send(
+        tmp_path, True, [_sent("al@x.com"), failed, _sent("bo@x.com")], "bo@x.com"
+    )
+    assert tool.invoked_with == ("send_email", {"to": "bo@x.com"})
+    [event] = flagged
+    payload = event["payload"]
+    assert event["activity_id"] == "a1"
+    # Only the successful identical call counts: the failed attempt at index 1 is not a write.
+    assert payload["earlier_history_indexes"] == [2]
+    assert payload["operation_name"] == "send_email"
+    assert payload["history_length"] == 3
+
+
+async def test_invoke_flag_records_the_active_frame_goal(tmp_path: Path) -> None:
+    tool = FakeTool(
+        "EmailClientApp",
+        manual=_write_manual(True),
+        invoke_results={"send_email": {"sent": True}},
+    )
+    registry, _ = _registry_with(tool)
+    await registry.join(_ORIGIN)
+    cycle, _, _ = _cycle(registry, tmp_path)
+    activity = _add_activity(cycle, "a1")
+    activity.history.append(_sent("bo@x.com"))
+    parent = Plan(
+        id="p",
+        goal="root",
+        steps=[Step(next_action="subgoal", params={"goal": "email the agent"})],
+    )
+    activity.parent_frames.append((parent, 0, 1))
+    activity.history_mark = 1
+    events = RuntimeEventCollector()
+    with collect_runtime_events(events):
+        await InvokeAction().execute(
+            registry,
+            cycle,
+            activity_id="a1",
+            tool_id="EmailClientApp",
+            operation_name="send_email",
+            to="bo@x.com",
+        )
+    [event] = [e for e in events.snapshot() if e["event"] == "action.possible_repeated_write"]
+    assert event["payload"]["frame_depth"] == 1
+    assert event["payload"]["frame_goal"] == "email the agent"
+    # Raw position facts only: the earlier call precedes the mark, but ownership is not inferred.
+    assert event["payload"]["history_mark"] == 1
+    assert event["payload"]["earlier_history_indexes"] == [0]
+
+
+@pytest.mark.parametrize(
+    ("side_effecting", "history", "to"),
+    [
+        (True, [_sent("al@x.com")], "bo@x.com"),  # different arguments
+        (  # an identical call that failed: retrying it is not a repeat
+            True,
+            [CompletedOperation(_sent("bo@x.com").invocation, OperationAck(ok=False))],
+            "bo@x.com",
+        ),
+        (False, [_sent("bo@x.com")], "bo@x.com"),  # a read is never flagged
+        (None, [_sent("bo@x.com")], "bo@x.com"),  # unknown metadata: a known coverage gap
+    ],
+)
+async def test_invoke_does_not_flag_new_reads_or_unknown_operations(
+    tmp_path: Path, side_effecting: bool | None, history: list[CompletedOperation], to: str
+) -> None:
+    _, tool, flagged = await _invoke_send(tmp_path, side_effecting, history, to)
+    assert flagged == ()
+    assert tool.invoked_with == ("send_email", {"to": to})
 
 
 # --------------------------------------------------------------------------------------------------

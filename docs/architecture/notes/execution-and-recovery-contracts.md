@@ -43,7 +43,15 @@ nonmatch semantics; a nonmatch is not a certificate that source data is complete
 
 A child inference receives its own goal and the full originating request separately as constraint
 context. The prompt directs the child to plan only its active goal, leave other work to the parent,
-and reuse completed results. The live activity's goal and execution history remain intact. A replacement plan receives the original
+and reuse completed results. Whether the model obeys is not something a test can establish, so the
+invoke action logs a `action.possible_repeated_write` runtime event when a `side_effecting`
+operation is dispatched with arguments identical to an earlier successful call in the same
+activity. It never blocks: an identical write can be legitimate, and the event cannot say why the
+planner repeated it. It records raw positions (earlier history indexes, `history_mark`, frame depth
+and goal) rather than inferring which frame owned the earlier call, because history is shared by
+every frame and the mark moves on replan. Operations with unknown `side_effecting` metadata are not
+checked, and zero events in a run is not proof that no repetition occurred.
+The live activity's goal and execution history remain intact. A replacement plan receives the original
 qualifiers, recent user instructions, executed results and the reason the previous plan failed.
 Recent messages from the user retain their full text so a final restriction cannot be lost to
 character truncation. Other senders' text and structured messages retain bounded previews. The recent-message window is still limited to ten messages; this is not a general
