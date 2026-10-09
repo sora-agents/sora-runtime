@@ -86,9 +86,9 @@ git rev-parse HEAD
 
 ```console
 uv run python -m examples.gaia2.evaluation prompt snapshot \
-  --identity pre-optimization-control \
-  --reason "Pre-optimization control captured after the byte-identical prompt source cleanup." \
-  --output examples/gaia2/evaluation/campaigns/prompt/snapshots/pre-optimization-control.json
+  --identity development-2026-10-09 \
+  --reason "Development baseline after the execution and recovery contracts; supersedes the pre-optimization control as the active prompt gate." \
+  --output examples/gaia2/evaluation/campaigns/prompt/snapshots/development-2026-10-09.json
 ```
 
 The snapshot records each of the seven semantic calls across all four perception profiles:
@@ -105,10 +105,19 @@ different bytes. Capturing it from a clean prompt-source commit records that rev
 source dirty-diff hash, why the identity was created, and a canonical digest over all 28 rendered
 rows. The test names this file directly; there is no movable `current` pointer to re-point.
 
+The active baseline is `development-2026-10-09`, captured from `2d6df3d`. It is a development
+baseline, not a final campaign baseline: prompt consolidation is expected to move it again. Each
+move is a new named snapshot from a clean commit, committed separately together with
+`BASELINE_PROMPT_SNAPSHOT` in `cli.py` and the transcribed digest in the test. Scores recorded
+under an earlier snapshot do not apply to the source after the move. The previous gate,
+`pre-optimization-control` (captured from `99ffea0`), is kept unchanged as the record that earlier
+campaign numbers were measured against; its integrity is still tested, but it is no longer compared
+with the live runtime.
+
 Evaluation profiles, settings, judge, and charge coefficients have a different lifecycle. They are
 mirrored in `campaigns/prompt/campaign.json`, regenerated with `prompt configuration`, and checked
 deeply against `profiles.json`, `judge.json`, and `charge_model.json`. That file may move until the
-campaign itself is frozen without rewriting the immutable prompt control. The dated price sheet and
+campaign itself is frozen without rewriting an immutable prompt snapshot. The dated price sheet and
 manifest digests remain report provenance rather than prompt-snapshot content.
 
 ### 2. Run the offline preflight
@@ -227,7 +236,7 @@ The pinned judge is attached automatically; the optional `--judge-model`, `--jud
 `--judge-endpoint` arguments are assertions and are rejected if they differ from the pin.
 
 Before any credential or provider is touched, the live renderer is checked against `--prompt-snapshot`
-(the control by default; a candidate arm names its own). A mismatch names the rows that moved and
+(the active baseline by default; a candidate arm names its own). A mismatch names the rows that moved and
 refuses the run, and the verified identity and digest are stamped on every record written — which is
 what lets the report tell the two arms apart. Resuming a checkpoint written under other prompts is
 refused for the same reason: use a separate output directory.
@@ -323,11 +332,11 @@ uv run python -m examples.gaia2.evaluation prompt report \
   --input "$PROMPT_CANDIDATE_OUT/checkpoint.jsonl" \
   --output "$PROMPT_PAIRED_OUT/report.json" \
   --price-sheet "$PROMPT_PRICE_SHEET" \
-  --baseline-snapshot examples/gaia2/evaluation/campaigns/prompt/snapshots/pre-optimization-control.json \
+  --baseline-snapshot examples/gaia2/evaluation/campaigns/prompt/snapshots/development-2026-10-09.json \
   --candidate-snapshot examples/gaia2/evaluation/campaigns/prompt/snapshots/<candidate>.json
 ```
 
-`--baseline-snapshot` defaults to the control, so a single-arm baseline report needs neither flag.
+`--baseline-snapshot` defaults to the active baseline, so a single-arm baseline report needs neither flag.
 `--candidate-snapshot` has **no default and cannot acquire one**: it is frozen per campaign, and a
 default would be the report guessing which prompts the candidate arm ran — the exact assumption the
 check exists to refuse. Omit it and the paired delta, its bootstrap interval, and the acceptance
@@ -346,7 +355,7 @@ Archive these outputs and inputs together:
 
 - `checkpoint.jsonl`, `report.json`, and the generated `configs/` directory;
 - the exact source commit ID and any recorded source dirty-diff hash;
-- `campaigns/prompt/snapshots/pre-optimization-control.json`, `campaigns/prompt/campaign.json`,
+- the baseline's `campaigns/prompt/snapshots/<identity>.json`, `campaigns/prompt/campaign.json`,
   `profiles.json`, and `campaigns/prompt/judge.json`;
 - `price_sheets/2026-09-12.json`;
 - all three prompt manifest files and their digests from `report.json`; and

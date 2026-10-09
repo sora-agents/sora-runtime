@@ -227,6 +227,12 @@ Frozen artifacts, verified 2026-09-21:
 | [`charge_model.json`](charge_model.json) | `9065b1dc6bda1aa832b64867b0c0c68885930f7c74bb08b6c48ad140dcbca585` | raw bytes |
 | [`campaigns/prompt/snapshots/pre-optimization-control.json`](campaigns/prompt/snapshots/pre-optimization-control.json) | `56c1cd60b049c73d12f258e03e59b31d3b00ca24cff31f647de38a5038276129` | canonical rendered prompt rows |
 
+The prompt gate moved on 2026-10-09 to
+[`campaigns/prompt/snapshots/development-2026-10-09.json`](campaigns/prompt/snapshots/development-2026-10-09.json)
+(`9bc566b1bda08f419e49156cd18bf7f4583520226454d8c48ac21d106bab9de5`, canonical rendered prompt
+rows), a development baseline captured from `2d6df3d`. The control above is kept unchanged as the
+prompt identity of results recorded before that date; those results do not apply to later source.
+
 Each of the three is a different kind of hash, and the difference is what each one is able to
 promise:
 
@@ -246,7 +252,7 @@ frozen-profile wall-clock result.
 different prompts by construction, so a single report-level snapshot can only ever describe one of
 them. Instead:
 
-- A run declares a snapshot (`--prompt-snapshot`, defaulting to the control above), and the live
+- A run declares a snapshot (`--prompt-snapshot`, defaulting to the active development baseline), and the live
   renderer is checked against all 28 of its rows *before* any credential, provider, or scenario is
   opened. A mismatch names the rows that moved and refuses the run.
 - The verified identity and digest are stamped on every record the run writes, and resuming a

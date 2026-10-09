@@ -54,7 +54,11 @@ from examples.gaia2.evaluation.core import (
 
 EVAL_ROOT = Path(__file__).parent
 PROMPT_ROOT = EVAL_ROOT / "campaigns" / "prompt"
-BASELINE_PROMPT_SNAPSHOT = PROMPT_ROOT / "snapshots" / "pre-optimization-control.json"
+# The active development baseline: runs refuse to spend unless the live prompts render to it. It
+# moves with each reviewed prompt change, always to a new named file; the control below is kept as
+# the historical record that earlier campaign numbers were measured against.
+BASELINE_PROMPT_SNAPSHOT = PROMPT_ROOT / "snapshots" / "development-2026-10-09.json"
+PRE_OPTIMIZATION_CONTROL_SNAPSHOT = PROMPT_ROOT / "snapshots" / "pre-optimization-control.json"
 CAMPAIGN_CONFIGURATION = PROMPT_ROOT / "campaign.json"
 DEFAULT_SCENARIO_ROOT = Path("examples/gaia2/scenarios")
 DEFAULT_PRICE_SHEET = EVAL_ROOT / "price_sheets" / "2026-09-12.json"
@@ -1261,8 +1265,8 @@ def _parser() -> argparse.ArgumentParser:
         default=str(BASELINE_PROMPT_SNAPSHOT),
         help=(
             "the prompt snapshot this run declares; the live renderer must match it exactly "
-            "before anything is spent. Defaults to the pre-optimization control, which is what "
-            "a baseline arm runs; a candidate arm names its own snapshot."
+            "before anything is spent. Defaults to the active development baseline, which is "
+            "what a baseline arm runs; a candidate arm names its own snapshot."
         ),
     )
     run.add_argument("--confirm-budget", required=True, type=float)

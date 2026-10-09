@@ -32,6 +32,7 @@ from examples.gaia2.evaluation.campaigns.prompt.synthetic import (
 from examples.gaia2.evaluation.cli import (
     BASELINE_PROMPT_SNAPSHOT,
     CAMPAIGN_CONFIGURATION,
+    PRE_OPTIMIZATION_CONTROL_SNAPSHOT,
     _append_checkpoint,
     _arm_live_judge_recording,
     _call_records_and_cost,
@@ -668,10 +669,22 @@ def test_the_exclusion_pathspec_is_repo_relative_and_only_built_when_needed(tmp_
     assert _exclude_pathspec(str(root), {(tmp_path / "elsewhere.json").resolve()}) == []
 
 
+_PROFILE_NAMES = (
+    "operations-only",
+    "signals-only",
+    "properties-and-signals",
+    "properties-only",
+)
+_SNAPSHOT_KEYS = {"identity", "prompts", "prompts_digest", "provenance", "schema_version"}
+# Transcribed, not read from the file, for the same reason as PRE_ADAPTIVE_RICH_PROMPT_HASHES: a
+# baseline move has to reach a reviewer as a failing assertion carrying the old digest.
+DEVELOPMENT_BASELINE_DIGEST = "9bc566b1bda08f419e49156cd18bf7f4583520226454d8c48ac21d106bab9de5"
+
+
 def test_named_baseline_snapshot_has_all_perception_profiles_and_matches_runtime() -> None:
-    # This names the control directly. Re-pointing a movable "current" alias cannot silently move
-    # the guard to a candidate snapshot after the prompt rewrite.
-    assert BASELINE_PROMPT_SNAPSHOT == PROMPT_ROOT / "snapshots" / "pre-optimization-control.json"
+    # This names the baseline directly. A move is a new named file plus this edit, never a
+    # re-pointed movable "current" alias that could silently carry the guard to a candidate.
+    assert BASELINE_PROMPT_SNAPSHOT == PROMPT_ROOT / "snapshots" / "development-2026-10-09.json"
     frozen = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
     rendered = build_prompt_snapshot(
         identity=frozen["identity"],
@@ -679,18 +692,37 @@ def test_named_baseline_snapshot_has_all_perception_profiles_and_matches_runtime
         reason=frozen["provenance"]["reason"],
         prompt_source_dirty_diff_sha256=frozen["provenance"]["prompt_source_dirty_diff_sha256"],
     )
-    profile_names = (
-        "operations-only",
-        "signals-only",
-        "properties-and-signals",
-        "properties-only",
-    )
     assert {(row["perception_profile"], row["semantic_label"]) for row in frozen["prompts"]} == {
-        (profile, label) for profile in profile_names for label in PROMPT_LABELS
+        (profile, label) for profile in _PROFILE_NAMES for label in PROMPT_LABELS
     }
     assert rendered["prompts"] == frozen["prompts"]
     assert rendered["prompts_digest"] == frozen["prompts_digest"]
     assert frozen["prompts_digest"] == prompt_rows_digest(frozen["prompts"])
+    assert frozen["prompts_digest"] == DEVELOPMENT_BASELINE_DIGEST
+    assert frozen["identity"] == "development-2026-10-09"
+    assert frozen["provenance"] == {
+        "prompt_source_dirty_diff_sha256": None,
+        "reason": (
+            "Development baseline after the execution and recovery contracts; supersedes the "
+            "pre-optimization control as the active prompt gate."
+        ),
+        "source_revision": "2d6df3df8ae08c06c18800506c5cb8ddffa83fdc",
+    }
+    assert set(frozen) == _SNAPSHOT_KEYS
+
+
+def test_pre_optimization_control_is_retained_intact_as_history() -> None:
+    # No longer the gate, so it is not compared against the live runtime. It is still the record
+    # earlier campaign numbers were measured against, so its bytes must not drift.
+    frozen = load_prompt_snapshot(PRE_OPTIMIZATION_CONTROL_SNAPSHOT)
+    assert {(row["perception_profile"], row["semantic_label"]) for row in frozen["prompts"]} == {
+        (profile, label) for profile in _PROFILE_NAMES for label in PROMPT_LABELS
+    }
+    assert frozen["prompts_digest"] == prompt_rows_digest(frozen["prompts"])
+    assert (
+        frozen["prompts_digest"]
+        == "56c1cd60b049c73d12f258e03e59b31d3b00ca24cff31f647de38a5038276129"
+    )
     assert frozen["identity"] == "pre-optimization-control"
     assert frozen["provenance"] == {
         "prompt_source_dirty_diff_sha256": None,
@@ -699,13 +731,15 @@ def test_named_baseline_snapshot_has_all_perception_profiles_and_matches_runtime
         ),
         "source_revision": "99ffea0fb37f1e95721c02b92dd2f0540a5c6ad7",
     }
-    assert set(frozen) == {
-        "identity",
-        "prompts",
-        "prompts_digest",
-        "provenance",
-        "schema_version",
+    assert set(frozen) == _SNAPSHOT_KEYS
+    rich_rows = {
+        row["semantic_label"]: row
+        for row in frozen["prompts"]
+        if row["perception_profile"] == "properties-and-signals"
     }
+    assert {
+        label: (row["system_sha256"], row["user_sha256"]) for label, row in rich_rows.items()
+    } == PRE_ADAPTIVE_RICH_PROMPT_HASHES
 
 
 def test_campaign_configuration_mirrors_mutable_inputs_without_entering_prompt_snapshot() -> None:
@@ -735,8 +769,9 @@ def test_campaign_configuration_mirrors_mutable_inputs_without_entering_prompt_s
     assert "sk-" not in serialized
 
 
-def test_prompt_snapshot_rows_are_complete_and_safe() -> None:
-    frozen = load_prompt_snapshot(BASELINE_PROMPT_SNAPSHOT)
+@pytest.mark.parametrize("path", [BASELINE_PROMPT_SNAPSHOT, PRE_OPTIMIZATION_CONTROL_SNAPSHOT])
+def test_prompt_snapshot_rows_are_complete_and_safe(path: Path) -> None:
+    frozen = load_prompt_snapshot(path)
     for row in frozen["prompts"]:
         assert len(row["system_sha256"]) == len(row["user_sha256"]) == 64
         assert row["system"] and row["user"]
@@ -752,14 +787,6 @@ def test_prompt_snapshot_rows_are_complete_and_safe() -> None:
         assert sum(section["characters"] for section in row["sections"]) == len(
             row["system"]
         ) + len(row["user"])
-    rich_rows = {
-        row["semantic_label"]: row
-        for row in frozen["prompts"]
-        if row["perception_profile"] == "properties-and-signals"
-    }
-    assert {
-        label: (row["system_sha256"], row["user_sha256"]) for label, row in rich_rows.items()
-    } == PRE_ADAPTIVE_RICH_PROMPT_HASHES
     serialized = json.dumps(frozen).lower()
     assert "scenario_universe" not in serialized
     assert '"oracle":' not in serialized
@@ -790,7 +817,7 @@ def test_prompt_snapshot_loader_rejects_a_row_changed_without_a_new_identity(
 ) -> None:
     snapshot = json.loads(BASELINE_PROMPT_SNAPSHOT.read_text())
     snapshot["prompts"][0]["system"] += " changed"
-    path = tmp_path / "pre-optimization-control.json"
+    path = tmp_path / BASELINE_PROMPT_SNAPSHOT.name
     path.write_text(json.dumps(snapshot))
 
     with pytest.raises(ValueError, match="digest does not match"):
