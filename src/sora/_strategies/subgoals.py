@@ -10,11 +10,13 @@ from sora.activity import Activity
 from sora.data_ops import (
     _resolve_collection,
 )
+from sora.manual import Manual
 from sora.memory import (
     step_from_raw,
 )
 from sora.perception import Percept
 from sora.references import (
+    _MISSING,
     _REF_BIND,
     _REF_PATH,
     _walk_path,
@@ -143,23 +145,35 @@ def _active_frame_goal(activity: Activity) -> str | None:
     return goal if isinstance(goal, str) and goal else None
 
 
-def _substitute_bindings(obj: Any, name: str, element: Any) -> Any:
+def _substitute_bindings(obj: Any, name: str, element: Any, *, optional: bool = False) -> Any:
     """Replace every ``{"$bind": name, "path": ...}`` in a template with the value at that path of
     the current loop ``element``, recursively. Only the named binding is substituted;
     ``$from``/``$decide`` references (and a ``$bind`` for a different name) pass through untouched,
-    to be grounded later by the ordinary Reason path. A path that doesn't resolve substitutes a
-    ``None`` — which the Act required-param guard skips, not a literal ``$bind`` dict reaching the
-    tool."""
+    to be grounded later by the ordinary Reason path. Missing paths reject the expansion unless
+    the entire containing parameter is schema-declared optional; then it is omitted. Present null
+    remains a value for the operation schema to validate."""
     if isinstance(obj, dict):
         if obj.get(_REF_BIND) == name:
             try:
                 return _walk_path(element, obj.get(_REF_PATH, ""))
-            except (KeyError, IndexError, TypeError, ValueError):
-                log.warning("subgoal: $bind path %r did not resolve against %r", obj, element)
-                return None
-        return {k: _substitute_bindings(v, name, element) for k, v in obj.items()}
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                if optional:
+                    return _MISSING
+                preview = repr(element)
+                if len(preview) > 300:
+                    preview = preview[:300] + "…"
+                raise ValueError(
+                    f"loop binding {name!r} has no readable path {obj.get(_REF_PATH, '')!r} "
+                    f"in element {preview}; use the actual record shape or flatten collected "
+                    "pages before fan-out. A missing field is not a null value."
+                ) from exc
+        resolved = {
+            k: _substitute_bindings(v, name, element, optional=optional) for k, v in obj.items()
+        }
+        return _MISSING if any(v is _MISSING for v in resolved.values()) else resolved
     if isinstance(obj, list):
-        return [_substitute_bindings(v, name, element) for v in obj]
+        resolved_list = [_substitute_bindings(v, name, element, optional=optional) for v in obj]
+        return _MISSING if any(v is _MISSING for v in resolved_list) else resolved_list
     return obj
 
 
@@ -169,6 +183,7 @@ def _expand_mechanical(
     bindings: dict[str, Any] | None = None,
     properties: dict[tuple[str, str], Percept] | None = None,
     meter: PropertyReadMeter | None = None,
+    tools: dict[str, Manual] | None = None,
 ) -> tuple[list[Step], str | None]:
     """Fan a mechanical sub-goal out to one concrete ``Step`` per element of its ``in`` collection,
     the element substituted for ``{"$bind": "<as>"}`` in its ``template``. The ``in`` collection may
@@ -189,6 +204,37 @@ def _expand_mechanical(
         return [], None
     loop_var = step.params.get("as", "")
     template = step.params.get("template", {})
-    return [
-        step_from_raw(_substitute_bindings(template, loop_var, element)) for element in elements
-    ], None
+    if not isinstance(template, dict):
+        return [], "a mechanical subgoal template must be one step object, not a list of steps"
+    params = template.get("params", {})
+    tool_id = template.get("tool_id")
+    manual = (tools or {}).get(tool_id) if isinstance(tool_id, str) else None
+    spec = manual.operation(template.get("operation_name", "")) if manual is not None else None
+    schema = spec.parameters if spec is not None else {}
+    declared = schema.get("properties", {})
+    optional_keys = (
+        set(declared) - set(schema.get("required", []))
+        if template.get("action", "invoke") == "invoke" and isinstance(declared, dict)
+        else set()
+    )
+    expanded: list[Step] = []
+    for index, element in enumerate(elements):
+        try:
+            if isinstance(params, dict):
+                substituted = {}
+                for key, value in params.items():
+                    resolved = _substitute_bindings(
+                        value, loop_var, element, optional=key in optional_keys
+                    )
+                    if resolved is not _MISSING:
+                        substituted[key] = resolved
+                raw = _substitute_bindings(
+                    {k: v for k, v in template.items() if k != "params"}, loop_var, element
+                )
+                raw["params"] = substituted
+            else:
+                raw = _substitute_bindings(template, loop_var, element)
+            expanded.append(step_from_raw(raw))
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            return [], f"fan-out element {index}: {exc}"
+    return expanded, None

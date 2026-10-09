@@ -20,6 +20,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace
 from sora._strategies.parameters import _mistyped_params, _null_required_params, _undeclared_params
 from sora.action import default_action_registry, invoke_step
@@ -625,10 +627,9 @@ async def test_bind_dispatches_null_when_schema_unavailable(tmp_path: Path) -> N
     assert bare_result.invocation is not None
 
 
-async def test_cycle_skips_invoke_dispatch_when_required_param_null(tmp_path: Path) -> None:
+async def test_cycle_replans_when_required_param_null(tmp_path: Path) -> None:
     # End-to-end through the cycle: a plan step whose required param grounds to null must never
-    # reach the tool. The step is *not* re-run — step_index advances (skip-and-continue), so the
-    # activity progresses to its next step rather than deadlocking on the guarded one.
+    # reach the tool or count as completed work. Reason returns an actionable replan defect.
     manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
     tool = FakeTool("email", manual=manual, invoke_results={"reply_to_email": {"sent": True}})
     cycle, working, registry = _cycle(tmp_path, ScriptedProcedural(), tool)
@@ -650,7 +651,9 @@ async def test_cycle_skips_invoke_dispatch_when_required_param_null(tmp_path: Pa
     assert activity.pending_operation is None  # never went RUNNING on an op
     state = activity.state
     assert state is ActivityState.READY  # not stuck RUNNING; free to advance
-    assert activity.step_index == 1  # advanced -> skip-and-continue, not stuck on the step
+    assert activity.step_index == 0
+    assert activity.plan is None
+    assert "required" in str(activity.replan_trail[-1])
 
 
 async def test_cycle_dispatches_invoke_when_required_params_present(tmp_path: Path) -> None:
@@ -1615,3 +1618,125 @@ async def test_the_reground_report_is_what_gets_dispatched(tmp_path: Path) -> No
 
     assert result.step is not None
     assert result.step.params["text"] == "No relative matched; nothing was sent."
+
+
+@pytest.mark.parametrize(
+    "nullable_schema",
+    [
+        {"type": ["string", "null"]},
+        {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        {"oneOf": [{"type": "string"}, {"type": "null"}]},
+    ],
+)
+async def test_required_nullable_and_optional_values_dispatch_through_cycle(
+    tmp_path: Path, nullable_schema: dict[str, Any]
+) -> None:
+    manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
+    manual.operations[0].parameters["properties"]["email_id"] = nullable_schema
+    manual.operations[0].parameters["properties"]["optional"] = {"type": "string"}
+    tool = FakeTool("email", manual=manual, invoke_results={"reply_to_email": {"sent": True}})
+    cycle, working, registry = _cycle(tmp_path, ScriptedProcedural(), tool)
+    await registry.join(_ORIGIN)
+    step = invoke_step("email", "reply_to_email", email_id=None, body="hi", optional=None)
+    activity = Activity(
+        id="a", goal="reply", context={}, plan=Plan(id="p", goal="reply", steps=[step])
+    )
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    await asyncio.sleep(0)
+    assert tool.invocations == [
+        ("reply_to_email", {"email_id": None, "body": "hi", "optional": None})
+    ]
+    assert not activity.replan_trail
+
+
+async def test_missing_required_nullable_key_still_replans(tmp_path: Path) -> None:
+    manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
+    manual.operations[0].parameters["properties"]["email_id"] = {"type": ["string", "null"]}
+    tool = FakeTool("email", manual=manual, invoke_results={"reply_to_email": {"sent": True}})
+    cycle, working, registry = _cycle(tmp_path, ScriptedProcedural(), tool)
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="reply",
+        context={},
+        plan=Plan(id="p", goal="reply", steps=[invoke_step("email", "reply_to_email", body="hi")]),
+    )
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    assert not tool.invocations
+    assert activity.plan is None
+    assert "email_id" in str(activity.replan_trail[-1])
+
+
+@pytest.mark.parametrize("route", ["send", "invoke"])
+@pytest.mark.parametrize(
+    "case",
+    ["previous_frame", "repaired", "unrepaired", "different_arguments", "failed_after_success"],
+)
+async def test_report_review_is_scoped_and_ignores_successfully_retried_failures(
+    tmp_path: Path, route: str, case: str
+) -> None:
+    tool = FakeTool("runtime/UserChannel", invoke_results={SEND_MESSAGE_TO_USER: None})
+    spy = ScriptedProcedural(ground_result={"text": "Reviewed outcome"})
+    cycle, working, registry = _cycle(tmp_path, spy, tool)
+    await registry.join(_ORIGIN)
+    activity = _report_activity("Saved records.")
+    if route == "send":
+        activity.plan = Plan(
+            id="p",
+            goal="report",
+            steps=[
+                Step(
+                    next_action="send", params={"to": "user", "content": {"text": "Saved records."}}
+                )
+            ],
+        )
+    invocation = OperationInvocation("catalog", "save", {"id": "one"})
+    failed = CompletedOperation(invocation, OperationAck(ok=False, result="temporary failure"))
+    success = CompletedOperation(invocation, OperationAck(ok=True, result="saved"))
+    activity.history = [failed]
+    if case == "previous_frame":
+        activity.history_mark = 1
+    elif case == "repaired":
+        activity.history.append(success)
+    elif case == "different_arguments":
+        activity.history.append(
+            CompletedOperation(
+                OperationInvocation("catalog", "save", {"id": "two"}), OperationAck(ok=True)
+            )
+        )
+    elif case == "failed_after_success":
+        activity.history = [success, failed]
+    working.activities[activity.id] = activity
+    result = await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+    needs_review = case in {"unrepaired", "different_arguments", "failed_after_success"}
+    assert bool(spy.ground_calls) == needs_review
+    assert (result.step is None) == needs_review
+
+
+async def test_typo_in_required_parameter_keeps_schema_correction_and_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    manual = _manual_with_required("email", "reply_to_email", ["email_id", "body"])
+    tool = FakeTool("email", manual=manual, invoke_results={"reply_to_email": None})
+    cycle, working, registry = _cycle(tmp_path, ScriptedProcedural(), tool)
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="reply",
+        context={},
+        plan=Plan(
+            id="p",
+            goal="reply",
+            steps=[invoke_step("email", "reply_to_email", email_ids="one", body="hello")],
+        ),
+    )
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    assert not tool.invocations
+    defect = str(activity.replan_trail[-1])
+    assert "no such parameter(s) 'email_ids'" in defect
+    assert "accepts only body, email_id" in defect
+    assert any("plan defect" in record.message for record in caplog.records)

@@ -30,3 +30,6 @@ Predefined external actions:
 - _retrieve_ manuals from external repositories
 - _focus_ on and _unfocus_ from tools to perceive observable properties and signals
 - _send_ messages to other agents, via a pluggable protocol (e.g., A2A, plain HTTP)
+
+The default execution and recovery checks, including their semantic limits, are described in
+[Execution and recovery contracts](../architecture/notes/execution-and-recovery-contracts.md).

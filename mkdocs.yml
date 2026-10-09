@@ -120,6 +120,7 @@ nav:
       - Design Notes:
           - ARE Dynamic Scenarios: architecture/notes/are-dynamic-scenarios.md
           - Attention Scoped to Live Intentions: architecture/notes/attention-scoped-to-live-intentions.md
+          - Execution and Recovery Contracts: architecture/notes/execution-and-recovery-contracts.md
           - Cross-Workspace Tool Sharing: architecture/notes/cross-workspace-tool-sharing.md
           - Jason Plan Representation: architecture/notes/jason-plan-representation.md
           - Mechanical Predicates over Model Filters: architecture/notes/mechanical-predicates-over-model-filters.md

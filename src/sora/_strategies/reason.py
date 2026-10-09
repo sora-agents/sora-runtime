@@ -28,6 +28,7 @@ from sora._strategies.observe import (
 from sora._strategies.parameters import (
     _declared_param_names,
     _mistyped_params,
+    _null_required_params,
     _undeclared_params,
 )
 from sora._strategies.reconsideration import (
@@ -65,6 +66,7 @@ from sora.activity import SEEDED_BINDINGS, Activity, ActivityState
 from sora.data_ops import (
     _enrich_with_params,
     _flatten,
+    _ordered_predicate_defect,
     _resolve_collection,
     _resolve_predicate_value,
     _resolve_sources,
@@ -134,6 +136,20 @@ def _replan_halt_prompt(activity: Activity, halt: str) -> str:
         f"What each abandoned plan ran into:\n{attempts}\n"
         "How should I proceed?"
     )
+
+
+def _report_needs_review(activity: Activity) -> bool:
+    """Review known gaps and failures in this frame that no later identical success repaired."""
+    if activity.noop_subgoals:
+        return True
+    completed_calls = []
+    for completed in reversed(activity.history[activity.history_mark :]):
+        invocation = completed.invocation
+        if completed.ack.ok:
+            completed_calls.append(invocation)
+        elif invocation not in completed_calls:
+            return True
+    return False
 
 
 class DefaultReasonStrategy:
@@ -563,9 +579,13 @@ class DefaultReasonStrategy:
                 passthrough, defect = _resolve_predicate_value(
                     passthrough, activity.history, activity.bindings, cycle.working.properties
                 )
+                if defect is None:
+                    defect = _ordered_predicate_defect(
+                        resolved if resolved is not None else [], passthrough.get("where")
+                    )
             if defect is None and step.next_action == FlattenAction.name:
                 # Concatenated here rather than in the action for the same reason a `collect` is
-                # gathered here: a `path` that names a field no element carries is a plan defect
+                # gathered here: a `path` missing from any element is a plan defect
                 # that has to drop the plan, and only Reason may do that.
                 resolved, defect = _flatten(
                     resolved if resolved is not None else [], passthrough.get("path")
@@ -961,6 +981,7 @@ class DefaultReasonStrategy:
             activity.bindings,
             cycle.working.properties,
             cycle.working.prop_reads,
+            tools={tool.id: tool.manual for tool in wm.registry.all_tools()},
         )
         if defect is not None:
             # Splicing in zero steps here would mean "this sub-goal had nothing to do", which is a
@@ -1102,7 +1123,7 @@ class DefaultReasonStrategy:
                 # The one step whose params a *plan-time literal* can already be wrong about (see
                 # _resolve): a report the planner phrased before the work it describes ran.
                 force=routing[OPERATION_NAME] == SEND_MESSAGE_TO_USER
-                and bool(activity.noop_subgoals),
+                and _report_needs_review(activity),
             )
             if resolved is None:
                 return None  # escalated to _ground_; RUNNING now
@@ -1126,6 +1147,16 @@ class DefaultReasonStrategy:
                 log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
                 activity.reset_for_replan(defect=defect)
                 return None
+            required = _null_required_params(manual, routing[OPERATION_NAME], resolved)
+            if required:
+                defect = (
+                    f"{routing[OPERATION_NAME]}: missing or null non-nullable required "
+                    f"parameter(s) {', '.join(repr(key) for key in required)}; "
+                    "resolve them before invoking. Required work cannot be silently skipped."
+                )
+                log.warning("reason: plan defect for activity %s — %s", activity.id, defect)
+                activity.reset_for_replan(defect=defect)
+                return None
             mistyped = _mistyped_params(manual, routing[OPERATION_NAME], resolved, op_params)
             if mistyped:
                 # Same defect class as `undeclared` above, one line down the same schema: the name
@@ -1142,7 +1173,15 @@ class DefaultReasonStrategy:
             content = step.params.get("content")
             if not isinstance(content, dict):
                 return step  # nothing groundable
-            resolved = await self._resolve(activity, wm, cycle, content, SendAction.name, None)
+            resolved = await self._resolve(
+                activity,
+                wm,
+                cycle,
+                content,
+                SendAction.name,
+                None,
+                force=step.params.get("to") == "user" and _report_needs_review(activity),
+            )
             if resolved is None:
                 return None
             if resolved == content:

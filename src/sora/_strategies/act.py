@@ -45,7 +45,8 @@ class DefaultActStrategy:
     the invoke and logs the offending paths instead. It is a backstop for a resolver bug, not part
     of normal flow; a healthy run never trips it.
 
-    The second: a **required** param that resolves to null is a schema violation, so the invoke is
+    The second: a missing required param or a **non-nullable required** param that resolves to null
+    is a schema violation, so the invoke is
     *skipped* — no
     invocation is emitted and the cycle dispatches nothing this step (`_act`). Grounding (Reason)
     has already run by now, so a null at bind time is a value the model declined or could not fill,
@@ -55,7 +56,9 @@ class DefaultActStrategy:
     synthesized) to know which params are required; with no manual/spec/declared ``required`` it
     cannot tell, so it does not fire and binds as before — the same structured-spec dependency the
     thread-reading Manual relocation has. It narrows, not eliminates, a null-invoke: an *optional*
-    null still passes through by design (many operations take legitimately-optional params)."""
+    null still passes through by design (many operations take legitimately-optional params), as does
+    an explicitly nullable required value. Default Reason diagnoses these defects before advancing
+    the step and replans; this skip guard remains a backstop for custom Reason strategies."""
 
     async def bind(
         self, step: Step, manual: Manual | None, cycle: DecisionCycle, result: TickResult

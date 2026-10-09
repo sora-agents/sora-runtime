@@ -222,6 +222,9 @@ class Activity:
     # Monotonic evaluation accounting. ``replan_trail`` is intentionally cleared by progress and
     # therefore cannot answer how many replans occurred over a whole scenario.
     replan_count: int = 0
+    # Inference copies replace `goal` with a child's goal; retain the full originating request
+    # separately so delegation cannot erase qualifiers or grant new communication authority.
+    originating_goal: str | None = None
     # context is exclusively for strategy-author data — the runtime itself never writes into it,
     # which is what keeps pending_operation/last_operation as dedicated fields instead of context
     # keys with a naming convention: no shared namespace means no collision to avoid in the first

@@ -125,11 +125,34 @@ def _null_required_params(
     manual: Manual | None, operation_name: str, params: dict[str, Any]
 ) -> list[str]:
     """The operation's *required* params (per its schema) that resolve to null in ``params`` —
-    either an explicit None or absent entirely (a required key the step never supplied). Empty when
+    either a non-nullable None or absent entirely (a required key the step never supplied).
+    Explicitly nullable required values are accepted, but the key must still be supplied.
+    Empty when
     the schema is unavailable (no manual, the manual doesn't describe this op, or it declares no
     ``required``): required-ness is then unknowable, so the guard can't fire and binding goes on."""
     spec = manual.operation(operation_name) if manual is not None else None
     if spec is None:
         return []
     required = spec.parameters.get("required", [])
-    return [key for key in required if params.get(key) is None]
+    properties = spec.parameters.get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    return [
+        key
+        for key in required
+        if key not in params or (params[key] is None and not _allows_null(properties.get(key, {})))
+    ]
+
+
+def _allows_null(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    declared_type = schema.get("type")
+    if declared_type == "null" or (isinstance(declared_type, list) and "null" in declared_type):
+        return True
+    return any(
+        _allows_null(branch)
+        for keyword in ("anyOf", "oneOf")
+        if isinstance(schema.get(keyword), list)
+        for branch in schema[keyword]
+    )

@@ -48,89 +48,85 @@ def _dedup_key(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)
 
 
-def _overlaps(element: Any, where: dict[str, Any]) -> bool:
-    """Does the element's own ``[start_path, end_path]`` interval meet any interval in ``against``?
+def _combine_predicates(results: list[bool | None], *, disjunction: bool) -> bool | None:
+    decisive = disjunction  # True for OR, False for AND
+    if decisive in results:
+        return decisive
+    return None if None in results else not decisive
 
-    The two-sided sibling of ``between``: ``between`` compares one value against one fixed pair,
-    this compares one *pair* against a whole collection of them. ``against`` arrives already
-    resolved and projected by Reason into ``[start, end]`` pairs, exactly as an ``in`` membership
-    set arrives projected to keys — so this stays a literal comparison with no reference
-    resolution, and no per-member alias to scope.
 
-    Half-open by default (``boundaries: "exclusive"``): two intervals that merely touch at a
-    boundary do NOT overlap, which is what a calendar means by a conflict. ``"inclusive"`` makes a
-    shared endpoint count. Nothing here is calendar-specific — intervals are ordered values of any
-    comparable type, and ISO-8601 timestamps happen to compare correctly as strings.
+def _ordered_comparison(left: Any, right: Any, op: str) -> bool | None:
+    if left is None or right is None:
+        return False  # missing bounds retain their existing nonmatch semantics
+    try:
+        if op == "lt":
+            return bool(left < right)
+        if op == "le":
+            return bool(left <= right)
+        if op == "gt":
+            return bool(left > right)
+        return bool(left >= right)
+    except TypeError:
+        return None
 
-    Every unusable input is a non-match rather than a crash or a blanket keep, matching the ordered
-    ops: an element missing either end, a malformed pair, a null bound, an incomparable type. That
-    direction is deliberate — this predicate's output feeds delete fan-outs, where failing *open*
-    would act on the whole collection. An ``against`` that could not be read at all is caught in
-    Reason as a plan defect (``_operand_defect``), since silently matching nothing is a confident
-    wrong answer about the world."""
+
+def _overlap_result(element: Any, where: dict[str, Any]) -> bool | None:
     start = pluck(element, where.get("start_path", ""))
     end = pluck(element, where.get("end_path", ""))
     intervals = where.get("against")
     if start is None or end is None or not isinstance(intervals, (list, tuple)):
         return False
     inclusive = where.get("boundaries") == "inclusive"
+    results: list[bool | None] = []
     for interval in intervals:
         if not (isinstance(interval, (list, tuple)) and len(interval) == 2):
             continue
         other_start, other_end = interval
         if other_start is None or other_end is None:
             continue
-        try:
-            if (
-                (start <= other_end and end >= other_start)
-                if inclusive
-                else (start < other_end and end > other_start)
-            ):
-                return True
-        except TypeError:
-            continue  # incomparable types -> non-match, never a crash (like lt/le/gt/ge)
-    return False
+        result = _combine_predicates(
+            [
+                _ordered_comparison(start, other_end, "le" if inclusive else "lt"),
+                _ordered_comparison(end, other_start, "ge" if inclusive else "gt"),
+            ],
+            disjunction=False,
+        )
+        if result is True:
+            return True
+        results.append(result)
+    return _combine_predicates(results, disjunction=True)
 
 
-def _matches(element: Any, where: Any) -> bool:
-    """Evaluate a mechanical ``filter`` predicate against one element: ``{"path", "op", "value"}``
-    with op in eq/ne/lt/le/gt/ge/between/in/not_in/overlaps. ``in``/``not_in`` test membership of
-    the element's ``path`` value in ``value`` (a literal list, or — resolved upstream in Reason —
-    the projected keys of another collection named by a reference); ``overlaps`` tests the
-    element's own interval against a collection of them (see ``_overlaps``). A ``$decide``
-    predicate never gets here, and that is now *enforced* rather than assumed: a whole-predicate
-    one is escalated by FilterAction, and a nested one — which FilterAction's top-level escalation
-    test does not see, so it used to arrive here and evaluate False for every element, silently
-    emptying the collection — is refused upstream as a plan defect by
-    ``_resolve_predicate_clause``. No predicate keeps everything. A
-    membership set that isn't a list is treated as empty: ``in`` matches nothing, ``not_in`` keeps
-    everything (fails open, so a malformed exclusion set never silently drops the whole
-    collection).
+def _overlaps(element: Any, where: dict[str, Any]) -> bool:
+    """Boolean compatibility view of the shared interval evaluator.
 
-    A predicate may instead COMPOSE others under ``all`` (conjunction) or ``any`` (disjunction),
-    recursively. Composition is what makes the mechanical path reach predicates that previously had
-    to escalate whole: the real ones are rarely a single clause — "not one of the newly added
-    events AND overlapping one of them" is two — and one un-mechanical clause used to drag the
-    entire predicate to a model call over the whole collection. A malformed or EMPTY clause list
-    matches nothing rather than vacuously everything: ``all([])`` is true in logic, but this
-    predicate's consumers fan out over what it keeps, so the failure that acts on the whole
-    collection is the one worth refusing. Reason reports either as a plan defect
-    (``_composition_defect``) rather than leaving it as a silent empty result."""
+    Half-open by default; inclusive boundaries count touching endpoints. Against intervals arrive
+    resolved by Reason. An incomparable interval cannot invalidate a proved overlap; absent such
+    a witness, Reason reports undecidability rather than certifying a conflict-free complement.
+    """
+    return _overlap_result(element, where) is True
+
+
+def _predicate_result(element: Any, where: Any) -> bool | None:
+    """One evaluation path for matching and preflight: True, False, or undecidable.
+
+    OR witnesses and AND exclusions settle the result even when another branch is incomparable.
+    Missing fields retain nonmatch semantics. Operand shapes/references are validated upstream.
+    """
     if not isinstance(where, dict):
         return False
-    if _COMPOSE_ALL in where:
-        clauses = where[_COMPOSE_ALL]
-        if not isinstance(clauses, list) or not clauses:
-            return False
-        return all(_matches(element, clause) for clause in clauses)
-    if _COMPOSE_ANY in where:
-        clauses = where[_COMPOSE_ANY]
-        if not isinstance(clauses, list) or not clauses:
-            return False
-        return any(_matches(element, clause) for clause in clauses)
+    for keyword in (_COMPOSE_ALL, _COMPOSE_ANY):
+        if keyword in where:
+            clauses = where[keyword]
+            if not isinstance(clauses, list) or not clauses:
+                return False
+            return _combine_predicates(
+                [_predicate_result(element, clause) for clause in clauses],
+                disjunction=keyword == _COMPOSE_ANY,
+            )
     op = where.get("op", "eq")
     if op == "overlaps":
-        return _overlaps(element, where)
+        return _overlap_result(element, where)
     actual = pluck(element, where.get("path", ""))
     value = where.get("value")
     if op == "eq":
@@ -144,28 +140,33 @@ def _matches(element: Any, where: Any) -> bool:
     if op == "between":
         if not (isinstance(value, (list, tuple)) and len(value) == 2):
             return False
-        lo, hi = value
-        if actual is None:
-            return False
-        try:
-            return bool(lo <= actual <= hi)
-        except TypeError:
-            return False  # incomparable types -> non-match, never a crash (like lt/le/gt/ge)
-    if actual is None:
-        return False  # ordered comparisons need a present value
-    try:
-        if op == "lt":
-            return bool(actual < value)
-        if op == "le":
-            return bool(actual <= value)
-        if op == "gt":
-            return bool(actual > value)
-        if op == "ge":
-            return bool(actual >= value)
-    except TypeError:
-        return False
+        return _combine_predicates(
+            [
+                _ordered_comparison(value[0], actual, "le"),
+                _ordered_comparison(actual, value[1], "le"),
+            ],
+            disjunction=False,
+        )
+    if op in ("lt", "le", "gt", "ge"):
+        return _ordered_comparison(actual, value, op)
     log.warning("filter: unknown predicate op %r -> excluding element", op)
     return False
+
+
+def _matches(element: Any, where: Any) -> bool:
+    """Boolean view; default Reason rejects undecidable predicates before filtering."""
+    return _predicate_result(element, where) is True
+
+
+def _ordered_predicate_defect(collection: list[Any], where: Any) -> str | None:
+    for index, element in enumerate(collection):
+        if _predicate_result(element, where) is None:
+            return (
+                f"predicate compares incompatible present values at element {index}; "
+                "Normalize both sides explicitly to the same ordered representation, or "
+                "recover with a supported comparison; a nonmatch would not prove absence."
+            )
+    return None
 
 
 # The names a windowed list operation uses for the metadata it returns *beside* its payload. Closed
@@ -510,6 +511,28 @@ def _resolve_sources(
     return concatenated, None
 
 
+def _empty_page(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if not value:
+        return True
+    metadata: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in _PAGE_META and not isinstance(item, (dict, list)):
+            metadata[key] = item
+        elif key in _PAGE_META_ENVELOPE and isinstance(item, dict):
+            if any(k not in _PAGE_META for k in item):
+                return False
+            metadata.update(item)
+        else:
+            return False
+    if "count" in metadata:
+        return type(metadata["count"]) is int and metadata["count"] == 0
+    return any(
+        type(metadata.get(key)) is int and metadata[key] == 0 for key in ("total", "total_count")
+    )
+
+
 def _flatten(collection: list[Any], path: str | None = None) -> tuple[list[Any] | None, str | None]:
     """Concatenate a collection *of collections* into one flat collection, returning
     ``(flattened, defect)`` on the same contract as ``_resolve_collection``.
@@ -525,30 +548,40 @@ def _flatten(collection: list[Any], path: str | None = None) -> tuple[list[Any] 
     Each element contributes ``pluck(element, path)`` when ``path`` is given, else itself, coerced
     through ``_as_collection``. An element that is not a collection contributes **itself**, so a
     defensively-placed flatten over records is a no-op rather than an error and no element is ever
-    dropped. A ``path`` that misses on *every* element is the exception: that is unreadable, not
+    dropped. With an explicit path, null payloads and provably empty pages contribute nothing.
+    A ``path`` that misses on a nonempty or ambiguous element is unreadable, not
     empty — the planner named a field the data does not have, which is the likeliest mistake where
     the ecosystem publishes no ``returns:`` shape to read the payload's name off — so it comes back
     as a defect to replan on, with the real field names named so the retry is informed."""
     if not collection:
         return [], None  # an empty sweep is an answer (nothing was there), not an unreadable input
     flattened: list[Any] = []
-    matched = 0
-    for element in collection:
-        value = pluck(element, path) if path else element
+    missing: list[int] = []
+    for index, element in enumerate(collection):
+        try:
+            value = walk_path(element, path) if path else element
+        except (KeyError, IndexError, TypeError, ValueError):
+            if not _empty_page(element):
+                missing.append(index)
+            continue
         if path and value is None:
-            continue  # this element has no such field; only ALL of them missing is a defect
-        matched += 1
+            continue  # explicit null payload is an empty page, not a null record
         inner = _as_collection(value)
         if inner is None:
             flattened.append(value)  # not a collection: contribute it whole rather than drop it
         else:
             flattened.extend(inner)
-    if path and matched == 0:
+    if path and missing:
         available = sorted(
             {k for e in collection if isinstance(e, dict) for k in e}
         )  # name what IS there: a blind retry would re-guess from the same nothing
         return None, (
-            f"the flatten step reads path {path!r}, which no element of its input has"
+            f"the flatten step reads path {path!r}, "
+            + (
+                "which no element of its input has"
+                if len(missing) == len(collection)
+                else f"which input element(s) {missing} do not have; refusing a partial result"
+            )
             + (f" (their fields are: {', '.join(available)})" if available else "")
         )
     return flattened, None

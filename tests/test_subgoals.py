@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, plan_json
+from fakes import FakeAdapter, FakeLLMClient, FakeTool, FakeWorkspace, ScriptedTransport, plan_json
 from sora._strategies.subgoals import _DEFAULT_MAX_SUBGOAL_DEPTH
 from sora.action import InferAction, SendAction, default_action_registry, invoke_step
 from sora.activity import Activity, ActivityState
@@ -54,10 +54,13 @@ from sora.strategies import (
 from sora.transport import MessageTransport
 from sora.types import (
     CompletedOperation,
+    ConditionFiring,
     InputWait,
     OperationAck,
     OperationInvocation,
+    PendingCondition,
     Plan,
+    SignalWait,
     Step,
     SubgoalMode,
     SupersededPlan,
@@ -979,7 +982,8 @@ async def test_infer_action_kind_subgoal_plans_against_the_overridden_goal(tmp_p
     await asyncio.sleep(0)
     _system, prompt = llm.calls[-1]
     assert "the sub goal" in prompt  # planned against the override
-    assert "parent goal" not in prompt  # not the activity's own goal
+    assert prompt.startswith("Goal: the sub goal\n")
+    assert "Originating request" in prompt and "parent goal" in prompt
 
 
 async def test_infer_action_defaults_to_kind_plan_and_activity_goal(tmp_path: Path) -> None:
@@ -1450,3 +1454,395 @@ def test_mechanical_fan_out_over_a_literal_offset_list_drives_a_paginated_sweep(
     assert defect is None
     assert [s.params["offset"] for s in steps] == [0, 20, 40]
     assert {s.params["operation_name"] for s in steps} == {"get_contacts"}
+
+
+@pytest.mark.parametrize("path", ["id", "record.id", "records.0.id"])
+async def test_missing_fanout_path_replans_atomically_before_any_invoke(
+    tmp_path: Path, path: str
+) -> None:
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    subgoal = _mechanical_subgoal()
+    subgoal.params["in"] = [
+        {"id": "first", "record": {"id": "first"}, "records": [{"id": "first"}]},
+        {},
+    ]
+    subgoal.params["template"]["params"]["apartment_id"]["path"] = path
+    activity = Activity(
+        id="a",
+        goal="save all qualifying records",
+        context={},
+        plan=Plan(id="p", goal="save", steps=[subgoal]),
+    )
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    await asyncio.sleep(0)
+    assert not tool.invocations
+    assert activity.plan is None
+    assert activity.step_index == 0
+    assert "fan-out element 1" in str(activity.replan_trail[-1])
+    assert "missing field is not a null" in str(activity.replan_trail[-1])
+    assert not activity.noop_subgoals
+
+
+async def test_mechanical_template_list_is_a_recoverable_defect(tmp_path: Path) -> None:
+    tool = FakeTool("realestate")
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    step = _mechanical_subgoal()
+    step.params["in"] = [{"id": "one"}]
+    step.params["template"] = [step.params["template"]]
+    activity = Activity(
+        id="a", goal="save", context={}, plan=Plan(id="p", goal="save", steps=[step])
+    )
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    assert activity.plan is None
+    assert "one step object" in str(activity.replan_trail[-1])
+    assert not tool.invocations
+
+
+@pytest.mark.parametrize("records", [[], ["first"], ["second", "first"]])
+async def test_pages_to_dependent_calls_preserve_identity_through_real_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, records: list[str]
+) -> None:
+    tool = FakeTool("catalog", invoke_results={"list_items": {}, "lookup": {}, "apply": {}})
+
+    async def invoke(operation: str, **params: object) -> OperationAck:
+        tool.invocations.append((operation, params))
+        if operation == "list_items":
+            offset = int(str(params["offset"]))
+            items = (
+                []
+                if offset == 0
+                else [{"code": records[offset - 1]}]
+                if offset <= len(records)
+                else []
+            )
+            if offset == 0:
+                return OperationAck(ok=True, result={"items": None})
+            if not items:
+                return OperationAck(
+                    ok=True, result={"count": 0, "metadata": {"total": len(records)}}
+                )
+            return OperationAck(ok=True, result={"items": items})
+        if operation == "lookup":
+            return OperationAck(ok=True, result=f"id-{params['code']}")
+        return OperationAck(ok=True, result={"applied": True})
+
+    monkeypatch.setattr(tool, "invoke", invoke)
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    steps = _parse_plan_steps(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "action": "subgoal",
+                        "mode": "mechanical",
+                        "goal": "read all pages",
+                        "in": [0, 1, 2],
+                        "as": "offset",
+                        "template": {
+                            "action": "invoke",
+                            "tool_id": "catalog",
+                            "operation_name": "list_items",
+                            "params": {"offset": {"$bind": "offset"}},
+                        },
+                    },
+                    {"action": "collect", "from": "list_items", "out": "pages"},
+                    {
+                        "action": "flatten",
+                        "in": {"$bind": "pages"},
+                        "path": "items",
+                        "out": "items",
+                    },
+                    {
+                        "action": "subgoal",
+                        "mode": "mechanical",
+                        "goal": "lookup every item",
+                        "in": {"$bind": "items"},
+                        "as": "item",
+                        "template": {
+                            "action": "invoke",
+                            "tool_id": "catalog",
+                            "operation_name": "lookup",
+                            "params": {"code": {"$bind": "item", "path": "code"}},
+                        },
+                    },
+                    {"action": "collect", "from": "lookup", "out": "resolved"},
+                    {
+                        "action": "subgoal",
+                        "mode": "mechanical",
+                        "goal": "apply each lookup",
+                        "in": {"$bind": "resolved"},
+                        "as": "resolved_item",
+                        "template": {
+                            "action": "invoke",
+                            "tool_id": "catalog",
+                            "operation_name": "apply",
+                            "params": {
+                                "code": {"$bind": "resolved_item", "path": "code"},
+                                "record_id": {"$bind": "resolved_item", "path": "result"},
+                            },
+                        },
+                    },
+                ]
+            }
+        )
+    )
+    activity = Activity(
+        id="a",
+        goal="apply every requested item",
+        context={},
+        plan=Plan(id="p", goal="apply", steps=steps),
+    )
+    working.activities[activity.id] = activity
+    for _ in range(40):
+        await cycle.tick()
+        await asyncio.sleep(0)
+        if activity.state is ActivityState.TERMINATED:
+            break
+    assert activity.state is ActivityState.TERMINATED
+    assert not activity.replan_trail
+    assert tool.invocations == [("list_items", {"offset": i}) for i in (0, 1, 2)] + [
+        ("lookup", {"code": code}) for code in records
+    ] + [("apply", {"code": code, "record_id": f"id-{code}"}) for code in records]
+
+
+@pytest.mark.parametrize("value", [None, "record-one"])
+async def test_fanout_preserves_present_nullable_values_and_omits_optional_arguments(
+    tmp_path: Path, value: str | None
+) -> None:
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    tool.manual.operations[0].parameters.update(
+        {
+            "properties": {
+                "apartment_id": {"type": ["string", "null"]},
+                "note": {"type": "string"},
+            },
+            "required": ["apartment_id"],
+        }
+    )
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    step = _mechanical_subgoal()
+    step.params["in"] = [{"id": value}]
+    activity = Activity(
+        id="a", goal="save", context={}, plan=Plan(id="p", goal="save", steps=[step])
+    )
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    await asyncio.sleep(0)
+    assert tool.invocations == [("save_apartment", {"apartment_id": value})]
+    assert not activity.replan_trail
+
+
+@pytest.mark.parametrize(
+    "qualifier",
+    [
+        "Only House records qualify",
+        "Use River Hall as the venue",
+        "Morgan means contact alias morgan-work",
+    ],
+)
+async def test_child_inference_and_recovery_keep_originating_constraints_and_history(
+    tmp_path: Path, qualifier: str
+) -> None:
+    root_goal = (
+        qualifier
+        + ". "
+        + "Additional task context. " * 30
+        + "Do not send any user reply or message to another person."
+    )
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    cycle, working, registry = _cycle(tmp_path, procedural, FakeTool("catalog"))
+    await registry.join(_ORIGIN)
+    parent = Plan(
+        id="p",
+        goal=root_goal,
+        steps=[
+            Step(
+                next_action="subgoal",
+                params={"mode": "deliberative", "goal": "resolve the remaining selection"},
+            )
+        ],
+    )
+    activity = Activity(
+        id="a",
+        goal=root_goal,
+        context={},
+        plan=parent,
+        history=[_history("read_catalog", {"completed_record_id": "already-read"})],
+    )
+    working.activities[activity.id] = activity
+    working.messages.append(Message(sender="user", content={"text": root_goal}, received_at=0.0))
+    await cycle.tick()
+    await asyncio.sleep(0)
+    assert len(llm.calls) == 1
+    prompt = llm.calls[-1][1]
+    assert prompt.startswith("Goal: resolve the remaining selection")
+    assert root_goal in prompt
+    assert "already-read" in prompt
+    assert "communication restrictions still apply" in prompt
+    assert "Plan ONLY for the active Goal above" in prompt
+    assert "do not repeat completed writes" in prompt
+    assert activity.goal == root_goal
+    await DefaultObserveStrategy().observe(cycle)
+    activity.reset_for_replan(defect="selection is empty; no substitute is authorized")
+    await DefaultReasonStrategy().reason(activity, working, cycle, TickResult())
+    await asyncio.sleep(0)
+    prompt = llm.calls[-1][1]
+    assert root_goal in prompt
+    assert "already-read" in prompt
+    assert "no substitute is authorized" in prompt
+    assert activity.history[-1].ack.result == {"completed_record_id": "already-read"}
+
+
+@pytest.mark.parametrize("route", ["send", "invoke"])
+@pytest.mark.parametrize("literal", [False, True])
+@pytest.mark.parametrize("gap", ["empty", "failed"])
+async def test_reports_use_execution_evidence_for_literal_and_grounded_text(
+    tmp_path: Path, route: str, literal: bool, gap: str
+) -> None:
+    corrected = "No records were updated: " + (
+        "none qualified." if gap == "empty" else "the operation failed."
+    )
+    llm = FakeLLMClient(json.dumps({"params": {"text": corrected}}))
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    tool = FakeTool("runtime-io", invoke_results={"send_message_to_user": {"sent": True}})
+    cycle, working, registry = _cycle(tmp_path, procedural, tool)
+    transport = ScriptedTransport()
+    cycle.communication = transport
+    await registry.join(_ORIGIN)
+    text = "All records were updated." if literal else {"$decide": "report actual effects"}
+    report = (
+        Step(next_action="send", params={"to": "user", "content": {"text": text}})
+        if route == "send"
+        else invoke_step("runtime-io", "send_message_to_user", text=text)
+    )
+    activity = Activity(
+        id="a",
+        goal="update matching records and report the actual outcome",
+        context={},
+        plan=Plan(id="p", goal="update", steps=[report]),
+    )
+    if gap == "empty":
+        activity.noop_subgoals.append("update each qualifying record")
+    else:
+        activity.history.append(_history("update_record", "rejected", ok=False))
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    await asyncio.sleep(0)
+    assert len(llm.calls) == 1
+    prompt = llm.calls[0][1]
+    assert ("expanded to no steps" if gap == "empty" else "ERROR: rejected") in prompt
+    assert not transport.sent and not tool.invocations
+    await cycle.tick()
+    await asyncio.sleep(0)
+    if route == "send":
+        assert transport.sent == [("user", {"text": corrected})]
+    else:
+        assert tool.invocations == [("send_message_to_user", {"text": corrected})]
+    assert not activity.replan_trail
+
+
+async def test_conditional_child_recursion_is_a_bounded_truthful_pause(tmp_path: Path) -> None:
+    goal = "If the qualifying records exist then save the qualifying records"
+    response = plan_json({"action": "subgoal", "mode": "deliberative", "goal": goal})
+    llm = FakeLLMClient(response)
+    procedural = ProceduralMemory(FileMemoryBackend(tmp_path / "proc"), llm=llm)
+    tool = FakeTool("catalog", invoke_results={"save": {"saved": True}})
+    cycle, working, registry = _cycle(tmp_path, procedural, tool)
+    transport = ScriptedTransport()
+    cycle.communication = transport
+    await registry.join(_ORIGIN)
+    activity = Activity(
+        id="a",
+        goal="maintain the requested selection",
+        context={},
+        plan=Plan(id="p", goal="watch", steps=[]),
+    )
+    activity.history = [_history("remove_record", {"removed_id": str(i)}) for i in range(6)]
+    activity.condition_fired.append(
+        ConditionFiring(
+            condition=PendingCondition(
+                watch=SignalWait(signal_name="change", source="catalog"),
+                when="a qualifying record arrives",
+                then=goal,
+            )
+        )
+    )
+    working.activities[activity.id] = activity
+    for _ in range(12):
+        await cycle.tick()
+        await asyncio.sleep(0)
+        if isinstance(activity.blocked_on, InputWait):
+            break
+    assert activity.state is ActivityState.BLOCKED
+    assert isinstance(activity.blocked_on, InputWait)
+    assert "repeats an ancestor" in (activity.blocked_on.prompt or "")
+    assert len(llm.calls) == 2
+    assert not tool.invocations
+    assert len(activity.history) == 6
+    assert len(transport.sent) == 1
+    assert transport.sent[0][1]["text"].startswith("Stuck on")
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_fanout_omits_unavailable_optional_parameter_without_losing_valid_records(
+    tmp_path: Path, nested: bool
+) -> None:
+    tool = FakeTool("realestate", invoke_results={"save_apartment": {"saved": True}})
+    tool.manual.operations[0].parameters.update(
+        {
+            "properties": {"apartment_id": {"type": "string"}, "note": {}},
+            "required": ["apartment_id"],
+        }
+    )
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    step = _mechanical_subgoal()
+    step.params["in"] = [
+        {"id": "one", "note": "keep"},
+        {"id": "two"},
+        {"id": "three", "note": None},
+    ]
+    ref = {"$bind": "apt", "path": "note"}
+    # _mechanical_subgoal uses 'apt' as its loop alias.
+    ref["$bind"] = step.params["as"]
+    step.params["template"]["params"]["note"] = {"text": ref} if nested else ref
+    activity = Activity(
+        id="a", goal="save", context={}, plan=Plan(id="p", goal="save", steps=[step])
+    )
+    working.activities[activity.id] = activity
+    for _ in range(10):
+        await cycle.tick()
+        await asyncio.sleep(0)
+        if activity.state is ActivityState.TERMINATED:
+            break
+    assert not activity.replan_trail
+    assert tool.invocations == [
+        ("save_apartment", {"apartment_id": "one", "note": {"text": "keep"} if nested else "keep"}),
+        ("save_apartment", {"apartment_id": "two"}),
+        ("save_apartment", {"apartment_id": "three", "note": {"text": None} if nested else None}),
+    ]
+
+
+async def test_fanout_defect_record_preview_is_bounded(tmp_path: Path) -> None:
+    tool = FakeTool("realestate")
+    cycle, working, registry = _cycle(tmp_path, _no_llm_procedural(tmp_path), tool)
+    await registry.join(_ORIGIN)
+    step = _mechanical_subgoal()
+    step.params["in"] = [{"huge": "x" * 100_000}]
+    activity = Activity(
+        id="a", goal="save", context={}, plan=Plan(id="p", goal="save", steps=[step])
+    )
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    defect = str(activity.replan_trail[-1])
+    assert "fan-out element 0" in defect
+    assert "readable path 'id'" in defect
+    assert len(defect) < 1000

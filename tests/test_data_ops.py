@@ -21,6 +21,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1525,9 +1526,8 @@ def test_a_decide_collection_is_soft_not_a_defect() -> None:
     assert _resolve_collection({"$decide": "the interesting ones"}, [], {}) == (None, None)
 
 
-async def test_filter_between_excludes_incomparable_value(tmp_path: Path) -> None:
-    # A `between` predicate over a collection with a non-numeric field must exclude the bad element,
-    # not raise (like the lt/le/gt/ge TypeError guard) — dirty tool output must not abort reason.
+async def test_filter_between_replans_on_incomparable_present_value(tmp_path: Path) -> None:
+    # Present incompatible values invalidate the comparison, rather than narrowing its answer.
     data = [{"crime": 6}, {"crime": "unknown"}, {"crime": 8}]
     step = Step(
         next_action="filter",
@@ -1538,7 +1538,9 @@ async def test_filter_between_excludes_incomparable_value(tmp_path: Path) -> Non
         },
     )
     activity = await _run_one_dataop(tmp_path, step, [])
-    assert [e["crime"] for e in activity.bindings["o"]] == [6, 8]
+    assert "o" not in activity.bindings
+    assert activity.plan is None
+    assert "incompatible present values" in str(activity.replan_trail[-1])
 
 
 async def test_filter_decide_dedupes_repeated_indices(tmp_path: Path) -> None:
@@ -2071,3 +2073,186 @@ async def test_filter_membership_accepts_list_valued_fields(
     assert activity.plan is not None
     assert activity.bindings["selected"] == [records[0] if op == "in" else records[1]]
     assert not caplog.records
+
+
+@pytest.mark.parametrize("compose", [None, "all", "any"])
+async def test_incompatible_overlap_cannot_certify_a_conflict_free_complement(
+    tmp_path: Path, compose: str | None
+) -> None:
+    where = {
+        "op": "overlaps",
+        "start_path": "start",
+        "end_path": "end",
+        "against": [{"start": "2026-01-01T10:00:00", "end": "2026-01-01T11:00:00"}],
+        "against_start_path": "start",
+        "against_end_path": "end",
+    }
+    if compose:
+        where = {
+            compose: [
+                {"path": "id", "op": "eq", "value": "other" if compose == "any" else "busy"},
+                where,
+            ]
+        }
+    steps = [
+        Step(
+            next_action="filter",
+            params={
+                "in": [{"id": "busy", "start": 100, "end": 200}],
+                "where": where,
+                "out": "conflicts",
+            },
+        ),
+        Step(
+            next_action="filter",
+            params={
+                "in": [{"id": "busy"}],
+                "where": {
+                    "path": "id",
+                    "op": "not_in",
+                    "value": {"$bind": "conflicts"},
+                    "value_path": "id",
+                },
+                "out": "free",
+            },
+        ),
+    ]
+    cycle, working, _ = _cycle(tmp_path, _no_llm_procedural(tmp_path), FakeTool("realestate"))
+    activity = _activity_with_plan(steps, [])
+    working.activities[activity.id] = activity
+    await cycle.tick()
+    assert activity.plan is None
+    assert "free" not in activity.bindings
+    assert "conflicts" not in activity.bindings
+    assert "Normalize both sides explicitly" in str(activity.replan_trail[-1])
+
+
+async def test_flatten_explicit_path_missing_on_one_page_replans_without_partial_binding(
+    tmp_path: Path,
+) -> None:
+    step = Step(
+        next_action="flatten",
+        params={
+            "in": [{"items": [{"id": "first"}]}, {"other_items": [{"id": "second"}]}],
+            "path": "items",
+            "out": "records",
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert activity.plan is None
+    assert "records" not in activity.bindings
+    assert "refusing a partial result" in str(activity.replan_trail[-1])
+
+
+async def test_flatten_explicit_null_and_empty_page_are_not_missing_paths(tmp_path: Path) -> None:
+    step = Step(
+        next_action="flatten",
+        params={
+            "in": [{"items": []}, {"items": None}, {"items": [{"id": "one"}]}],
+            "path": "items",
+            "out": "records",
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert activity.bindings["records"] == [{"id": "one"}]
+    assert not activity.replan_trail
+
+
+@pytest.mark.parametrize(
+    "compose,guard_value,expected", [("any", "busy", ["busy"]), ("all", "other", [])]
+)
+@pytest.mark.parametrize("guard_first", [False, True])
+async def test_known_boolean_branch_preserves_truth_despite_incompatible_other_clause(
+    tmp_path: Path, compose: str, guard_value: str, expected: list[str], guard_first: bool
+) -> None:
+    guard = {"path": "id", "op": "eq", "value": guard_value}
+    ordered = {"path": "value", "op": "lt", "value": 10}
+    where = {compose: [guard, ordered] if guard_first else [ordered, guard]}
+    step = Step(
+        next_action="filter",
+        params={"in": [{"id": "busy", "value": "not-numeric"}], "where": where, "out": "selected"},
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert not activity.replan_trail
+    assert [item["id"] for item in activity.bindings["selected"]] == expected
+
+
+@pytest.mark.parametrize(
+    "empty_page", [{}, {"count": 0}, {"metadata": {"total": 0}}, {"items": None}]
+)
+async def test_flatten_empty_page_variants_contribute_no_records(
+    tmp_path: Path, empty_page: dict[str, Any]
+) -> None:
+    step = Step(
+        next_action="flatten",
+        params={
+            "in": [{"items": [{"id": "one"}]}, empty_page],
+            "path": "items",
+            "out": "records",
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert activity.bindings["records"] == [{"id": "one"}]
+    assert not activity.replan_trail
+
+
+@pytest.mark.parametrize(
+    "page", [{"total": 2, "has_more": False}, {"count": 0, "other": [{"id": "lost"}]}]
+)
+async def test_flatten_does_not_guess_ambiguous_missing_payload_is_empty(
+    tmp_path: Path, page: dict[str, Any]
+) -> None:
+    step = Step(next_action="flatten", params={"in": [page], "path": "items", "out": "records"})
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert activity.plan is None
+    assert "records" not in activity.bindings
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("inclusive", [False, True])
+async def test_overlap_witness_settles_result_despite_an_incomparable_interval(
+    tmp_path: Path, reverse: bool, inclusive: bool
+) -> None:
+    intervals = [[150, 250], ["2026-01-01", "2026-01-02"]]
+    if reverse:
+        intervals.reverse()
+    step = Step(
+        next_action="filter",
+        params={
+            "in": [{"id": "busy", "start": 100, "end": 200}],
+            "out": "selected",
+            "where": {
+                "op": "overlaps",
+                "start_path": "start",
+                "end_path": "end",
+                "against": intervals,
+                "against_start_path": "0",
+                "against_end_path": "1",
+                "boundaries": "inclusive" if inclusive else "exclusive",
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert not activity.replan_trail
+    assert [item["id"] for item in activity.bindings["selected"]] == ["busy"]
+
+
+async def test_nonoverlap_can_be_proved_by_one_comparable_endpoint(tmp_path: Path) -> None:
+    step = Step(
+        next_action="filter",
+        params={
+            "in": [{"start": 100, "end": 200}],
+            "out": "selected",
+            "where": {
+                "op": "overlaps",
+                "start_path": "start",
+                "end_path": "end",
+                "against": [[300, "unknown"]],
+                "against_start_path": "0",
+                "against_end_path": "1",
+            },
+        },
+    )
+    activity = await _run_one_dataop(tmp_path, step, [])
+    assert not activity.replan_trail
+    assert activity.bindings["selected"] == []

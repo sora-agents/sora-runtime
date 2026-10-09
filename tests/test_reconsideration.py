@@ -1441,3 +1441,20 @@ async def test_an_unbaselined_activity_is_left_for_its_own_entry_anchor(tmp_path
     await DefaultObserveStrategy().observe(cycle)
 
     assert activity.reconsider_baseline is None
+
+
+def test_unrelated_novel_success_resets_once_but_repeated_reads_do_not() -> None:
+    activity = Activity(id="a", goal="finish the constrained task", context={})
+    defect = "required record_id missing"
+    _replanned(activity, defect)
+    unrelated = CompletedOperation(
+        OperationInvocation("weather", "read_weather", {"city": "Example"}),
+        OperationAck(ok=True, result={"temperature": 20}),
+    )
+    activity.history.append(unrelated)
+    _replanned(activity, defect)
+    assert activity.replan_trail == [defect]
+    activity.history.append(unrelated)
+    _replanned(activity, defect)
+    assert activity.replan_trail == [defect, defect]
+    assert DefaultReasonStrategy()._replanning_would_loop(activity) is not None

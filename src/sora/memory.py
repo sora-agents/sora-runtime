@@ -837,15 +837,17 @@ def render_messages(messages: list[Message]) -> str:
     the channel that carries user *instructions / steering* (a follow-up after a stop, a mid-task
     correction) into inference, distinct from an activity's goal string. An append log like
     ``render_signals``; only the most recent ``_MESSAGE_RENDER`` are shown (storage is uncapped, so
-    the prompt window is capped here instead), each length-capped. ``(none)`` when empty. Public so
-    a custom ``PlanPrompt`` can reuse it."""
+    the prompt window is capped here instead). User instructions are rendered whole: truncating a
+    message can erase its final restriction. Other senders retain the bounded preview. ``(none)``
+    when empty. Public so a custom ``PlanPrompt`` can reuse it."""
     if not messages:
         return "(none)"
     lines = []
     for m in messages[-_MESSAGE_RENDER:]:
         text = m.content.get("text")
         rendered = text if isinstance(text, str) else _render_json(m.content)
-        lines.append(f"- {m.sender}: {_truncate(rendered)}")
+        preview = rendered if m.sender == "user" and isinstance(text, str) else _truncate(rendered)
+        lines.append(f"- {m.sender}: {preview}")
     return "\n".join(lines)
 
 
@@ -879,7 +881,8 @@ def _render_goal_provenance(activity: Activity) -> str:
 
     ``PLAN_SYSTEM_PROMPT`` tells the planner to end with ``send_message_to_user`` *if the goal came
     from the user* — a condition the model cannot evaluate, because a sub-goal is inferred against
-    its own goal string with the parent nowhere in the prompt. Every plan therefore read as the
+    its own goal string. The originating request is separate constraint context, not the child
+    goal or an instruction to execute the parent work again. Every plan therefore read as the
     user's and ended with a report, so one user turn produced a report per plan in the tree instead
     of one for the turn. An explicitly delegated user question is still work the child owes;
     suppressing automatic signoffs must not suppress that operation. A non-empty intention stack
@@ -907,11 +910,13 @@ def _render_goal_provenance(activity: Activity) -> str:
         if not activity.condition_fired and not activity.parent_frames:
             return (
                 "This goal is the last currently queued condition branch (`then` or `otherwise`) "
-                "at the top level, NOT a new request from the user. After completing its work, "
-                "send ONE closing user reply summarizing ALL completed follow-up work in the "
+                "at the top level, NOT a new request from the user. Unless the originating "
+                "request forbids a reply, send ONE closing user reply after "
+                "completing its work, summarizing ALL completed follow-up work in the "
                 "execution record. Do not report halfway through this plan. If this goal already "
                 "requests a user message that supplies that closing reply, it is sufficient; "
-                "do not append a second report."
+                "do not append a second report. Explicit communication restrictions in the "
+                "originating request govern every branch and override automatic signoffs."
             ) + matching_scope
         return (
             "This goal is a condition branch (`then` or `otherwise`), NOT a new request from the "
@@ -1046,7 +1051,17 @@ def _default_plan_user_prompt(
     channels = fitted_channels(observed.channels)
     user = (
         f"Goal: {activity.goal}\n"
-        f"{_render_goal_provenance(activity)}\n"
+        + (
+            "Originating request — constraint context only:\n"
+            f"{activity.originating_goal}\n"
+            "Plan ONLY for the active Goal above. Do not execute or redecompose the originating "
+            "request here. Its relevant qualifiers and communication restrictions still apply; "
+            "the parent owns other work. Reuse executed results and do not repeat "
+            "completed writes.\n"
+            if activity.originating_goal is not None and activity.originating_goal != activity.goal
+            else ""
+        )
+        + f"{_render_goal_provenance(activity)}\n"
         f"{_render_governing_step_conditions(activity)}"
         f"{_render_armed_conditions_section(activity)}"
         f"Available tools and their operations:\n{render_tools(tools, channels)}\n\n"
@@ -1866,6 +1881,10 @@ def _default_ground_user_prompt(
         # Deliberately unwindowed: a $from/$decide reference may name any past result, and hiding
         # the entry that holds the referent fails the same way truncating it mid-record does.
         f"Results of operations already executed:\n{render_history(activity.history)}\n\n"
+        "A successful retry with the same tool, operation and arguments resolves that earlier "
+        "failure; distinguish attempts from the actual final outcome.\n"
+        f"Outstanding monitoring conditions (not yet retired):\n"
+        f"{render_armed_conditions(activity.pending_conditions)}\n\n"
         # The other half of the record, and the half a report gets wrong. Everything above says
         # what happened; only this says what was planned, ran, and did nothing — without it the
         # grounder has no way to distinguish that from success and falls back on the goal's intent.

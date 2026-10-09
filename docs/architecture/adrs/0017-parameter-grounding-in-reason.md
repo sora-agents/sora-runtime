@@ -57,6 +57,12 @@ mechanistic schema split. Grounding moves into `DefaultReasonStrategy`, on the a
   partially-resolved params + the rendered history. A step with no references is a pure no-op (the
   cheap advance path makes no model call), so typically ≤1 model call/cycle still holds.
 
+After resolution, Default Reason preflights the operation schema before advancing the step.
+A missing required argument, or a null required argument not explicitly declared nullable, is a
+recoverable plan defect. Required nullable arguments must still be supplied; optional arguments
+may be omitted or null. Act retains its mechanical guard as a backstop for custom strategies,
+but the default path does not silently skip required work.
+
 The `ground` model call is packaged in `ProceduralMemory` (reusing its `LLMClient` and a pluggable
 `GroundPrompt`, mirroring `infer`) only because procedural memory currently owns the model handle;
 grounding is really an Act-adjacent reasoning act, and its eventual home is a client injected per

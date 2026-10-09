@@ -104,7 +104,7 @@ Concretely:
   field of one element — it can never concatenate *across* elements, so this cardinality change has
   no other home. An element that is not itself a collection contributes itself (so a defensive
   flatten over records is a no-op and nothing is ever dropped); an explicit `path` that misses on
-  *every* element is a plan defect, not an empty result, because guessing the payload field's name
+  *any nonempty or ambiguous* element is a plan defect, not an empty result, because guessing the payload field's name
   is the likeliest mistake wherever the adapted ecosystem publishes no `returns:` shape to read it
   off. The same gap widened `_as_collection`'s paginated-envelope tier to accept a **nested**
   metadata block (`{"contacts": [...], "metadata": {"range": …, "total": …}}`) beside the flat
@@ -129,6 +129,19 @@ Concretely:
 
 Named bindings are transient run state (a sibling of `history`/`grounded_params`, **not** a new
 memory module) and are cleared on replan, since they are coupled to the plan that produced them.
+
+Reason validates ordered comparisons against their actual input values before executing a filter.
+Present incomparable values are a recoverable defect when the predicate remains undecidable.
+A valid OR branch can prove inclusion and a valid AND branch can prove exclusion without requiring
+an irrelevant ordered comparison to succeed, independently of clause order. Predicate matching and
+preflight share one three-valued evaluator; an overlap witness likewise settles the answer even
+when another candidate interval has incompatible bounds. This preserves the distinction between “no
+overlap” and “the comparison could not be evaluated,” particularly when a later complement uses
+the result. Equality and membership retain their generic value semantics; no implicit timestamp
+conversion is introduced. An explicit `flatten.path` must resolve except on empty objects or
+metadata-only pages reporting zero records. Empty and null payloads contribute nothing; ambiguous
+missing paths reject the whole transformation. The generic no-path flatten still preserves
+noncollection elements, including null, unchanged.
 
 ### Positive Consequences
 

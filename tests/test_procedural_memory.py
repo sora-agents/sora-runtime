@@ -1716,3 +1716,53 @@ async def test_aclose_tolerates_a_client_that_offers_no_teardown(tmp_path: Path)
     has no client. Neither may raise — this runs in the teardown that also leaves workspaces."""
     await ProceduralMemory(FileMemoryBackend(tmp_path), llm=FakeLLMClient()).aclose()
     await ProceduralMemory(FileMemoryBackend(tmp_path)).aclose()  # no model configured at all
+
+
+async def test_last_condition_branch_keeps_full_communication_prohibition(tmp_path: Path) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+    root = (
+        "Monitor the requested records. " + "Detailed context. " * 40 + "Do not reply to the user."
+    )
+    activity = _activity("Process the qualifying addition")
+    activity.originating_goal = root
+    activity.pending_inference = PendingInference(
+        id="followup", kind=InferenceKind.CONDITION_FOLLOWUP, requested_at=0.0
+    )
+    await mem.infer(
+        activity, {}, messages=[Message(sender="user", content={"text": root}, received_at=0.0)]
+    )
+    prompt = llm.calls[-1][1]
+    assert root in prompt
+    assert "Unless the originating request forbids a reply" in prompt
+    assert "override automatic signoffs" in prompt
+
+
+def test_only_user_instruction_text_is_untruncated() -> None:
+    instruction = "Task details. " * 100 + "Do not contact anyone."
+    agent_text = "Agent details. " * 100 + "agent-text-tail"
+    messages = [
+        Message(sender="user", content={"text": instruction}, received_at=0.0),
+        Message(sender="worker", content={"text": agent_text}, received_at=1.0),
+        Message(sender="user", content={"data": "x" * 100_000 + "json-tail"}, received_at=2.0),
+    ]
+    rendered = render_messages(messages)
+    assert instruction in rendered
+    assert "agent-text-tail" not in rendered
+    assert "json-tail" not in rendered
+    assert len(rendered) < len(instruction) + 1000
+
+
+async def test_last_condition_branch_retains_default_closing_reply(tmp_path: Path) -> None:
+    llm = FakeLLMClient(plan_json({"action": "wait"}))
+    mem = _llm_memory(tmp_path, llm)
+    activity = _activity("Process the qualifying addition")
+    activity.originating_goal = "Monitor the requested records."
+    activity.pending_inference = PendingInference(
+        id="followup", kind=InferenceKind.CONDITION_FOLLOWUP, requested_at=0.0
+    )
+    await mem.infer(activity, {})
+    prompt = llm.calls[-1][1]
+    assert "Unless the originating request forbids a reply, send ONE closing user reply" in prompt
+    assert "Plan ONLY for the active Goal above" in prompt
+    assert "Do not execute or redecompose the originating request here" in prompt
